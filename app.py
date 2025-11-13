@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
+import time
 
 st.title("iTick 短线王（实时选股）")
 
@@ -16,44 +17,67 @@ now = datetime.now()
 if now.hour < 9 or (now.hour == 9 and now.minute < 30) or now.hour >= 15:
     st.warning("当前非交易时间，数据为昨收价，建议 9:30-15:00 运行")
 
+headers = {
+    "accept": "application/json",
+    "token": ITICK_KEY  # iTick 认证方式
+}
+
 # ==================== 获取 iTick 实时行情 ====================
 @st.cache_data(ttl=300)  # 5分钟缓存
 def get_itick_data():
     try:
-        # 1. 获取所有 A股 代码列表（iTick 提供）
-        codes_url = "https://api.itick.org/stock/codes"
-        codes_resp = requests.get(codes_url, headers={"Authorization": ITICK_KEY})
+        # 1. 获取 A股代码列表
+        codes_url = "https://api.itick.org/stock/list?region=cn"  # A股代码列表
+        codes_resp = requests.get(codes_url, headers=headers)
         if codes_resp.status_code != 200:
-            st.error("获取代码列表失败")
+            st.error(f"获取代码列表失败，状态码: {codes_resp.status_code}。检查 Key 或网络。")
             return None
-        codes = [item['code'] for item in codes_resp.json()['data'] if item['code'].startswith(('sh', 'sz'))]
+        codes_data = codes_resp.json()
+        codes = [item['symbol'] for item in codes_data.get('data', []) if item['symbol'].startswith(('sh', 'sz'))]  # 过滤 A股
 
-        # 2. 批量查询实时行情（单次最多 500 只）
-        batch_size = 500
+        if not codes:
+            st.error("无 A股代码返回")
+            return None
+
+        st.info(f"获取到 {len(codes)} 个 A股代码")
+
+        # 2. 批量查询实时行情（分批，每批 100 只，避免限额）
+        batch_size = 100
         all_data = []
         for i in range(0, len(codes), batch_size):
             batch_codes = ','.join(codes[i:i+batch_size])
-            url = f"https://api.itick.org/stock/realtime?codes={batch_codes}"
-            resp = requests.get(url, headers={"Authorization": ITICK_KEY})
+            url = f"https://api.itick.org/stock/quote?symbols={batch_codes}&region=cn"
+            resp = requests.get(url, headers=headers)
             if resp.status_code == 200:
-                all_data.extend(resp.json()['data'])
-        
+                batch_data = resp.json().get('data', [])
+                all_data.extend(batch_data)
+            else:
+                st.warning(f"批次 {i//batch_size + 1} 失败，状态码: {resp.status_code}")
+            time.sleep(0.5)  # 防限流
+
         if not all_data:
-            st.error("无数据返回")
+            st.error("无实时数据返回")
             return None
 
         df = pd.DataFrame(all_data)
-        # 字段映射
-        df['code'] = df['code'].str.lower()
-        df['open'] = pd.to_numeric(df['open'], errors='coerce')
-        df['close_yesterday'] = pd.to_numeric(df['pre_close'], errors='coerce')
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        if df.empty:
+            st.error("数据解析为空")
+            return None
+
+        # 字段映射（iTick 标准字段）
+        df['code'] = df['symbol'].str.lower() if 'symbol' in df.columns else df['code'].str.lower()
+        df['name'] = df.get('name', 'N/A')
+        df['open'] = pd.to_numeric(df.get('open', df.get('open_price')), errors='coerce')
+        df['close_yesterday'] = pd.to_numeric(df.get('pre_close', df.get('prev_close')), errors='coerce')
+        df['volume'] = pd.to_numeric(df.get('volume', df.get('vol')), errors='coerce')
+
         df.dropna(subset=['open', 'close_yesterday', 'volume'], inplace=True)
+        df = df[df['open'] > 0]
 
         # 计算指标
         df['price_momentum'] = (df['open'] - df['close_yesterday']) / df['close_yesterday']
         median_vol = df['volume'].median()
-        df['volume_ratio'] = df['volume'] / median_vol
+        df['volume_ratio'] = df['volume'] / median_vol if median_vol > 0 else 1
 
         st.success(f"iTick 数据获取成功！共 {len(df)} 只股票")
         return df
@@ -72,7 +96,7 @@ if st.button("一键生成短线王"):
         df = data.copy()
         st.write(f"**初始股票数**：{len(df)}")
 
-        # 你的核心过滤条件
+        # 过滤条件
         df = df[df["open"] > 10]
         st.write(f"**股价 > 10元**：{len(df)}")
 
