@@ -1,0 +1,4 @@
+streamlit
+akshare
+pandas
+tushare  # 可选，增强兜底
