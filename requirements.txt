@@ -2,3 +2,4 @@ streamlit
 tushare
 pandas
 requests
+akshare --upgrade
