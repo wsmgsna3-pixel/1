@@ -1,88 +1,100 @@
 import streamlit as st
 import akshare as ak
 import pandas as pd
-import requests
 from datetime import datetime
-import time
 
-st.title("短线王（多源稳定版）")
+st.title("短線王（終極 5 條版）")
 
-# 交易时间提示
+# 交易時間提示
 now = datetime.now()
 if now.hour < 9 or (now.hour == 9 and now.minute < 30) or now.hour >= 15:
-    st.warning("当前非交易时间，数据静态，建议 9:30-15:00 运行")
+    st.warning("當前非交易時間，數據靜態，建議 9:30-15:00 運行")
 
+# 獲取實時數據
 def get_realtime_data():
     sources = [
         ("新浪", lambda: ak.stock_zh_a_spot()),
-        ("东方财富", lambda: ak.stock_zh_a_spot_em()),
+        ("東方財富", lambda: ak.stock_zh_a_spot_em()),
     ]
     for name, func in sources:
         try:
             df = func()
-            if not df.empty and len(df) > 100:  # 验证数据量
-                st.success(f"使用 {name} 数据源成功！共 {len(df)} 只股票")
+            if not df.empty and len(df) > 100:
+                st.success(f"使用 {name} 數據源成功！共 {len(df)} 只股票")
                 return df
         except Exception as e:
-            st.warning(f"{name} 失败：{e}，尝试下一个...")
-    
-    # 兜底：腾讯 HTTP 直接调用（无库）
+            st.warning(f"{name} 失敗：{e}")
+    st.error("所有源失敗")
+    return None
+
+# 新增：獲取 10 天歷史數據
+def get_10d_data(symbol):
     try:
-        st.info("兜底使用腾讯 HTTP 接口...")
-        r = requests.get('http://qt.gtimg.cn/q=s_sh000001,s_sz399001')  # 示例全市场
-        data_str = r.text.split('=')[1].strip(';')
-        # 解析示例（简化，实际需扩展）
-        st.warning("腾讯 HTTP 需自定义解析，建议升级 akshare")
-        return pd.DataFrame()  # 临时空 DF
+        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", adjust="qfq")
+        if len(df) < 10:
+            return None
+        df = df.tail(10)
+        return {
+            "10d_return": (df.iloc[-1]['收盘'] / df.iloc[0]['开盘']) - 1,
+            "10d_avg_turnover": df['换手率'].mean(),
+            "high_yesterday": df.iloc[-2]['最高'],
+            "volume_yesterday": df.iloc[-2]['成交量']
+        }
     except:
-        st.error("所有源失败，请升级 akshare 或检查网络")
         return None
 
-if st.button("一键生成短线王"):
-    with st.spinner("拉取实时行情..."):
+if st.button("一鍵生成短線王"):
+    with st.spinner("拉取實時 + 歷史數據..."):
+        # 1. 獲取實時數據
         data = get_realtime_data()
         if data is None:
             st.stop()
 
-        # 列处理（通用中文列名）
-        try:
-            df = data[["代码", "名称", "今开", "昨收", "成交量"]].copy()
-            df.rename(columns={
-                "代码": "code", "名称": "name", "今开": "open",
-                "昨收": "close_yesterday", "成交量": "volume"
-            }, inplace=True)
-        except KeyError as e:
-            st.error(f"列名问题：{e}")
-            st.stop()
+        df = data[["代码", "名称", "今开", "昨收", "成交量"]].copy()
+        df.rename(columns={
+            "代码": "code", "名称": "name", "今开": "open",
+            "昨收": "close_yesterday", "成交量": "volume"
+        }, inplace=True)
 
         df["open"] = pd.to_numeric(df["open"], errors='coerce')
         df["close_yesterday"] = pd.to_numeric(df["close_yesterday"], errors='coerce')
         df["volume"] = pd.to_numeric(df["volume"], errors='coerce')
         df.dropna(subset=["open", "close_yesterday", "volume"], inplace=True)
 
-        # 指标计算
-        df["price_momentum"] = (df["open"] - df["close_yesterday"]) / df["close_yesterday"]
-        median_vol = df["volume"].median()
-        df["volume_ratio"] = df["volume"] / median_vol
+        # 2. 循環獲取 10 天數據（限前 1000 隻，避免超時）
+        history_data = []
+        codes = df["code"].tolist()[:1000]
+        for i, code in enumerate(codes):
+            st.write(f"處理 {i+1}/{len(codes)}: {code}")
+            hist = get_10d_data(code)
+            if hist:
+                hist["code"] = code
+                history_data.append(hist)
+            time.sleep(0.1)  # 防限流
 
-        # 过滤（宽松版）
-        df_filtered = df[df["open"] > 10]
-        df_filtered = df_filtered[df_filtered["open"] < df_filtered["close_yesterday"] * 1.099]
-        df_filtered = df_filtered[df_filtered["price_momentum"] > 0.01]
-        df_filtered = df_filtered[df_filtered["volume_ratio"] > 1.5]
+        if not history_data:
+            st.error("無歷史數據")
+            st.stop()
 
-        st.write(f"初始：{len(df)} | 最终：{len(df_filtered)}")
+        hist_df = pd.DataFrame(history_data)
+        df = df.merge(hist_df, on="code", how="inner")
 
-        if len(df_filtered) == 0:
-            st.warning("无结果，建议开盘运行")
+        # 3. 終極 5 條過濾
+        df = df[df["open"] > 10]                                      # 你的條件 1
+        df = df[df["10d_return"] <= 0.50]                             # 你的條件 2
+        df = df[df["10d_avg_turnover"] >= 3.0]                        # 你的條件 3
+        df = df[df["volume"] > 3 * df["volume_yesterday"]]            # 我的條件 1
+        df = df[df["open"] > df["high_yesterday"]]                    # 我的條件 2
+
+        if len(df) == 0:
+            st.warning("無符合條件的股票")
             st.stop()
 
         # 打分
-        df_filtered["score"] = df_filtered["price_momentum"] * 100 + df_filtered["volume_ratio"] * 10
-        result = df_filtered.sort_values("score", ascending=False).head(30)
+        df["score"] = (df["open"] - df["close_yesterday"]) / df["close_yesterday"] * 100 + \
+                      df["volume"] / df["volume_yesterday"] * 10
+        result = df.sort_values("score", descending=True).head(30)
 
-        st.success(f"找到 {len(result)} 只短线王！")
-        st.dataframe(result[["code", "name", "open", "price_momentum", "volume_ratio", "score"]])
-
-        csv = result.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("下载CSV", csv, "multi_source_kings.csv", "text/csv")
+        st.success(f"找到 {len(result)} 只終極短線王！")
+        st.dataframe(result[["code", "name", "open", "10d_return", "10d_avg_turnover", "score"]])
+        st.download_button("下載CSV", result.to_csv(index=False).encode('utf-8-sig'), "ultimate_kings.csv")
