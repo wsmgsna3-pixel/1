@@ -40,33 +40,35 @@ last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
 
 # ==============================
-# 拉取当天 A 股行情（300 只以内）
+# 拉取当天行情（限制 300 只）
 # ==============================
 @st.cache_data(ttl=60)
 def get_today_data(trade_date):
-    df = pro.daily(trade_date=trade_date)
+    try:
+        df = pro.daily(trade_date=trade_date)
+    except:
+        df = pd.DataFrame()
     return df
 
 # ==============================
-# 拉取历史数据（10 根 K 线）
+# 拉取最近 10 根 K 线历史数据
 # ==============================
 def get_10d(ts_code):
-    end = datetime.now()
-    start = end - timedelta(days=20)
-    start = start.strftime("%Y%m%d")
-    end = end.strftime("%Y%m%d")
-
-    df = pro.daily(ts_code=ts_code, start_date=start, end_date=end)
-    if df is None or len(df) < 10:
+    try:
+        end_date = last_trade_day
+        start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=20)).strftime("%Y%m%d")
+        df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        if df is None or len(df) < 10:
+            return None
+        df = df.sort_values("trade_date").tail(10)
+        row = {}
+        row["10d_return"] = df.iloc[-1]["close"] / df.iloc[0]["open"] - 1
+        row["volume_yesterday"] = df.iloc[-2]["vol"]
+        row["high_yesterday"] = df.iloc[-2]["high"]
+        row["10d_avg_turnover"] = df["pct_chg"].abs().mean()  # 近似指标
+        return row
+    except:
         return None
-    df = df.sort_values("trade_date").tail(10)
-
-    row = {}
-    row["10d_return"] = df.iloc[-1]["close"] / df.iloc[0]["open"] - 1
-    row["volume_yesterday"] = df.iloc[-2]["vol"]
-    row["high_yesterday"] = df.iloc[-2]["high"]
-    row["10d_avg_turnover"] = df["pct_chg"].abs().mean()  # 用 pct_chg 作为近似指标
-    return row
 
 # ==============================
 # 主入口
@@ -86,7 +88,6 @@ if st.button("一键生成短线王"):
 
     for i, (idx, row) in enumerate(df.iterrows()):
         ts_code = row["ts_code"]
-
         hist = get_10d(ts_code)
         if not hist:
             progress.progress((i+1)/len(df))
@@ -106,7 +107,6 @@ if st.button("一键生成短线王"):
         if cond1 and cond2 and cond3 and cond4 and cond5:
             score = (row["open"] - row["pre_close"]) / row["pre_close"] * 100 \
                     + row["vol"] / hist["volume_yesterday"] * 10
-
             result.append({
                 "ts_code": ts_code,
                 "name": row["ts_code"].split(".")[0],
