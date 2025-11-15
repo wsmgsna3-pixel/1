@@ -21,7 +21,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ==============================
-# 获取最近交易日（简单逻辑）
+# 获取最近交易日
 # ==============================
 def get_last_trade_day():
     today = datetime.now()
@@ -35,16 +35,6 @@ def get_last_trade_day():
 
 last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
-
-# ==============================
-# 获取股票基本信息（名称）
-# ==============================
-@st.cache_data(ttl=86400)
-def get_stock_info():
-    df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
-    return df
-
-stock_info = get_stock_info()
 
 # ==============================
 # 拉取当天行情
@@ -110,7 +100,6 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
                     + row["vol"] / hist["volume_yesterday"] * 10
             result.append({
                 "ts_code": ts_code,
-                "name": row["name"],
                 "open": row["open"],
                 "10d_return": round(hist["10d_return"], 4),
                 "10d_avg_turnover": round(hist["10d_avg_turnover"], 2),
@@ -137,9 +126,6 @@ if st.button("一键生成短线王"):
     if df is None or df.empty:
         st.error("未获取到行情数据")
         st.stop()
-
-    # 合并股票名称
-    df = df.merge(stock_info, on='ts_code', how='left')
 
     st.write(f"初筛总股票数: {len(df)}")
 
