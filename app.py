@@ -25,13 +25,10 @@ pro = ts.pro_api()
 # ==============================
 def get_last_trade_day():
     today = datetime.now()
-    # 周六
     if today.weekday() == 5:
         last_trade_day = today - timedelta(days=1)
-    # 周日
     elif today.weekday() == 6:
         last_trade_day = today - timedelta(days=2)
-    # 平日
     else:
         last_trade_day = today - timedelta(days=1)
     return last_trade_day.strftime("%Y%m%d")
@@ -65,43 +62,33 @@ def get_10d(ts_code):
         row["10d_return"] = df.iloc[-1]["close"] / df.iloc[0]["open"] - 1
         row["volume_yesterday"] = df.iloc[-2]["vol"]
         row["high_yesterday"] = df.iloc[-2]["high"]
-        row["10d_avg_turnover"] = df["pct_chg"].abs().mean()  # 近似指标
+        row["10d_avg_turnover"] = df["pct_chg"].abs().mean()
         return row
     except:
         return None
 
 # ==============================
-# 主入口
+# 筛选函数
 # ==============================
-if st.button("一键生成短线王"):
-    with st.spinner("正在获取 A 股行情..."):
-        df = get_today_data(last_trade_day)
-
-    if df is None or df.empty:
-        st.error("未获取到行情数据")
-        st.stop()
-
-    df = df.head(300)  # 限制 300 只股票
-
+def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
     result = []
-    progress = st.progress(0)
-
     for i, (idx, row) in enumerate(df.iterrows()):
         ts_code = row["ts_code"]
         hist = get_10d(ts_code)
         if not hist:
-            progress.progress((i+1)/len(df))
             continue
 
-        # 五条选股条件（开盘价条件改为 ≥ 昨日最高价的 70%）
         try:
             cond1 = row["open"] > 10
             cond2 = hist["10d_return"] <= 0.50
             cond3 = hist["10d_avg_turnover"] >= 3
-            cond4 = row["vol"] > hist["volume_yesterday"] * 3
-            cond5 = row["open"] >= hist["high_yesterday"] * 0.7  # 改动
+            cond4 = row["vol"] > hist["volume_yesterday"] * vol_multiplier
+            if not fallback:
+                cond5 = row["open"] >= hist["high_yesterday"] * open_multiplier
+            else:
+                # 放宽条件：开盘价 ≥ 昨日收盘价
+                cond5 = row["open"] >= row["pre_close"]
         except:
-            progress.progress((i+1)/len(df))
             continue
 
         if cond1 and cond2 and cond3 and cond4 and cond5:
@@ -117,11 +104,31 @@ if st.button("一键生成短线王"):
                 "volume_today": row["vol"],
                 "score": round(score, 2)
             })
+    return result
 
-        progress.progress((i+1)/len(df))
+# ==============================
+# 主入口
+# ==============================
+if st.button("一键生成短线王"):
+    with st.spinner("正在获取 A 股行情..."):
+        df = get_today_data(last_trade_day)
+
+    if df is None or df.empty:
+        st.error("未获取到行情数据")
+        st.stop()
+
+    df = df.head(300)
+
+    # 首轮筛选
+    result = select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3)
+
+    # 自动放宽条件
+    if not result:
+        st.warning("首次筛选无候选，自动放宽成交量和开盘价条件...")
+        result = select_stocks(df, vol_multiplier=1.0, open_multiplier=0.0, fallback=True)
 
     if not result:
-        st.warning("未找到符合条件的短线王")
+        st.error("即便放宽条件，仍未找到符合条件的短线王")
         st.stop()
 
     result_df = pd.DataFrame(result).sort_values("score", ascending=False)
