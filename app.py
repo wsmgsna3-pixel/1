@@ -21,17 +21,19 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ==============================
-# 获取最近交易日（周末/节假日安全）
+# 获取最近交易日（真实交易日）
 # ==============================
 def get_last_trade_day():
-    today = datetime.now()
-    if today.weekday() == 5:
-        last_trade_day = today - timedelta(days=1)
-    elif today.weekday() == 6:
-        last_trade_day = today - timedelta(days=2)
-    else:
-        last_trade_day = today - timedelta(days=1)
-    return last_trade_day.strftime("%Y%m%d")
+    today = datetime.now().strftime("%Y%m%d")
+    try:
+        cal = pro.trade_cal(exchange='SSE', start_date='20250101', end_date=today)
+        cal = cal[cal['is_open'] == 1]
+        cal = cal.sort_values('cal_date')
+        last_trade_day = cal[cal['cal_date'] <= today]['cal_date'].iloc[-1]
+        return last_trade_day
+    except Exception as e:
+        st.error(f"获取最近交易日失败: {e}")
+        return today
 
 last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
