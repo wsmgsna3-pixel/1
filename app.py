@@ -21,7 +21,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ==============================
-# 获取最近交易日（简单推算）
+# 获取最近交易日（简单逻辑）
 # ==============================
 def get_last_trade_day():
     today = datetime.now()
@@ -37,7 +37,7 @@ last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
 
 # ==============================
-# 拉取当天行情（限制 300 只）
+# 拉取当天行情
 # ==============================
 @st.cache_data(ttl=60)
 def get_today_data(trade_date):
@@ -50,6 +50,7 @@ def get_today_data(trade_date):
 # ==============================
 # 拉取最近 10 根 K 线历史数据
 # ==============================
+@st.cache_data(ttl=600)
 def get_10d(ts_code):
     try:
         end_date = last_trade_day
@@ -72,10 +73,12 @@ def get_10d(ts_code):
 # ==============================
 def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
     result = []
+    progress = st.progress(0)
     for i, (idx, row) in enumerate(df.iterrows()):
         ts_code = row["ts_code"]
         hist = get_10d(ts_code)
         if not hist:
+            progress.progress((i+1)/len(df))
             continue
 
         try:
@@ -86,9 +89,9 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
             if not fallback:
                 cond5 = row["open"] >= hist["high_yesterday"] * open_multiplier
             else:
-                # 放宽条件：开盘价 ≥ 昨日收盘价
                 cond5 = row["open"] >= row["pre_close"]
         except:
+            progress.progress((i+1)/len(df))
             continue
 
         if cond1 and cond2 and cond3 and cond4 and cond5:
@@ -104,6 +107,7 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
                 "volume_today": row["vol"],
                 "score": round(score, 2)
             })
+        progress.progress((i+1)/len(df))
     return result
 
 # ==============================
@@ -118,7 +122,8 @@ if st.button("一键生成短线王"):
         st.error("未获取到行情数据")
         st.stop()
 
-    df = df.head(300)
+    # 按涨幅排序，取前 300 只作为初筛
+    df = df.sort_values("pct_chg", ascending=False).head(300)
 
     # 首轮筛选
     result = select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3)
