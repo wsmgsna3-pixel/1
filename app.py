@@ -3,6 +3,9 @@ import tushare as ts
 import pandas as pd
 from datetime import datetime, timedelta
 
+# ==============================
+# 页面配置
+# ==============================
 st.set_page_config(page_title="短线王（Tushare 版）", layout="wide")
 st.title("短线王（Tushare 极速 300 只股票版）")
 
@@ -18,21 +21,26 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ==============================
-# 获取最近一个交易日
+# 获取最近交易日（适合周末/节假日）
 # ==============================
-@st.cache_data(ttl=3600)
 def get_last_trade_day():
-    today = datetime.now().strftime("%Y%m%d")
-    cal = pro.trade_cal(exchange='SSE', start_date='20250101', end_date=today)
-    # 取最近开盘日
-    last_trade_day = cal[cal['is_open']==1]['cal_date'].max()
-    return last_trade_day
+    today = datetime.now()
+    # 周六
+    if today.weekday() == 5:
+        last_trade_day = today - timedelta(days=1)
+    # 周日
+    elif today.weekday() == 6:
+        last_trade_day = today - timedelta(days=2)
+    # 平日
+    else:
+        last_trade_day = today - timedelta(days=1)
+    return last_trade_day.strftime("%Y%m%d")
 
 last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
 
 # ==============================
-# 拉取当天 A 股行情（300 只以内 / 积分安全）
+# 拉取当天 A 股行情（前 300 只）
 # ==============================
 @st.cache_data(ttl=60)
 def get_today_data(trade_date):
@@ -57,7 +65,7 @@ def get_10d(ts_code):
     row["10d_return"] = df.iloc[-1]["close"] / df.iloc[0]["open"] - 1
     row["volume_yesterday"] = df.iloc[-2]["vol"]
     row["high_yesterday"] = df.iloc[-2]["high"]
-    row["10d_avg_turnover"] = df["pct_chg"].abs().mean()  # 用 pct_chg 当替代指标
+    row["10d_avg_turnover"] = df["pct_chg"].abs().mean()  # 用 pct_chg 作为近似指标
     return row
 
 # ==============================
