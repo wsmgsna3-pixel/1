@@ -29,12 +29,23 @@ def get_last_trade_day():
         last_trade_day = today - timedelta(days=1)
     elif today.weekday() == 6:     # 周日
         last_trade_day = today - timedelta(days=2)
-    else:                          # 工作日取前一天
+    else:
         last_trade_day = today - timedelta(days=1)
     return last_trade_day.strftime("%Y%m%d")
 
 last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
+
+# ==============================
+# 获取股票基本信息（含总市值）
+# ==============================
+@st.cache_data(ttl=86400)
+def get_stock_info():
+    df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,total_mv')
+    df['total_mv'] = df['total_mv'] / 10000  # 万元 -> 亿元
+    return df
+
+stock_info = get_stock_info()
 
 # ==============================
 # 拉取当天行情
@@ -82,6 +93,7 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
             continue
 
         try:
+            # 五条短线王条件
             cond1 = row["open"] > 10
             cond2 = hist["10d_return"] <= 0.50
             cond3 = hist["10d_avg_turnover"] >= 3
@@ -99,16 +111,23 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
                     + row["vol"] / hist["volume_yesterday"] * 10
             result.append({
                 "ts_code": ts_code,
-                "name": row["ts_code"].split(".")[0],
+                "name": row["name"],
                 "open": row["open"],
                 "10d_return": round(hist["10d_return"], 4),
                 "10d_avg_turnover": round(hist["10d_avg_turnover"], 2),
                 "volume_yesterday": hist["volume_yesterday"],
                 "volume_today": row["vol"],
+                "total_mv": row["total_mv"],
                 "score": round(score, 2)
             })
         progress.progress((i+1)/len(df))
     return result
+
+# ==============================
+# 高亮前 10 条开盘价和成交量
+# ==============================
+def highlight_top10(s):
+    return ['background-color: lightgreen' if i < 10 else '' for i in range(len(s))]
 
 # ==============================
 # 主入口
@@ -116,11 +135,17 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
 if st.button("一键生成短线王"):
     with st.spinner("正在获取 A 股行情..."):
         df = get_today_data(last_trade_day)
-    st.write(f"获取到 {len(df)} 条行情数据")  # 输出调试信息
 
     if df is None or df.empty:
         st.error("未获取到行情数据")
         st.stop()
+
+    # 合并股票名称和总市值
+    df = df.merge(stock_info[['ts_code','name','total_mv']], on='ts_code', how='left')
+    # 过滤总市值 > 500亿
+    df = df[df['total_mv'] <= 500]
+
+    st.write(f"初筛总股票数（总市值≤500亿）: {len(df)}")
 
     # 按涨幅排序，取前 300 只作为初筛
     df = df.sort_values("pct_chg", ascending=False).head(300)
@@ -138,7 +163,9 @@ if st.button("一键生成短线王"):
         st.stop()
 
     result_df = pd.DataFrame(result).sort_values("score", ascending=False)
-    st.dataframe(result_df, use_container_width=True)
+    # 高亮前 10 条
+    styled_df = result_df.style.apply(highlight_top10, subset=['open','volume_today'])
+    st.dataframe(styled_df, use_container_width=True)
 
     csv = result_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button("下载 CSV", data=csv, file_name="短线王.csv", mime="text/csv")
