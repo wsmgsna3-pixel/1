@@ -70,7 +70,6 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
             continue
 
         try:
-            # 五条短线王条件
             cond1 = row["open"] > 10
             cond2 = hist["10d_return"] <= 0.50
             cond3 = hist["10d_avg_turnover"] >= 3
@@ -97,10 +96,6 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
             })
         progress.progress((i+1)/len(df))
     return result
-
-# 高亮前10条开盘价和成交量
-def highlight_top10(s):
-    return ['background-color: lightgreen' if i < 10 else '' for i in range(len(s))]
 
 # 本地股票名称映射（可扩展）
 stock_name_map = {
@@ -148,9 +143,11 @@ if st.button("一键生成短线王"):
     result_df = result_df[cols]
     result_df = result_df.rename(columns={'score': '综合评分'})
 
-    # 高亮前10条
-    styled_df = result_df.style.apply(highlight_top10, subset=['open','volume_today'])
-    st.dataframe(styled_df, use_container_width=True)
+    # 按综合评分降序排列
+    result_df = result_df.sort_values("综合评分", ascending=False).reset_index(drop=True)
+
+    # 显示表格
+    st.dataframe(result_df, use_container_width=True)
 
     # 下载 CSV
     csv = result_df.to_csv(index=False).encode("utf-8-sig")
