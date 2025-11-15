@@ -37,12 +37,11 @@ last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
 
 # ==============================
-# 获取股票基本信息（含总市值）
+# 获取股票基本信息（名称）
 # ==============================
 @st.cache_data(ttl=86400)
 def get_stock_info():
-    df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,total_mv')
-    df['total_mv'] = df['total_mv'] / 10000  # 万元 -> 亿元
+    df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
     return df
 
 stock_info = get_stock_info()
@@ -117,7 +116,6 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
                 "10d_avg_turnover": round(hist["10d_avg_turnover"], 2),
                 "volume_yesterday": hist["volume_yesterday"],
                 "volume_today": row["vol"],
-                "total_mv": row["total_mv"],
                 "score": round(score, 2)
             })
         progress.progress((i+1)/len(df))
@@ -140,12 +138,10 @@ if st.button("一键生成短线王"):
         st.error("未获取到行情数据")
         st.stop()
 
-    # 合并股票名称和总市值
-    df = df.merge(stock_info[['ts_code','name','total_mv']], on='ts_code', how='left')
-    # 过滤总市值 > 500亿
-    df = df[df['total_mv'] <= 500]
+    # 合并股票名称
+    df = df.merge(stock_info, on='ts_code', how='left')
 
-    st.write(f"初筛总股票数（总市值≤500亿）: {len(df)}")
+    st.write(f"初筛总股票数: {len(df)}")
 
     # 按涨幅排序，取前 300 只作为初筛
     df = df.sort_values("pct_chg", ascending=False).head(300)
