@@ -21,7 +21,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ==============================
-# 获取最近交易日（适合周末/节假日）
+# 获取最近交易日（周末/节假日安全）
 # ==============================
 def get_last_trade_day():
     today = datetime.now()
@@ -40,7 +40,7 @@ last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
 
 # ==============================
-# 拉取当天 A 股行情（前 300 只）
+# 拉取当天 A 股行情（300 只以内）
 # ==============================
 @st.cache_data(ttl=60)
 def get_today_data(trade_date):
