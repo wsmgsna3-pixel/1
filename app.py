@@ -3,15 +3,11 @@ import tushare as ts
 import pandas as pd
 from datetime import datetime, timedelta
 
-# ==============================
 # 页面配置
-# ==============================
 st.set_page_config(page_title="短线王（Tushare 版）", layout="wide")
 st.title("短线王（Tushare 极速 300 只股票版）")
 
-# ==============================
-# 运行时输入 Tushare Token
-# ==============================
+# 运行时输入 Token
 TS_TOKEN = st.text_input("请输入你的 Tushare Token", type="password")
 if not TS_TOKEN:
     st.warning("请输入 Tushare Token 后才能运行")
@@ -20,14 +16,12 @@ if not TS_TOKEN:
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-# ==============================
 # 获取最近交易日
-# ==============================
 def get_last_trade_day():
     today = datetime.now()
-    if today.weekday() == 5:       # 周六
+    if today.weekday() == 5:  # 周六
         last_trade_day = today - timedelta(days=1)
-    elif today.weekday() == 6:     # 周日
+    elif today.weekday() == 6:  # 周日
         last_trade_day = today - timedelta(days=2)
     else:
         last_trade_day = today - timedelta(days=1)
@@ -36,9 +30,7 @@ def get_last_trade_day():
 last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
 
-# ==============================
 # 拉取当天行情
-# ==============================
 @st.cache_data(ttl=60)
 def get_today_data(trade_date):
     try:
@@ -47,9 +39,7 @@ def get_today_data(trade_date):
         df = pd.DataFrame()
     return df
 
-# ==============================
-# 拉取最近 10 根 K 线历史数据
-# ==============================
+# 拉取最近10根K线历史数据
 @st.cache_data(ttl=600)
 def get_10d(ts_code):
     try:
@@ -68,9 +58,7 @@ def get_10d(ts_code):
     except:
         return None
 
-# ==============================
 # 筛选函数
-# ==============================
 def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
     result = []
     progress = st.progress(0)
@@ -110,15 +98,11 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
         progress.progress((i+1)/len(df))
     return result
 
-# ==============================
-# 高亮前 10 条开盘价和成交量
-# ==============================
+# 高亮前10条
 def highlight_top10(s):
     return ['background-color: lightgreen' if i < 10 else '' for i in range(len(s))]
 
-# ==============================
 # 主入口
-# ==============================
 if st.button("一键生成短线王"):
     with st.spinner("正在获取 A 股行情..."):
         df = get_today_data(last_trade_day)
@@ -129,7 +113,7 @@ if st.button("一键生成短线王"):
 
     st.write(f"初筛总股票数: {len(df)}")
 
-    # 按涨幅排序，取前 300 只作为初筛
+    # 按涨幅排序，取前300只
     df = df.sort_values("pct_chg", ascending=False).head(300)
 
     # 首轮筛选
@@ -145,7 +129,6 @@ if st.button("一键生成短线王"):
         st.stop()
 
     result_df = pd.DataFrame(result).sort_values("score", ascending=False)
-    # 高亮前 10 条
     styled_df = result_df.style.apply(highlight_top10, subset=['open','volume_today'])
     st.dataframe(styled_df, use_container_width=True)
 
