@@ -21,19 +21,17 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ==============================
-# 获取最近交易日（真实交易日）
+# 获取最近交易日（简单推算）
 # ==============================
 def get_last_trade_day():
-    today = datetime.now().strftime("%Y%m%d")
-    try:
-        cal = pro.trade_cal(exchange='SSE', start_date='20250101', end_date=today)
-        cal = cal[cal['is_open'] == 1]
-        cal = cal.sort_values('cal_date')
-        last_trade_day = cal[cal['cal_date'] <= today]['cal_date'].iloc[-1]
-        return last_trade_day
-    except Exception as e:
-        st.error(f"获取最近交易日失败: {e}")
-        return today
+    today = datetime.now()
+    if today.weekday() == 5:       # 周六
+        last_trade_day = today - timedelta(days=1)
+    elif today.weekday() == 6:     # 周日
+        last_trade_day = today - timedelta(days=2)
+    else:                          # 工作日取前一天
+        last_trade_day = today - timedelta(days=1)
+    return last_trade_day.strftime("%Y%m%d")
 
 last_trade_day = get_last_trade_day()
 st.info(f"当前使用最近交易日: {last_trade_day}")
@@ -114,6 +112,7 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
 if st.button("一键生成短线王"):
     with st.spinner("正在获取 A 股行情..."):
         df = get_today_data(last_trade_day)
+    st.write(f"获取到 {len(df)} 条行情数据")  # 输出调试信息
 
     if df is None or df.empty:
         st.error("未获取到行情数据")
