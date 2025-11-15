@@ -93,13 +93,13 @@ if st.button("一键生成短线王"):
             progress.progress((i+1)/len(df))
             continue
 
-        # 五条选股条件
+        # 五条选股条件（开盘价条件改为 ≥ 昨日最高价的 70%）
         try:
             cond1 = row["open"] > 10
             cond2 = hist["10d_return"] <= 0.50
             cond3 = hist["10d_avg_turnover"] >= 3
             cond4 = row["vol"] > hist["volume_yesterday"] * 3
-            cond5 = row["open"] > hist["high_yesterday"]
+            cond5 = row["open"] >= hist["high_yesterday"] * 0.7  # 改动
         except:
             progress.progress((i+1)/len(df))
             continue
