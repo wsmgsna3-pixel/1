@@ -98,9 +98,18 @@ def select_stocks(df, vol_multiplier=1.5, open_multiplier=0.3, fallback=False):
         progress.progress((i+1)/len(df))
     return result
 
-# 高亮前10条
+# 高亮前10条开盘价和成交量
 def highlight_top10(s):
     return ['background-color: lightgreen' if i < 10 else '' for i in range(len(s))]
+
+# 本地股票名称映射（可扩展）
+stock_name_map = {
+    '600519.SH': '贵州茅台',
+    '000001.SZ': '平安银行',
+    '000651.SZ': '格力电器',
+    '300750.SZ': '宁德时代',
+    # 可继续添加
+}
 
 # 主入口
 if st.button("一键生成短线王"):
@@ -128,9 +137,21 @@ if st.button("一键生成短线王"):
         st.error("即便放宽条件，仍未找到符合条件的短线王")
         st.stop()
 
-    result_df = pd.DataFrame(result).sort_values("score", ascending=False)
+    # 添加名称列
+    for item in result:
+        ts_code = item['ts_code']
+        item['name'] = stock_name_map.get(ts_code, ts_code)
+
+    # 转 DataFrame 并调整列顺序
+    result_df = pd.DataFrame(result)
+    cols = ['name', 'ts_code', 'score', 'open', '10d_return', '10d_avg_turnover', 'volume_yesterday', 'volume_today']
+    result_df = result_df[cols]
+    result_df = result_df.rename(columns={'score': '综合评分'})
+
+    # 高亮前10条
     styled_df = result_df.style.apply(highlight_top10, subset=['open','volume_today'])
     st.dataframe(styled_df, use_container_width=True)
 
+    # 下载 CSV
     csv = result_df.to_csv(index=False).encode("utf-8-sig")
     st.download_button("下载 CSV", data=csv, file_name="短线王.csv", mime="text/csv")
