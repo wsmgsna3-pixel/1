@@ -7,7 +7,7 @@ st.set_page_config(page_title="短线王（Tushare 版）", layout="wide")
 st.title("短线王（Tushare 极速 300 只股票版）")
 
 # ==============================
-# 运行时输入 Tushare Token（安全）
+# 运行时输入 Tushare Token
 # ==============================
 TS_TOKEN = st.text_input("请输入你的 Tushare Token", type="password")
 if not TS_TOKEN:
@@ -18,12 +18,25 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ==============================
+# 获取最近一个交易日
+# ==============================
+@st.cache_data(ttl=3600)
+def get_last_trade_day():
+    today = datetime.now().strftime("%Y%m%d")
+    cal = pro.trade_cal(exchange='SSE', start_date='20250101', end_date=today)
+    # 取最近开盘日
+    last_trade_day = cal[cal['is_open']==1]['cal_date'].max()
+    return last_trade_day
+
+last_trade_day = get_last_trade_day()
+st.info(f"当前使用最近交易日: {last_trade_day}")
+
+# ==============================
 # 拉取当天 A 股行情（300 只以内 / 积分安全）
 # ==============================
 @st.cache_data(ttl=60)
-def get_today_data():
-    today = datetime.now().strftime("%Y%m%d")
-    df = pro.daily(trade_date=today)
+def get_today_data(trade_date):
+    df = pro.daily(trade_date=trade_date)
     return df
 
 # ==============================
@@ -44,7 +57,7 @@ def get_10d(ts_code):
     row["10d_return"] = df.iloc[-1]["close"] / df.iloc[0]["open"] - 1
     row["volume_yesterday"] = df.iloc[-2]["vol"]
     row["high_yesterday"] = df.iloc[-2]["high"]
-    row["10d_avg_turnover"] = df["pct_chg"].abs().mean()  # 用 pct_chg 当替代指标（省积分）
+    row["10d_avg_turnover"] = df["pct_chg"].abs().mean()  # 用 pct_chg 当替代指标
     return row
 
 # ==============================
@@ -52,14 +65,13 @@ def get_10d(ts_code):
 # ==============================
 if st.button("一键生成短线王"):
     with st.spinner("正在获取 A 股行情..."):
-        df = get_today_data()
+        df = get_today_data(last_trade_day)
 
     if df is None or df.empty:
-        st.error("今日数据获取失败")
+        st.error("未获取到行情数据")
         st.stop()
 
-    # 限制为前 300 只（120 积分稳定运行）
-    df = df.head(300)
+    df = df.head(300)  # 限制 300 只股票
 
     result = []
     progress = st.progress(0)
@@ -72,7 +84,7 @@ if st.button("一键生成短线王"):
             progress.progress((i+1)/len(df))
             continue
 
-        # 五条筛选
+        # 五条选股条件
         try:
             cond1 = row["open"] > 10
             cond2 = hist["10d_return"] <= 0.50
@@ -101,7 +113,7 @@ if st.button("一键生成短线王"):
         progress.progress((i+1)/len(df))
 
     if not result:
-        st.warning("今日没有符合条件的短线王")
+        st.warning("未找到符合条件的短线王")
         st.stop()
 
     result_df = pd.DataFrame(result).sort_values("score", ascending=False)
