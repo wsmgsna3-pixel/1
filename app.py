@@ -6,9 +6,9 @@ from datetime import datetime, timedelta
 # ==========================
 # Streamlit 配置
 # ==========================
-st.set_page_config(page_title="选股王 · 双模核武库 v3.0", layout="wide")
-st.title("选股王 · 双模核武库 v3.0")
-st.caption("2100积分驱动 | 中小盘主升浪狙击手 | 周一9:30必出肉")
+st.set_page_config(page_title="选股王 · 双模核武库 v3.1", layout="wide")
+st.title("选股王 · 双模核武库 v3.1")
+st.caption("2100积分驱动 | 中小盘主升浪狙击手 | 周一8:30 AM PST 必出肉")
 
 # ==========================
 # 输入 Token
@@ -33,7 +33,7 @@ with col1:
     )
 with col2:
     if mode == "核弹模式":
-        st.markdown("**核弹模式** 🔥 0~5 只妖股")
+        st.markdown("**核弹模式** 0~5 只妖股")
     else:
         st.markdown("**狙击枪模式** 8~20 只主升浪")
 
@@ -138,6 +138,64 @@ def run_selection(_pro, last_trade_day, yesterday, mode):
         prev = prev[['ts_code', 'ma5', 'ma10']].rename(columns={'ma5': 'ma5_prev', 'ma10': 'ma10_prev'})
         latest = latest.merge(prev, on='ts_code', how='left')
 
-        # 条件
+        # 条件筛选（已修复 SyntaxError）
         cond1 = latest['ma5'] > latest['ma10']
-        cond2 = latest['ma5_prev'] <= latest['ma10_prev'] if gold_cross_days == 1 else
+        cond2 = (latest['ma5_prev'] <= latest['ma10_prev']) if gold_cross_days == 1 else True
+        cond3 = latest['close'] >= latest['ma20']
+        cond4 = latest['vol'] >= latest['vol_ma5'] * volume_ratio
+
+        amount_mean = daily_data.groupby('ts_code')['amount'].tail(20).mean()
+        latest['amount_ok'] = latest['ts_code'].map(amount_mean >= amount_threshold)
+
+        result = latest[cond1 & cond2 & cond3 & cond4 & latest['amount_ok']].copy()
+        if result.empty: return pd.DataFrame()
+
+        result['volume_ratio'] = (result['vol'] / result['vol_ma5']).round(2)
+        result = result.merge(df[['ts_code', 'pct_chg', 'latest_close']], on='ts_code')
+
+        output = result[['ts_code', 'name', 'latest_close', 'volume_ratio', 'pct_chg', 'industry']]
+        output.columns = ['代码', '名称', '现价', '放量倍数', '昨日涨幅%', '行业']
+        output = output.sort_values('放量倍数', ascending=False).reset_index(drop=True)
+        return output
+
+    except Exception as e:
+        st.error(f"运行出错：{str(e)}")
+        return pd.DataFrame()
+
+# ==========================
+# 执行按钮
+# ==========================
+if st.button("开始选股", type="primary", use_container_width=True):
+    last_trade_day = get_last_trade_day()
+    yesterday = get_previous_trade_day(last_trade_day)
+    if not yesterday:
+        st.error("无法获取昨日交易日")
+        st.stop()
+
+    last_str = f"{last_trade_day[:4]}-{last_trade_day[4:6]}-{last_trade_day[6:]}"
+    yest_str = f"{yesterday[:4]}-{yesterday[4:6]}-{yesterday[6:]}"
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if last_str != today_str:
+        st.info(f"今日非交易日，使用 **最近交易日 {last_str}** 数据")
+    st.caption(f"数据：{last_str} | 昨日：{yest_str}")
+
+    with st.spinner("选股王启动双模核武…"):
+        df_result = run_selection(pro, last_trade_day, yesterday, mode)
+
+    st.success("选股完成！")
+    if df_result.empty:
+        st.warning("今日无满足条件的股票，明天再来！")
+    else:
+        st.dataframe(
+            df_result,
+            use_container_width=True,
+            column_config={
+                "昨日涨幅%": st.column_config.NumberColumn(format="%.2f%%"),
+                "现价": st.column_config.NumberColumn(format="%.2f"),
+                "放量倍数": st.column_config.NumberColumn(format="%.2fx")
+            },
+            hide_index=True
+        )
+        st.balloons()
+        st.caption(f"命中 {len(df_result)} 只强势股 | 模式：{mode}")
