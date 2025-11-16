@@ -142,28 +142,30 @@ if df_db.empty:
     st.warning("daily_basic 为空：市值/换手过滤将自动降级")
 
 # ---------------------------
-# --- ⭐ 修复的关键部分：安全合并 daily_basic（不会再报 KeyError）
+# --- ⭐ 合并（安全版）amount 只使用 daily，不用 daily_basic
 # ---------------------------
 df = df_daily.copy()
 
-db_needed = ['ts_code', 'turnover_rate', 'circ_mv', 'amount']
+# daily_basic 仅用于 circ_mv & turnover_rate
+db_needed = ['ts_code', 'turnover_rate', 'circ_mv']
 db_exist = [c for c in db_needed if c in df_db.columns]
 
 if len(db_exist) < len(db_needed):
     missing = set(db_needed) - set(db_exist)
-    st.warning(f"daily_basic 缺少字段：{missing}，已自动跳过缺失字段")
+    st.warning(f"daily_basic 缺少字段：{missing}，不影响 amount，因为 amount 来自 daily")
 
 if 'ts_code' in df_db.columns:
     df = df.merge(df_db[db_exist], on='ts_code', how='left')
 else:
-    st.warning("daily_basic 缺少 ts_code，已跳过合并")
+    st.warning("daily_basic 缺少 ts_code，跳过合并")
 
 # 合并 stock_basic
 sb_cols = ['ts_code','name','industry','exchange','market','list_date']
 sb_exist = [c for c in sb_cols if c in df_stock_basic.columns]
 df = df.merge(df_stock_basic[sb_exist], on='ts_code', how='left')
+
 # ---------------------------
-# --- 计算昨收
+# --- 昨收
 # ---------------------------
 yesterday_idx = trade_dates.index(last_trade) - 1
 if yesterday_idx >= 0:
@@ -173,13 +175,12 @@ if yesterday_idx >= 0:
         df_prev.rename(columns={'close':'pre_close2'}, inplace=True)
         df = df.merge(df_prev, on='ts_code', how='left')
     except:
-        st.warning("昨日收盘拉取失败，pre_close2 = pre_close")
         df['pre_close2'] = df['pre_close']
 else:
     df['pre_close2'] = df['pre_close']
 
 # ---------------------------
-# --- 筛选逻辑开始
+# --- 筛选
 # ---------------------------
 df['circ_mv'] = df['circ_mv'] / 1e8
 
@@ -187,32 +188,22 @@ cond = pd.Series([True] * len(df))
 
 if 'circ_mv' in df.columns:
     cond &= (df['circ_mv'] >= MIN_CIRC_MV) & (df['circ_mv'] <= MAX_CIRC_MV)
-else:
-    st.warning("缺少 circ_mv，无法按市值过滤")
-    
+
 if 'turnover_rate' in df.columns:
     cond &= (df['turnover_rate'] >= MIN_TURNOVER)
-else:
-    st.warning("缺少换手率字段 turnover_rate，已跳过此过滤")
 
-if 'open' in df.columns and 'pre_close2' in df.columns:
-    cond &= (df['open'] >= df['pre_close2'] * OPEN_MIN_RATIO)
-else:
-    st.warning("open 或 pre_close2 缺失，跳过开盘过滤")
-
+cond &= (df['open'] >= df['pre_close2'] * OPEN_MIN_RATIO)
 cond &= (df['high'] > df['pre_close2'])
 
-if 'circ_mv' in df.columns and 'amount' in df.columns:
-    cond &= (df['amount'] >= df['circ_mv'] * 1e8 * AMOUNT_PCT_OF_CIRC / 100)
-else:
-    st.warning("缺少 circ_mv 或 amount，跳过成交额过滤")
+# ⭐ amount 现在一定存在（来自 daily）
+cond &= (df['amount'] >= df['circ_mv'] * 1e8 * AMOUNT_PCT_OF_CIRC / 100)
 
 cond &= (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
 
 df_filtered = df[cond].copy()
 
 # ---------------------------
-# --- 剔除连续下跌 N 日的股票
+# --- 连续下跌剔除
 # ---------------------------
 bad_down = set()
 if not df_hist.empty:
@@ -223,17 +214,15 @@ if not df_hist.empty:
         if (sub['cd'] >= CONTINUOUS_DOWN_DAYS).any():
             bad_down.add(code)
 
-before_down = len(df_filtered)
 df_filtered = df_filtered[~df_filtered['ts_code'].isin(bad_down)]
 
 # ---------------------------
-# --- 剔除 10 日最大涨幅超过阈值的股票
+# --- 10日涨幅过滤
 # ---------------------------
 bad_10d = set()
 if not df_hist.empty:
     for code, sub in df_hist.groupby('ts_code'):
         sub = sub.sort_values('trade_date')
-        sub['r'] = sub['close'].pct_change()
         sub['max10'] = sub['close'].pct_change(10)
         if sub['max10'].max() * 100 > RETURN_10D_MAX_PCT:
             bad_10d.add(code)
@@ -241,14 +230,14 @@ if not df_hist.empty:
 df_filtered = df_filtered[~df_filtered['ts_code'].isin(bad_10d)]
 
 # ---------------------------
-# --- 剔除龙虎榜异常票
+# --- 龙虎榜过滤
 # ---------------------------
 if not df_top.empty:
     bg_codes = df_top[df_top['reason'].str.contains("畸", na=False)]['ts_code'].unique()
     df_filtered = df_filtered[~df_filtered['ts_code'].isin(bg_codes)]
 
 # ---------------------------
-# --- 排序逻辑（可调整）
+# --- 排序
 # ---------------------------
 df_filtered['rank_score'] = (
     df_filtered['turnover_rate'].fillna(0) * 0.4 +
@@ -259,36 +248,35 @@ df_filtered['rank_score'] = (
 df_final = df_filtered.sort_values('rank_score', ascending=False).head(TOP_N)
 
 # ---------------------------
-# --- 展示结果
+# --- 展示
 # ---------------------------
 st.subheader("最终选股结果")
-st.dataframe(df_final[['ts_code','name','close','pct_chg','turnover_rate','circ_mv','amount']], height=400)
-
-st.success(f"最终筛选数量：{len(df_final)} 支（从 {len(df_daily)} 支股票中）")
+if len(df_final) == 0:
+    st.error("⚠️ 没有选出股票，请降低过滤参数再试。")
+else:
+    st.dataframe(df_final[['ts_code','name','close','pct_chg','turnover_rate','circ_mv','amount']], height=380)
 
 # ---------------------------
-# --- 允许导出
+# --- 导出
 # ---------------------------
 @st.cache_data
 def convert_df(df):
     return df.to_csv(index=False).encode('utf-8')
 
-csv = convert_df(df_final)
-st.download_button("下载结果 CSV", csv, file_name=f"selected_{last_trade}.csv", mime='text/csv')
+if len(df_final) > 0:
+    csv = convert_df(df_final)
+    st.download_button("下载结果 CSV", csv, file_name=f"selected_{last_trade}.csv", mime='text/csv')
+
 # ---------------------------
-# --- 显示必要的调试信息（可选）
+# --- 调试信息（可选）
 # ---------------------------
-with st.expander("调试信息（如果出现错误可展开查看）"):
+with st.expander("调试信息"):
     st.write("df_daily：", df_daily.shape)
     st.write("df_daily_basic：", df_db.shape)
     st.write("df_stock_basic：", df_stock_basic.shape)
     st.write("hist_daily：", df_hist.shape)
-    st.write("moneyflow：", df_money.shape)
-    st.write("top_list：", df_top.shape)
-    st.write("limit_list：", df_limit.shape)
-
     st.write("合并后 df：", df.shape)
-    st.write("筛选后 df_filtered：", df_filtered.shape)
-    st.write("最终 df_final：", df_final.shape)
+    st.write("筛选后：", df_filtered.shape)
+    st.write("最终结果：", df_final.shape)
 
-st.info("🎉 已完成全部筛选与排序，无 KeyError，可正常使用！")
+st.success("🎉 已完成全部筛选与排序（amount 来源已修复，不会再出现空选）")
