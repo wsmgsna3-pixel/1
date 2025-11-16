@@ -169,22 +169,7 @@ df = df_daily.copy()
 if not df_db.empty:
     # daily_basic 的 ts_code 索引可能是列
     if 'ts_code' in df_db.columns:
-        # ---- 安全字段并集 merge（不会 KeyError）----
-need_cols = ['ts_code', 'turnover_rate', 'turnover_rate_f', 'circ_mv', 'float_mv', 'amount', 'vol', 'total_mv']
-
-# 找出 df_db 里实际存在的列
-merge_cols = [c for c in need_cols if c in df_db.columns] + ['ts_code']
-merge_cols = list(dict.fromkeys(merge_cols))  # 去重
-
-df = df.merge(df_db[merge_cols], on='ts_code', how='left', suffixes=('', '_db'))
-
-# 统一市值字段（谁有用谁）
-if 'circ_mv' not in df.columns and 'float_mv' in df.columns:
-    df['circ_mv'] = df['float_mv']
-
-# 统一换手率字段
-if 'turnover_rate' not in df.columns and 'turnover_rate_f' in df.columns:
-    df['turnover_rate'] = df['turnover_rate_f']
+        df = df.merge(df_db[['ts_code', 'turnover_rate', 'circ_mv', 'amount']], on='ts_code', how='left', suffixes=('', '_db'))
     else:
         st.warning("daily_basic missing ts_code column: 跳过 merge")
 if not df_stock_basic.empty:
