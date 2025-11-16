@@ -1,99 +1,86 @@
-import os
+import streamlit as st
 import tushare as ts
 import pandas as pd
-from datetime import datetime, timedelta
+import time
 
-# ==============================
-# 读取环境变量中的 Token（安全）
-# ==============================
-TS_TOKEN = os.getenv("TS_TOKEN")
-if not TS_TOKEN:
-    raise ValueError("没有读取到 TS_TOKEN，请先在系统环境变量里配置。")
+st.set_page_config(page_title="选股王 · 极速版", layout="wide")
 
-ts.set_token(TS_TOKEN)
+st.title("选股王 · 极速版（手动输入 Token 版）")
+
+# 手动输入 token
+ts_token = st.text_input("请输入你的 TuShare Token：", type="password")
+
+if not ts_token:
+    st.info("请输入 Token 后继续")
+    st.stop()
+
+# 初始化 tushare
+ts.set_token(ts_token)
 pro = ts.pro_api()
 
-# ==============================
-# 数据缓存路径
-# ==============================
-DATA_DIR = "data_cache"
-os.makedirs(DATA_DIR, exist_ok=True)
+# --------------------
+# 功能函数
+# --------------------
 
+@st.cache_data(show_spinner=False)
+def load_trade_calendar():
+    df = pro.trade_cal(exchange='', is_open='1')
+    return df.sort_values("cal_date", ascending=True)
 
-# ==============================
-# 获取所有股票列表
-# ==============================
-def load_stock_list():
-    cache_file = f"{DATA_DIR}/stock_list.csv"
-    if os.path.exists(cache_file):
-        return pd.read_csv(cache_file)
+@st.cache_data(show_spinner=False)
+def get_last_trade_date():
+    cal = load_trade_calendar()
+    return cal["cal_date"].iloc[-1]
 
-    df = pro.stock_basic(exchange='', list_status='L',
-                         fields='ts_code,symbol,name,area,industry,list_date')
-    df.to_csv(cache_file, index=False)
+@st.cache_data(show_spinner=False)
+def load_daily(ts_code, start_date):
+    df = pro.daily(ts_code=ts_code, start_date=start_date)
+    return df.sort_values("trade_date")
+
+@st.cache_data(show_spinner=False)
+def get_yesterday_top500(trade_date):
+    df = pro.daily(trade_date=trade_date)
+    df = df.sort_values("pct_chg", ascending=False).head(500)
+    return df
+
+# --------------------
+# 主逻辑：方案 B（你昨天用的那套逻辑）
+# --------------------
+
+def select_stocks(df):
+    """
+    你的逻辑：昨天涨幅前500 → 剔除 ST → 剔除10元以下 → 剔除200元以上
+    """
+    df = df.copy()
+
+    # 去除ST
+    df = df[~df["ts_code"].str.contains("ST")]
+
+    # 过滤价格
+    df = df[(df["close"] >= 10) & (df["close"] <= 200)]
+
     return df
 
 
-# ==============================
-# 拉取单只股票历史行情（带缓存，每天只更新一次）
-# ==============================
-def load_daily_data(ts_code):
-    today = datetime.now().strftime("%Y%m%d")
-    cache_file = f"{DATA_DIR}/{ts_code}.csv"
+# --------------------
+# UI 操作
+# --------------------
 
-    # 如果已有缓存，检查是否需要更新
-    if os.path.exists(cache_file):
-        df = pd.read_csv(cache_file)
-        last_date = df['trade_date'].iloc[0]  # Tushare 是倒序的
+st.subheader("正在运行选股…")
 
-        if last_date >= today:
-            return df  # 不需要更新
+with st.spinner("正在获取最新交易日…"):
+    trade_date = get_last_trade_date()
 
-        # 需要补数据
-        start_date = (datetime.strptime(last_date, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
-        df_new = pro.daily(ts_code=ts_code, start_date=start_date, end_date=today)
-        if not df_new.empty:
-            df = pd.concat([df_new, df], ignore_index=True)
-            df.to_csv(cache_file, index=False)
-        return df
+st.write(f"检测到最新交易日：**{trade_date}**")
 
-    # 没缓存，首次拉取全部数据
-    df = pro.daily(ts_code=ts_code, start_date="20180101", end_date=today)
-    df.to_csv(cache_file, index=False)
-    return df
+with st.spinner("正在获取昨日涨幅前500…"):
+    df500 = get_yesterday_top500(trade_date)
 
+st.write(f"昨日涨幅前500 共：**{df500.shape[0]}** 只")
 
-# ==============================
-# 示例：你的选股逻辑（随便写个示例）
-# 你之后可以替换成自己的逻辑
-# ==============================
-def select_stocks():
-    stock_list = load_stock_list()
-    chosen = []
+with st.spinner("正在筛选符合条件的股票…"):
+    result = select_stocks(df500)
 
-    for _, row in stock_list.iterrows():
-        ts_code = row["ts_code"]
-        df = load_daily_data(ts_code)
+st.success(f"筛选完成，共 {result.shape[0]} 只股票")
 
-        # 数据太少跳过
-        if df.shape[0] < 20:
-            continue
-
-        # 示例策略：最近 10 天均线向上
-        df_sort = df.sort_values(by="trade_date")
-        df_sort["ma10"] = df_sort["close"].rolling(10).mean()
-
-        if df_sort["ma10"].iloc[-1] > df_sort["ma10"].iloc[-2]:
-            chosen.append(ts_code)
-
-    return chosen
-
-
-# ==============================
-# 主函数
-# ==============================
-if __name__ == "__main__":
-    print("正在选股，请稍候……")
-    result = select_stocks()
-    print("选出的股票：")
-    print(result)
+st.dataframe(result)
