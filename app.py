@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 # ==========================
 # Streamlit 配置
 # ==========================
-st.set_page_config(page_title="选股王 · 双模核武库 v3.1", layout="wide")
-st.title("选股王 · 双模核武库 v3.1")
+st.set_page_config(page_title="选股王 · 双模核武库 v3.2", layout="wide")
+st.title("选股王 · 双模核武库 v3.2")
 st.caption("2100积分驱动 | 中小盘主升浪狙击手 | 周一8:30 AM PST 必出肉")
 
 # ==========================
@@ -87,17 +87,19 @@ def run_selection(_pro, last_trade_day, yesterday, mode):
         df = daily_basic.merge(stock_basic, on='ts_code')
         df = df.rename(columns={'close': 'latest_close'})
 
-        # Step 3: 初筛 → 300 只
+        # Step 3: 初筛 → 300 只（修复 *ST 正则错误）
         df = df[
             (~df['name'].str.contains('ST', na=False)) &
-            (~df['name'].str.contains('*ST', na=False)) &
+            (~df['name'].str.contains(r'\*ST', na=False, regex=True)) &  # 转义 *ST
             (~df['ts_code'].str.startswith('8')) &
             (~df['ts_code'].str.startswith('4')) &
             (df['latest_close'] >= 10) & (df['latest_close'] <= 200) &
             (df['total_mv'] >= 100000) & (df['total_mv'] <= 50000000)
         ].copy()
 
-        if df.empty: return pd.DataFrame()
+        if df.empty: 
+            st.info("初筛后无候选股，市场可能休整中")
+            return pd.DataFrame()
 
         # Step 4: 昨日涨幅（在 300 只中排序）
         with st.spinner("Step 3: 获取昨日涨跌幅…"):
@@ -106,6 +108,8 @@ def run_selection(_pro, last_trade_day, yesterday, mode):
 
             daily = daily[daily['pct_chg'] < 9.8]  # 排除涨停
             daily = daily[daily['ts_code'].isin(df['ts_code'])]
+            if daily.empty: return pd.DataFrame()
+
             top_codes = daily.nlargest(top_n, 'pct_chg')['ts_code'].tolist()
 
         df = df[df['ts_code'].isin(top_codes)]
