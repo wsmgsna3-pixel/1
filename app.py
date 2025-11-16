@@ -1,121 +1,55 @@
+import streamlit as st
 import tushare as ts
 import pandas as pd
-import streamlit as st
-from datetime import datetime, timedelta
 
+st.title("升级版选股王")
 
-# ==========================
-# Streamlit 页面标题
-# ==========================
-st.title("📈 选股王 · 2100 积分旗舰版")
-st.write("请输入你的 Tushare Token 后开始选股。")
-
-
-# ==========================
-# 手动输入 Token
-# ==========================
-user_token = st.text_input("请输入你的 TS_TOKEN", type="password")
-
-if not user_token:
+# 手动输入Token
+token = st.text_input("请输入TuShare Token", type="password")
+if not token:
+    st.warning("请输入Token后才能运行选股")
     st.stop()
 
-# 初始化 API
-pro = ts.pro_api(user_token)
+ts.set_token(token)
+pro = ts.pro_api()
 
+st.write("正在获取股票列表...")
 
-# ==========================
-# 核心函数
-# ==========================
-def fetch_daily(ts_code, start, end):
-    for _ in range(3):
-        try:
-            df = pro.daily(ts_code=ts_code, start_date=start, end_date=end)
-            if df is not None and len(df) > 0:
-                return df
-        except:
-            continue
-    return pd.DataFrame()
+# 1. 获取全部股票基本信息（低积分接口）
+stocks = pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,area,industry,list_date')
+# 假设取最新收盘价，10元-200元
+df_price = pro.daily(ts_code='', start_date='20251115', end_date='20251115')  # 测试用当天数据
+df = pd.merge(stocks, df_price, on='ts_code')
 
+# 排除ST股
+df = df[~df['name'].str.contains('ST')]
 
-def select_stocks():
-    today = datetime.today()
-    start_date = (today - timedelta(days=120)).strftime("%Y%m%d")
-    end_date = today.strftime("%Y%m%d")
+# 价格区间筛选
+df = df[(df['close'] >= 10) & (df['close'] <= 200)]
 
-    # 全市场股票
-    stock_basic = pro.stock_basic(exchange='', list_status='L',
-                                  fields='ts_code,name,area,industry,list_date')
+st.write(f"初筛后股票数量: {len(df)}")
 
-    # 去掉 ST 和 北交所
-    stock_basic = stock_basic[
-        (~stock_basic['name'].str.contains('ST')) &
-        (~stock_basic['ts_code'].str.startswith('8')) &
-        (~stock_basic['ts_code'].str.startswith('4'))
-    ]
+# 2. 获取昨日涨幅并选前500
+df['pct_chg'] = df['close'].pct_change() * 100
+df_sorted = df.sort_values(by='pct_chg', ascending=False).head(500)
 
-    results = []
+st.write("昨日涨幅前500名股票：")
+st.dataframe(df_sorted[['ts_code','name','close','pct_chg']])
 
-    for _, row in stock_basic.iterrows():
-        ts_code = row['ts_code']
+# 3. 高级筛选示例（量价、财务指标）
+st.write("正在进行高级筛选...")
 
-        df = fetch_daily(ts_code, start_date, end_date)
-        if df is None or len(df) < 60:
-            continue
+selected_stocks = []
+for ts_code in df_sorted['ts_code']:
+    # 示例：获取每日行情和财务指标（高积分接口）
+    try:
+        daily = pro.daily(ts_code=ts_code, start_date='20251115', end_date='20251115')
+        fin = pro.fina_indicator(ts_code=ts_code, start_date='20251115', end_date='20251115')
+        # 简单策略：昨日成交量大于均量，ROE > 10%
+        if (daily['vol'].iloc[-1] > daily['vol'].mean()) and (fin['roe'].iloc[-1] > 10):
+            selected_stocks.append(ts_code)
+    except:
+        continue
 
-        df = df.sort_values(by="trade_date")
-
-        # ---- 价格区间过滤 ----
-        price = df.iloc[-1]['close']
-        if price < 10 or price > 200:
-            continue
-
-        # ---- 均线 ----
-        df['ma5'] = df['close'].rolling(5).mean()
-        df['ma10'] = df['close'].rolling(10).mean()
-        df['ma20'] = df['close'].rolling(20).mean()
-
-        # 5 上穿 10
-        if not (df.iloc[-1]['ma5'] > df.iloc[-1]['ma10'] and
-                df.iloc[-2]['ma5'] <= df.iloc[-2]['ma10']):
-            continue
-
-        # 站上 20 日线
-        if price < df.iloc[-1]['ma20']:
-            continue
-
-        # ---- 成交量过滤 ----
-        df['vol_ma5'] = df['vol'].rolling(5).mean()
-        if df.iloc[-1]['vol'] < df.iloc[-1]['vol_ma5'] * 1.5:
-            continue
-
-        df['amount'] = df['amount'] / 1e6  # 转百万
-        if df['amount'].tail(20).mean() < 100:
-            continue
-
-        if df.iloc[-1]['amount'] < 50:
-            continue
-
-        volume_ratio = df.iloc[-1]['vol'] / df.iloc[-1]['vol_ma5']
-        results.append({
-            "ts_code": ts_code,
-            "name": row['name'],
-            "price": price,
-            "volume_ratio": round(volume_ratio, 2)
-        })
-
-    return pd.DataFrame(sorted(results, key=lambda x: x['volume_ratio'], reverse=True))
-
-
-# ==========================
-# 执行按钮
-# ==========================
-if st.button("开始选股"):
-    with st.spinner("正在分析全市场，请稍候…"):
-        df = select_stocks()
-
-    st.success("选股完成！")
-
-    if len(df) == 0:
-        st.write("今日无满足条件的股票。")
-    else:
-        st.dataframe(df, use_container_width=True)
+st.write("最终候选股票：")
+st.dataframe(df_sorted[df_sorted['ts_code'].isin(selected_stocks)][['ts_code','name','close','pct_chg']])
