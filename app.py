@@ -1,85 +1,88 @@
 import streamlit as st
 import tushare as ts
 import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="选股王 v7", layout="wide")
-st.title("选股王 v7")
-st.caption("零错误 | 日期锁定 | 必出结果")
+st.set_page_config(page_title="选股王（极速版）", layout="wide")
+st.title("🔥 极速版选股王（2100 积分专属优化）")
 
-token = st.text_input("Tushare Token", type="password")
-if not token: st.stop()
+# -------------------------------
+# 1. 手动输入 Token
+# -------------------------------
+token = st.text_input("请输入 TuShare Token（不会保存，非常安全）", type="password")
+
+if not token:
+    st.info("输入 Token 后开始选股。")
+    st.stop()
+
+ts.set_token(token)
 pro = ts.pro_api(token)
 
-mode = st.radio("模式", ["核弹模式", "狙击枪模式"], index=1, horizontal=True)
+# -------------------------------
+# 2. 日期区间
+# -------------------------------
+today = datetime.today()
+yesterday = (today - timedelta(days=1)).strftime("%Y%m%d")
+start_60 = (today - timedelta(days=120)).strftime("%Y%m%d")  # 用 120 天够算 MA60
 
-last_trade_day = "20251114"
-yesterday = "20251113"
+# -------------------------------
+# 3. 批量拉取全市场日线 —— 关键优化！
+# -------------------------------
+st.write("📡 正在批量获取行情（不会卡，请稍候几秒）...")
 
-@st.cache_data(ttl=3600)
-def run():
-    top_n = 500 if mode == "核弹模式" else 1000
-    vol_r = 1.3 if mode == "核弹模式" else 1.25
-    amt_thr = 100 if mode == "核弹模式" else 50
-    gold_days = 1 if mode == "核弹模式" else 2
+df_daily = pro.daily(start_date=start_60, end_date=yesterday)
+df_daily.sort_values(["ts_code", "trade_date"], inplace=True)
 
-    db = pro.daily_basic(trade_date=last_trade_day, fields='ts_code,close,total_mv')
-    sb = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
-    df = db.merge(sb, on='ts_code').rename(columns={'close':'price'})
+# -------------------------------
+# 4. 股票基本信息
+# -------------------------------
+df_basic = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
 
-    df = df[
-        (~df['name'].str.contains('ST')) &
-        (~df['name'].str.contains(r'\*ST', regex=True)) &
-        (~df['ts_code'].str.startswith(('8','4'))) &
-        (df['price'].between(10,200)) &
-        (df['total_mv'].between(100000,50000000))
-    ]
+# 合并
+df = df_daily.merge(df_basic, on="ts_code", how="left")
 
-    if df.empty: return pd.DataFrame()
+# -------------------------------
+# 5. 价格过滤（你自定义）
+# -------------------------------
+# 最新一天的收盘价
+last_day = df[df.trade_date == df.trade_date.max()]
+last_day = last_day[(last_day["close"] >= 10) & (last_day["close"] <= 200)]
+last_codes = last_day.ts_code.unique()
 
-    dy = pro.daily(trade_date=yesterday, fields='ts_code,pct_chg')
-    dy = dy[(dy['pct_chg'] < 9.8) & (dy['ts_code'].isin(df['ts_code']))]
-    if dy.empty: return pd.DataFrame()
+df = df[df.ts_code.isin(last_codes)]
 
-    codes = dy.nlargest(top_n, 'pct_chg')['ts_code'].tolist()
-    df = df[df['ts_code'].isin(codes)].merge(dy, on='ts_code')
+# -------------------------------
+# 6. 计算涨幅、均线、量能等全部指标（批量计算，不循环）
+# -------------------------------
+df["pct_chg"] = df.groupby("ts_code")["close"].pct_change() * 100
+df["vol_ma5"] = df.groupby("ts_code")["vol"].rolling(5).mean().reset_index(0, drop=True)
+df["vol_ma10"] = df.groupby("ts_code")["vol"].rolling(10).mean().reset_index(0, drop=True)
+df["ma20"] = df.groupby("ts_code")["close"].rolling(20).mean().reset_index(0, drop=True)
+df["ma60"] = df.groupby("ts_code")["close"].rolling(60).mean().reset_index(0, drop=True)
 
-    data = pro.daily(ts_code=','.join(df['ts_code']), start_date="20250901", end_date=last_trade_day)
-    data = data.merge(df[['ts_code','name','industry']], on='ts_code').sort_values(['ts_code','trade_date'])
+# -------------------------------
+# 7. 取昨日的所有数据
+# -------------------------------
+df_y = df[df.trade_date == df.trade_date.max()].copy()
 
-    for ma in ['ma5','ma10','ma20']:
-        data[ma] = data.groupby('ts_code')['close'].transform(lambda x: x.rolling(int(ma[2:])).mean())
-    data['vol_ma5'] = data.groupby('ts_code')['vol'].transform(lambda x: x.rolling(5).mean())
+# -------------------------------
+# 8. 昨日涨幅前 500 名
+# -------------------------------
+df_top = df_y.sort_values("pct_chg", ascending=False).head(500)
 
-    latest = data.groupby('ts_code').tail(1).copy()
-    prev = data.groupby('ts_code').apply(lambda x: x.tail(2).iloc[:-1] if len(x)>=2 else pd.DataFrame()).reset_index(drop=True)
-    prev = prev[['ts_code','ma5','ma10']].rename(columns={'ma5':'ma5_prev','ma10':'ma10_prev'})
-    latest = latest.merge(prev, on='ts_code', how='left')
+# -------------------------------
+# 9. 高级策略过滤（批量，不循环接口）
+# -------------------------------
+df_sel = df_top[
+    (df_top["vol"] > df_top["vol_ma5"]) &          # 放量
+    (df_top["close"] > df_top["ma20"]) &          # 收盘价站上20日均线
+    (df_top["ma20"] > df_top["ma60"])             # 20日线上穿60日（趋势向上）
+]
 
-    c1 = latest['ma5'] > latest['ma10']
-    c2 = latest['ma5_prev'].le(latest['ma10_prev']) if gold_days == 1 else pd.Series(True, index=latest.index)
-    c3 = latest['close'] >= latest['ma20']
-    c4 = latest['vol'] >= latest['vol_ma5'] * vol_r
+st.success(f"筛选完成，共 {len(df_sel)} 只股票")
 
-    amt = data.groupby('ts_code')['amount'].tail(20).mean()
-    latest['amt_ok'] = amt.reindex(latest['ts_code']).fillna(0) >= amt_thr  # 修复 apply 错误
-
-    res = latest[c1 & c2 & c3 & c4 & latest['amt_ok']].copy()
-    if res.empty: return pd.DataFrame()
-
-    res['vol_ratio'] = (res['vol'] / res['vol_ma5']).round(2)
-    res = res.merge(df[['ts_code','pct_chg','price']], on='ts_code')
-    out = res[['ts_code','name','price','vol_ratio','pct_chg','industry']]
-    out.columns = ['代码','名称','现价','放量倍数','昨日涨幅%','行业']
-    return out.sort_values('放量倍数', ascending=False).reset_index(drop=True)
-
-if st.button("开始选股", type="primary"):
-    st.caption("数据：2025-11-14 | 昨日：2025-11-13")
-    with st.spinner("运行中..."):
-        df = run()
-    st.success("完成")
-    if df.empty:
-        st.warning("暂无符合股票")
-    else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.balloons()
-        st.caption(f"命中 {len(df)} 只 | {mode}")
+st.dataframe(
+    df_sel[["ts_code", "name", "close", "pct_chg", "vol", "vol_ma5", "ma20", "ma60"]],
+    height=600
+)
