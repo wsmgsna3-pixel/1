@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 # ==========================
 # Streamlit 配置
 # ==========================
-st.set_page_config(page_title="选股王 · 双模核武库 v3.2", layout="wide")
-st.title("选股王 · 双模核武库 v3.2")
+st.set_page_config(page_title="选股王 · 双模核武库 v3.3", layout="wide")
+st.title("选股王 · 双模核武库 v3.3")
 st.caption("2100积分驱动 | 中小盘主升浪狙击手 | 周一8:30 AM PST 必出肉")
 
 # ==========================
@@ -38,19 +38,31 @@ with col2:
         st.markdown("**狙击枪模式** 8~20 只主升浪")
 
 # ==========================
-# 缓存函数
+# 缓存函数（已修复日期问题）
 # ==========================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_last_trade_day():
-    today = datetime.now().strftime("%Y%m%d")
-    start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
-    cal = pro.trade_cal(start_date=start, end_date=today)
-    return cal[cal['is_open'] == 1]['cal_date'].iloc[-1]
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+    cal = pro.trade_cal(start_date=start_date, end_date=end_date)
+    
+    if cal.empty:
+        st.error("无法获取交易日历，请检查网络或 Token")
+        return None
+    
+    open_days = cal[cal['is_open'] == 1]
+    if open_days.empty:
+        st.error("近期无交易日数据")
+        return None
+    
+    return open_days['cal_date'].iloc[-1]
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_previous_trade_day(current):
+    if not current:
+        return None
     dt = datetime.strptime(current, "%Y%m%d")
-    for i in range(1, 10):
+    for i in range(1, 15):
         prev = (dt - timedelta(days=i)).strftime("%Y%m%d")
         cal = pro.trade_cal(start_date=prev, end_date=prev)
         if not cal.empty and cal.iloc[0]['is_open']:
@@ -90,7 +102,7 @@ def run_selection(_pro, last_trade_day, yesterday, mode):
         # Step 3: 初筛 → 300 只（修复 *ST 正则错误）
         df = df[
             (~df['name'].str.contains('ST', na=False)) &
-            (~df['name'].str.contains(r'\*ST', na=False, regex=True)) &  # 转义 *ST
+            (~df['name'].str.contains(r'\*ST', na=False, regex=True)) &
             (~df['ts_code'].str.startswith('8')) &
             (~df['ts_code'].str.startswith('4')) &
             (df['latest_close'] >= 10) & (df['latest_close'] <= 200) &
@@ -106,7 +118,7 @@ def run_selection(_pro, last_trade_day, yesterday, mode):
             daily = _pro.daily(trade_date=yesterday, fields='ts_code,pct_chg')
             if daily.empty: return pd.DataFrame()
 
-            daily = daily[daily['pct_chg'] < 9.8]  # 排除涨停
+            daily = daily[daily['pct_chg'] < 9.8]
             daily = daily[daily['ts_code'].isin(df['ts_code'])]
             if daily.empty: return pd.DataFrame()
 
@@ -142,7 +154,7 @@ def run_selection(_pro, last_trade_day, yesterday, mode):
         prev = prev[['ts_code', 'ma5', 'ma10']].rename(columns={'ma5': 'ma5_prev', 'ma10': 'ma10_prev'})
         latest = latest.merge(prev, on='ts_code', how='left')
 
-        # 条件筛选（已修复 SyntaxError）
+        # 条件筛选
         cond1 = latest['ma5'] > latest['ma10']
         cond2 = (latest['ma5_prev'] <= latest['ma10_prev']) if gold_cross_days == 1 else True
         cond3 = latest['close'] >= latest['ma20']
@@ -167,10 +179,13 @@ def run_selection(_pro, last_trade_day, yesterday, mode):
         return pd.DataFrame()
 
 # ==========================
-# 执行按钮
+# 执行按钮（已修复日期显示）
 # ==========================
 if st.button("开始选股", type="primary", use_container_width=True):
     last_trade_day = get_last_trade_day()
+    if not last_trade_day:
+        st.stop()
+        
     yesterday = get_previous_trade_day(last_trade_day)
     if not yesterday:
         st.error("无法获取昨日交易日")
@@ -180,7 +195,7 @@ if st.button("开始选股", type="primary", use_container_width=True):
     yest_str = f"{yesterday[:4]}-{yesterday[4:6]}-{yesterday[6:]}"
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    if last_str != today_str:
+    if last_str != today_str[:10].replace('-', ''):
         st.info(f"今日非交易日，使用 **最近交易日 {last_str}** 数据")
     st.caption(f"数据：{last_str} | 昨日：{yest_str}")
 
