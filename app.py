@@ -144,9 +144,26 @@ moneyflow_df = try_get_moneyflow(last_trade)
 # ---------------------------
 pool = market_df.sort_values('pct_chg', ascending=False).head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
 
-# 合并部分基本信息（若 available）
+# 合并部分基本信息（若 available） —— 安全合并，防止 KeyError
 if not stock_basic_df.empty:
-    pool = pool.merge(stock_basic_df[['ts_code','name','industry','total_mv','circ_mv']], on='ts_code', how='left')
+    # 仅保留在 stock_basic_df 中真实存在的列
+    wanted = ['ts_code', 'name', 'industry', 'total_mv', 'circ_mv']
+    available = [c for c in wanted if c in stock_basic_df.columns]
+    if 'ts_code' not in available:
+        st.warning("stock_basic 返回缺少 ts_code 字段，跳过合并，界面将显示代码代替名称。")
+        pool['name'] = pool['ts_code']
+        pool['industry'] = ""
+    else:
+        pool = pool.merge(stock_basic_df[available], on='ts_code', how='left')
+        # 补齐缺失列的兜底值
+        if 'name' not in pool.columns:
+            pool['name'] = pool['ts_code']
+        if 'industry' not in pool.columns:
+            pool['industry'] = ""
+        if 'total_mv' not in pool.columns:
+            pool['total_mv'] = np.nan
+        if 'circ_mv' not in pool.columns:
+            pool['circ_mv'] = np.nan
 else:
     pool['name'] = pool['ts_code']
     pool['industry'] = ""
