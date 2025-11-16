@@ -1,88 +1,115 @@
 import streamlit as st
 import tushare as ts
 import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="选股王（极速版）", layout="wide")
-st.title("🔥 极速版选股王（2100 积分专属优化）")
+# ---------------------------
+# Streamlit 界面
+# ---------------------------
+st.title("选股王 · 极速版（适配 2100 积分）")
 
-# -------------------------------
-# 1. 手动输入 Token
-# -------------------------------
-token = st.text_input("请输入 TuShare Token（不会保存，非常安全）", type="password")
-
+token = st.text_input("请输入你的 Tushare Token（不会上传，很安全）", type="password")
 if not token:
-    st.info("输入 Token 后开始选股。")
     st.stop()
 
 ts.set_token(token)
-pro = ts.pro_api(token)
+pro = ts.pro_api()
 
-# -------------------------------
-# 2. 日期区间
-# -------------------------------
-today = datetime.today()
-yesterday = (today - timedelta(days=1)).strftime("%Y%m%d")
-start_60 = (today - timedelta(days=120)).strftime("%Y%m%d")  # 用 120 天够算 MA60
+st.write("正在获取最新交易日…")
 
-# -------------------------------
-# 3. 批量拉取全市场日线 —— 关键优化！
-# -------------------------------
-st.write("📡 正在批量获取行情（不会卡，请稍候几秒）...")
+# ---------------------------
+# 自动获取最近一个交易日
+# ---------------------------
+today_str = datetime.now().strftime("%Y%m%d")
 
-df_daily = pro.daily(start_date=start_60, end_date=yesterday)
-df_daily.sort_values(["ts_code", "trade_date"], inplace=True)
+cal = pro.trade_cal(start_date="20240101", end_date=today_str)
+open_days = cal[cal["is_open"] == 1]["cal_date"].tolist()
+last_trade_day = open_days[-1]
 
-# -------------------------------
-# 4. 股票基本信息
-# -------------------------------
-df_basic = pro.stock_basic(exchange="", list_status="L", fields="ts_code,name")
+st.write(f"使用交易日：{last_trade_day}")
 
-# 合并
-df = df_daily.merge(df_basic, on="ts_code", how="left")
+# ---------------------------
+# 获取昨日全市场日线
+# ---------------------------
+st.write("获取昨日行情…")
 
-# -------------------------------
-# 5. 价格过滤（你自定义）
-# -------------------------------
-# 最新一天的收盘价
-last_day = df[df.trade_date == df.trade_date.max()]
-last_day = last_day[(last_day["close"] >= 10) & (last_day["close"] <= 200)]
-last_codes = last_day.ts_code.unique()
+df = pro.daily(trade_date=last_trade_day)
 
-df = df[df.ts_code.isin(last_codes)]
+# 排除ST
+df = df[~df['ts_code'].str.contains("ST")]
 
-# -------------------------------
-# 6. 计算涨幅、均线、量能等全部指标（批量计算，不循环）
-# -------------------------------
-df["pct_chg"] = df.groupby("ts_code")["close"].pct_change() * 100
-df["vol_ma5"] = df.groupby("ts_code")["vol"].rolling(5).mean().reset_index(0, drop=True)
-df["vol_ma10"] = df.groupby("ts_code")["vol"].rolling(10).mean().reset_index(0, drop=True)
-df["ma20"] = df.groupby("ts_code")["close"].rolling(20).mean().reset_index(0, drop=True)
-df["ma60"] = df.groupby("ts_code")["close"].rolling(60).mean().reset_index(0, drop=True)
+# 价格过滤 10~200 元
+df = df[(df["close"] >= 10) & (df["close"] <= 200)]
 
-# -------------------------------
-# 7. 取昨日的所有数据
-# -------------------------------
-df_y = df[df.trade_date == df.trade_date.max()].copy()
+# 如果过滤后剩很少，直接提示
+if df.empty:
+    st.error("价格过滤后无股票，请检查。")
+    st.stop()
 
-# -------------------------------
-# 8. 昨日涨幅前 500 名
-# -------------------------------
-df_top = df_y.sort_values("pct_chg", ascending=False).head(500)
+# ---------------------------
+# 取昨日涨幅前500
+# ---------------------------
+df = df.sort_values("pct_chg", ascending=False).head(500)
 
-# -------------------------------
-# 9. 高级策略过滤（批量，不循环接口）
-# -------------------------------
-df_sel = df_top[
-    (df_top["vol"] > df_top["vol_ma5"]) &          # 放量
-    (df_top["close"] > df_top["ma20"]) &          # 收盘价站上20日均线
-    (df_top["ma20"] > df_top["ma60"])             # 20日线上穿60日（趋势向上）
+st.write(f"昨日涨幅前500中，共 {len(df)} 只符合价格区间")
+
+# 若500中可能仍大幅减少，也正常
+if df.empty:
+    st.warning("昨日涨幅前500中，没有符合条件的股票。")
+    st.stop()
+
+# ---------------------------
+# 获取均线、成交量等批量数据（极速）
+# ---------------------------
+st.write("正在获取近20日K线以筛选趋势…（耗时约 1～2 秒）")
+
+codes = df["ts_code"].tolist()
+
+# 批量取K线（不会卡，因为只请求500个）
+all_k = []
+for code in codes:
+    k = pro.daily(ts_code=code, start_date=(datetime.now() - timedelta(days=40)).strftime("%Y%m%d"))
+    if k is not None and len(k) > 0:
+        all_k.append(k)
+
+if len(all_k) == 0:
+    st.error("未能获取 K 线数据，请稍后重试")
+    st.stop()
+
+full_k = pd.concat(all_k)
+
+# 按股票分组求 MA5 & MA10
+def calc_ma(group):
+    group = group.sort_values("trade_date")
+    group["ma5"] = group["close"].rolling(5).mean()
+    group["ma10"] = group["close"].rolling(10).mean()
+    return group
+
+full_k = full_k.groupby("ts_code").apply(calc_ma)
+
+# 取最后一天的数据（即昨日）
+latest_k = full_k.groupby("ts_code").tail(1)
+
+# ---------------------------
+# 趋势过滤：MA5 > MA10（短期趋势向上）
+# ---------------------------
+result = latest_k[
+    (latest_k["ma5"] > latest_k["ma10"]) &
+    (latest_k["close"] >= 10) &
+    (latest_k["close"] <= 200)
 ]
 
-st.success(f"筛选完成，共 {len(df_sel)} 只股票")
+# ---------------------------
+# 输出最终结果
+# ---------------------------
+st.subheader("选股结果")
 
-st.dataframe(
-    df_sel[["ts_code", "name", "close", "pct_chg", "vol", "vol_ma5", "ma20", "ma60"]],
-    height=600
-)
+if result.empty:
+    st.warning("筛选完成，0 只股票（可能是市场整体疲弱导致 MA 条件无法满足）")
+else:
+    st.success(f"筛选完成，共 {len(result)} 只股票")
+    st.dataframe(result[["ts_code", "close", "pct_chg", "ma5", "ma10"]])
+
+    # 下载 CSV
+    csv = result.to_csv(index=False).encode("utf-8")
+    st.download_button("下载结果 CSV", csv, "stock_result.csv", "text/csv")
