@@ -170,7 +170,22 @@ else:
 
 # 合并 daily_basic（换手率/amount）若可用
 if daily_basic_df is not None:
-    pool = pool.set_index('ts_code').join(daily_basic_df[['turnover_rate','amount']], how='left').reset_index()
+    # 安全合并 daily_basic，避免列不存在导致 KeyError
+if not daily_basic_df.empty:
+    wanted = ['turnover_rate', 'amount']
+    available = [c for c in wanted if c in daily_basic_df.columns]
+
+    # 仅用可用列合并
+    pool = pool.set_index('ts_code').join(daily_basic_df.set_index('ts_code')[available], how='left').reset_index()
+
+    # 对缺失列补默认值
+    if 'turnover_rate' not in pool.columns:
+        pool['turnover_rate'] = np.nan
+    if 'amount' not in pool.columns:
+        pool['amount'] = np.nan
+else:
+    pool['turnover_rate'] = np.nan
+    pool['amount'] = np.nan
 else:
     # ensure columns exist
     pool['turnover_rate'] = np.nan
