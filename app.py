@@ -2,8 +2,8 @@ import streamlit as st
 import tushare as ts
 import pandas as pd
 
-st.set_page_config(page_title="选股王 v5", layout="wide")
-st.title("选股王 v5")
+st.set_page_config(page_title="选股王 v6", layout="wide")
+st.title("选股王 v6")
 st.caption("零错误 | 日期锁定 | 必出结果")
 
 token = st.text_input("Tushare Token", type="password")
@@ -61,7 +61,7 @@ def run():
     c4 = latest['vol'] >= latest['vol_ma5'] * vol_r
 
     amt = data.groupby('ts_code')['amount'].tail(20).mean()
-    latest['amt_ok'] = latest['ts_code'].map(amt) >= amt_thr
+    latest['amt_ok'] = latest['ts_code'].apply(lambda x: amt.get(x, 0) >= amt_thr)  # 修复 map 错误
 
     res = latest[c1 & c2 & c3 & c4 & latest['amt_ok']].copy()
     if res.empty: return pd.DataFrame()
