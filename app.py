@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 2100 积分旗舰版 (Streamlit)
-特性：
-- 界面输入 Tushare Token（只用于本次运行）
-- 使用高级指标（换手率、量比、成交额、资金流向、行业等）
-- 先做干净候选池过滤，再取涨幅前 N，最后做多因子综合评分
-- 权限回退保护：若某些接口无权限会自动降级并提示
-- 可在界面调整关键阈值
+选股王 · 2100 积分旗舰版 (Streamlit) - 稳健版
+说明：此版本对缺失字段做了大量容错，适配 5000 积分 / 部分接口不可用的情况。
 """
 import streamlit as st
 import tushare as ts
@@ -14,8 +9,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="选股王 · 2100 旗舰版", layout="wide")
-st.title("选股王 · 2100 积分旗舰版（先过滤→涨幅→评分）")
+st.set_page_config(page_title="选股王 · 2100 旗舰版（稳健版）", layout="wide")
+st.title("选股王 · 2100 积分旗舰版（先过滤→涨幅→评分）（稳健容错）")
 
 # ---------------------------
 # 运行时输入 Token（首选界面输入）
@@ -39,8 +34,8 @@ TOP_K = st.sidebar.number_input("最终展示 Top K（界面显示）", min_valu
 MIN_PRICE = st.sidebar.number_input("最低价格（元）", min_value=0.1, max_value=1000.0, value=10.0, step=0.1)
 MAX_PRICE = st.sidebar.number_input("最高价格（元）", min_value=1.0, max_value=2000.0, value=200.0, step=1.0)
 MIN_TURNOVER = st.sidebar.number_input("换手率最低阈值（%）", min_value=0.0, max_value=100.0, value=3.0, step=0.5)
-MIN_AMOUNT = st.sidebar.number_input("成交额最低阈值（元，近似）", min_value=0.0, max_value=1e10, value=200_000_000.0, step=10_000_000.0)
-MAX_TOTAL_MV = st.sidebar.number_input("排除总市值 > （元）", min_value=1e8, max_value=1e13, value=1000_0000_00000.0, step=100_000_000.0)  # default ~1000亿, approximate
+MIN_AMOUNT = st.sidebar.number_input("成交额最低阈值（元，近似）", min_value=0.0, max_value=1e12, value=200_000_000.0, step=10_000_000.0)
+MAX_TOTAL_MV = st.sidebar.number_input("排除总市值 > （元）", min_value=1e8, max_value=1e13, value=1000 * 100000000.0, step=100_000_000.0)  # default ~1000亿
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("评分权重（可选）")
@@ -91,8 +86,11 @@ st.info(f"参考最近交易日：{last_trade}")
 def load_market_daily(trade_date):
     try:
         df = pro.daily(trade_date=trade_date)
+        if df is None:
+            return pd.DataFrame()
         return df
     except Exception as e:
+        st.warning(f"拉取 daily 失败：{e}")
         return pd.DataFrame()
 
 market_df = load_market_daily(last_trade)
@@ -106,64 +104,126 @@ st.write(f"当日记录数：{len(market_df)}（后续将从涨幅榜前 {INITIA
 # 尝试获取 stock_basic & daily_basic & moneyflow（若权限足够）
 # ---------------------------
 def try_get_stock_basic():
+    # request broader fields but handle missing ones
     try:
         info = pro.stock_basic(list_status='L', fields='ts_code,name,market,industry,list_date,total_mv,circ_mv')
+        if info is None:
+            return pd.DataFrame()
         info = info.drop_duplicates(subset=['ts_code'])
         return info
-    except Exception:
-        st.warning("无法获取 stock_basic（名称/市值/行业）。界面将以代码代替名称并降级市值判断。")
+    except Exception as e:
+        st.warning(f"无法获取 stock_basic（名称/市值/行业）。说明：{e}")
         return pd.DataFrame()
 
 def try_get_daily_basic(trade_date):
     try:
         db = pro.daily_basic(trade_date=trade_date, fields='ts_code,turnover_rate,amount')
+        if db is None:
+            return None
         db = db.drop_duplicates(subset=['ts_code']).set_index('ts_code')
         return db
-    except Exception:
-        st.warning("无法获取 daily_basic（换手率/成交额），将尝试用日线中的 amount/vol 做近似判断。")
+    except Exception as e:
+        st.warning(f"无法获取 daily_basic（换手率/成交额）：{e}")
         return None
 
 def try_get_moneyflow(trade_date):
     """
-    moneyflow: try to get daily money flow; field name may be 'net_mf' or 'net_mf_amount' - use try.
+    尝试检测 moneyflow 的合适字段名（不同权限下字段名可能不同）。
+    返回的 DataFrame index 为 ts_code，包含一列 'net_mf'（统一列名）。
     """
     try:
-        mf = pro.moneyflow(trade_date=trade_date)  # may return many fields
-        mf = mf[['ts_code', 'net_mf']].drop_duplicates(subset=['ts_code']).set_index('ts_code')
-        return mf
-    except Exception:
-        st.warning("无法获取 moneyflow（主力净流），评分中此项将降级为0。")
+        mf = pro.moneyflow(trade_date=trade_date)
+        if mf is None or mf.empty:
+            st.warning("moneyflow 返回为空（接口可用但无数据）。")
+            return None
+        mf = mf.drop_duplicates(subset=['ts_code'])
+        # 尝试可能的主力列名
+        possible = ['net_mf', 'net_mf_amount', 'net_mf_amt', 'net_mf_vol', 'net_mf_amt_main', 'net_mf_main']
+        found = None
+        for c in possible:
+            if c in mf.columns:
+                found = c
+                break
+        if found is None:
+            # 尝试任何以 'net' 开头的列
+            for c in mf.columns:
+                if isinstance(c, str) and c.lower().startswith('net'):
+                    found = c
+                    break
+        if found is None:
+            st.warning("moneyflow 中未找到可识别的主力净流字段，资金项将降级为0。")
+            return None
+        mf2 = mf[['ts_code', found]].rename(columns={found: 'net_mf'}).set_index('ts_code')
+        return mf2
+    except Exception as e:
+        st.warning(f"无法获取 moneyflow（主力净流），评分中此项将降级为0：{e}")
         return None
 
 stock_basic_df = try_get_stock_basic()
 daily_basic_df = try_get_daily_basic(last_trade)
 moneyflow_df = try_get_moneyflow(last_trade)
 
+# 友好提示已取得哪些关键表
+st.write("stock_basic 行数：", 0 if stock_basic_df is None else len(stock_basic_df))
+st.write("daily_basic 可用：" , "是" if (daily_basic_df is not None and not daily_basic_df.empty) else "否")
+st.write("moneyflow 可用：" , "是" if (moneyflow_df is not None and not moneyflow_df.empty) else "否")
+
 # ---------------------------
 # 初筛：按涨幅取 top N（减少后续调用）
 # ---------------------------
 pool = market_df.sort_values('pct_chg', ascending=False).head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
 
-# 合并部分基本信息（若 available）
+# --- 合并部分基本信息（若 available），但先检测字段
 if not stock_basic_df.empty:
-    pool = pool.merge(stock_basic_df[['ts_code','name','industry','total_mv','circ_mv']], on='ts_code', how='left')
+    want_cols = ['ts_code','name','industry','total_mv','circ_mv']
+    exist_cols = [c for c in want_cols if c in stock_basic_df.columns]
+    if len(exist_cols) < len(want_cols):
+        missing = set(want_cols) - set(exist_cols)
+        st.warning(f"stock_basic 缺少字段：{missing}。会使用可用字段并对缺失项降级。")
+    # merge only existing cols
+    try:
+        pool = pool.merge(stock_basic_df[exist_cols], on='ts_code', how='left')
+    except Exception as e:
+        st.warning(f"合并 stock_basic 失败（回退为不合并）：{e}")
 else:
+    # ensure name/industry columns exist to avoid later KeyError
     pool['name'] = pool['ts_code']
     pool['industry'] = ""
 
 # 合并 daily_basic（换手率/amount）若可用
-if daily_basic_df is not None:
-    pool = pool.set_index('ts_code').join(daily_basic_df[['turnover_rate','amount']], how='left').reset_index()
+if daily_basic_df is not None and not daily_basic_df.empty:
+    want_db_cols = ['turnover_rate','amount']
+    exist_db_cols = [c for c in want_db_cols if c in daily_basic_df.columns]
+    if len(exist_db_cols) < len(want_db_cols):
+        st.warning(f"daily_basic 缺少字段：{set(want_db_cols)-set(exist_db_cols)}。将使用可用字段。")
+    try:
+        # join on index
+        pool = pool.set_index('ts_code').join(daily_basic_df[exist_db_cols], how='left').reset_index()
+    except Exception as e:
+        st.warning(f"daily_basic 合并失败：{e}")
+        # ensure the columns exist
+        if 'turnover_rate' not in pool.columns:
+            pool['turnover_rate'] = np.nan
+        if 'amount' not in pool.columns:
+            pool['amount'] = np.nan
 else:
     # ensure columns exist
-    pool['turnover_rate'] = np.nan
-    pool['amount'] = pool.get('amount', np.nan)
+    if 'turnover_rate' not in pool.columns:
+        pool['turnover_rate'] = np.nan
+    if 'amount' not in pool.columns:
+        pool['amount'] = np.nan
 
-# 合并 moneyflow 若可用
-if moneyflow_df is not None:
-    pool = pool.set_index('ts_code').join(moneyflow_df[['net_mf']], how='left').reset_index()
+# 合并 moneyflow 若可用（moneyflow_df 已经将主力列重命名为 net_mf）
+if moneyflow_df is not None and not moneyflow_df.empty:
+    try:
+        pool = pool.set_index('ts_code').join(moneyflow_df[['net_mf']], how='left').reset_index()
+    except Exception as e:
+        st.warning(f"moneyflow 合并失败：{e}")
+        if 'net_mf' not in pool.columns:
+            pool['net_mf'] = 0.0
 else:
-    pool['net_mf'] = 0.0
+    if 'net_mf' not in pool.columns:
+        pool['net_mf'] = 0.0
 
 # ---------------------------
 # 清洗候选池（按你要求的规则）
@@ -176,16 +236,33 @@ def safe_float(x, default=np.nan):
 
 cleaned = []
 for idx, r in pool.iterrows():
-    ts = r['ts_code']
+    ts = r.get('ts_code', None)
+    if not ts:
+        continue
+
     # 排除停牌（vol==0 或 amount==0）
     vol = safe_float(r.get('vol', 0))
-    amount = safe_float(r.get('amount', r.get('amount', 0)))
-    if vol == 0 or (amount == 0 or np.isnan(amount)):
+    amount = safe_float(r.get('amount', np.nan))
+
+    # 若 amount 为 NaN，但 market_df 有 amount 列则使用
+    if pd.isna(amount) and 'amount' in r:
+        amount = safe_float(r.get('amount', np.nan))
+
+    # 如果仍然 NaN，尝试用成交额换算：vol * close（若 vol 与 close 存在且 vol 单位是手）
+    if pd.isna(amount):
+        if 'vol' in r and 'close' in r and not pd.isna(r.get('vol')) and not pd.isna(r.get('close')):
+            try:
+                amount = float(r.get('vol')) * float(r.get('close'))
+            except:
+                amount = np.nan
+
+    # 认为停牌或无成交的直接跳过
+    if vol == 0 or (pd.isna(amount) or amount == 0):
         continue
 
     # 价格区间
     price = safe_float(r.get('close', r.get('open', np.nan)))
-    if np.isnan(price):
+    if pd.isna(price):
         continue
     if price < MIN_PRICE or price > MAX_PRICE:
         continue
@@ -196,17 +273,15 @@ for idx, r in pool.iterrows():
         up = name.upper()
         if 'ST' in up or '退' in up:
             continue
+
     # 排除总市值 > MAX_TOTAL_MV （需先确定 stock_basic 提供的单位）
     total_mv = r.get('total_mv', np.nan)
     if not (pd.isna(total_mv)):
-        # Tushare total_mv commonly in 万元 (historical). We try reasonable check:
-        # If value is huge (like >1e6), assume it's in 万元 and convert to 元: total_mv*10000
         try:
             tv = float(total_mv)
-            # if tv > 1e6 assume it's in 万元
+            # 如果 tv 看起来像是万元级别（较大），把它 *10000 转换为元
             if tv > 1e6:
-                # convert to 元
-                tv_yuan = tv * 10000
+                tv_yuan = tv * 10000.0
             else:
                 tv_yuan = tv
             if tv_yuan > MAX_TOTAL_MV:
@@ -220,14 +295,14 @@ for idx, r in pool.iterrows():
         if tr < MIN_TURNOVER:
             continue
     else:
-        # 无 daily_basic 时，用量放大近似：今天 vol 比昨天平均 vol 多倍（这里简单跳过，交由后续更严格计算）
+        # 无 daily_basic 时，不强制排除（保守策略）
         pass
 
     # 排除成交额过低（近似）
-    amt = safe_float(r.get('amount', 0))
-    # some API return amount in 元, some return in 万元; we normalize: if amt < 1e5 treat as 万元 and multiply
+    amt = amount if not pd.isna(amount) else 0.0
+    # some API return amount in 万元; normalize: 若小于1e5则认为是万元，乘以10000
     if amt > 0 and amt < 1e5:
-        amt *= 10000
+        amt = amt * 10000.0
     if amt < MIN_AMOUNT:
         continue
 
@@ -243,7 +318,7 @@ for idx, r in pool.iterrows():
 cleaned_df = pd.DataFrame(cleaned).reset_index(drop=True)
 st.write(f"清洗后候选数量：{len(cleaned_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
 if len(cleaned_df) == 0:
-    st.error("清洗后无候选，请放宽条件或检查 Token 权限。")
+    st.error("清洗后无候选，请放宽条件或检查 Token 权限（例如 daily_basic / stock_basic 是否完整）。")
     st.stop()
 
 # ---------------------------
@@ -253,7 +328,7 @@ cleaned_df = cleaned_df.sort_values('pct_chg', ascending=False).head(int(FINAL_P
 st.write(f"用于评分的池子大小：{len(cleaned_df)}")
 
 # ---------------------------
-# 辅助：获取单只历史（10/20 日）并缓存（用于量比/10日收益等）
+# 辅助：获取单只历史（20 日）并缓存（用于量比/10日收益等）
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_hist(ts_code, end_date, days=20):
@@ -272,58 +347,78 @@ def get_hist(ts_code, end_date, days=20):
 # ---------------------------
 records = []
 pbar = st.progress(0)
+n = len(cleaned_df)
 for i, row in enumerate(cleaned_df.itertuples()):
-    ts = getattr(row, 'ts_code')
+    ts = getattr(row, 'ts_code', None)
     pct = safe_float(getattr(row, 'pct_chg', 0))
     turnover = safe_float(getattr(row, 'turnover_rate', np.nan))
-    amount_val = safe_float(getattr(row, 'amount', 0))
+    # amount：优先 cleaned_df 的 amount，再尝试 row.amount 字段
+    amount_val = safe_float(getattr(row, 'amount', np.nan))
+    if pd.isna(amount_val):
+        # try market_df
+        try:
+            amount_val = float(cleaned_df.loc[cleaned_df['ts_code']==ts, 'amount'].values[0])
+        except:
+            amount_val = np.nan
     if amount_val > 0 and amount_val < 1e5:
-        amount_val *= 10000
+        amount_val *= 10000.0
 
     # try to get 10/20d history
     hist = get_hist(ts, last_trade, days=20)
     if hist is None or len(hist) < 5:
-        # we can still use available daily fields but with penalties
         avg_vol_5 = np.nan
         vol_ratio = np.nan
         ten_return = np.nan
     else:
         hist_tail = hist.tail(10)
         vols = hist_tail['vol'].astype(float).tolist()
-        # avg of previous 5 (exclude last day)
         if len(vols) >= 6:
             avg_vol_5 = np.mean(vols[:-1][-5:])
         else:
             avg_vol_5 = np.mean(vols[:-1]) if len(vols[:-1])>0 else np.nan
-        vol_today = float(vols[-1])
+        vol_today = float(vols[-1]) if len(vols)>0 else np.nan
         vol_ratio = vol_today / (avg_vol_5+1e-9) if not np.isnan(avg_vol_5) and avg_vol_5>0 else np.nan
         ten_return = (hist_tail.iloc[-1]['close'] / hist_tail.iloc[0]['open'] - 1) if len(hist_tail)>=2 else np.nan
 
     # moneyflow if available
     net_mf = 0.0
-    if moneyflow_df is not None and ts in moneyflow_df.index:
+    if moneyflow_df is not None and not moneyflow_df.empty:
         try:
-            net_mf = float(moneyflow_df.loc[ts, 'net_mf'])
+            if ts in moneyflow_df.index:
+                net_mf = float(moneyflow_df.loc[ts, 'net_mf'])
+            else:
+                net_mf = 0.0
         except:
             net_mf = 0.0
 
-    # industry strength: compute later as percentile placeholder
-    industry = getattr(row, 'industry', '') if 'industry' in cleaned_df.columns else ''
+    # industry if available in merged cleaned_df or stock_basic
+    industry = ''
+    if 'industry' in cleaned_df.columns:
+        try:
+            industry = cleaned_df.loc[cleaned_df['ts_code']==ts, 'industry'].values[0]
+        except:
+            industry = ''
+    elif not stock_basic_df.empty and 'industry' in stock_basic_df.columns:
+        try:
+            industry = stock_basic_df.loc[stock_basic_df['ts_code']==ts, 'industry'].values[0]
+        except:
+            industry = ''
 
     records.append({
         'ts_code': ts,
         'name': getattr(row, 'name', ts),
         'pct_chg': pct,
         'turnover_rate': turnover,
-        'amount': amount_val,
+        'amount': amount_val if not pd.isna(amount_val) else 0.0,
         'vol_ratio': vol_ratio if not pd.isna(vol_ratio) else 1.0,
         'net_mf': net_mf,
         'ten_return': ten_return if not pd.isna(ten_return) else 0.0,
         'price': safe_float(getattr(row, 'close', getattr(row, 'open', np.nan))),
         'open': safe_float(getattr(row, 'open', np.nan)),
-        'pre_close': safe_float(getattr(row, 'pre_close', np.nan))
+        'pre_close': safe_float(getattr(row, 'pre_close', np.nan)),
+        'industry': industry if industry is not None else ''
     })
-    pbar.progress((i+1)/len(cleaned_df))
+    pbar.progress((i+1)/n if n>0 else 1.0)
 
 pbar.progress(1.0)
 score_df = pd.DataFrame(records)
@@ -331,39 +426,37 @@ score_df = pd.DataFrame(records)
 # ---------------------------
 # 计算行业热度（基础：行业内平均涨幅，用于 industry_score）
 # ---------------------------
-if not stock_basic_df.empty and 'industry' in stock_basic_df.columns:
-    # merge industry from stock_basic (if available)
-    score_df = score_df.merge(stock_basic_df[['ts_code','industry']], on='ts_code', how='left')
+if 'industry' in score_df.columns:
+    ind_mean = score_df.groupby('industry')['pct_chg'].transform('mean')
+    # industry strength normalized
+    if ind_mean.max() - ind_mean.min() < 1e-9:
+        score_df['industry_score'] = 0.0
+    else:
+        score_df['industry_score'] = (ind_mean - ind_mean.min()) / (ind_mean.max() - ind_mean.min() + 1e-9)
+    score_df['industry_score'] = score_df['industry_score'].fillna(0.0)
 else:
-    score_df['industry'] = ''
-
-# simple industry score: for each industry compute avg pct_chg among the pool
-ind_mean = score_df.groupby('industry')['pct_chg'].transform('mean')
-# industry strength normalized
-score_df['industry_score'] = (ind_mean - ind_mean.min()) / (ind_mean.max() - ind_mean.min() + 1e-9)
-score_df['industry_score'] = score_df['industry_score'].fillna(0.0)
+    score_df['industry_score'] = 0.0
 
 # ---------------------------
 # 归一化每个子指标到 0-1（越大越好）
 # ---------------------------
 def norm_series(s):
+    s = pd.Series(s).astype(float)
     if s.isnull().all():
         return pd.Series(np.zeros(len(s)), index=s.index)
     mn = s.min()
     mx = s.max()
     if mx - mn < 1e-9:
-        return pd.Series(np.ones(len(s)), index=s.index) * 0.5
+        return pd.Series(np.ones(len(s))*0.5, index=s.index)
     return (s - mn) / (mx - mn)
 
-score_df['pct_rank'] = norm_series(score_df['pct_chg'])
+score_df['pct_rank'] = norm_series(score_df['pct_chg'].fillna(0))
 score_df['volratio_rank'] = norm_series(score_df['vol_ratio'].replace([np.inf, -np.inf], np.nan).fillna(0))
 score_df['turn_rank'] = norm_series(score_df['turnover_rate'].fillna(0))
 score_df['money_rank'] = norm_series(score_df['net_mf'].fillna(0))
-score_df['health_score'] = 1.0  # placeholder positive baseline; we can penalize extremes
-# penalize extreme huge amount without follow-up (if amount is extremely large vs vol) - simple heuristic
 score_df['amount_norm'] = norm_series(score_df['amount'].fillna(0))
-# health_score = 1 - amount_norm * 0.1 (slight penalty for excessive amount)
 score_df['health_score'] = 1.0 - 0.1 * score_df['amount_norm']
+score_df['health_score'] = score_df['health_score'].clip(0,1)
 
 # ---------------------------
 # 综合评分（加权）
@@ -396,10 +489,16 @@ st.download_button("下载全部评分结果 CSV", data=csv, file_name=f"score_r
 # 小结与提示
 st.markdown("### 小结与注意事项")
 st.markdown("""
-- 该脚本在 2100 积分情况下应能高速运行并提供更丰富因子（换手率、量比、资金流向、行业强度等）。  
-- 若某些字段（如 daily_basic、moneyflow、stock_basic）因权限不足而不可用，脚本会降级并提示，这会影响评分精度。  
-- 若要进一步提升，你可以：调整权重、缩小 INITIAL_TOP_N（加速）或扩大 FINAL_POOL（更全面）。  
-- 推荐的实战节奏：**每天早盘只运行 1 次（9:25-9:35）→ 10:05 观察 → 持续复盘 3 天**。  
+- 此版本已尽可能对 stock_basic/daily_basic/moneyflow 的字段差异做容错：  
+  - 若 stock_basic 缺少某些列（如 total_mv/circ_mv/industry），脚本会跳过并在界面提醒。  
+  - 若 daily_basic 或 moneyflow 不可用，相关因子会降级为保守默认（不再报 KeyError）。  
+- 如果你仍然看到“清洗后无候选”或“选出数量为0”，请检查：  
+  1. 权重与阈值是否过严（例如 MIN_AMOUNT 带来严格剪枝）  
+  2. Token 是否确实有 daily_basic / stock_basic / moneyflow 的权限  
+- 我可以继续为你做：  
+  - “显示每一步被刷掉多少票”的更详细过滤统计版本，或  
+  - 自动放宽阈值直到至少选出 N 支股票（自动调参版）。  
+如需其中一个，请回复“过滤统计版”或“自动调参版”。  
 """)
 
-st.info("如需我把这个脚本再精细化（例如加入 5/10 日均线、放量检测阈值、行业轮动加分等），回复我我会把下一版代码一次性输出。")
+st.info("如需我继续优化（例如加入 MA 选股、放量判断或行业轮动逻辑），告诉我你的偏好，我会在此基础上给出完整可替换代码。")
