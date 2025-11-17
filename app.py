@@ -513,7 +513,7 @@ st.dataframe(fdf[display_cols].head(TOP_DISPLAY), use_container_width=True)
 
 # CSV 下载
 csv = fdf[display_cols].to_csv(index=True, encoding='utf-8-sig')
-st.download_button("下载全部评分结果 CSV", data=csv, file_name=f"score_result_{}.csv".format(last_trade), mime="text/csv")
+st.download_button("下载全部评分结果 CSV", data=csv, file_name=f"score_result_{last_trade}.csv".format(last_trade), mime="text/csv")
 
 # ---------------------------
 # 小结（提示）
