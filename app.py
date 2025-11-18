@@ -126,8 +126,8 @@ with st.spinner(f"正在用 {last_date} 数据扫描全市场..."):
         if 30 <= circ_mv <= 200:
             score += 5
 
-        # 关键：门槛降到33（专业平衡点）
-        if score >= 33:
+        # 关键：门槛降到31（专业平衡点）
+        if score >= 31:
             result.append({
                 '代码': code[:6],
                 '名称': name,
