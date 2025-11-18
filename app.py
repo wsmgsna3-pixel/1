@@ -185,6 +185,14 @@ pool_merged = safe_merge_pool(pool0, daily_basic, ['turnover_rate','amount','tot
 moneyflow = moneyflow if not moneyflow.empty else pd.DataFrame({'net_mf': [0] * len(pool_merged)}, index=pool_merged.index)
 
 # 合并数据时忽略空值
+# 如果 moneyflow 没有 'ts_code' 列，添加一个默认的空列 'ts_code'
+if 'ts_code' not in moneyflow.columns:
+    moneyflow['ts_code'] = None  # 或者使用其他默认值，例如：pool_merged['ts_code']
+
+# 如果 moneyflow 为空，则使用默认值 0，确保合并时不会出错
+moneyflow = moneyflow if not moneyflow.empty else pd.DataFrame({'net_mf': [0] * len(pool_merged)}, index=pool_merged.index)
+
+# 合并数据时忽略空值，避免出现 KeyError
 pool_merged = pool_merged.set_index('ts_code').join(moneyflow.set_index('ts_code'), how='left').reset_index()
 if 'net_mf' not in pool_merged.columns:
     pool_merged['net_mf'] = 0.0
