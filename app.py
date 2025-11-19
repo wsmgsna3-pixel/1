@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰 · BC 混合版
+选股王 · 10000 积分旗舰（BC 混合增强版）
 说明：
-- 适配短线爆发 (B) + 妖股捕捉 (C) 混合策略（持股 1-5 天）
-- 在界面输入 Tushare Token（仅本次会话使用）
+- 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
+- 在界面输入 Tushare Token（仅本次运行使用）
 - 尽可能调用 moneyflow / chip / ths_member 等高级接口，若无权限会自动降级
 - 已做大量异常处理与缓存，降低因接口波动导致的报错
 """
@@ -17,28 +17,29 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 页面与说明
+# 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（BC混合）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（BC 混合型：短线爆发 + 妖股捕捉）")
-st.markdown("输入你的 Tushare Token（仅本次运行使用）。遇到权限问题会自动降级，不会中断程序。")
+st.set_page_config(page_title="选股王 · 10000旗舰（BC增强）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（BC 混合增强版）")
+st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
-# 用户参数（可在侧边栏快速调整）
+# 侧边栏参数（实时可改）
 # ---------------------------
 with st.sidebar:
     st.header("可调参数（实时）")
-    INITIAL_TOP_N = st.number_input("初筛：涨幅榜取前 N", value=1000, step=100)
-    FINAL_POOL = st.number_input("清洗后取前 M 进入评分", value=500, step=50)
-    TOP_DISPLAY = st.number_input("界面显示 Top K", value=30, step=5)
-    MIN_PRICE = st.number_input("最低价格 (元)", value=10.0, step=1.0)
-    MAX_PRICE = st.number_input("最高价格 (元)", value=200.0, step=10.0)
-    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=3.0, step=0.5)
-    MIN_AMOUNT = st.number_input("最低成交额 (元)", value=200_000_000.0, step=50_000_000.0)
-    VOL_SPIKE_MULT = st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1)
-    VOLATILITY_MAX = st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5)
-    HIGH_PCT_THRESHOLD = st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5)
-    st.caption("注：阈值保守可降低假信号，激进可放宽。")
+    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
+    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
+    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
+    MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
+    MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=200_000_000.0, step=50_000_000.0))
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1))
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5))
+    HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
+    st.markdown("---")
+    st.caption("提示：保守→降低阈值；激进→提高阈值。")
 
 # ---------------------------
 # Token 输入（主区）
@@ -48,20 +49,18 @@ if not TS_TOKEN:
     st.warning("请输入 Tushare Token 才能运行脚本。")
     st.stop()
 
-# init tushare
+# 初始化 tushare
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ---------------------------
-# 辅助函数：安全调用与近期交易日
+# 安全调用 & 缓存辅助
 # ---------------------------
 def safe_get(func, **kwargs):
     """Call API and return DataFrame or empty df on any error."""
     try:
         df = func(**kwargs)
-        if df is None:
-            return pd.DataFrame()
-        if isinstance(df, pd.DataFrame) and df.empty:
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame()
         return df
     except Exception:
@@ -85,7 +84,7 @@ if not last_trade:
 st.info(f"参考最近交易日：{last_trade}")
 
 # ---------------------------
-# 拉取当日涨幅榜初筛
+# 拉当日涨幅榜初筛
 # ---------------------------
 st.write("正在拉取当日 daily（涨幅榜）作为初筛...")
 daily_all = safe_get(pro.daily, trade_date=last_trade)
@@ -98,17 +97,29 @@ st.write(f"当日记录：{len(daily_all)}，取涨幅前 {INITIAL_TOP_N} 作为
 pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
 
 # ---------------------------
-# 尝试拉取高级表（有权限时启用）
+# 尝试加载高级接口（有权限时启用）
 # ---------------------------
 st.write("尝试加载 stock_basic / daily_basic / moneyflow / ths_member / chip 等高级接口（若权限允许）...")
 stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,list_date,total_mv,circ_mv')
 daily_basic = safe_get(pro.daily_basic, trade_date=last_trade, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
 mf_raw = safe_get(pro.moneyflow, trade_date=last_trade)
-ths_hot = safe_get(pro.ths_member)  # may require permission
-# chip distribution & other advanced: try but safe
-chip_dist_sample = safe_get(pro.chip, ts_code=pool0['ts_code'].iloc[0] if len(pool0)>0 else '', trade_date=last_trade) if hasattr(pro, 'chip') else pd.DataFrame()
+# ths_member 可能需权限
+try:
+    ths_hot = safe_get(pro.ths_member)
+except Exception:
+    ths_hot = pd.DataFrame()
 
-# prepare moneyflow processed
+# chip 接口有时需要高级权限（尝试拉取示例）
+chip_sample = pd.DataFrame()
+if hasattr(pro, 'chip'):
+    try:
+        # 仅尝试示例，不在评分主流程中大量请求
+        if len(pool0) > 0:
+            chip_sample = safe_get(pro.chip, ts_code=pool0['ts_code'].iloc[0], trade_date=last_trade)
+    except Exception:
+        chip_sample = pd.DataFrame()
+
+# moneyflow 预处理
 if not mf_raw.empty:
     possible = ['net_mf','net_mf_amount','net_mf_in','net_mf_out']
     col = None
@@ -116,8 +127,8 @@ if not mf_raw.empty:
         if c in mf_raw.columns:
             col = c; break
     if col is None:
-        numcols = [c for c in mf_raw.columns if c != 'ts_code' and pd.api.types.is_numeric_dtype(mf_raw[c])]
-        col = numcols[0] if numcols else None
+        numeric_cols = [c for c in mf_raw.columns if c != 'ts_code' and pd.api.types.is_numeric_dtype(mf_raw[c])]
+        col = numeric_cols[0] if numeric_cols else None
     if col:
         moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
     else:
@@ -410,6 +421,12 @@ for idx, row in enumerate(clean_df.itertuples()):
     prev3_sum = ind.get('prev3_sum', np.nan)
     volatility_10 = ind.get('volatility_10', np.nan)
 
+    # 资金强度代理（不依赖 moneyflow）：简单乘积指标（price move * vol_ratio * turnover）
+    try:
+        proxy_money = (abs(pct_chg) + 1e-9) * (vol_ratio if not pd.isna(vol_ratio) else 0.0) * (turnover_rate if not pd.isna(turnover_rate) else 0.0)
+    except:
+        proxy_money = 0.0
+
     rec = {
         'ts_code': ts_code, 'name': name, 'pct_chg': pct_chg,
         'amount': amount if not pd.isna(amount) else 0.0,
@@ -420,7 +437,8 @@ for idx, row in enumerate(clean_df.itertuples()):
         'ma5': ma5, 'ma10': ma10, 'ma20': ma20,
         'macd': macd, 'k': k, 'd': d, 'j': j,
         'last_close': last_close, 'vol_last': vol_last, 'vol_ma5': vol_ma5,
-        'prev3_sum': prev3_sum, 'volatility_10': volatility_10
+        'prev3_sum': prev3_sum, 'volatility_10': volatility_10,
+        'proxy_money': proxy_money
     }
 
     records.append(rec)
@@ -433,7 +451,7 @@ if fdf.empty:
     st.stop()
 
 # ---------------------------
-# 风险过滤（放在评分前，省积分/时间）
+# 风险过滤（放在评分前以节省历史调用）
 # ---------------------------
 st.write("执行风险过滤：下跌途中大阳 / 巨量冲高 / 高位大阳 / 极端波动 ...")
 try:
@@ -459,12 +477,12 @@ try:
         fdf = fdf[~mask_volatility]
 
     after_cnt = len(fdf)
-    st.write(f"风险过滤：{before_cnt} -> {after_cnt}（若过严请调整阈值）")
+    st.write(f"风险过滤：{before_cnt} -> {after_cnt}（若过严请在侧边栏调整阈值）")
 except Exception as e:
     st.warning(f"风险过滤模块异常，跳过过滤。错误：{e}")
 
 # ---------------------------
-# RSL（相对强弱） —— 基于池内 10d_return 的相对表现
+# RSL（相对强弱）：基于池内 10d_return 的相对表现
 # ---------------------------
 if '10d_return' in fdf.columns:
     try:
@@ -490,7 +508,11 @@ def norm_col(s):
 fdf['s_pct'] = norm_col(fdf.get('pct_chg', pd.Series([0]*len(fdf))))
 fdf['s_volratio'] = norm_col(fdf.get('vol_ratio', pd.Series([0]*len(fdf))))
 fdf['s_turn'] = norm_col(fdf.get('turnover_rate', pd.Series([0]*len(fdf))))
-fdf['s_money'] = norm_col(fdf.get('net_mf', pd.Series([0]*len(fdf))))
+# prefer real moneyflow if available, else proxy_money
+if 'net_mf' in fdf.columns and fdf['net_mf'].abs().sum() > 0:
+    fdf['s_money'] = norm_col(fdf.get('net_mf', pd.Series([0]*len(fdf))))
+else:
+    fdf['s_money'] = norm_col(fdf.get('proxy_money', pd.Series([0]*len(fdf))))
 fdf['s_amount'] = norm_col(fdf.get('amount', pd.Series([0]*len(fdf))))
 fdf['s_10d'] = norm_col(fdf.get('10d_return', pd.Series([0]*len(fdf))))
 fdf['s_macd'] = norm_col(fdf.get('macd', pd.Series([0]*len(fdf))))
@@ -499,9 +521,7 @@ fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fd
 
 # ---------------------------
 # 综合评分（BC 混合权重）
-#   - B（爆发）偏重：今日涨幅 / 量能 / 换手 / 近10日动能
-#   - C（妖股）偏重：相对强弱（rsl），筹码 & 放量特征
-# 权重可调整（若你要做动态调整我可以把权重放 UI）
+#    B (爆发) + C (妖股) 混合权重
 # ---------------------------
 w_pct = 0.18
 w_volratio = 0.18
@@ -524,33 +544,33 @@ fdf['综合评分'] = (
 )
 
 # ---------------------------
-# 最终排序、展示与输出
+# 最终排序与展示
 # ---------------------------
 fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
 fdf.index = fdf.index + 1
 
 st.success(f"评分完成：总候选 {len(fdf)} 支，显示 Top {min(TOP_DISPLAY, len(fdf))}。")
-display_cols = ['name','ts_code','综合评分','pct_chg','vol_ratio','turnover_rate','net_mf','amount','10d_return','macd','k','d','j','rsl','volatility_10']
+display_cols = ['name','ts_code','综合评分','pct_chg','vol_ratio','turnover_rate','net_mf','proxy_money','amount','10d_return','macd','k','d','j','rsl','volatility_10']
 for c in display_cols:
     if c not in fdf.columns:
         fdf[c] = np.nan
 
 st.dataframe(fdf[display_cols].head(TOP_DISPLAY), use_container_width=True)
 
-# 下载（只导出前 200 列以防太大）
+# 下载（仅导出前200避免过大）
 out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
 st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
 # ---------------------------
-# 小结与下一步建议
+# 小结与建议（简洁）
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- 本版本为 BC 混合型（短线爆发 + 妖股捕捉），持股周期建议：1–5 天。  
-- 已启用 MACD、RSL（相对强弱）、下跌途中大阳过滤、巨量冲高过滤、极端波动过滤。  
-- 如果 moneyflow / chip / ths_member 被成功拉取，将显著提高选股质量；若无权限则会自动降级。  
-- 实战纪律（必须遵守）：**9:40 前不买 → 观察 9:40-10:05 的量价结构 → 10:05 后择优介入**。  
-- 若你希望更激进，可提升 HIGH_PCT_THRESHOLD 与 VOL_SPIKE_MULT；若想保守则降低这些值。  
+- 本版本为 BC 混合增强版（短线爆发 + 妖股捕捉）。  
+- 已启用 MACD、RSL、下跌途中大阳线过滤、巨量冲高过滤、极端波动过滤。  
+- 若 moneyflow / chip / ths_member 能成功拉取，将作为额外加分因子；若无权限脚本会自动用 proxy_money 代替。  
+- 实战纪律（必须遵守）：**9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入**。  
+- 若今日候选普遍翻绿，请保持空仓。  
 """)
 
-st.info("运行出现问题请把 Streamlit 的错误日志/截图发给我（只需首段错误信息），我会在两次修改机会内帮你调优。")
+st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在两次修改内继续帮你调优。")
