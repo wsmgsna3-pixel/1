@@ -187,13 +187,19 @@ moneyflow = moneyflow if not moneyflow.empty else pd.DataFrame({'net_mf': [0] * 
 # 合并数据时忽略空值
 # 如果 moneyflow 没有 'ts_code' 列，添加一个默认的空列 'ts_code'
 if 'ts_code' not in moneyflow.columns:
-    moneyflow['ts_code'] = None  # 或者使用其他默认值，例如：pool_merged['ts_code']
+    moneyflow['ts_code'] = None
 
-# 如果 moneyflow 为空，则使用默认值 0，确保合并时不会出错
+# 再次兜底
 moneyflow = moneyflow if not moneyflow.empty else pd.DataFrame({'net_mf': [0] * len(pool_merged)}, index=pool_merged.index)
 
 # 合并数据时忽略空值，避免出现 KeyError
-pool_merged = pool_merged.set_index('ts_code').join(moneyflow.set_index('ts_code'), how='left').reset_index()
+try:
+    pool_merged = pool_merged.set_index('ts_code').join(moneyflow.set_index('ts_code'), how='left').reset_index()
+except Exception:
+    # fallback: ensure net_mf column exists
+    if 'net_mf' not in pool_merged.columns:
+        pool_merged['net_mf'] = 0.0
+
 if 'net_mf' not in pool_merged.columns:
     pool_merged['net_mf'] = 0.0
 pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
@@ -208,7 +214,8 @@ for i, r in enumerate(pool_merged.itertuples()):
     ts = getattr(r, 'ts_code')
     try:
         # skip vol==0 or amount==0 -> 停牌或无交易
-        vol = safe_get(pro.daily, ts_code=ts, trade_date=last_trade).get('vol', pd.Series([0])).iloc[0] if True else 0
+        vol_df = safe_get(pro.daily, ts_code=ts, trade_date=last_trade)
+        vol = vol_df.get('vol', pd.Series([0])).iloc[0] if not vol_df.empty else getattr(r, 'vol') if 'vol' in pool_merged.columns else 0
     except Exception:
         vol = getattr(r, 'vol') if 'vol' in pool_merged.columns else 0
 
@@ -336,6 +343,12 @@ def compute_indicators(df):
     high = df['high'].astype(float)
     low = df['low'].astype(float)
 
+    # last close
+    try:
+        res['last_close'] = close.iloc[-1]
+    except Exception:
+        res['last_close'] = np.nan
+
     # MAs
     for n in (5,10,20):
         if len(close) >= n:
@@ -380,14 +393,28 @@ def compute_indicators(df):
     if len(vols) >= 6:
         avg_prev5 = np.mean(vols[-6:-1])
         res['vol_ratio'] = vols[-1] / (avg_prev5 + 1e-9)
+        res['vol_last'] = vols[-1]
+        res['vol_ma5'] = avg_prev5
     else:
         res['vol_ratio'] = np.nan
+        res['vol_last'] = np.nan
+        res['vol_ma5'] = np.nan
 
     # 10d return
     if len(close) >= 10:
         res['10d_return'] = close.iloc[-1] / close.iloc[-10] - 1
     else:
         res['10d_return'] = np.nan
+
+    # prev3_sum: sum of previous 3 pct_chg excluding the last day (helps detect '下跌途中')
+    if 'pct_chg' in df.columns and len(df) >= 4:
+        try:
+            pct = df['pct_chg'].astype(float)
+            res['prev3_sum'] = pct.iloc[-4:-1].sum()  # three days before last
+        except:
+            res['prev3_sum'] = np.nan
+    else:
+        res['prev3_sum'] = np.nan
 
     return res
 
@@ -419,6 +446,10 @@ for idx, row in enumerate(clean_df.itertuples()):
     ma20 = ind.get('ma20', np.nan)
     macd = ind.get('macd', np.nan)
     k, d, j = ind.get('k', np.nan), ind.get('d', np.nan), ind.get('j', np.nan)
+    last_close = ind.get('last_close', np.nan)
+    vol_last = ind.get('vol_last', np.nan)
+    vol_ma5 = ind.get('vol_ma5', np.nan)
+    prev3_sum = ind.get('prev3_sum', np.nan)
 
     # feature normalization later - store raw
     rec = {
@@ -431,7 +462,11 @@ for idx, row in enumerate(clean_df.itertuples()):
         'vol_ratio': vol_ratio if not pd.isna(vol_ratio) else np.nan,
         '10d_return': ten_return if not pd.isna(ten_return) else np.nan,
         'ma5': ma5, 'ma10': ma10, 'ma20': ma20,
-        'macd': macd, 'k': k, 'd': d, 'j': j
+        'macd': macd, 'k': k, 'd': d, 'j': j,
+        'last_close': last_close,
+        'vol_last': vol_last,
+        'vol_ma5': vol_ma5,
+        'prev3_sum': prev3_sum
     }
 
     records.append(rec)
@@ -442,6 +477,34 @@ fdf = pd.DataFrame(records)
 if fdf.empty:
     st.error("评分计算失败或无数据，请检查 Token 权限与接口。")
     st.stop()
+
+# ---------------------------
+# 在评分前加入大阳线风险过滤模块（放在这里，避免对明显危险票拉更多历史）
+# ---------------------------
+
+st.write("正在执行大阳线风险过滤（高位放量 / 下跌途中反抽 / 巨量放量）...")
+try:
+    before_cnt = len(fdf)
+
+    # 过滤 A：高位大阳线 -> 昨天收盘 > ma20*1.10 且 pct_chg > 5%
+    if 'ma20' in fdf.columns and 'last_close' in fdf.columns and 'pct_chg' in fdf.columns:
+        mask_high_big = (fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > 5.0)
+        fdf = fdf[~mask_high_big]
+
+    # 过滤 B：下跌途中大阳线 -> prev3_sum < 0 (最近3日多数下跌) 且今天大涨 pct_chg > 5%
+    if 'prev3_sum' in fdf.columns and 'pct_chg' in fdf.columns:
+        mask_down_rebound = (fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > 5.0)
+        fdf = fdf[~mask_down_rebound]
+
+    # 过滤 C：巨量放量大阳线 -> vol_last > vol_ma5 * 1.5
+    if 'vol_last' in fdf.columns and 'vol_ma5' in fdf.columns:
+        mask_vol_spike = (fdf['vol_last'] > (fdf['vol_ma5'] * 1.5))
+        fdf = fdf[~mask_vol_spike]
+
+    after_cnt = len(fdf)
+    st.write(f"过滤完成：从 {before_cnt} 条候选过滤至 {after_cnt} 条（若过度严格请调整阈值）。")
+except Exception as e:
+    st.warning(f"风险过滤模块运行异常，已跳过过滤。错误信息：{e}")
 
 # ---------------------------
 # 行业热度（简单）：基于 pool_merged 的 industry平均pct_chg
@@ -525,7 +588,7 @@ st.dataframe(fdf[display_cols].head(TOP_DISPLAY), use_container_width=True)
 
 # CSV 下载
 csv = fdf[display_cols].to_csv(index=True, encoding='utf-8-sig')
-st.download_button("下载全部评分结果 CSV", data=csv, file_name=f"score_result_{last_trade}.csv".format(last_trade), mime="text/csv")
+st.download_button("下载全部评分结果 CSV", data=csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
 # ---------------------------
 # 小结（提示）
