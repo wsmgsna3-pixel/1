@@ -1,4 +1,4 @@
-# 文件名：app.py   （最终修复版：防merge列冲突 + 加name + 超防空）
+# 文件名：app.py   （超级防空版：处理空数据 + 自动放松门槛 + 防'p_change'错）
 
 import streamlit as st
 import tushare as ts
@@ -32,16 +32,16 @@ if st.button("🚀 开始今日核弹选股（3秒出结果）"):
             daily_all = pro.daily(start_date=start_date, end_date=today)
             today_df = pro.daily(trade_date=today)
             basic = pro.daily_basic(trade_date=today)
-            stock_basic = pro.stock_basic(list_status='L', fields='ts_code,name')  # 新增：拉name
+            stock_basic = pro.stock_basic(list_status='L', fields='ts_code,name')
 
-            # 基础池（修复merge：用suffixes防列冲突）
-            pool = today_df.merge(basic, on='ts_code', suffixes=('', '_basic'))  # 保留daily的close等
-            pool = pool.merge(stock_basic, on='ts_code')  # 加name
+            # 基础池（防列冲突）
+            pool = today_df.merge(basic, on='ts_code', suffixes=('', '_basic'))
+            pool = pool.merge(stock_basic, on='ts_code')
             pool = pool[(pool['close'] >= 12) & (pool['close'] <= 120) &
                         (pool['total_mv'] >= 3e9) & (pool['total_mv'] <= 1.5e10)]
 
-            # 防假阳线三保险（超稳版）
-            def is_clean_uptrend(code):
+            # 防假阳线三保险（加放松参数）
+            def is_clean_uptrend(code, strict=True):
                 df = daily_all[daily_all['ts_code'] == code].sort_values('trade_date')
                 if len(df) < 60:
                     return False
@@ -57,15 +57,32 @@ if st.button("🚀 开始今日核弹选股（3秒出结果）"):
                 low_min = np.nanmin(low[-40:]) if len(low[-40:]) > 0 else np.nan
                 if np.isnan(low_min) or np.isnan(ma20):
                     return False
-                return (slope > 0 and close[-1] > ma20 * 1.01 and close[-1] > low_min * 1.35)
+                if strict:
+                    return (slope > 0 and close[-1] > ma20 * 1.01 and close[-1] > low_min * 1.35)
+                else:
+                    return (slope > -0.005 and close[-1] > ma20 * 0.99 and close[-1] > low_min * 1.25)  # 放松版
 
+            # 先用严格过滤
             valid_codes = [c for c in pool['ts_code'].unique() if is_clean_uptrend(c)]
+            if len(valid_codes) == 0:
+                st.warning("严格趋势过滤后0只票，正在自动放松门槛重试……")
+                valid_codes = [c for c in pool['ts_code'].unique() if is_clean_uptrend(c, strict=False)]
             pool = pool[pool['ts_code'].isin(valid_codes)]
             st.info(f"趋势过滤后剩余 {len(pool)} 只基础票（剔除了数据不全的）")
 
-            # 三大核弹信号
+            # 三大核弹信号（防空forecast）
             forecast = pro.forecast_vip(period='202503')
-            forecast = forecast[forecast['p_change'] >= 35].drop_duplicates('ts_code')
+            if forecast.empty or 'p_change' not in forecast.columns:
+                st.warning("今日盈利预测数据为空，正在用所有预测数据（无门槛）……")
+                forecast_filtered = forecast.drop_duplicates('ts_code')
+                p_threshold = 0
+            else:
+                forecast_filtered = forecast[forecast['p_change'] >= 35].drop_duplicates('ts_code')
+                p_threshold = 35
+                if len(forecast_filtered) == 0:
+                    st.warning("无>=35%上调预测，正在降门槛到20%……")
+                    forecast_filtered = forecast[forecast['p_change'] >= 20].drop_duplicates('ts_code')
+                    p_threshold = 20
 
             money = pro.moneyflow_realtime()
             top_money = money.nlargest(150, 'net_amount')['ts_code'].tolist()
@@ -77,11 +94,11 @@ if st.button("🚀 开始今日核弹选股（3秒出结果）"):
 
             # 最终合并
             final = pool[pool['ts_code'].isin(top_money) & 
-                         pool['ts_code'].isin(forecast['ts_code']) &
+                         pool['ts_code'].isin(forecast_filtered['ts_code']) &
                          pool['ts_code'].isin(multi_top)]
 
             if len(final) == 0:
-                st.error("今天暂时没有完全满足核弹条件的票，建议手动把p_change门槛降到30试试（代码第68行）")
+                st.error(f"今天没有完全满足核弹条件的票（p_change>={p_threshold}）。建议明天再试，或手动改代码门槛。")
             else:
                 final = final.merge(forecast[['ts_code','p_change']], on='ts_code', how='left')
                 final = final.merge(money[['ts_code','net_amount']], on='ts_code', how='left')
@@ -106,7 +123,7 @@ if st.button("🚀 开始今日核弹选股（3秒出结果）"):
 
         except KeyError as e:
             st.error(f"数据列错误：{e}")
-            st.info("已修复！用新代码重跑。")
+            st.info("已超级修复！用新代码重跑。")
         except Exception as e:
             st.error(f"其他问题：{e}")
             st.info("检查网络/Tushare延迟，或重启Streamlit。Token没问题！")
