@@ -100,7 +100,9 @@ pool["net_mf"] = pool["net_mf"].fillna(0)
 st.write("对初筛池进行清洗...")
 
 clean = pool.copy()
-
+# 确保一定有 close 列
+if "close" not in clean.columns:
+    clean["close"] = clean["pre_close"] if "pre_close" in clean.columns else 0
 clean = clean[~clean["name"].str.contains("ST", na=False)]
 clean = clean[clean["open"] > 3]
 clean = clean[clean["close"] > 3]
