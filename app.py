@@ -4,20 +4,10 @@ import pandas as pd
 import numpy as np
 
 # 设置Tushare Token
-def set_tushare_token():
-    token = st.sidebar.text_input("请输入 Tushare Token")
-    if token:
-        try:
-            ts.set_token(token)
-            pro = ts.pro_api()
-            st.sidebar.success("Token 输入成功！")
-            return pro
-        except Exception as e:
-            st.sidebar.error(f"Token 错误: {e}")
-            return None
-    else:
-        st.sidebar.warning("请先输入您的 Token")
-        return None
+ts.set_token('your_tushare_token')  # 用你自己的Token替换
+
+# 创建Pro API接口
+pro = ts.pro_api()
 
 # 拉取数据函数
 def load_data(pro, start_date, end_date):
@@ -67,19 +57,24 @@ def select_stocks(df, target_date):
         st.warning(f"没有找到符合条件的数据: {target_date}")
         return today
 
-    # 筛选条件：成交额、价格、涨幅、均线等
-    today = today[today["amount"] * 1000 >= 5e6]  # 筛选成交额大于500万的股票
-    today = today[(today["close"] >= 1) & (today["close"] <= 1000)]  # 筛选价格区间
-    today = today[(today["pct_chg"] >= 0) & (today["pct_chg"] <= 20)]  # 筛选涨幅0~20%
+    # 放宽筛选条件：成交额、价格、涨幅等
+    st.write("筛选数据前的样本数:", len(today))
+    today = today[today["amount"] * 1000 >= 2e6]  # 成交额大于200万
+    today = today[(today["close"] >= 0.5) & (today["close"] <= 500)]  # 价格区间 0.5 ~ 500
+    today = today[(today["pct_chg"] >= -10) & (today["pct_chg"] <= 50)]  # 涨幅 -10 ~ 50%
+    st.write("筛选成交额、价格、涨幅后的样本数:", len(today))
 
     # 筛选趋势条件：20日均线 > 60日均线，且收盘价大于20日均线
     today = today[(today["ma_20"] > today["ma_60"]) & (today["close"] > today["ma_20"])]
+    st.write("筛选趋势条件后的样本数:", len(today))
     
-    # 放量：放量要求 >= 20日均量的0.8倍
-    today = today[today["vol"] >= today["avg_vol_20"] * 0.8]
+    # 放量：放量要求 >= 20日均量的0.5倍
+    today = today[today["vol"] >= today["avg_vol_20"] * 0.5]
+    st.write("筛选放量后的样本数:", len(today))
     
-    # 突破：收盘价大于过去20日的最高价 * 1.005
-    today = today[today["close"] >= today["high_20"] * 1.005]
+    # 突破：收盘价大于过去20日的最高价 * 1.01
+    today = today[today["close"] >= today["high_20"] * 1.01]
+    st.write("筛选突破后的样本数:", len(today))
 
     st.write(f"符合选股条件的股票：{today[['ts_code', 'trade_date', 'close', 'pct_chg']].head()}")
     return today
@@ -88,38 +83,36 @@ def select_stocks(df, target_date):
 def main():
     st.title("股票回测与选股系统")
     
-    # 设置 Tushare Token
-    pro = set_tushare_token()
+    # Token输入框在侧边栏
+    token = st.sidebar.text_input("请输入 Tushare Token")
 
-    if pro is None:
-        st.stop()  # 如果 Token 无效，停止执行
+    # 检查是否输入了 Token
+    if not token:
+        st.sidebar.warning("请先输入您的 Token")
+        return  # 如果没有输入 Token，就返回，不执行后续逻辑
 
-    # 获取用户输入的日期范围和参数
+    st.sidebar.success("Token 已输入！")
+    
+    # 输入框：开始日期、结束日期、持股天数、初始资金等
     start_date = st.sidebar.text_input("开始日期 (YYYYMMDD)", "20220101")
     end_date = st.sidebar.text_input("结束日期 (YYYYMMDD)", "20220201")
     holding_days = st.sidebar.slider("持股天数", 1, 20, 5)
     initial_capital = st.sidebar.number_input("初始资金 (元)", min_value=10000, value=100000)
 
-    # 按钮：开始回测
-    if st.sidebar.button("开始回测"):
-        # 获取数据
-        df = load_data(pro, start_date, end_date)
-        
-        if df is not None:
-            df = add_features(df)
-            
-            # 执行选股
-            selected_stocks = select_stocks(df, end_date)
-
-            # 如果选股成功，展示选股结果
-            if not selected_stocks.empty:
-                st.write("选股结果：", selected_stocks)
-            else:
-                st.write("没有找到符合条件的股票。")
+    # 获取数据
+    df = load_data(pro, start_date, end_date)
     
-    # 按钮：开始选股
-    if st.sidebar.button("开始选股"):
-        st.write("请先进行回测，以确保获取数据并应用选股策略。")
+    if df is not None:
+        df = add_features(df)
+        
+        # 选股
+        selected_stocks = select_stocks(df, end_date)
+
+        # 如果选股成功，展示选股结果
+        if not selected_stocks.empty:
+            st.write("选股结果：", selected_stocks)
+        else:
+            st.write("没有找到符合条件的股票。")
 
 # 运行主函数
 if __name__ == "__main__":
