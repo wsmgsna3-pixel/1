@@ -76,11 +76,20 @@ def select_stocks(df, target_date):
 def main():
     st.title("股票回测与选股系统")
     
+    # Token输入框在侧边栏
+    token = st.sidebar.text_input("请输入 Tushare Token")
+
+    # 检查是否输入了 Token
+    if token:
+        st.sidebar.success("Token 已输入！")
+    else:
+        st.sidebar.warning("请先输入您的 Token")
+
     # 输入框：开始日期、结束日期、持股天数、初始资金等
-    start_date = st.text_input("开始日期 (YYYYMMDD)", "20220101")
-    end_date = st.text_input("结束日期 (YYYYMMDD)", "20220201")
-    holding_days = st.slider("持股天数", 1, 20, 5)
-    initial_capital = st.number_input("初始资金 (元)", min_value=10000, value=100000)
+    start_date = st.sidebar.text_input("开始日期 (YYYYMMDD)", "20220101")
+    end_date = st.sidebar.text_input("结束日期 (YYYYMMDD)", "20220201")
+    holding_days = st.sidebar.slider("持股天数", 1, 20, 5)
+    initial_capital = st.sidebar.number_input("初始资金 (元)", min_value=10000, value=100000)
 
     # 获取数据
     df = load_data(pro, start_date, end_date)
