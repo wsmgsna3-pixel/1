@@ -34,7 +34,7 @@ def load_daily_range(pro, start_date: str, end_date: str):
         return None
 
 
-# ========== 特征计算 & 选股逻辑（强势突破 + 放量） ==========
+# ========== 特征计算 & 选股逻辑（强势突破 + 放量，放宽版） ==========
 
 def add_features(df_all: pd.DataFrame,
                  ma_short: int = 20,
@@ -61,16 +61,23 @@ def add_features(df_all: pd.DataFrame,
 
 def select_strong_breakout(df_all_feat: pd.DataFrame,
                            target_date: str,
-                           min_amount: float = 3e7,
-                           min_price: float = 5,
-                           max_price: float = 150,
+                           min_amount: float = 2e7,
+                           min_price: float = 3,
+                           max_price: float = 200,
                            ma_short: int = 20,
                            ma_long: int = 60,
                            breakout_n: int = 20,
-                           vol_ratio: float = 1.5,
-                           min_chg: float = 3,
-                           max_chg: float = 9) -> pd.DataFrame:
-    """在某一天做“强势突破 + 放量”选股。"""
+                           vol_ratio: float = 1.2,
+                           min_chg: float = 1,
+                           max_chg: float = 11) -> pd.DataFrame:
+    """
+    在某一天做“强势突破 + 放量”选股（放宽条件版）：
+    - 成交额 >= 2000 万
+    - 价格 3~200 元
+    - 涨幅 1%~11%
+    - 放量 >= 1.2 * 20 日均量
+    - 收盘价 >= 近 20 日最高价 * 1.005
+    """
     today = df_all_feat[df_all_feat["trade_date"] == target_date].copy()
     if today.empty:
         return today
@@ -93,11 +100,11 @@ def select_strong_breakout(df_all_feat: pd.DataFrame,
     pos_in_bar = (today["close"] - today["low"]) / price_range.replace(0, np.nan)
     today = today[pos_in_bar >= 0.6]
 
-    # 5) 放量
+    # 5) 放量（1.2 倍 20 日均量）
     today = today[today["vol"] >= today["avg_vol_n"] * vol_ratio]
 
-    # 6) 突破
-    today = today[today["close"] >= today["high_n"] * 1.01]
+    # 6) 突破（收盘价 >= 近 20 日高点 * 1.005）
+    today = today[today["close"] >= today["high_n"] * 1.005]
 
     show_cols = [
         "ts_code", "trade_date", "open", "high", "low", "close",
@@ -217,9 +224,9 @@ def calc_stats(equity_df: pd.DataFrame, initial_capital: float):
 
 st.set_page_config(page_title="A股短线选股小工具", layout="wide")
 
-st.title("A股短线选股 + 回测 Demo（第 4 步）")
+st.title("A股短线选股 + 回测 Demo（放宽条件版）")
 st.write(
-    "已经接入 Tushare，这一步我们用“强势突破 + 放量”策略做一个简单的区间回测："
+    "已经接入 Tushare，用“强势突破 + 放量（放宽条件版）”做一个简单的区间回测："
     "每天选股 -> 次日开盘买入 -> 持 N 天后收盘卖出。"
 )
 
@@ -232,7 +239,8 @@ ts_token = st.sidebar.text_input(
     type="password"
 )
 
-start_date = st.sidebar.text_input("开始日期 (YYYYMMDD)", "20230901")
+# 把默认时间拉长一点，方便有更多交易
+start_date = st.sidebar.text_input("开始日期 (YYYYMMDD)", "20220101")
 end_date = st.sidebar.text_input("结束日期 (YYYYMMDD)", "20240201")
 hold_days = st.sidebar.slider("持股天数（示例策略）", 1, 5, 2)
 initial_capital = st.sidebar.number_input("初始资金(元)", value=100000.0, step=10000.0)
@@ -242,7 +250,7 @@ run = st.sidebar.button("开始回测（示例策略）")
 if run:
     st.success("按钮已点击：开始拉取区间日线数据并进行简单回测。")
 
-    # 1. 仍然画一条示例曲线对比
+    # 1. 示意收益曲线（假数据，对比用）
     dates_demo = pd.date_range("2023-01-01", periods=100)
     equity_demo = initial_capital * (1 + np.linspace(0, 0.5, 100))
     df_equity_demo = pd.DataFrame({"date": dates_demo, "equity": equity_demo}).set_index("date")
@@ -272,7 +280,7 @@ if run:
             st.subheader(f"示例选股结果（最后一个交易日：{last_date}）")
             selected_last = select_strong_breakout(df_feat, last_date)
             if selected_last.empty:
-                st.warning("在最后一个交易日，没有股票符合当前示例策略的条件。")
+                st.warning("在最后一个交易日，没有股票符合当前示例策略的条件（放宽版）。")
             else:
                 st.write(f"共选出 **{len(selected_last)}** 只股票：")
                 st.dataframe(selected_last.reset_index(drop=True))
