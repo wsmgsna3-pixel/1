@@ -7,7 +7,7 @@
   2) 评分阶段最多对 300 支股票拉历史（上限，FINAL_POOL 仍可调）
 - 【短线优化】针对持股1-5天调整：提高成交额和降低波动阈值，削弱纯爆发因子，增强中期趋势因子。
 - 【最终优化】放宽放量倍数阈值至 1.9，允许捕捉加速期的龙头股。
-- 【本次新增】已添加**简易历史回测模块**，可验证策略在过去 N 天的表现。
+- 【本次修复】**已解决 Streamlit UnhashableParamError**，将 pro 客户端对象从缓存函数中移除。
 """
 
 import streamlit as st
@@ -71,7 +71,7 @@ if not TS_TOKEN:
 
 # 初始化 tushare
 ts.set_token(TS_TOKEN)
-pro = ts.pro_api()
+pro = ts.pro_api() # 全局可用的 pro 对象
 
 # ---------------------------
 # 安全调用 & 缓存辅助
@@ -99,6 +99,7 @@ def find_last_trade_day(max_days=20):
 
 @st.cache_data(ttl=600)
 def get_hist(ts_code, end_date, days=60):
+    # 使用全局的 pro 对象，不作为参数传入缓存函数
     try:
         start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
         df = safe_get(pro.daily, ts_code=ts_code, start_date=start, end_date=end_date)
@@ -193,19 +194,20 @@ def norm_col(s):
 
 # ----------------------------------------------------
 # 核心评分函数 (封装) - 适用于实时和回测
+# 【修复点 1：移除 pro_api 参数】
 # ----------------------------------------------------
 @st.cache_data(ttl=600)
-def run_scoring_for_date(trade_date, pro_api, params):
-    # 1. 拉取当日涨幅榜初筛
-    daily_all = safe_get(pro_api.daily, trade_date=trade_date)
-    if daily_all.empty: return pd.DataFrame(), None # Add an empty string for the next_date if failure occurs
+def run_scoring_for_date(trade_date, params):
+    # 1. 拉取当日涨幅榜初筛 (使用全局 pro 对象)
+    daily_all = safe_get(pro.daily, trade_date=trade_date)
+    if daily_all.empty: return pd.DataFrame()
     
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
     pool0 = daily_all.head(int(params['INITIAL_TOP_N'])).copy().reset_index(drop=True)
 
-    # 2. 拉取和合并高级接口数据 (简化 for backtest speed)
-    daily_basic = safe_get(pro_api.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
-    mf_raw = safe_get(pro_api.moneyflow, trade_date=trade_date)
+    # 2. 拉取和合并高级接口数据 (使用全局 pro 对象)
+    daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
+    mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
     
     moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
     if not mf_raw.empty:
@@ -213,7 +215,7 @@ def run_scoring_for_date(trade_date, pro_api, params):
         col = next((c for c in possible if c in mf_raw.columns), None)
         if col: moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
 
-    try: pool0 = pool0.merge(safe_get(pro_api.stock_basic, list_status='L', fields='ts_code,name,industry'), on='ts_code', how='left')
+    try: pool0 = pool0.merge(safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry'), on='ts_code', how='left')
     except: pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
     
     pool_merged = safe_merge_pool(pool0, daily_basic, ['turnover_rate','amount','total_mv','circ_mv'])
@@ -262,7 +264,7 @@ def run_scoring_for_date(trade_date, pro_api, params):
         clean_list.append(r)
     
     clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
-    if clean_df.empty: return pd.DataFrame(), None
+    if clean_df.empty: return pd.DataFrame()
 
     score_pool_n = min(int(params['FINAL_POOL']), 300)
     clean_df = clean_df.sort_values('pct_chg', ascending=False).head(score_pool_n).reset_index(drop=True)
@@ -295,7 +297,7 @@ def run_scoring_for_date(trade_date, pro_api, params):
         records.append(rec)
 
     fdf = pd.DataFrame(records)
-    if fdf.empty: return pd.DataFrame(), None
+    if fdf.empty: return pd.DataFrame()
 
     # 5. 风险过滤 (回测时也需应用)
     before_cnt = len(fdf)
@@ -308,7 +310,7 @@ def run_scoring_for_date(trade_date, pro_api, params):
     if 'volatility_10' in fdf.columns:
         fdf = fdf[~(fdf['volatility_10'] > params['VOLATILITY_MAX'])]
     
-    if fdf.empty: return pd.DataFrame(), None
+    if fdf.empty: return pd.DataFrame()
 
     # 6. RSL & 归一化
     if '10d_return' in fdf.columns:
@@ -341,12 +343,13 @@ def run_scoring_for_date(trade_date, pro_api, params):
 
 # ----------------------------------------------------
 # 简易回测模块
+# 【修复点 2：移除 pro_api 参数】
 # ----------------------------------------------------
-def run_simple_backtest(pro_api, days):
+def run_simple_backtest(days):
     st.header("📈 简易历史回测结果")
     
-    # 1. 确定回测日期范围
-    trade_dates_df = safe_get(pro_api.trade_cal, exchange='SSE', is_open='1', end_date=find_last_trade_day(), fields='cal_date')
+    # 1. 确定回测日期范围 (使用全局 pro 对象)
+    trade_dates_df = safe_get(pro.trade_cal, exchange='SSE', is_open='1', end_date=find_last_trade_day(), fields='cal_date')
     if trade_dates_df.empty:
         st.error("无法获取历史交易日历。")
         return
@@ -376,7 +379,8 @@ def run_simple_backtest(pro_api, days):
         pbar.progress((i+1) / (len(trade_dates) - 1))
 
         # A. 运行选股逻辑
-        select_df = run_scoring_for_date(select_date, pro_api, params)
+        # 【修复点 3：移除 pro_api 参数】
+        select_df = run_scoring_for_date(select_date, params)
         if select_df.empty:
             backtest_results.append({'选股日': select_date, '股票': '无符合条件', 'T+1 收益率': 0.0, '买入价': np.nan, '卖出价': np.nan})
             continue
@@ -385,8 +389,8 @@ def run_simple_backtest(pro_api, days):
         top_pick = select_df.iloc[0]
         ts_code = top_pick['ts_code']
         
-        # C. 获取次日价格 (T+1)
-        next_day_data = safe_get(pro_api.daily, ts_code=ts_code, trade_date=next_trade_date)
+        # C. 获取次日价格 (T+1) (使用全局 pro 对象)
+        next_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
         
         return_pct = 0.0
         buy_price, sell_price = np.nan, np.nan
@@ -438,7 +442,8 @@ st.info(f"参考最近交易日：{last_trade}")
 
 # 检查是否需要运行回测
 if st.session_state.get('run_backtest', False):
-    run_simple_backtest(pro, BACKTEST_DAYS)
+    # 【修复点 4：移除 pro 参数】
+    run_simple_backtest(BACKTEST_DAYS)
     st.session_state['run_backtest'] = False # 重置状态，避免刷新页面再次运行
     st.stop()
 else:
@@ -452,7 +457,8 @@ else:
         'HIGH_PCT_THRESHOLD': HIGH_PCT_THRESHOLD
     }
     
-    fdf = run_scoring_for_date(last_trade, pro, params)
+    # 【修复点 5：移除 pro 参数】
+    fdf = run_scoring_for_date(last_trade, params)
 
     if fdf.empty:
         st.error("清洗和评分后没有候选，建议放宽条件或检查接口权限。")
@@ -486,4 +492,3 @@ else:
     3. **止损/止盈：** 买入后，股价跌破**昨日收盘价**或**当日买入价 2%** 时，应考虑硬止损。
 """)
     st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在两次修改内继续帮你调优。")
-
