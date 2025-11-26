@@ -2,12 +2,9 @@
 """
 选股王 · 10000 积分旗舰（BC 混合增强版）· 极速版
 说明：
-- 该版本在完全保留现有逻辑与功能的前提下做两项加速：
-  1) 清洗阶段不再调用 API（使用已合并的 pool_merged 字段）
-  2) 评分阶段最多对 300 支股票拉历史（上限，FINAL_POOL 仍可调）
 - 【短线优化】针对持股1-5天调整：提高成交额和降低波动阈值，削弱纯爆发因子，增强中期趋势因子。
 - 【最终优化】放宽放量倍数阈值至 1.9，允许捕捉加速期的龙头股。
-- 【本次修复】**已解决 Streamlit UnhashableParamError**，将 pro 客户端对象从缓存函数中移除。
+- 【本次修复】**已解决 Streamlit UnhashableParamError**，并增加**按钮控制**，避免自动运行导致回测结果丢失。
 """
 
 import streamlit as st
@@ -48,16 +45,34 @@ with st.sidebar:
     st.header("🔍 回测设置 (T+1 简单回测)")
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     st.markdown("""
-        **回测假设：**
-        - 在选股日（T日）收盘后得到结果。
-        - 在次日（T+1日）**开盘价**买入。
-        - 在次日（T+1日）**收盘价**卖出。
-        - 仅对每日**得分最高的 Top 1** 股票进行模拟交易。
+        **回测假设：** 次日开盘买入，收盘卖出。
     """)
-    if st.button("运行回测"):
-        st.session_state['run_backtest'] = True
-    else:
+
+    # ----------------------------------------------------
+    # 新增按钮控制模块
+    # ----------------------------------------------------
+    st.markdown("---")
+    st.header("⚡ 运行控制")
+    
+    # 初始化 session state for control
+    if 'run_selection' not in st.session_state:
+        st.session_state['run_selection'] = False
+    if 'run_backtest' not in st.session_state:
         st.session_state['run_backtest'] = False
+        
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("运行回测 (T+1)"):
+            st.session_state['run_backtest'] = True
+            st.session_state['run_selection'] = False
+            st.experimental_rerun() # 触发重新运行以执行回测
+            
+    with col2:
+        if st.button("运行当日选股"):
+            st.session_state['run_selection'] = True
+            st.session_state['run_backtest'] = False
+            st.experimental_rerun() # 触发重新运行以执行选股
 
     st.caption("提示：保守→降低阈值；激进→提高阈值。")
 
@@ -71,10 +86,10 @@ if not TS_TOKEN:
 
 # 初始化 tushare
 ts.set_token(TS_TOKEN)
-pro = ts.pro_api() # 全局可用的 pro 对象
+pro = ts.pro_api()
 
 # ---------------------------
-# 安全调用 & 缓存辅助
+# 安全调用 & 缓存辅助 (逻辑不变)
 # ---------------------------
 def safe_get(func, **kwargs):
     """Call API and return DataFrame or empty df on any error."""
@@ -99,7 +114,6 @@ def find_last_trade_day(max_days=20):
 
 @st.cache_data(ttl=600)
 def get_hist(ts_code, end_date, days=60):
-    # 使用全局的 pro 对象，不作为参数传入缓存函数
     try:
         start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
         df = safe_get(pro.daily, ts_code=ts_code, start_date=start, end_date=end_date)
@@ -193,8 +207,7 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ----------------------------------------------------
-# 核心评分函数 (封装) - 适用于实时和回测
-# 【修复点 1：移除 pro_api 参数】
+# 核心评分函数 (封装) - 适用于实时和回测 (逻辑不变)
 # ----------------------------------------------------
 @st.cache_data(ttl=600)
 def run_scoring_for_date(trade_date, params):
@@ -342,13 +355,11 @@ def run_scoring_for_date(trade_date, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块
-# 【修复点 2：移除 pro_api 参数】
+# 简易回测模块 (逻辑不变)
 # ----------------------------------------------------
 def run_simple_backtest(days):
     st.header("📈 简易历史回测结果")
     
-    # 1. 确定回测日期范围 (使用全局 pro 对象)
     trade_dates_df = safe_get(pro.trade_cal, exchange='SSE', is_open='1', end_date=find_last_trade_day(), fields='cal_date')
     if trade_dates_df.empty:
         st.error("无法获取历史交易日历。")
@@ -372,31 +383,25 @@ def run_simple_backtest(days):
     backtest_placeholder = st.empty()
     pbar = st.progress(0)
 
-    # 2. 循环回测
     for i in range(len(trade_dates) - 1):
         select_date = trade_dates[i]
         next_trade_date = trade_dates[i+1]
         pbar.progress((i+1) / (len(trade_dates) - 1))
 
-        # A. 运行选股逻辑
-        # 【修复点 3：移除 pro_api 参数】
         select_df = run_scoring_for_date(select_date, params)
         if select_df.empty:
             backtest_results.append({'选股日': select_date, '股票': '无符合条件', 'T+1 收益率': 0.0, '买入价': np.nan, '卖出价': np.nan})
             continue
 
-        # B. 选取 Top 1
         top_pick = select_df.iloc[0]
         ts_code = top_pick['ts_code']
         
-        # C. 获取次日价格 (T+1) (使用全局 pro 对象)
         next_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
         
         return_pct = 0.0
         buy_price, sell_price = np.nan, np.nan
 
         if not next_day_data.empty:
-            # 假设：次日开盘价买入 (Buy at Open), 收盘价卖出 (Sell at Close)
             buy_price = next_day_data.iloc[0]['open']
             sell_price = next_day_data.iloc[0]['close']
             
@@ -414,10 +419,8 @@ def run_simple_backtest(days):
 
     pbar.progress(1.0)
     
-    # 3. 统计结果
     results_df = pd.DataFrame(backtest_results)
     
-    # 计算总收益和胜率
     results_df['T+1 收益率'] = results_df['T+1 收益率'].replace([np.inf, -np.inf], 0.0).fillna(0.0)
     cumulative_return = (results_df['T+1 收益率'] / 100 + 1).product() - 1
     wins = (results_df['T+1 收益率'] > 0).sum()
@@ -432,7 +435,7 @@ def run_simple_backtest(days):
     st.dataframe(results_df, use_container_width=True)
 
 # ----------------------------------------------------
-# 主程序入口
+# 主程序入口 (新增逻辑：等待按钮点击)
 # ----------------------------------------------------
 last_trade = find_last_trade_day()
 if not last_trade:
@@ -440,14 +443,22 @@ if not last_trade:
     st.stop()
 st.info(f"参考最近交易日：{last_trade}")
 
+
+# >>>>> 新增控制逻辑：只有在点击按钮后才执行后续代码 <<<<<
+if not st.session_state.get('run_selection') and not st.session_state.get('run_backtest'):
+    st.info("请在侧边栏选择 '运行当日选股' 或 '运行回测 (T+1)' 开始。")
+    st.stop()
+
+
 # 检查是否需要运行回测
 if st.session_state.get('run_backtest', False):
-    # 【修复点 4：移除 pro 参数】
     run_simple_backtest(BACKTEST_DAYS)
-    st.session_state['run_backtest'] = False # 重置状态，避免刷新页面再次运行
+    # 脚本在此处停止，回测结果会保留在屏幕上
     st.stop()
-else:
-    # 实时选股（默认流程）
+
+
+# 实时选股（只有当 run_selection 为 True 时运行）
+if st.session_state.get('run_selection', False):
     st.write("正在运行实时选股（最近交易日）...")
 
     params = {
@@ -457,7 +468,6 @@ else:
         'HIGH_PCT_THRESHOLD': HIGH_PCT_THRESHOLD
     }
     
-    # 【修复点 5：移除 pro 参数】
     fdf = run_scoring_for_date(last_trade, params)
 
     if fdf.empty:
