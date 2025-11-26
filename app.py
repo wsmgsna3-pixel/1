@@ -4,8 +4,20 @@ import pandas as pd
 import numpy as np
 
 # 设置Tushare Token
-ts.set_token('your_tushare_token')
-pro = ts.pro_api()
+def set_tushare_token():
+    token = st.sidebar.text_input("请输入 Tushare Token")
+    if token:
+        try:
+            ts.set_token(token)
+            pro = ts.pro_api()
+            st.sidebar.success("Token 输入成功！")
+            return pro
+        except Exception as e:
+            st.sidebar.error(f"Token 错误: {e}")
+            return None
+    else:
+        st.sidebar.warning("请先输入您的 Token")
+        return None
 
 # 拉取数据函数
 def load_data(pro, start_date, end_date):
@@ -76,35 +88,38 @@ def select_stocks(df, target_date):
 def main():
     st.title("股票回测与选股系统")
     
-    # Token输入框在侧边栏
-    token = st.sidebar.text_input("请输入 Tushare Token")
+    # 设置 Tushare Token
+    pro = set_tushare_token()
 
-    # 检查是否输入了 Token
-    if token:
-        st.sidebar.success("Token 已输入！")
-    else:
-        st.sidebar.warning("请先输入您的 Token")
+    if pro is None:
+        st.stop()  # 如果 Token 无效，停止执行
 
-    # 输入框：开始日期、结束日期、持股天数、初始资金等
+    # 获取用户输入的日期范围和参数
     start_date = st.sidebar.text_input("开始日期 (YYYYMMDD)", "20220101")
     end_date = st.sidebar.text_input("结束日期 (YYYYMMDD)", "20220201")
     holding_days = st.sidebar.slider("持股天数", 1, 20, 5)
     initial_capital = st.sidebar.number_input("初始资金 (元)", min_value=10000, value=100000)
 
-    # 获取数据
-    df = load_data(pro, start_date, end_date)
-    
-    if df is not None:
-        df = add_features(df)
+    # 按钮：开始回测
+    if st.sidebar.button("开始回测"):
+        # 获取数据
+        df = load_data(pro, start_date, end_date)
         
-        # 选股
-        selected_stocks = select_stocks(df, end_date)
+        if df is not None:
+            df = add_features(df)
+            
+            # 执行选股
+            selected_stocks = select_stocks(df, end_date)
 
-        # 如果选股成功，展示选股结果
-        if not selected_stocks.empty:
-            st.write("选股结果：", selected_stocks)
-        else:
-            st.write("没有找到符合条件的股票。")
+            # 如果选股成功，展示选股结果
+            if not selected_stocks.empty:
+                st.write("选股结果：", selected_stocks)
+            else:
+                st.write("没有找到符合条件的股票。")
+    
+    # 按钮：开始选股
+    if st.sidebar.button("开始选股"):
+        st.write("请先进行回测，以确保获取数据并应用选股策略。")
 
 # 运行主函数
 if __name__ == "__main__":
