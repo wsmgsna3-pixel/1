@@ -23,11 +23,24 @@ def get_pro(token: str):
 def load_daily_range(pro, start_date: str, end_date: str):
     """从 Tushare 拉一段时间内所有 A 股的日线数据。"""
     try:
+        # 确保日期范围传递正确，打印调试信息
+        st.write(f"正在拉取数据：从 {start_date} 到 {end_date}")
+        
+        # 调用 Tushare API 拉取数据
         df = pro.daily(start_date=start_date, end_date=end_date)
+        
+        # 如果数据为空，输出警告并返回
         if df.empty:
-            st.warning("这一段时间内没有日线数据，请检查开始/结束日期是否正确。")
+            st.warning(f"没有获取到数据，检查日期区间是否正确：{start_date} ~ {end_date}")
             return None
+        
+        # 输出获取到的总数据行数
+        st.write(f"成功获取 {len(df)} 条数据")
+        
+        # 确保日期列是字符串格式，并按日期排序
         df["trade_date"] = df["trade_date"].astype(str)
+        df = df.sort_values("trade_date")
+        
         return df
     except Exception as e:
         st.error(f"拉取日线数据失败：{e}")
