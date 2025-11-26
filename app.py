@@ -1,19 +1,13 @@
 import streamlit as st
 import tushare as ts
 import pandas as pd
-import numpy as np
 
 # 设置Tushare Token
 ts.set_token('your_tushare_token')  # 用你自己的Token替换
-
-# 创建Pro API接口
 pro = ts.pro_api()
 
 # 拉取数据函数
 def load_data(pro, start_date, end_date):
-    """
-    拉取指定日期区间的股票数据
-    """
     try:
         st.write(f"正在拉取数据：从 {start_date} 到 {end_date}")
         df = pro.daily(start_date=start_date, end_date=end_date)
@@ -23,6 +17,7 @@ def load_data(pro, start_date, end_date):
             return None
         
         st.write(f"成功获取 {len(df)} 条数据")
+        st.write(f"数据的日期范围：{df['trade_date'].min()} 到 {df['trade_date'].max()}")
         st.dataframe(df.head())  # 显示前几条数据进行检查
         
         df["trade_date"] = df["trade_date"].astype(str)
@@ -46,7 +41,7 @@ def add_features(df):
     st.dataframe(df.head())  # 显示数据查看特征是否计算成功
     return df
 
-# 选股策略函数
+# 选股函数
 def select_stocks(df, target_date):
     """
     按照强势突破 + 放量的策略进行选股
@@ -58,25 +53,14 @@ def select_stocks(df, target_date):
         return today
 
     # 放宽筛选条件：成交额、价格、涨幅等
-    st.write("筛选数据前的样本数:", len(today))
     today = today[today["amount"] * 1000 >= 2e6]  # 成交额大于200万
     today = today[(today["close"] >= 0.5) & (today["close"] <= 500)]  # 价格区间 0.5 ~ 500
     today = today[(today["pct_chg"] >= -10) & (today["pct_chg"] <= 50)]  # 涨幅 -10 ~ 50%
-    st.write("筛选成交额、价格、涨幅后的样本数:", len(today))
-
-    # 筛选趋势条件：20日均线 > 60日均线，且收盘价大于20日均线
-    today = today[(today["ma_20"] > today["ma_60"]) & (today["close"] > today["ma_20"])]
-    st.write("筛选趋势条件后的样本数:", len(today))
     
-    # 放量：放量要求 >= 20日均量的0.5倍
-    today = today[today["vol"] >= today["avg_vol_20"] * 0.5]
-    st.write("筛选放量后的样本数:", len(today))
-    
-    # 突破：收盘价大于过去20日的最高价 * 1.01
-    today = today[today["close"] >= today["high_20"] * 1.01]
-    st.write("筛选突破后的样本数:", len(today))
+    today = today[(today["ma_20"] > today["ma_60"]) & (today["close"] > today["ma_20"])]  # 均线突破
+    today = today[today["vol"] >= today["avg_vol_20"] * 0.5]  # 放量要求
+    today = today[today["close"] >= today["high_20"] * 1.01]  # 突破
 
-    st.write(f"符合选股条件的股票：{today[['ts_code', 'trade_date', 'close', 'pct_chg']].head()}")
     return today
 
 # 主函数
