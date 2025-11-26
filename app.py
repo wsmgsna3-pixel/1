@@ -61,21 +61,21 @@ def add_features(df_all: pd.DataFrame,
 
 def select_strong_breakout(df_all_feat: pd.DataFrame,
                            target_date: str,
-                           min_amount: float = 1e7,  # 成交额降低
+                           min_amount: float = 5e6,  # 成交额进一步降低
                            min_price: float = 1,  # 最低价降到 1
-                           max_price: float = 500,  # 价格上限 500
+                           max_price: float = 1000,  # 价格上限 1000
                            ma_short: int = 20,
                            ma_long: int = 60,
                            breakout_n: int = 20,
-                           vol_ratio: float = 1.0,  # 放量要求放宽
+                           vol_ratio: float = 0.8,  # 放量要求进一步放宽
                            min_chg: float = 0,  # 涨幅从 0 开始
-                           max_chg: float = 15) -> pd.DataFrame:
+                           max_chg: float = 20) -> pd.DataFrame:
     """
     在某一天做“强势突破 + 放量”选股（放宽条件版）：
-    - 成交额 >= 2000 万
-    - 价格 3~200 元
-    - 涨幅 1%~11%
-    - 放量 >= 1.2 * 20 日均量
+    - 成交额 >= 500 万
+    - 价格 1~1000 元
+    - 涨幅 0%~20%
+    - 放量 >= 0.8 * 20 日均量
     - 收盘价 >= 近 20 日最高价 * 1.005
     """
     today = df_all_feat[df_all_feat["trade_date"] == target_date].copy()
@@ -100,7 +100,7 @@ def select_strong_breakout(df_all_feat: pd.DataFrame,
     pos_in_bar = (today["close"] - today["low"]) / price_range.replace(0, np.nan)
     today = today[pos_in_bar >= 0.6]
 
-    # 5) 放量（1.0 倍 20 日均量）
+    # 5) 放量（0.8 倍 20 日均量）
     today = today[today["vol"] >= today["avg_vol_n"] * vol_ratio]
 
     # 6) 突破（收盘价 >= 近 20 日高点 * 1.005）
