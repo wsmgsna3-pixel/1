@@ -1,3 +1,4 @@
 streamlit
-tushare
 pandas
+numpy
+tushare
