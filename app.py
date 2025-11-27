@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V9.2 严格策略回归版（带 DEBUG 诊断）
+选股王 · V9.0 极限防御版 (批量获取 + 极度偏爱流动性与低波动)
 说明：
-1. 【核心修复】**市值上限硬编码**：将市值上限设置为 **800 亿人民币**，并加入了对 **total_mv NaN** 值的防御（解决了立讯精密问题）。
-2. 【策略回归】所有侧边栏默认参数回归至 **V9.0 的严格高收益配置** (高换手/低波动严格要求，且只选当日上涨股)。
-3. 【诊断】新增两行 DEBUG 语句，用于排查候选股在哪个步骤归零。
+1. 【性能保持】保留 V5.0 批量获取数据逻辑，确保回测速度在秒级/分钟低端。
+2. 【策略更新】实施 V9.0 极限防御策略：
+    - 保持 V6.0 严格风控参数 (波动率、换手率等)。
+    - **核心调整：** 将换手率和低波动率权重推向极致 (0.35, 0.25)，极度弱化所有动量因子，以求在弱势市场中找到绝对安全的股票。
+3. 【稳定性】使用 Joblib 磁盘缓存 + Streamlit Session State 断点续传。
 """
 
 import streamlit as st
@@ -27,22 +29,16 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 memory = joblib.Memory(CACHE_DIR, verbose=0)
 
 # ---------------------------
-# V9.2 核心策略参数 (硬编码)
-# ---------------------------
-# V9.2 市值上限：800 亿人民币的绝对值 (万元 * 10000)
-MAX_TOTAL_MV_YUAN = 80000000000.0 
-
-# ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V9.2 严格策略回归版）", layout="wide")
-st.markdown("### 选股王（V9.2 严格策略回归版 · **带 DEBUG 诊断**）") 
+st.set_page_config(page_title="选股王（V9.0 极限防御版）", layout="wide")
+st.markdown("### 选股王（V9.0 极限防御版）") 
 
 # ---------------------------
-# 侧边栏参数（回归 V9.0 严格默认值）
+# 侧边栏参数（V9.0 策略：沿用 V6.0 的严格防御默认值）
 # ---------------------------
 with st.sidebar:
-    st.header("可调参数（V9.0 严格配置）")
+    st.header("可调参数（实时）")
     INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
@@ -50,12 +46,11 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # ⚠️ 回归严格配置：最低换手率 3.5%
+    # V6.0/V9.0 调整：严格收紧流动性要求 (3.5%)
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.5, step=0.5)) 
-    # ⚠️ 回归严格配置：最低成交额 1.5 亿
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0))
     
-    # ⚠️ 回归严格配置：波动率阈值 6.0%
+    # V6.0/V9.0 调整：严格收紧风险过滤
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.4, step=0.1)) 
     VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.0, step=0.5)) 
     
@@ -63,8 +58,7 @@ with st.sidebar:
     
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     st.markdown("---")
-    st.caption("提示：策略已回归 **V9.0 严格配置**。")
-    st.caption(f"**V9.2 市值上限：{MAX_TOTAL_MV_YUAN/1e8:.0f} 亿** (硬编码)")
+    st.caption("提示：策略已调整至 '极限防御' 模式。")
 
 # ---------------------------
 # Token 输入
@@ -111,7 +105,7 @@ st.info(f"参考最近交易日：{last_trade}")
 
 
 # ----------------------------------------------------
-# V5.0/V9.1 核心加速函数：批量获取历史数据
+# V5.0/V9.0 核心加速函数：批量获取历史数据
 # ----------------------------------------------------
 @memory.cache
 def bulk_fetch_daily(ts_codes, start_date, end_date):
@@ -122,7 +116,7 @@ def bulk_fetch_daily(ts_codes, start_date, end_date):
     all_data = []
     # 限制每次查询的股票数量，避免 URL 过长或查询超时
     chunk_size = 50 
-  
+    
     # 显示加载进度条
     fetch_bar = st.progress(0.0, text=f"正在批量获取 {len(ts_codes)} 支股票历史数据...")
     
@@ -189,7 +183,6 @@ def compute_indicators(df):
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         diff = ema12 - ema26
-        
         dea = diff.ewm(span=9, adjust=False).mean()
         macd_val = (diff - dea) * 2
         res['macd'] = macd_val.iloc[-1]; res['diff'] = diff.iloc[-1]; res['dea'] = dea.iloc[-1]
@@ -251,11 +244,11 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ----------------------------------------------------
-# 核心评分函数 (V9.2：严格策略 + 市值过滤修复 + DEBUG)
+# 核心评分函数 (V9.0：使用批量数据进行评分，并调整权重)
 # ----------------------------------------------------
 def run_scoring_for_date(trade_date, all_daily_data, params):
     """
-    V9.2 评分函数：从内存中的 all_daily_data 中切片获取历史数据，不再调用 API。
+    V9.0 评分函数：从内存中的 all_daily_data 中切片获取历史数据，不再调用 API。
     """
     
     # 解包参数
@@ -272,9 +265,6 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     if daily_all.empty: return pd.DataFrame()
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
     pool0 = daily_all.head(int(initial_top_n)).copy().reset_index(drop=True)
-
-    # 🚨 DEBUG 1: 检查初筛数据池大小
-    st.info(f"DEBUG 1: 初筛池 (pool0) 大小: {len(pool0)} (应接近 {initial_top_n}，若为0则Tushare Token或接口有问题)") 
 
     # 2. 合并高级接口数据 (逻辑不变)
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,total_mv,circ_mv')
@@ -297,7 +287,7 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     except: pool_merged['net_mf'] = 0.0
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
     
-    # 3. 清洗 (使用 V9.0 严格参数 + V9.1 Bug Fix)
+    # 3. 清洗 (使用 V6.0 严格参数)
     clean_list = []
     for r in pool_merged.itertuples():
         ts_code = getattr(r, 'ts_code')
@@ -318,46 +308,30 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
             high = getattr(r, 'high', np.nan); low = getattr(r, 'low', np.nan)
             if (not pd.isna(open_p) and not pd.isna(high) and not pd.isna(low) and not pd.isna(pre_close)) and (open_p == high == low == pre_close): continue
         except: pass
-        
-        # V9.2 核心修复：市值过滤 (800亿上限 + NaN数据防御)
         try:
-            tv = total_mv 
-            tv_yuan = tv * 10000.0 if not pd.isna(tv) else np.nan 
-
-            if pd.isna(tv_yuan): continue 
-
-            if tv_yuan > MAX_TOTAL_MV_YUAN: continue 
-            
-        except Exception:
-            continue
-        
-        # V9.0 严格参数：高换手率 (3.5%)
+            tv = total_mv; tv_yuan = tv * 10000.0 if not pd.isna(tv) and tv > 1e6 else tv;
+            if not pd.isna(tv_yuan) and tv_yuan > 2000 * 1e8: continue
+        except: pass
+        # V6.0/V9.0 使用调整后的严格参数
         if not pd.isna(turnover) and float(turnover) < min_turnover: continue
-        # V9.0 严格参数：高成交额 (1.5 亿)
         if not pd.isna(amount):
-            amt = amount; 
+            amt = amount;
             if amt > 0 and amt < 1e5: amt = amt * 10000.0
             if amt < min_amount: continue
-            
-        # V9.0 严格参数：只选当日上涨股 (pct_chg > 0)
-        if not pd.isna(pct) and float(pct) < 0: continue 
+        if not pd.isna(pct) and float(pct) < 0: continue
         
         clean_list.append(r)
 
     
     clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
-    
-    # 🚨 DEBUG 2: 检查清洗后数据池大小
-    st.info(f"DEBUG 2: 清洗后 (clean_df) 大小: {len(clean_df)} (应大于0才能进入评分)")
-
     if clean_df.empty: return pd.DataFrame()
 
     score_pool_n = min(int(final_pool_limit), 300)
     clean_df = clean_df.sort_values('pct_chg', ascending=False).head(score_pool_n).reset_index(drop=True)
     
- 
     # 4. 指标计算与评分
     records = []
+    # 找到当前日期的数据范围，只取 trade_date <= 当前日期的
     current_hist_data = all_daily_data[all_daily_data['trade_date'] <= trade_date]
 
     for row in clean_df.itertuples():
@@ -368,11 +342,11 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         amount = amount if not pd.isna(amount) else 0.0
         name = getattr(row, 'name', ts_code)
 
+        # 关键：从内存中获取历史数据
         hist = current_hist_data[current_hist_data['ts_code'] == ts_code].tail(60).copy()
         
         ind = compute_indicators(hist)
 
-     
         vol_ratio, ten_return, macd, k, d, j, vol_last, vol_ma5, prev3_sum, volatility_10, ma20, last_close = \
             ind.get('vol_ratio', np.nan), ind.get('10d_return', np.nan), ind.get('macd', np.nan), \
             ind.get('k', np.nan), ind.get('d', np.nan), ind.get('j', np.nan), \
@@ -391,15 +365,15 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame()
 
-    # 5. 风险过滤 (V9.0 严格参数)
+    # 5. 风险过滤 (使用 V6.0 严格参数)
     if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
         fdf = fdf[~((fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > high_pct_threshold))]
     if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
         fdf = fdf[~((fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > high_pct_threshold))]
-    # V9.0 严格参数：放量倍数 (1.4)
+    # V6.0/V9.0 使用调整后的严格参数：vol_spike_mult
     if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
         fdf = fdf[~((fdf['vol_last'] > (fdf['vol_ma5'] * vol_spike_mult)))]
-    # V9.0 严格参数：波动率 (6.0%)
+    # V6.0/V9.0 使用调整后的严格参数：volatility_max
     if 'volatility_10' in fdf.columns:
         fdf = fdf[~(fdf['volatility_10'] > volatility_max)]
 
@@ -423,17 +397,17 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # 7. 综合评分 (V9.0/V9.2 权重保持)
+    # 7. 综合评分 (V9.0 权重调整：极限防御：w_turn (0.35), w_volatility (0.25))
+    # V9.0 权重: w_pct (0.05), w_volratio (0.10), w_turn (0.35), w_money (0.10), w_10d (0.05), w_macd (0.10), w_rsl (0.05), w_volatility (0.25)
     w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.05, 0.10, 0.35, 0.10, 0.05, 0.10, 0.05, 0.25
     
-    fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] 
-    * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
+    fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
     
     return fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
 
 
 # ----------------------------------------------------
-# 简易回测模块 (V9.2：使用批量数据进行回测)
+# 简易回测模块 (V9.0：使用批量数据进行回测)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     status = st.session_state['backtest_status']
@@ -458,9 +432,9 @@ def run_simple_backtest(days, params):
             
         status['total_days'] = total_iterations
         
-        # 2. 预加载所有数据
+        # 2. V5.0 预加载所有数据 (仅在 bulk_data 为 None 时运行)
         if status['bulk_data'] is None:
-            st.warning("V9.2 终极加速中：正在预加载所有所需历史数据。请耐心等待，只需运行一次。")
+            st.warning("V9.0 终极加速中：正在预加载所有所需历史数据。请耐心等待，只需运行一次。")
             
             # a) 确定所有股票代码
             stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code')
@@ -484,7 +458,7 @@ def run_simple_backtest(days, params):
                 return
             
             st.success(f"数据预加载完成！共获取 {len(all_codes)} 支股票在 {start_date_hist} 至 {final_end_date} 间的数据。")
-            st.rerun() 
+            st.rerun() # 预加载完成后强制刷新，进入正式回测阶段
 
         # 3. 正式回测流程
         bulk_data = status['bulk_data']
@@ -509,7 +483,7 @@ def run_simple_backtest(days, params):
             select_date = trade_dates[i]
             next_trade_date = trade_dates[i+1]
             
-            # 核心步骤：调用 V9.2 评分函数
+            # 核心步骤：调用 V9.0 评分函数，传入内存中的 bulk_data
             select_df_full = run_scoring_for_date(select_date, bulk_data, params_dict) 
 
             # T+1 收益计算逻辑 (不变)
@@ -524,6 +498,7 @@ def run_simple_backtest(days, params):
                 
                 next_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
                 
+
                 if not next_day_data.empty and 'open' in next_day_data.columns and 'close' in next_day_data.columns:
                     buy_price = next_day_data.iloc[0]['open']
                     sell_price = next_day_data.iloc[0]['close']
@@ -547,6 +522,7 @@ def run_simple_backtest(days, params):
             
             pbar.progress(status['progress'], text=f"正在回测 {select_date}... [{i+1}/{total_iterations}]")
             
+            # 强制 Rerun 确保进度条更新
             if (i+1) % 2 == 0: 
                  st.rerun() 
         
@@ -571,7 +547,6 @@ def run_simple_backtest(days, params):
         st.markdown("---")
         st.subheader("💡 最终回测指标")
         colA, colB, colC = st.columns(3)
-        
         colA.metric("累计收益率 (T+1)", f"{cumulative_return*100:.2f}%")
         colB.metric("胜率", f"{win_rate*100:.2f}%")
         colC.metric("交易次数", f"{total_trades}")
@@ -580,22 +555,25 @@ def run_simple_backtest(days, params):
         st.dataframe(results_df, use_container_width=True)
 
 # ----------------------------------------------------
-# 实时选股模块 (V9.2：使用批量数据进行实时评分)
+# 实时选股模块 (V9.0：使用批量数据进行实时评分)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
     
+    # V9.0 实时选股也需要历史数据，但不再逐个获取
     st.warning("正在预加载历史数据...")
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code')
     all_codes = stock_basic['ts_code'].tolist()
     start_dt = datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=60 * 1.5) 
     start_date_hist = start_dt.strftime("%Y%m%d")
     
+    # 批量获取数据并缓存
     bulk_data = bulk_fetch_daily(all_codes, start_date_hist, last_trade)
     if bulk_data.empty:
         st.error("实时选股所需历史数据获取失败。")
         return
     
+    # 5. 传入 bulk_data 进行评分
     params_dict = {
         'INITIAL_TOP_N': params['INITIAL_TOP_N'], 'FINAL_POOL': params['FINAL_POOL'], 'MIN_PRICE': params['MIN_PRICE'], 
         'MAX_PRICE': params['MAX_PRICE'], 'MIN_TURNOVER': params['MIN_TURNOVER'], 'MIN_AMOUNT': params['MIN_AMOUNT'], 
@@ -618,15 +596,13 @@ def run_live_selection(last_trade, params):
 
     st.dataframe(fdf[display_cols], use_container_width=True)
 
-    
     out_csv = fdf_full[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
     st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V9.0 严格高收益配置**，极度偏爱高换手率和低波动率。
-- **【核心防御】** 已实施 **800 亿市值上限**和**数据缺失防御**，解决了 V9.0 的核心 Bug。
-- **【市场风险】** 如果在当前市场下没有候选，说明市场环境**极度弱势**，缺乏符合高标准流动性和动能的股票。请保持观察，或将参数放宽。
+- **【策略风格】** 本版本为 **极限防御模式**，极度偏爱高换手率和低波动率，是当前弱势行情下的最安全策略。
+- **【风控提示】** 已启用最严格的风控参数。实战中，请遵循交易纪律，及时止盈止损。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
