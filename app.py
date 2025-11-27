@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V6.0 终极防御加速版 (批量获取 + 极端防御)
+选股王 · V7.0 趋势加速防御版 (批量获取 + 趋势加速)
 说明：
-1. 【性能突破】保留 V5.0 批量获取数据逻辑，确保回测速度在秒级/分钟低端。
-2. 【策略更新】根据近期弱势市场回测结果，实施 V6.0 极端防御策略：
-    - 严格收紧风险过滤参数 (波动率、换手率、放量倍数)。
-    - 调整评分权重：降低短线资金流权重，重仓中线趋势和相对强度 (RSL) 权重。
+1. 【性能保持】保留 V5.0 批量获取数据逻辑，确保回测速度在秒级/分钟低端。
+2. 【策略更新】实施 V7.0 趋势加速策略：
+    - 保持 V6.0 严格风控参数 (波动率、换手率等)。
+    - **核心调整：** 大幅提高 MACD 和 10日回报权重，降低短期资金流和成交量权重，以寻找趋势正在加速的股票。
 3. 【稳定性】使用 Joblib 磁盘缓存 + Streamlit Session State 断点续传。
 """
 
@@ -31,11 +31,11 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V6.0 终极防御加速版）", layout="wide")
-st.markdown("### 选股王（V6.0 终极防御加速版）") 
+st.set_page_config(page_title="选股王（V7.0 趋势加速防御版）", layout="wide")
+st.markdown("### 选股王（V7.0 趋势加速防御版）") 
 
 # ---------------------------
-# 侧边栏参数（V6.0 策略：极端防御的默认值）
+# 侧边栏参数（V7.0 策略：沿用 V6.0 的严格防御默认值）
 # ---------------------------
 with st.sidebar:
     st.header("可调参数（实时）")
@@ -46,19 +46,19 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # V6.0 调整：严格收紧流动性要求
-    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.5, step=0.5)) # 从 2.5 提到 3.5
+    # V6.0/V7.0 调整：严格收紧流动性要求
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.5, step=0.5)) 
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0))
     
-    # V6.0 调整：严格收紧风险过滤
-    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.4, step=0.1)) # 从 1.5 提到 1.4
-    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.0, step=0.5)) # 从 7.0 提到 6.0
+    # V6.0/V7.0 调整：严格收紧风险过滤
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.4, step=0.1)) 
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.0, step=0.5)) 
     
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
     
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     st.markdown("---")
-    st.caption("提示：策略已调整至 '终极防御' 模式。")
+    st.caption("提示：策略已调整至 '趋势加速防御' 模式。")
 
 # ---------------------------
 # Token 输入
@@ -105,7 +105,7 @@ st.info(f"参考最近交易日：{last_trade}")
 
 
 # ----------------------------------------------------
-# V5.0/V6.0 核心加速函数：批量获取历史数据
+# V5.0/V6.0/V7.0 核心加速函数：批量获取历史数据
 # ----------------------------------------------------
 @memory.cache
 def bulk_fetch_daily(ts_codes, start_date, end_date):
@@ -244,11 +244,11 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ----------------------------------------------------
-# 核心评分函数 (V6.0：使用批量数据进行评分)
+# 核心评分函数 (V7.0：使用批量数据进行评分，并调整权重)
 # ----------------------------------------------------
 def run_scoring_for_date(trade_date, all_daily_data, params):
     """
-    V6.0 评分函数：从内存中的 all_daily_data 中切片获取历史数据，不再调用 API。
+    V7.0 评分函数：从内存中的 all_daily_data 中切片获取历史数据，不再调用 API。
     """
     
     # 解包参数
@@ -312,7 +312,7 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
             tv = total_mv; tv_yuan = tv * 10000.0 if not pd.isna(tv) and tv > 1e6 else tv;
             if not pd.isna(tv_yuan) and tv_yuan > 2000 * 1e8: continue
         except: pass
-        # V6.0 使用调整后的严格参数
+        # V6.0/V7.0 使用调整后的严格参数
         if not pd.isna(turnover) and float(turnover) < min_turnover: continue
         if not pd.isna(amount):
             amt = amount;
@@ -342,7 +342,7 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         amount = amount if not pd.isna(amount) else 0.0
         name = getattr(row, 'name', ts_code)
 
-        # V5.0 关键：从内存中获取历史数据
+        # 关键：从内存中获取历史数据
         hist = current_hist_data[current_hist_data['ts_code'] == ts_code].tail(60).copy()
         
         ind = compute_indicators(hist)
@@ -370,10 +370,10 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         fdf = fdf[~((fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > high_pct_threshold))]
     if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
         fdf = fdf[~((fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > high_pct_threshold))]
-    # V6.0 使用调整后的严格参数：vol_spike_mult
+    # V6.0/V7.0 使用调整后的严格参数：vol_spike_mult
     if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
         fdf = fdf[~((fdf['vol_last'] > (fdf['vol_ma5'] * vol_spike_mult)))]
-    # V6.0 使用调整后的严格参数：volatility_max
+    # V6.0/V7.0 使用调整后的严格参数：volatility_max
     if 'volatility_10' in fdf.columns:
         fdf = fdf[~(fdf['volatility_10'] > volatility_max)]
 
@@ -397,9 +397,9 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # 7. 综合评分 (V6.0 权重调整：降低短线爆发，增强中线趋势/RSL)
-    # V6.0 权重: w_volratio (0.18->0.14), w_money (0.16->0.12), w_10d (0.12->0.16), w_rsl (0.12->0.18), w_volatility (0.06->0.04)
-    w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.18, 0.14, 0.12, 0.12, 0.16, 0.06, 0.18, 0.04
+    # 7. 综合评分 (V7.0 权重调整：重仓趋势和加速度)
+    # V7.0 权重: w_volratio (0.14->0.12), w_money (0.12->0.08), w_10d (0.16->0.18), w_macd (0.06->0.10)
+    w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.18, 0.12, 0.12, 0.08, 0.18, 0.10, 0.18, 0.04 
     
     fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
     
@@ -407,7 +407,7 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块 (V6.0：增加预加载步骤)
+# 简易回测模块 (V7.0：使用批量数据进行回测)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     status = st.session_state['backtest_status']
@@ -434,7 +434,7 @@ def run_simple_backtest(days, params):
         
         # 2. V5.0 预加载所有数据 (仅在 bulk_data 为 None 时运行)
         if status['bulk_data'] is None:
-            st.warning("V6.0 终极加速中：正在预加载所有所需历史数据。请耐心等待，只需运行一次。")
+            st.warning("V7.0 终极加速中：正在预加载所有所需历史数据。请耐心等待，只需运行一次。")
             
             # a) 确定所有股票代码
             stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code')
@@ -483,7 +483,7 @@ def run_simple_backtest(days, params):
             select_date = trade_dates[i]
             next_trade_date = trade_dates[i+1]
             
-            # 核心步骤：调用 V6.0 评分函数，传入内存中的 bulk_data
+            # 核心步骤：调用 V7.0 评分函数，传入内存中的 bulk_data
             select_df_full = run_scoring_for_date(select_date, bulk_data, params_dict) 
 
             # T+1 收益计算逻辑 (不变)
@@ -555,12 +555,12 @@ def run_simple_backtest(days, params):
         st.dataframe(results_df, use_container_width=True)
 
 # ----------------------------------------------------
-# 实时选股模块 (V6.0：使用批量数据进行实时评分)
+# 实时选股模块 (V7.0：使用批量数据进行实时评分)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
     
-    # V6.0 实时选股也需要历史数据，但不再逐个获取
+    # V7.0 实时选股也需要历史数据，但不再逐个获取
     st.warning("正在预加载历史数据...")
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code')
     all_codes = stock_basic['ts_code'].tolist()
@@ -601,7 +601,7 @@ def run_live_selection(last_trade, params):
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **终极防御模式**，重仓中线趋势和相对强度。
+- **【策略风格】** 本版本为 **趋势加速防御模式**，重仓中线趋势和加速度。
 - **【风控提示】** 已启用最严格的风控参数。实战中，请遵循交易纪律，及时止盈止损。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
