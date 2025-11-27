@@ -2,9 +2,7 @@
 """
 选股王 · 10000 积分旗舰（BC 混合增强版）· 极速版
 说明：
-- 【短线优化】针对持股1-5天调整：提高成交额和降低波动阈值，削弱纯爆发因子，增强中期趋势因子。
-- 【最终优化】放宽放量倍数阈值至 1.9，允许捕捉加速期的龙头股。
-- 【本次修复】**已解决 Streamlit UnhashableParamError**，增加按钮控制，并将 `st.experimental_rerun()` 替换为 `st.rerun()` 以兼容新版本。
+- 【本次修复】将运行按钮和回测按钮移动到主界面 Token 输入框下方，并修复了 Streamlit `st.rerun()` 兼容性问题。
 """
 
 import streamlit as st
@@ -23,61 +21,7 @@ st.title("选股王 · 10000 积分旗舰（BC 混合增强版）· 极速版")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
-# 侧边栏参数（实时可改）
-# ---------------------------
-with st.sidebar:
-    st.header("可调参数（实时）")
-    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
-    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
-    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
-    MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
-    MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
-    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
-    # 【已优化】成交额提高到 3.5 亿
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=350_000_000.0, step=50_000_000.0))
-    # 【最终优化】放量倍数阈值放宽到 1.9
-    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.9, step=0.1))
-    # 【已优化】波动阈值降低到 6.5%
-    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.5, step=0.5))
-    HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
-    st.markdown("---")
-    
-    st.header("🔍 回测设置 (T+1 简单回测)")
-    BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
-    st.markdown("""
-        **回测假设：** 次日开盘买入，收盘卖出。
-    """)
-
-    # ----------------------------------------------------
-    # 新增按钮控制模块
-    # ----------------------------------------------------
-    st.markdown("---")
-    st.header("⚡ 运行控制")
-    
-    # 初始化 session state for control
-    if 'run_selection' not in st.session_state:
-        st.session_state['run_selection'] = False
-    if 'run_backtest' not in st.session_state:
-        st.session_state['run_backtest'] = False
-        
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("运行回测 (T+1)"):
-            st.session_state['run_backtest'] = True
-            st.session_state['run_selection'] = False
-            st.rerun() # <<< 修复点 1：替换为 st.rerun()
-            
-    with col2:
-        if st.button("运行当日选股"):
-            st.session_state['run_selection'] = True
-            st.session_state['run_backtest'] = False
-            st.rerun() # <<< 修复点 2：替换为 st.rerun()
-
-    st.caption("提示：保守→降低阈值；激进→提高阈值。")
-
-# ---------------------------
-# Token 输入（主区）
+# Token 输入（主区） - 保持在顶部
 # ---------------------------
 TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password")
 if not TS_TOKEN:
@@ -88,9 +32,58 @@ if not TS_TOKEN:
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
+# ----------------------------------------------------
+# 按钮控制模块 - 移至主界面 Token 检查成功后
+# ----------------------------------------------------
+
+st.subheader("⚡ 运行模式选择")
+# 初始化 session state for control
+if 'run_selection' not in st.session_state:
+    st.session_state['run_selection'] = False
+if 'run_backtest' not in st.session_state:
+    st.session_state['run_backtest'] = False
+    
+col1, col2 = st.columns(2)
+
+# 读取侧边栏的回测天数设置，确保回测按钮能使用
+with st.sidebar:
+    st.header("🔍 回测设置 (T+1 简单回测)")
+    BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
+    st.markdown("---")
+    st.header("可调参数（实时）")
+    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
+    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
+    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
+    MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
+    MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=350_000_000.0, step=50_000_000.0))
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.9, step=0.1))
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.5, step=0.5))
+    HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
+    st.markdown("---")
+    st.caption("提示：保守→降低阈值；激进→提高阈值。")
+    
+# 主界面的按钮
+with col1:
+    if st.button("运行当日选股", use_container_width=True):
+        st.session_state['run_selection'] = True
+        st.session_state['run_backtest'] = False
+        st.rerun()
+        
+with col2:
+    if st.button(f"运行回测 (最近 {BACKTEST_DAYS} 日)", use_container_width=True):
+        st.session_state['run_backtest'] = True
+        st.session_state['run_selection'] = False
+        st.rerun()
+
+st.markdown("---")
+
+
 # ---------------------------
-# 安全调用 & 缓存辅助
+# 安全调用 & 缓存辅助 (函数保持不变)
 # ---------------------------
+
 def safe_get(func, **kwargs):
     """Call API and return DataFrame or empty df on any error."""
     try:
@@ -207,18 +200,18 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ----------------------------------------------------
-# 核心评分函数 (封装) - 适用于实时和回测
+# 核心评分函数 (封装)
 # ----------------------------------------------------
 @st.cache_data(ttl=600)
 def run_scoring_for_date(trade_date, params):
-    # 1. 拉取当日涨幅榜初筛 (使用全局 pro 对象)
+    # 1. 拉取当日涨幅榜初筛
     daily_all = safe_get(pro.daily, trade_date=trade_date)
     if daily_all.empty: return pd.DataFrame()
     
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
     pool0 = daily_all.head(int(params['INITIAL_TOP_N'])).copy().reset_index(drop=True)
 
-    # 2. 拉取和合并高级接口数据 (使用全局 pro 对象)
+    # 2. 拉取和合并高级接口数据
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
     
@@ -446,7 +439,7 @@ st.info(f"参考最近交易日：{last_trade}")
 
 # >>>>> 控制逻辑：只有在点击按钮后才执行后续代码 <<<<<
 if not st.session_state.get('run_selection') and not st.session_state.get('run_backtest'):
-    st.info("请在侧边栏选择 '运行当日选股' 或 '运行回测 (T+1)' 开始。")
+    st.info("请点击上方的 '运行当日选股' 或 '运行回测' 开始。")
     st.stop()
 
 
