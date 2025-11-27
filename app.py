@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.0 趋势风控版 (策略突破：取消涨幅榜初筛 + 引入 MA20 趋势硬性过滤)
+选股王 · V12.0 防御强化版 (核心：新增市值上限 + 极度强化低波动防御)
 
 说明：
-1. 【策略核心】彻底改变哲学。取消对涨幅榜的依赖（Initial Top N 设为所有 A 股）。
-2. 【强风控】引入 MA20 趋势硬性过滤：收盘价必须高于 20 日均线。
-3. 【评分简化】评分权重专注于中期趋势（MACD 0.35）、防御（低波动 0.35）和流动性（换手率 0.30）。
-4. 【回测专注】暂时取消 T+5，只回测 T+1 和 T+3，专注于优化中期持仓。
+1. 【新增风控】新增最高流通市值 (MAX_CIRC_MV_Billion) 硬性过滤，排除超大盘股。
+2. 【评分强化】大幅提高低波动率权重至 0.45，重点解决 T+3/T+5 的回撤风险。
+3. 【回测专注】继续回测 T+1 和 T+3，T+5 的巨大回撤需要防御性解决。
 """
 
 import streamlit as st
@@ -30,8 +29,8 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V11.0 趋势风控版）", layout="wide")
-st.markdown("### 选股王（V11.0 趋势风控版）") 
+st.set_page_config(page_title="选股王（V12.0 防御强化版）", layout="wide")
+st.markdown("### 选股王（V12.0 防御强化版）") 
 
 # ---------------------------
 # 侧边栏参数
@@ -46,8 +45,10 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # 市值下限参数
+    # 市值上下限参数
     MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=35.0, step=5.0)) 
+    # V12.0 新增参数
+    MAX_CIRC_MV_Billion = float(st.number_input("最高流通市值 (亿)", value=600.0, step=50.0)) 
     
     # 极限宽松流动性
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.1)) 
@@ -57,7 +58,7 @@ with st.sidebar:
     MA_TREND_PERIOD = int(st.number_input("硬性趋势过滤：MA 周期", value=20, step=5))
     
     VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.0, step=0.5)) 
-    HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5)) # 保留，但评分权重降低
+    HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5)) 
     
     st.markdown("---")
     
@@ -65,8 +66,8 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V11.0 趋势风控版'。")
-    st.caption("回测将专注于 T+1 和 T+3 收益。")
+    st.caption("提示：策略已升级至 'V12.0 防御强化版'。")
+    st.caption("核心：新增市值上限，并极度强化低波动权重。")
 
 # ---------------------------
 # Token 输入
@@ -232,15 +233,15 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V11.0 趋势风控版)
+# 核心评分函数 (V12.0 防御强化版)
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
     
     # 解包参数
-    initial_top_n, final_pool_limit, min_price, max_price, min_turnover, min_amount, min_circ_mv_billion, ma_trend_period = \
+    initial_top_n, final_pool_limit, min_price, max_price, min_turnover, min_amount, min_circ_mv_billion, max_circ_mv_billion, ma_trend_period = \
         params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], params['MAX_PRICE'], \
-        params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['MIN_CIRC_MV_Billion'], params['MA_TREND_PERIOD']
+        params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['MIN_CIRC_MV_Billion'], params['MAX_CIRC_MV_Billion'], params['MA_TREND_PERIOD']
     
     # 1. V11.0 核心变化：拉取所有 A 股，不再是涨幅榜初筛
     daily_all = safe_get(pro.daily, trade_date=trade_date)
@@ -309,6 +310,10 @@ def run_scoring_for_date(trade_date, params):
     min_circ_mv_wan = min_circ_mv_billion * 10000.0 
     clean_df = clean_df[clean_df['circ_mv_wan'].notna() & (clean_df['circ_mv_wan'] >= min_circ_mv_wan)]
 
+    # V12.0 新增：流通市值上限过滤 
+    max_circ_mv_wan = max_circ_mv_billion * 10000.0 
+    clean_df = clean_df[clean_df['circ_mv_wan'].notna() & (clean_df['circ_mv_wan'] <= max_circ_mv_wan)]
+
     # 成交额硬性过滤
     clean_df = clean_df[clean_df['amount_yuan'].notna() & (clean_df['amount_yuan'] >= min_amount)]
     
@@ -326,9 +331,9 @@ def run_scoring_for_date(trade_date, params):
         return pd.DataFrame()
 
     if trade_date == last_trade:
-        st.info(f"诊断：硬性过滤后，剩余股票数量: **{len(clean_df)}** 支，开始计算指标...")
+        st.info(f"诊断：硬性过滤 (包含市值上下限) 后，剩余股票数量: **{len(clean_df)}** 支，开始计算指标...")
 
-    # 4. 指标计算与 MA20 趋势硬性过滤 (V11.0 核心)
+    # 4. 指标计算与 MA20 趋势硬性过滤 
     records = []
     
     # 历史数据拉取范围
@@ -386,7 +391,7 @@ def run_scoring_for_date(trade_date, params):
         records.append(rec)
         final_clean_df.append(ts_code)
         
-        if pbar: pbar.progress((i + 1) / len(clean_df), text=f"指标计算进度：[{i+1}/{len(clean_df)}]...")
+        if pbar: pbar.progress((i + 1) / len(clean_df), text=f"指标计算进度：[{i+1}/{len(clean_df)}]... (已排除趋势向下股)")
         
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame()
@@ -403,7 +408,7 @@ def run_scoring_for_date(trade_date, params):
         except: fdf['rsl'] = 1.0
     else: fdf['rsl'] = 1.0
 
-    # V11.0 评分：趋势与防御
+    # V12.0 评分：极度强化低波动防御
     fdf['s_pct'] = norm_col(fdf.get('pct_chg', pd.Series([0]*len(fdf))))
     fdf['s_volratio'] = norm_col(fdf.get('vol_ratio', pd.Series([0]*len(fdf))))
     fdf['s_turn'] = norm_col(fdf.get('turnover_rate', pd.Series([0]*len(fdf))))
@@ -413,15 +418,15 @@ def run_scoring_for_date(trade_date, params):
     fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # V11.0 核心权重：中期趋势(MACD 0.35) + 低波动(0.35) + 换手率(0.30)
-    w_pct = 0.0      # 归零：不再追涨
-    w_volratio = 0.0 # 归零
-    w_turn = 0.30    # 高流动性
-    w_money = 0.0    # 归零
-    w_10d = 0.0      # 归零
-    w_macd = 0.35    # 高中期趋势
-    w_rsl = 0.0      # 归零
-    w_volatility = 0.35 # 高防御性
+    # V12.0 核心权重：低波动(0.45) + 中期趋势(MACD 0.30) + 换手率(0.25)
+    w_pct = 0.0      
+    w_volratio = 0.0 
+    w_turn = 0.25    # 保证基础流动性
+    w_money = 0.0    
+    w_10d = 0.0      
+    w_macd = 0.30    # 中期趋势，要求趋势为正
+    w_rsl = 0.0      
+    w_volatility = 0.45 # 极度强化防御性
 
     fdf['综合评分'] = (fdf['s_turn'] * w_turn + fdf['s_macd'] * w_macd + fdf['s_volatility'] * w_volatility)
     
@@ -429,7 +434,7 @@ def run_scoring_for_date(trade_date, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块 (V11.0 专注 T+1 和 T+3)
+# 简易回测模块 (V12.0 专注 T+1 和 T+3)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     
@@ -470,6 +475,7 @@ def run_simple_backtest(days, params):
             'VOLATILITY_MAX': params['VOLATILITY_MAX'], 
             'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD'],
             'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'],
+            'MAX_CIRC_MV_Billion': params['MAX_CIRC_MV_Billion'],
             'MA_TREND_PERIOD': params['MA_TREND_PERIOD'] 
         }
         
@@ -491,7 +497,7 @@ def run_simple_backtest(days, params):
                  
             
             if not select_df_full.empty:
-                # 随机选择 Top 10 中评分最高的股票 (V11.0 仅关注 Top 1)
+                # 随机选择 Top 10 中评分最高的股票 (V12.0 仅关注 Top 1)
                 top_pick = select_df_full.iloc[0] 
                 ts_code = top_pick['ts_code']
                 
@@ -565,7 +571,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (V11.0)
+# 实时选股模块 (V12.0)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -576,13 +582,14 @@ def run_live_selection(last_trade, params):
         'VOLATILITY_MAX': params['VOLATILITY_MAX'], 
         'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD'],
         'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'],
+        'MAX_CIRC_MV_Billion': params['MAX_CIRC_MV_Billion'],
         'MA_TREND_PERIOD': params['MA_TREND_PERIOD']
     }
     # 评分函数中会根据 FINAL_POOL 限制数量
     fdf_full = run_scoring_for_date(last_trade, params_dict)
 
     if fdf_full.empty:
-        st.error("清洗和评分后没有候选。请检查硬性过滤参数是否过于严格（尤其是 MA20 趋势过滤）。")
+        st.error("清洗和评分后没有候选。请检查硬性过滤参数是否过于严格（尤其是 MA20 趋势过滤或新的市值上限）。")
         st.stop()
 
     fdf = fdf_full.head(params['TOP_DISPLAY']).copy()
@@ -593,6 +600,7 @@ def run_live_selection(last_trade, params):
     # 转换为亿显示 
     fdf['流通市值 (亿)'] = fdf['circ_mv_wan'] / 10000.0
     
+    # 确保所有列都存在
     display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
     for c in display_cols:
         if c not in fdf_full.columns: fdf_full[c] = np.nan 
@@ -602,13 +610,13 @@ def run_live_selection(last_trade, params):
     st.dataframe(fdf[final_display_cols], use_container_width=True)
 
     out_csv = fdf_full[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
-    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V11_0.csv", mime="text/csv")
+    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V12_0.csv", mime="text/csv")
 
-    st.markdown("### 小结与操作提示（V11.0 趋势风控版）")
+    st.markdown("### 小结与操作提示（V12.0 防御强化版）")
     st.markdown(f"""
-- **【核心哲学】** **放弃追涨**，只选符合 **MA{params['MA_TREND_PERIOD']} 趋势** 的股票。
-- **【评分重点】** 评分仅看 **中期趋势 (MACD 0.35)**、**低波动 (0.35)** 和 **流动性 (0.30)**。
-- **【风险提示】** 如果回测结果仍不理想，说明回测期内趋势策略也失效。
+- **【核心哲学】** **去追涨，锁定趋势 + 极度防御。**
+- **【评分重点】** 评分极度偏向：**低波动 (0.45)**、**中期趋势 (0.30)**。
+- **【新增风控】** 流通市值已限定在 **{params['MIN_CIRC_MV_Billion']} 亿 到 {params['MAX_CIRC_MV_Billion']} 亿** 之间，排除超大盘股。
 """)
 
 
@@ -621,6 +629,7 @@ params = {
     'MIN_AMOUNT': MIN_AMOUNT, 'VOLATILITY_MAX': VOLATILITY_MAX,
     'HIGH_PCT_THRESHOLD': HIGH_PCT_THRESHOLD,
     'MIN_CIRC_MV_Billion': MIN_CIRC_MV_Billion,
+    'MAX_CIRC_MV_Billion': MAX_CIRC_MV_Billion,
     'MA_TREND_PERIOD': MA_TREND_PERIOD
 }
 
