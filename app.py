@@ -310,7 +310,7 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         except: pass
         try:
             tv = total_mv; tv_yuan = tv * 10000.0 if not pd.isna(tv) and tv > 1e6 else tv;
-            if not pd.isna(tv_yuan) and tv_yuan > 800 * 1e8: continue
+            if not pd.isna(tv_yuan) and tv_yuan > 80000000000.0: continue
         except: pass
         # V6.0/V9.0 使用调整后的严格参数
         if not pd.isna(turnover) and float(turnover) < min_turnover: continue
