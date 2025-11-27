@@ -4,7 +4,7 @@
 说明：
 - 【短线优化】针对持股1-5天调整：提高成交额和降低波动阈值，削弱纯爆发因子，增强中期趋势因子。
 - 【最终优化】放宽放量倍数阈值至 1.9，允许捕捉加速期的龙头股。
-- 【本次修复】**已解决 Streamlit UnhashableParamError**，并增加**按钮控制**，避免自动运行导致回测结果丢失。
+- 【本次修复】**已解决 Streamlit UnhashableParamError**，增加按钮控制，并将 `st.experimental_rerun()` 替换为 `st.rerun()` 以兼容新版本。
 """
 
 import streamlit as st
@@ -66,13 +66,13 @@ with st.sidebar:
         if st.button("运行回测 (T+1)"):
             st.session_state['run_backtest'] = True
             st.session_state['run_selection'] = False
-            st.experimental_rerun() # 触发重新运行以执行回测
+            st.rerun() # <<< 修复点 1：替换为 st.rerun()
             
     with col2:
         if st.button("运行当日选股"):
             st.session_state['run_selection'] = True
             st.session_state['run_backtest'] = False
-            st.experimental_rerun() # 触发重新运行以执行选股
+            st.rerun() # <<< 修复点 2：替换为 st.rerun()
 
     st.caption("提示：保守→降低阈值；激进→提高阈值。")
 
@@ -89,7 +89,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ---------------------------
-# 安全调用 & 缓存辅助 (逻辑不变)
+# 安全调用 & 缓存辅助
 # ---------------------------
 def safe_get(func, **kwargs):
     """Call API and return DataFrame or empty df on any error."""
@@ -207,7 +207,7 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ----------------------------------------------------
-# 核心评分函数 (封装) - 适用于实时和回测 (逻辑不变)
+# 核心评分函数 (封装) - 适用于实时和回测
 # ----------------------------------------------------
 @st.cache_data(ttl=600)
 def run_scoring_for_date(trade_date, params):
@@ -355,7 +355,7 @@ def run_scoring_for_date(trade_date, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块 (逻辑不变)
+# 简易回测模块
 # ----------------------------------------------------
 def run_simple_backtest(days):
     st.header("📈 简易历史回测结果")
@@ -435,7 +435,7 @@ def run_simple_backtest(days):
     st.dataframe(results_df, use_container_width=True)
 
 # ----------------------------------------------------
-# 主程序入口 (新增逻辑：等待按钮点击)
+# 主程序入口
 # ----------------------------------------------------
 last_trade = find_last_trade_day()
 if not last_trade:
@@ -444,7 +444,7 @@ if not last_trade:
 st.info(f"参考最近交易日：{last_trade}")
 
 
-# >>>>> 新增控制逻辑：只有在点击按钮后才执行后续代码 <<<<<
+# >>>>> 控制逻辑：只有在点击按钮后才执行后续代码 <<<<<
 if not st.session_state.get('run_selection') and not st.session_state.get('run_backtest'):
     st.info("请在侧边栏选择 '运行当日选股' 或 '运行回测 (T+1)' 开始。")
     st.stop()
@@ -453,7 +453,6 @@ if not st.session_state.get('run_selection') and not st.session_state.get('run_b
 # 检查是否需要运行回测
 if st.session_state.get('run_backtest', False):
     run_simple_backtest(BACKTEST_DAYS)
-    # 脚本在此处停止，回测结果会保留在屏幕上
     st.stop()
 
 
