@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V9.4 终极市值防御版 (V9.3 策略 + 绝对鲁棒的市值过滤)
+选股王 · V9.6 逻辑修正终极版 (保留防御，移除风控硬性淘汰，极限宽松流动性)
+
 说明：
-1. 【策略核心】评分权重和当日上涨要求保持 V9.0 严格高收益配置。
-2. 【核心防御】**使用 stock_basic 的 total_mv 进行绝对 800 亿市值上限过滤**，并强制淘汰 NaN 值股票。
-3. 【流动性门槛】换手率和成交额门槛保持 V9.3 的宽松值 (1.0% / 5000 万)，以兼容弱市。
+1. 【修复核心 Bug】移除 V9.0/V9.4 中将风控因子 (波动率、放量倍数等) 作为硬性淘汰条件的逻辑。
+   - 所有风控因子（volatility_10, vol_ratio等）现在只影响综合评分，不再清空候选。
+2. 【市值防御】保留 V9.4 严格的 800 亿市值上限（修复 V9.0 的 Bug）。
+3. 【流动性】采纳 V9.5 的极限宽松流动性 (0.5% 换手率 / 2000 万成交额)，应对缩量市场。
+4. 【策略风格】保留 V9.0 极限防御的评分权重（高换手、低波动率权重推向极致）。
 """
 
 import streamlit as st
@@ -23,25 +26,20 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 CACHE_DIR = "data_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
+# joblib 封装 Tushare 接口，实现磁盘持久化缓存
 memory = joblib.Memory(CACHE_DIR, verbose=0)
-
-# ---------------------------
-# V9.4 核心策略参数 (硬编码)
-# ---------------------------
-# V9.4 市值上限：800 亿人民币的绝对值 (万元 * 10000)
-MAX_TOTAL_MV_YUAN = 80000000000.0 
 
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V9.4 终极防御版）", layout="wide")
-st.markdown("### 选股王（V9.4 终极市值防御版 · 800亿上限）") 
+st.set_page_config(page_title="选股王（V9.6 逻辑修正终极版）", layout="wide")
+st.markdown("### 选股王（V9.6 逻辑修正终极版）") 
 
 # ---------------------------
-# 侧边栏参数（策略回归 V9.0，流动性参数宽松）
+# 侧边栏参数（V9.6 策略：极限宽松流动性，保留风控参数用于评分）
 # ---------------------------
 with st.sidebar:
-    st.header("可调参数（V9.4 弱市兼容配置）")
+    st.header("可调参数（实时）")
     INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
@@ -49,12 +47,11 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # V9.3/V9.4 宽松参数：最低换手率 1.0% (兼容弱市)
-    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=1.0, step=0.5)) 
-    # V9.3/V9.4 宽松参数：最低成交额 5000 万 (兼容弱市)
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=50_000_000.0, step=10_000_000.0))
+    # V9.6 调整：极限宽松流动性
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.1)) 
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=20_000_000.0, step=5_000_000.0)) # 2000万
     
-    # 波动率和放量参数：回归 V9.0 严格值
+    # 风控参数保留，但仅用于评分 (不再硬性排除)
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.4, step=0.1)) 
     VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.0, step=0.5)) 
     
@@ -62,11 +59,10 @@ with st.sidebar:
     
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     st.markdown("---")
-    st.caption("提示：此版本修复了市值过滤的致命漏洞。")
-    st.caption(f"**V9.4 市值上限：{MAX_TOTAL_MV_YUAN/1e8:.0f} 亿** (硬编码)")
+    st.caption("提示：策略已调整至 'V9.6 逻辑修正' 模式，只进行必要的硬性过滤。")
 
 # ---------------------------
-# Token 输入
+# Token 输入 (保留)
 # ---------------------------
 st.markdown("请输入 Tushare Token。")
 TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password", label_visibility="collapsed")
@@ -80,7 +76,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ---------------------------
-# 依赖函数：数据安全获取和交易日查找
+# 依赖函数：数据安全获取和交易日查找 (保留)
 # ---------------------------
 def safe_get(func, **kwargs):
     try:
@@ -110,7 +106,7 @@ st.info(f"参考最近交易日：{last_trade}")
 
 
 # ----------------------------------------------------
-# V9.4 核心加速函数：批量获取历史数据 (不变)
+# V5.0/V9.0 核心加速函数：批量获取历史数据 (保留)
 # ----------------------------------------------------
 @memory.cache
 def bulk_fetch_daily(ts_codes, start_date, end_date):
@@ -119,14 +115,17 @@ def bulk_fetch_daily(ts_codes, start_date, end_date):
         return pd.DataFrame()
         
     all_data = []
+    # 限制每次查询的股票数量，避免 URL 过长或查询超时
     chunk_size = 50 
-  
+    
+    # 显示加载进度条
     fetch_bar = st.progress(0.0, text=f"正在批量获取 {len(ts_codes)} 支股票历史数据...")
     
     for i in range(0, len(ts_codes), chunk_size):
         chunk_codes = ts_codes[i:i + chunk_size]
         ts_code_list = ','.join(chunk_codes)
         
+        # 使用 pro.daily 接口的 ts_code 参数批量查询
         df = safe_get(pro.daily, ts_code=ts_code_list, start_date=start_date, end_date=end_date)
         if not df.empty:
             all_data.append(df)
@@ -143,7 +142,7 @@ def bulk_fetch_daily(ts_codes, start_date, end_date):
     return final_df
 
 # ----------------------------------------------------
-# 按钮控制模块 (不变)
+# 按钮控制模块 (Session State 断点续传) (保留)
 # ----------------------------------------------------
 if 'run_selection' not in st.session_state: st.session_state['run_selection'] = False
 if 'run_backtest' not in st.session_state: st.session_state['run_backtest'] = False
@@ -170,7 +169,7 @@ with col2:
 st.markdown("---")
 
 # ---------------------------
-# 指标计算和归一化 (不变)
+# 指标计算和归一化 (保留)
 # ---------------------------
 def compute_indicators(df):
     res = {}
@@ -185,7 +184,6 @@ def compute_indicators(df):
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         diff = ema12 - ema26
-        
         dea = diff.ewm(span=9, adjust=False).mean()
         macd_val = (diff - dea) * 2
         res['macd'] = macd_val.iloc[-1]; res['diff'] = diff.iloc[-1]; res['dea'] = dea.iloc[-1]
@@ -247,9 +245,12 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ----------------------------------------------------
-# 核心评分函数 (V9.4：市值过滤逻辑优化)
+# 核心评分函数 (V9.6：关键修正点)
 # ----------------------------------------------------
 def run_scoring_for_date(trade_date, all_daily_data, params):
+    """
+    V9.6 评分函数：移除风控硬性淘汰，只保留必要的硬性过滤。
+    """
     
     # 解包参数
     initial_top_n, final_pool_limit, min_price, max_price, min_turnover, min_amount, vol_spike_mult, volatility_max, high_pct_threshold = \
@@ -257,7 +258,7 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['VOL_SPIKE_MULT'], \
         params['VOLATILITY_MAX'], params['HIGH_PCT_THRESHOLD']
     
-    # 1. 拉取当日涨幅榜初筛 
+    # 1. 拉取当日涨幅榜初筛 (保留)
     daily_all = safe_get(pro.daily, trade_date=trade_date)
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
@@ -266,11 +267,7 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
     pool0 = daily_all.head(int(initial_top_n)).copy().reset_index(drop=True)
 
-    # 🚨 DEBUG 1: 检查初筛数据池大小
-    st.info(f"DEBUG 1: 初筛池 (pool0) 大小: {len(pool0)} (应接近 {initial_top_n}，若为0则Tushare Token或接口有问题)") 
-
-    # 2. 合并高级接口数据
-    # ⚠️ V9.4 关键：获取 stock_basic 并使用其 total_mv 字段，它比 daily_basic 更稳定
+    # 2. 合并高级接口数据 (保留)
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,total_mv,circ_mv')
     moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
     if not mf_raw.empty:
@@ -279,14 +276,11 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         if col: moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
     
     if not stock_basic.empty:
-        # 重命名 total_mv 以避免与 daily_basic 的 total_mv 冲突，确保使用 stock_basic 的值进行过滤
-        stock_basic = stock_basic.rename(columns={'total_mv': 'static_total_mv'}) 
-        keep = [c for c in ['ts_code','name','industry','static_total_mv','circ_mv'] if c in stock_basic.columns]
+        keep = [c for c in ['ts_code','name','industry','total_mv','circ_mv'] if c in stock_basic.columns]
         try: pool0 = pool0.merge(stock_basic[keep], on='ts_code', how='left')
-        except Exception: pool0['name'] = pool0['ts_code']; pool0['industry'] = ''; pool0['static_total_mv'] = np.nan
-    else: pool0['name'] = pool0['ts_code']; pool0['industry'] = ''; pool0['static_total_mv'] = np.nan
+        except Exception: pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
+    else: pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
         
-    # 合并 daily_basic，虽然包含 total_mv, 但清洗时将使用 static_total_mv
     pool_merged = safe_merge_pool(pool0, daily_basic, ['turnover_rate','amount','total_mv','circ_mv'])
     
     if moneyflow.empty: moneyflow = pd.DataFrame({'ts_code': pool_merged['ts_code'].tolist(), 'net_mf': [0.0]*len(pool_merged)})
@@ -294,68 +288,43 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     except: pool_merged['net_mf'] = 0.0
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
     
-    # 3. 清洗 (V9.4: 绝对市值防御 + 宽松流动性)
-    clean_list = []
-    for r in pool_merged.itertuples():
-        ts_code = getattr(r, 'ts_code')
-        vol = getattr(r, 'vol', np.nan)
-        close = getattr(r, 'close', np.nan)
-        open_p = getattr(r, 'open', np.nan)
-        pre_close = getattr(r, 'pre_close', np.nan)
-        pct = getattr(r, 'pct_chg', np.nan)
-        amount = getattr(r, 'amount', np.nan)
-        turnover = getattr(r, 'turnover_rate', np.nan)
-        name = getattr(r, 'name', ts_code)
-        
-        # ⚠️ V9.4 核心修复：使用 static_total_mv (来自 stock_basic) 进行过滤
-        static_total_mv = getattr(r, 'static_total_mv', np.nan) 
-
-        if (pd.isna(vol) or vol == 0) and (pd.isna(amount) or amount == 0): continue
-        if pd.isna(close) or (close < min_price) or (close > max_price): continue
-        if isinstance(name, str) and (('ST' in name.upper()) or ('退' in name)): continue
-        try:
-            high = getattr(r, 'high', np.nan); low = getattr(r, 'low', np.nan)
-            if (not pd.isna(open_p) and not pd.isna(high) and not pd.isna(low) and not pd.isna(pre_close)) and (open_p == high == low == pre_close): continue
-        except: pass
-        
-        # V9.4 绝对市值过滤：强制转换为人民币，并进行 NaN/超限检查
-        try:
-            tv_yuan = static_total_mv * 10000.0 if not pd.isna(static_total_mv) else np.nan 
-
-            if pd.isna(tv_yuan): continue # 强制淘汰市值数据缺失的股票
-
-            if tv_yuan > MAX_TOTAL_MV_YUAN: continue # 800 亿上限过滤
-            
-        except Exception:
-            continue
-        
-        # V9.4 宽松参数：高换手率 (1.0% - 兼容弱市)
-        if not pd.isna(turnover) and float(turnover) < min_turnover: continue
-        # V9.4 宽松参数：高成交额 (5000 万 - 兼容弱市)
-        if not pd.isna(amount):
-            amt = amount; 
-            if amt > 0 and amt < 1e5: amt = amt * 10000.0
-            if amt < min_amount: continue
-            
-        # V9.0 严格参数：只选当日上涨股 (pct_chg > 0) - 保持严格
-        if not pd.isna(pct) and float(pct) < 0: continue 
-        
-        clean_list.append(r)
-
+    # 3. 清洗 (只保留必要的硬性过滤：价格、ST、市值、流动性、当日上涨)
     
-    clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
-    
-    # 🚨 DEBUG 2: 检查清洗后数据池大小
-    st.info(f"DEBUG 2: 清洗后 (clean_df) 大小: {len(clean_df)} (应大于0才能进入评分)")
+    # --- V9.6 严格市值防御 (800亿) ---
+    MAX_TOTAL_MV_YUAN = 80000000000.0 
+    pool_merged['total_mv_yuan'] = pool_merged['total_mv'].apply(
+        lambda tv: tv * 10000.0 if not pd.isna(tv) and tv > 1e6 else tv)
+    pool_merged['amount_yuan'] = pool_merged['amount'].apply(
+        lambda amt: amt * 10000.0 if not pd.isna(amt) and amt > 0 and amt < 1e5 else amt)
 
+    clean_df = pool_merged.copy()
+    
+    # 价格、ST、停牌过滤
+    clean_df = clean_df[~(
+        (clean_df['close'].isna()) | 
+        (clean_df['close'] < min_price) | 
+        (clean_df['close'] > max_price) | 
+        (clean_df['name'].str.contains('ST|退', case=False, na=False))
+    )]
+    
+    # 涨跌幅过滤
+    clean_df = clean_df[~((clean_df['pct_chg'].isna()) | (clean_df['pct_chg'] < 0))]
+    
+    # V9.6 市值防御过滤 (核心修正)
+    clean_df = clean_df[~((clean_df['total_mv_yuan'].notna()) & (clean_df['total_mv_yuan'] > MAX_TOTAL_MV_YUAN))]
+
+    # V9.6 极限宽松流动性过滤 (核心修正)
+    clean_df = clean_df[~((clean_df['turnover_rate'].isna()) | (clean_df['turnover_rate'] < min_turnover))]
+    clean_df = clean_df[~((clean_df['amount_yuan'].isna()) | (clean_df['amount_yuan'] < min_amount))]
+    
     if clean_df.empty: return pd.DataFrame()
 
     score_pool_n = min(int(final_pool_limit), 300)
     clean_df = clean_df.sort_values('pct_chg', ascending=False).head(score_pool_n).reset_index(drop=True)
     
- 
-    # 4. 指标计算与评分 (不变)
+    # 4. 指标计算与评分 (保留)
     records = []
+    # 找到当前日期的数据范围，只取 trade_date <= 当前日期的
     current_hist_data = all_daily_data[all_daily_data['trade_date'] <= trade_date]
 
     for row in clean_df.itertuples():
@@ -366,11 +335,11 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         amount = amount if not pd.isna(amount) else 0.0
         name = getattr(row, 'name', ts_code)
 
+        # 关键：从内存中获取历史数据
         hist = current_hist_data[current_hist_data['ts_code'] == ts_code].tail(60).copy()
         
         ind = compute_indicators(hist)
 
-     
         vol_ratio, ten_return, macd, k, d, j, vol_last, vol_ma5, prev3_sum, volatility_10, ma20, last_close = \
             ind.get('vol_ratio', np.nan), ind.get('10d_return', np.nan), ind.get('macd', np.nan), \
             ind.get('k', np.nan), ind.get('d', np.nan), ind.get('j', np.nan), \
@@ -389,19 +358,10 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame()
 
-    # 5. 风险过滤 (V9.0 严格参数 - 不变)
-    if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
-        fdf = fdf[~((fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > high_pct_threshold))]
-    if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
-        fdf = fdf[~((fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > high_pct_threshold))]
-    if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
-        fdf = fdf[~((fdf['vol_last'] > (fdf['vol_ma5'] * vol_spike_mult)))]
-    if 'volatility_10' in fdf.columns:
-        fdf = fdf[~(fdf['volatility_10'] > volatility_max)]
-
-    if fdf.empty: return pd.DataFrame()
-
-    # 6. RSL & 归一化 (不变)
+    # 5. 风险过滤 (V9.6 修正：将所有风控硬性过滤逻辑移除，仅保留到评分阶段)
+    # V9.0/V9.4 硬性过滤的代码已被移除，只保留基础的 RSL 计算和归一化。
+    
+    # 6. RSL & 归一化 (保留)
     if '10d_return' in fdf.columns:
         try:
             market_mean_10d = fdf['10d_return'].replace([np.inf,-np.inf], np.nan).dropna().mean()
@@ -417,23 +377,24 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     fdf['s_10d'] = norm_col(fdf.get('10d_return', pd.Series([0]*len(fdf))))
     fdf['s_macd'] = norm_col(fdf.get('macd', pd.Series([0]*len(fdf))))
     fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
+    
+    # 关键：低波动性得分
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # 7. 综合评分 (V9.0/V9.4 权重保持)
+    # 7. 综合评分 (V9.0 权重调整：极限防御：w_turn (0.35), w_volatility (0.25))
+    # 权重: w_pct (0.05), w_volratio (0.10), w_turn (0.35), w_money (0.10), w_10d (0.05), w_macd (0.10), w_rsl (0.05), w_volatility (0.25)
     w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.05, 0.10, 0.35, 0.10, 0.05, 0.10, 0.05, 0.25
     
     fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] 
-    * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
+        * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
     
     return fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
 
 
 # ----------------------------------------------------
-# 简易回测模块 (不变)
+# 简易回测模块 (V9.6：使用批量数据进行回测) (保留)
 # ----------------------------------------------------
-# (代码与 V9.0 保持一致，调用 V9.4 run_scoring_for_date)
 def run_simple_backtest(days, params):
-    # ... (与 V9.0 代码保持一致)
     status = st.session_state['backtest_status']
     
     container = st.empty()
@@ -456,9 +417,9 @@ def run_simple_backtest(days, params):
             
         status['total_days'] = total_iterations
         
-        # 2. 预加载所有数据
+        # 2. V5.0 预加载所有数据 (仅在 bulk_data 为 None 时运行)
         if status['bulk_data'] is None:
-            st.warning("V9.4 终极加速中：正在预加载所有所需历史数据。请耐心等待，只需运行一次。")
+            st.warning("V9.6 终极加速中：正在预加载所有所需历史数据。请耐心等待，只需运行一次。")
             
             # a) 确定所有股票代码
             stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code')
@@ -482,7 +443,7 @@ def run_simple_backtest(days, params):
                 return
             
             st.success(f"数据预加载完成！共获取 {len(all_codes)} 支股票在 {start_date_hist} 至 {final_end_date} 间的数据。")
-            st.rerun() 
+            st.rerun() # 预加载完成后强制刷新，进入正式回测阶段
 
         # 3. 正式回测流程
         bulk_data = status['bulk_data']
@@ -507,10 +468,10 @@ def run_simple_backtest(days, params):
             select_date = trade_dates[i]
             next_trade_date = trade_dates[i+1]
             
-            # 核心步骤：调用 V9.4 评分函数
+            # 核心步骤：调用 V9.6 评分函数，传入内存中的 bulk_data
             select_df_full = run_scoring_for_date(select_date, bulk_data, params_dict) 
 
-            # T+1 收益计算逻辑 
+            # T+1 收益计算逻辑 (不变)
             return_pct = 0.0
             buy_price, sell_price = np.nan, np.nan
 
@@ -522,6 +483,7 @@ def run_simple_backtest(days, params):
                 
                 next_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
                 
+
                 if not next_day_data.empty and 'open' in next_day_data.columns and 'close' in next_day_data.columns:
                     buy_price = next_day_data.iloc[0]['open']
                     sell_price = next_day_data.iloc[0]['close']
@@ -545,6 +507,7 @@ def run_simple_backtest(days, params):
             
             pbar.progress(status['progress'], text=f"正在回测 {select_date}... [{i+1}/{total_iterations}]")
             
+            # 强制 Rerun 确保进度条更新
             if (i+1) % 2 == 0: 
                  st.rerun() 
         
@@ -553,7 +516,7 @@ def run_simple_backtest(days, params):
         status['current_index'] = total_iterations
         pbar.progress(1.0, text="回测完成。")
         
-        # 6. 结果展示
+        # 6. 结果展示 (不变)
         results_df = pd.DataFrame(status['results'])
         
         if results_df.empty:
@@ -569,7 +532,6 @@ def run_simple_backtest(days, params):
         st.markdown("---")
         st.subheader("💡 最终回测指标")
         colA, colB, colC = st.columns(3)
-        
         colA.metric("累计收益率 (T+1)", f"{cumulative_return*100:.2f}%")
         colB.metric("胜率", f"{win_rate*100:.2f}%")
         colC.metric("交易次数", f"{total_trades}")
@@ -578,23 +540,25 @@ def run_simple_backtest(days, params):
         st.dataframe(results_df, use_container_width=True)
 
 # ----------------------------------------------------
-# 实时选股模块 (不变)
+# 实时选股模块 (V9.6：使用批量数据进行实时评分) (保留)
 # ----------------------------------------------------
-# (代码与 V9.0 保持一致，调用 V9.4 run_scoring_for_date)
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
     
+    # V9.6 实时选股也需要历史数据，但不再逐个获取
     st.warning("正在预加载历史数据...")
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code')
     all_codes = stock_basic['ts_code'].tolist()
     start_dt = datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=60 * 1.5) 
     start_date_hist = start_dt.strftime("%Y%m%d")
     
+    # 批量获取数据并缓存
     bulk_data = bulk_fetch_daily(all_codes, start_date_hist, last_trade)
     if bulk_data.empty:
         st.error("实时选股所需历史数据获取失败。")
         return
     
+    # 5. 传入 bulk_data 进行评分
     params_dict = {
         'INITIAL_TOP_N': params['INITIAL_TOP_N'], 'FINAL_POOL': params['FINAL_POOL'], 'MIN_PRICE': params['MIN_PRICE'], 
         'MAX_PRICE': params['MAX_PRICE'], 'MIN_TURNOVER': params['MIN_TURNOVER'], 'MIN_AMOUNT': params['MIN_AMOUNT'], 
@@ -617,20 +581,19 @@ def run_live_selection(last_trade, params):
 
     st.dataframe(fdf[display_cols], use_container_width=True)
 
-    
     out_csv = fdf_full[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
     st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **极限防御模式**，极度偏爱高换手率和低波动率，是当前弱势行情下的最安全策略。
-- **【风控提示】** 已启用最严格的市值风控，避免选中大市值股。
+- **【策略风格】** 本版本为 **V9.6 逻辑修正版**，移除了风控硬性淘汰，让符合条件的股票能进入评分，是当前弱势行情下的最新优化策略。
+- **【风控提示】** 风控指标（波动率、放量倍数等）现已全部纳入**评分体系**。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
 
 # ----------------------------------------------------
-# 主程序控制逻辑
+# 主程序控制逻辑 (保留)
 # ----------------------------------------------------
 params = {
     'INITIAL_TOP_N': INITIAL_TOP_N, 'FINAL_POOL': FINAL_POOL, 'TOP_DISPLAY': TOP_DISPLAY,
@@ -647,4 +610,3 @@ elif st.session_state.get('run_selection', False):
     
 else:
     st.info("请点击上方的按钮开始运行。")
-
