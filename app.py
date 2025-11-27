@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V10.6 总市值修复版 (修复 total_mv_yuan KeyError)
+选股王 · V10.7 动量增强版 (修复 total_mv_yuan KeyError + 策略权重调整)
 
 说明：
-1. 【核心修复】修复了 V10.5 在指标评分时丢失 'total_mv_yuan' 列导致的 KeyError，确保 CSV 导出不再崩溃。
-2. 【稳定性】保留 V10.4 的交易日历稳定查找方式。
+1. 【修复继承】继承 V10.6 的 total_mv_yuan 列修复，确保 CSV 导出不再崩溃。
+2. 【核心策略】将评分权重从“极限防御”转向“流动性与动量平衡”，增加 s_pct, s_money, s_rsl 权重，降低 s_turn, s_volatility 权重，旨在提高 T+1/T+3 的短期收益。
 3. 【市值防御】保留“最低流通市值”硬性过滤，排除超小盘股。
 4. 【并列回测】保留 T+1, T+3, T+5 并列回测功能。
 """
@@ -30,8 +30,8 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V10.6 总市值修复版）", layout="wide")
-st.markdown("### 选股王（V10.6 总市值修复版）") 
+st.set_page_config(page_title="选股王（V10.7 动量增强版）", layout="wide")
+st.markdown("### 选股王（V10.7 动量增强版）") 
 
 # ---------------------------
 # 侧边栏参数
@@ -45,7 +45,7 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # V10.3 市值下限参数
+    # V10.3 市值下限参数 (用户可调整)
     MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=50.0, step=5.0)) 
     
     # 极限宽松流动性
@@ -63,7 +63,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V10.6 总市值修复版'。")
+    st.caption("提示：策略已升级至 'V10.7 动量增强版'。")
     st.caption("回测将同时计算 T+1, T+3, T+5 收益。")
 
 # ---------------------------
@@ -222,7 +222,7 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V10.6 修复：确保 total_mv_yuan 被带入最终 fdf)
+# 核心评分函数 (V10.7 修复 total_mv_yuan 并调整权重)
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
@@ -341,7 +341,6 @@ def run_scoring_for_date(trade_date, params):
         name = getattr(row, 'name', ts_code)
         
         circ_mv_wan = getattr(row, 'circ_mv_wan', np.nan)
-        # --- V10.6 核心修复：确保 total_mv_yuan 被获取 ---
         total_mv_yuan = getattr(row, 'total_mv_yuan', np.nan)
         # ----------------------------------------------------
 
@@ -366,7 +365,7 @@ def run_scoring_for_date(trade_date, params):
                'vol_last': vol_last, 'vol_ma5': vol_ma5, 'prev3_sum': prev3_sum, 'volatility_10': volatility_10,
                'proxy_money': proxy_money, 'name': name,
                'circ_mv_wan': circ_mv_wan,
-               'total_mv_yuan': total_mv_yuan} # <-- V10.6 FIX HERE: 添加 total_mv_yuan
+               'total_mv_yuan': total_mv_yuan} # 确保 total_mv_yuan 被带入
         records.append(rec)
         
         if pbar: pbar.progress((i + 1) / len(clean_df), text=f"指标计算进度：[{i+1}/{len(clean_df)}]...")
@@ -395,9 +394,17 @@ def run_scoring_for_date(trade_date, params):
     # 低波动率是加分项
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # V10.0 权重：高换手 (0.35) 和 低波动 (0.25) 权重最高
-    w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.05, 0.10, 0.35, 0.10, 0.05, 0.10, 0.05, 0.25
-    
+    # V10.7 权重：流动性与动量平衡 (高换手 0.25, 低波动 0.15)
+    # w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility
+    w_pct = 0.10      # 动量增强 (0.05 -> 0.10)
+    w_volratio = 0.10 # 保持
+    w_turn = 0.25     # 降低 (0.35 -> 0.25)
+    w_money = 0.15    # 动量增强 (0.10 -> 0.15)
+    w_10d = 0.05      # 保持
+    w_macd = 0.05     # 降低 (0.10 -> 0.05) - 将 MACD 权重分散
+    w_rsl = 0.10      # 动量增强 (0.05 -> 0.10)
+    w_volatility = 0.15 # 降低 (0.25 -> 0.15)
+
     fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] 
         * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
     
@@ -540,7 +547,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (V10.6：修复 CSV 导出列)
+# 实时选股模块 (V10.7)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -567,7 +574,7 @@ def run_live_selection(last_trade, params):
     fdf['流通市值 (亿)'] = fdf['circ_mv_wan'] / 10000.0
     
     # --------------------------------------------------
-    # V10.6 修复：CSV 导出列
+    # V10.6/V10.7 修复：CSV 导出列
     # 确保 display_cols 中的所有列都存在于 fdf_full 中
     display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
     
@@ -587,8 +594,8 @@ def run_live_selection(last_trade, params):
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V10.6 总市值修复版**，已修复所有已知 KeyError 错误。
-- **【风控提示】** **当前剩余候选仅 16 支。** 如果数量太少，请尝试降低侧边栏的 **“最低流通市值 (亿)”** 或 **“最低价格 (元)”** 参数。
+- **【策略风格】** 本版本为 **V10.7 动量增强版**，已修复所有已知 KeyError 错误。策略侧重于 **流动性与动量平衡**，旨在提高短期爆发力。
+- **【市值提示】** 您设置的 **“最低流通市值”** 有效地过滤了小盘股。如果选股数量太少，可以尝试降低该值。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
