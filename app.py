@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V10.5 流通市值修复版 (修复 circ_mv_wan KeyError)
+选股王 · V10.6 总市值修复版 (修复 total_mv_yuan KeyError)
 
 说明：
-1. 【核心修复】修复了 V10.3/V10.4 在指标评分时丢失 'circ_mv_wan' 列导致的 KeyError，确保流通市值能正确显示。
+1. 【核心修复】修复了 V10.5 在指标评分时丢失 'total_mv_yuan' 列导致的 KeyError，确保 CSV 导出不再崩溃。
 2. 【稳定性】保留 V10.4 的交易日历稳定查找方式。
 3. 【市值防御】保留“最低流通市值”硬性过滤，排除超小盘股。
 4. 【并列回测】保留 T+1, T+3, T+5 并列回测功能。
@@ -30,8 +30,8 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V10.5 流通市值修复版）", layout="wide")
-st.markdown("### 选股王（V10.5 流通市值修复版）") 
+st.set_page_config(page_title="选股王（V10.6 总市值修复版）", layout="wide")
+st.markdown("### 选股王（V10.6 总市值修复版）") 
 
 # ---------------------------
 # 侧边栏参数
@@ -46,7 +46,6 @@ with st.sidebar:
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
     # V10.3 市值下限参数
-    # --- 建议用户调整此参数 ---
     MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=50.0, step=5.0)) 
     
     # 极限宽松流动性
@@ -64,7 +63,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V10.5 流通市值修复版'。")
+    st.caption("提示：策略已升级至 'V10.6 总市值修复版'。")
     st.caption("回测将同时计算 T+1, T+3, T+5 收益。")
 
 # ---------------------------
@@ -223,7 +222,7 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V10.5 修复：确保 circ_mv_wan 被带入最终 fdf)
+# 核心评分函数 (V10.6 修复：确保 total_mv_yuan 被带入最终 fdf)
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
@@ -340,8 +339,10 @@ def run_scoring_for_date(trade_date, params):
         turnover_rate = getattr(row, 'turnover_rate', np.nan); net_mf = float(getattr(row, 'net_mf', 0.0));
         amount = getattr(row, 'amount_yuan', 0.0) 
         name = getattr(row, 'name', ts_code)
-        # --- V10.5 修复：确保 circ_mv_wan 被带入最终 fdf ---
+        
         circ_mv_wan = getattr(row, 'circ_mv_wan', np.nan)
+        # --- V10.6 核心修复：确保 total_mv_yuan 被获取 ---
+        total_mv_yuan = getattr(row, 'total_mv_yuan', np.nan)
         # ----------------------------------------------------
 
         @memory.cache
@@ -364,7 +365,8 @@ def run_scoring_for_date(trade_date, params):
                'vol_ratio': vol_ratio, '10d_return': ten_return, 'macd': macd, 'k': k, 'd': d, 'j': j,
                'vol_last': vol_last, 'vol_ma5': vol_ma5, 'prev3_sum': prev3_sum, 'volatility_10': volatility_10,
                'proxy_money': proxy_money, 'name': name,
-               'circ_mv_wan': circ_mv_wan} # <-- V10.5 FIX HERE: Pass to final DataFrame
+               'circ_mv_wan': circ_mv_wan,
+               'total_mv_yuan': total_mv_yuan} # <-- V10.6 FIX HERE: 添加 total_mv_yuan
         records.append(rec)
         
         if pbar: pbar.progress((i + 1) / len(clean_df), text=f"指标计算进度：[{i+1}/{len(clean_df)}]...")
@@ -538,7 +540,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (V10.5 使用修复后的 fdf)
+# 实时选股模块 (V10.6：修复 CSV 导出列)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -561,10 +563,19 @@ def run_live_selection(last_trade, params):
 
     st.success(f"评分完成：总候选 {len(fdf_full)} 支，显示 Top {min(params['TOP_DISPLAY'], len(fdf))}。")
     
-    # 转换为亿显示 (V10.5: circ_mv_wan 列现在保证存在)
+    # 转换为亿显示 
     fdf['流通市值 (亿)'] = fdf['circ_mv_wan'] / 10000.0
     
+    # --------------------------------------------------
+    # V10.6 修复：CSV 导出列
+    # 确保 display_cols 中的所有列都存在于 fdf_full 中
     display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
+    
+    for c in display_cols:
+        if c not in fdf_full.columns:
+            fdf_full[c] = np.nan # 确保所有列存在，防止 CSV 导出崩溃
+
+    # --------------------------------------------------
     
     # 调整显示列的顺序和名称
     final_display_cols = ['name','ts_code','综合评分','流通市值 (亿)','pct_chg','turnover_rate','amount','volatility_10','10d_return']
@@ -576,7 +587,7 @@ def run_live_selection(last_trade, params):
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V10.5 流通市值修复版**，已修复显示错误。
+- **【策略风格】** 本版本为 **V10.6 总市值修复版**，已修复所有已知 KeyError 错误。
 - **【风控提示】** **当前剩余候选仅 16 支。** 如果数量太少，请尝试降低侧边栏的 **“最低流通市值 (亿)”** 或 **“最低价格 (元)”** 参数。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
