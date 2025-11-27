@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（BC 混合增强版）· 极速版
+选股王 · 10000 积分旗舰（BC 混合增强版）· 极速版 - V3.0 最终稳定版
 说明：
-- 【本次修复】**最大化垂直空间**（精简标题，移除多余标题/空行）。
-- **优化页面回弹问题**：将回测和选股逻辑函数化，稳定内容显示。
+- 【本次修复】彻底解决 **回测速度慢** 和 **进度回退** 问题。
+- 采用 **Joblib 磁盘缓存** 替代 Streamlit 内存缓存，确保历史数据下载一次后永久复用。
+- 引入 **st.session_state** 实现回测**断点续传**，防止中途 Rerun 导致进度丢失。
 """
 
 import streamlit as st
@@ -12,15 +13,23 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
+import joblib 
+import os
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 页面设置
+# 外部缓存配置 (用于历史数据)
+# ---------------------------
+CACHE_DIR = "data_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+# joblib 封装 Tushare 接口，实现磁盘持久化缓存
+memory = joblib.Memory(CACHE_DIR, verbose=0)
+
+# ---------------------------
+# 页面设置 (UI 空间最大化)
 # ---------------------------
 st.set_page_config(page_title="选股王（极速版）", layout="wide")
-
-# 标题优化：使用 Markdown H3 进一步减小字号，仅保留最简信息
-st.markdown("### 选股王（极速版）")
+st.markdown("### 选股王（极速版）") # 精简标题
 
 # ---------------------------
 # 侧边栏参数（实时可改）- 保持不变
@@ -85,11 +94,33 @@ if not last_trade:
     st.stop()
 st.info(f"参考最近交易日：{last_trade}")
 
+
+# ---------------------------
+# 核心历史数据获取函数 (使用 joblib 外部缓存)
+# ---------------------------
+@memory.cache # 磁盘缓存
+def cached_get_hist(ts_code, end_date, days=60):
+    """使用 joblib 磁盘缓存，解决 Streamlit Rerun 丢失缓存的问题"""
+    try:
+        start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
+        # ⚠️ 注意：这里必须直接调用 pro.daily，不能使用 safe_get，否则 joblib 缓存会失败。
+        df = pro.daily(ts_code=ts_code, start_date=start, end_date=end_date) 
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.sort_values('trade_date').reset_index(drop=True)
+        return df
+    except Exception as e:
+        # print(f"Error fetching hist for {ts_code}: {e}") # 调试用
+        return pd.DataFrame()
+
 # ----------------------------------------------------
 # 按钮控制模块（优化：移除 “运行模式选择” 标题）
 # ----------------------------------------------------
 if 'run_selection' not in st.session_state: st.session_state['run_selection'] = False
 if 'run_backtest' not in st.session_state: st.session_state['run_backtest'] = False
+if 'backtest_status' not in st.session_state: 
+    # 初始化回测状态：progress - 进度条值；results - 已完成的交易结果；current_index - 当前进行到第几天
+    st.session_state['backtest_status'] = {'progress': 0.0, 'results': [], 'current_index': 0, 'total_days': 0}
 
 col1, col2 = st.columns(2)
 
@@ -97,31 +128,24 @@ with col1:
     if st.button("🚀 运行当日选股", use_container_width=True):
         st.session_state['run_selection'] = True
         st.session_state['run_backtest'] = False
+        # 重置回测状态，确保下次回测从头开始
+        st.session_state['backtest_status'] = {'progress': 0.0, 'results': [], 'current_index': 0, 'total_days': 0}
         st.rerun()
 
 with col2:
     if st.button(f"✅ 运行历史回测 ({BACKTEST_DAYS} 日)", use_container_width=True):
         st.session_state['run_backtest'] = True
         st.session_state['run_selection'] = False
+        # 如果是重新开始回测，则重置状态
+        if st.session_state['backtest_status']['progress'] == 1.0 or st.session_state['backtest_status']['total_days'] == 0:
+             st.session_state['backtest_status'] = {'progress': 0.0, 'results': [], 'current_index': 0, 'total_days': 0}
         st.rerun()
 
 st.markdown("---")
 
 # ---------------------------
-# 核心评分函数 (缓存 - 修复 FINAL_POOL 缓存问题)
+# 指标计算与归一化（保持不变）
 # ---------------------------
-@st.cache_data(ttl=600)
-def get_hist(ts_code, end_date, days=60):
-    try:
-        start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
-        df = safe_get(pro.daily, ts_code=ts_code, start_date=start, end_date=end_date)
-        if df.empty:
-            return pd.DataFrame()
-        df = df.sort_values('trade_date').reset_index(drop=True)
-        return df
-    except:
-        return pd.DataFrame()
-
 def compute_indicators(df):
     res = {}
     if df.empty or len(df) < 3: return res
@@ -195,12 +219,12 @@ def norm_col(s):
     if mx - mn < 1e-9: return pd.Series([0.5]*len(s), index=s.index)
     return (s - mn) / (mx - mn)
 
-# 核心评分函数
+# 核心评分函数 (此处必须用 st.cache_data 缓存，因为传入的参数是交易日，不同交易日结果不同)
 @st.cache_data(ttl=600)
 def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD):
     """
     核心评分函数，参数必须是可哈希的类型（如 float/int/str）。
-    TOP_DISPLAY 不影响评分逻辑，所以不作为缓存参数。
+    内部调用 cached_get_hist (joblib 缓存)
     """
     
     # 1. 拉取当日涨幅榜初筛
@@ -209,7 +233,7 @@ def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE,
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
     pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
 
-    # 2. 拉取和合并高级接口数据
+    # 2. 拉取和合并高级接口数据 (与 V2.0 一致)
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,total_mv,circ_mv')
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
@@ -233,7 +257,7 @@ def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE,
     except: pool_merged['net_mf'] = 0.0
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
     
-    # 3. 清洗 (此处应使用您完整代码中的清洗逻辑)
+    # 3. 清洗 (与 V2.0 一致)
     clean_list = []
     for r in pool_merged.itertuples():
         ts_code = getattr(r, 'ts_code')
@@ -270,13 +294,12 @@ def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE,
     clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
     if clean_df.empty: return pd.DataFrame()
 
-    # 关键修复：在缓存函数内部限制评分池大小
     score_pool_n = min(int(FINAL_POOL_LIMIT), 300)
     clean_df = clean_df.sort_values('pct_chg', ascending=False).head(score_pool_n).reset_index(drop=True)
     
-    # 4. 指标计算与评分 (此处应使用您完整代码中的评分逻辑)
+    # 4. 指标计算与评分 (与 V2.0 一致，注意调用 cached_get_hist)
     records = []
-    # (省略了逐票计算指标和评分的循环，请确保您使用的是完整的代码)
+    # **此处移除了进度条，因为 run_scoring_for_date 在回测时已经有上层进度条控制**
     for row in clean_df.itertuples():
         ts_code = getattr(row, 'ts_code'); pct_chg = getattr(row, 'pct_chg', 0.0);
         turnover_rate = getattr(row, 'turnover_rate', np.nan); net_mf = float(getattr(row, 'net_mf', 0.0));
@@ -285,7 +308,8 @@ def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE,
         amount = amount if not pd.isna(amount) else 0.0
         name = getattr(row, 'name', ts_code)
 
-        hist = get_hist(ts_code, trade_date, days=60)
+        # 核心变动：调用磁盘缓存函数
+        hist = cached_get_hist(ts_code, trade_date, days=60)
         ind = compute_indicators(hist)
 
         vol_ratio, ten_return, macd, k, d, j, vol_last, vol_ma5, prev3_sum, volatility_10, ma20, last_close = \
@@ -306,7 +330,7 @@ def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE,
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame()
 
-    # 5. 风险过滤 (与原代码一致)
+    # 5. 风险过滤 (与 V2.0 一致)
     if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
         fdf = fdf[~((fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD))]
     if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
@@ -318,7 +342,7 @@ def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE,
 
     if fdf.empty: return pd.DataFrame()
 
-    # 6. RSL & 归一化 (与原代码一致)
+    # 6. RSL & 归一化 (与 V2.0 一致)
     if '10d_return' in fdf.columns:
         try:
             market_mean_10d = fdf['10d_return'].replace([np.inf,-np.inf], np.nan).dropna().mean()
@@ -336,22 +360,23 @@ def run_scoring_for_date(trade_date, INITIAL_TOP_N, FINAL_POOL_LIMIT, MIN_PRICE,
     fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # 7. 综合评分 (与原代码一致)
+    # 7. 综合评分 (与 V2.0 一致)
     w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.18, 0.18, 0.12, 0.14, 0.12, 0.06, 0.12, 0.08
     fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
     
     return fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
 
 # ----------------------------------------------------
-# 简易回测模块
+# 简易回测模块 (实现断点续传)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
-    # 使用 st.empty() 创建一个容器，用于存放回测进度和结果
+    status = st.session_state['backtest_status']
+    
     container = st.empty()
     with container.container():
         st.subheader("📈 简易历史回测结果")
         
-        # 获取交易日历
+        # 1. 获取交易日历
         trade_dates_df = safe_get(pro.trade_cal, exchange='SSE', is_open='1', end_date=find_last_trade_day(), fields='cal_date')
         if trade_dates_df.empty:
             st.error("无法获取历史交易日历。")
@@ -360,51 +385,46 @@ def run_simple_backtest(days, params):
         trade_dates = trade_dates_df['cal_date'].sort_values(ascending=False).head(days + 1).tolist()
         trade_dates.reverse() # 从老到新
 
-        if len(trade_dates) < 2:
+        total_iterations = len(trade_dates) - 1
+        if total_iterations < 1:
             st.warning("交易日不足，无法进行回测。")
             return
         
-        # 将 TOP_DISPLAY 设为 1 用于回测（只取第一名），但不用传入 run_scoring_for_date
-        backtest_results = []
+        # 2. 初始化/检查状态
+        if status['total_days'] == 0:
+            status['total_days'] = total_iterations
         
-        # 进度条文本优化
-        pbar_text = f"回测开始... [0/{len(trade_dates) - 1}]"
-        pbar = st.progress(0, text=pbar_text)
+        start_index = status['current_index'] # 从上次中断的点继续
         
-        st.markdown(f"**回测周期：** 最近 **{days}** 个交易日（**{trade_dates[0]}** 至 **{trade_dates[-2]}**）")
+        if start_index >= total_iterations:
+             st.success(f"回测已完成。累计收益率请查看下方。")
+        else:
+             st.info(f"回测周期：**{trade_dates[0]}** 至 **{trade_dates[-2]}**。正在从第 {start_index+1} 天继续...")
 
-        try:
-            # 回测参数 (FINAL_POOL 限制在 300 已经在 run_scoring_for_date 内部实现)
-            score_params = (
-                params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], params['MAX_PRICE'], 
-                params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['VOL_SPIKE_MULT'], 
-                params['VOLATILITY_MAX'], params['HIGH_PCT_THRESHOLD']
-            )
+        # 3. 进度条 (进度条必须在循环外部定义，并在循环内部更新)
+        pbar = st.progress(status['progress'], text=f"回测进度：[{status['current_index']}/{status['total_days']}]...")
+        
+        # 4. 回测循环 (从断点开始)
+        score_params_tuple = (
+            params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], params['MAX_PRICE'], 
+            params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['VOL_SPIKE_MULT'], 
+            params['VOLATILITY_MAX'], params['HIGH_PCT_THRESHOLD']
+        )
+        
+        for i in range(start_index, total_iterations):
+            select_date = trade_dates[i]
+            next_trade_date = trade_dates[i+1]
+            
+            # **核心步骤：调用评分函数**
+            select_df_full = run_scoring_for_date(select_date, *score_params_tuple)
 
-            for i in range(len(trade_dates) - 1):
-                select_date = trade_dates[i]
-                next_trade_date = trade_dates[i+1]
-                
-                # 更新进度条
-                pbar_text = f"正在回测 {select_date}... [{i+1}/{len(trade_dates) - 1}]"
-                pbar.progress((i+1) / (len(trade_dates) - 1), text=pbar_text)
-
-                # 调用缓存函数
-                # 注意：这里只传入了缓存参数，避免 UnhashableParamError
-                select_df_full = run_scoring_for_date(
-                    select_date, params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], 
-                    params['MAX_PRICE'], params['MIN_TURNOVER'], params['MIN_AMOUNT'], 
-                    params['VOL_SPIKE_MULT'], params['VOLATILITY_MAX'], params['HIGH_PCT_THRESHOLD']
-                )
-
-                if select_df_full.empty:
-                    backtest_results.append({'选股日': select_date, '股票': '无符合条件', 'T+1 收益率': 0.0, '买入价 (T+1 开盘)': np.nan, '卖出价 (T+1 收盘)': np.nan, '评分': np.nan})
-                    continue
-
+            if select_df_full.empty:
+                result = {'选股日': select_date, '股票': '无符合条件', 'T+1 收益率': 0.0, '买入价 (T+1 开盘)': np.nan, '卖出价 (T+1 收盘)': np.nan, '评分': np.nan}
+            else:
                 top_pick = select_df_full.iloc[0] # 只取第一名
                 ts_code = top_pick['ts_code']
                 
-                # 获取 T+1 交易日数据
+                # 获取 T+1 交易日数据 (这里也可能调用 cached_get_hist 或 pro.daily，但频率不高)
                 next_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
                 
                 return_pct = 0.0
@@ -417,25 +437,39 @@ def run_simple_backtest(days, params):
                     if buy_price > 0 and not pd.isna(sell_price):
                         return_pct = (sell_price / buy_price) - 1.0
 
-                backtest_results.append({
+                result = {
                     '选股日': select_date,
                     '股票': f"{top_pick.get('name', 'N/A')}({ts_code})",
                     'T+1 收益率': return_pct * 100,
                     '买入价 (T+1 开盘)': buy_price,
                     '卖出价 (T+1 收盘)': sell_price,
                     '评分': top_pick['综合评分']
-                })
-        except Exception as e:
-            # 捕获回测过程中的错误，并显示
-            st.error(f"回测过程中断，可能出现网络或数据权限问题。错误信息：{e}")
-            pbar.empty() # 清除进度条
-            return
+                }
 
-        # 进度条跑完
+            # 5. 更新状态和进度条
+            status['results'].append(result)
+            status['current_index'] = i + 1
+            status['progress'] = (i + 1) / total_iterations
+            
+            pbar.progress(status['progress'], text=f"正在回测 {select_date}... [{i+1}/{total_iterations}]")
+            
+            # **关键修复**：每隔 X 天强制 Rerun，确保进度条和已完成的 results 被 Streamlit 正常渲染。
+            # 这会触发 Streamlit Rerun，但由于进度保存在 session_state，下次会从断点继续。
+            if i % 2 == 0: 
+                 st.rerun() 
+        
+        # 循环结束，标记完成
+        status['progress'] = 1.0
+        status['current_index'] = total_iterations
         pbar.progress(1.0, text="回测完成。")
         
-        # 结果展示
-        results_df = pd.DataFrame(backtest_results)
+        # 6. 结果展示
+        results_df = pd.DataFrame(status['results'])
+        
+        if results_df.empty:
+            st.warning("回测结果为空。")
+            return
+            
         results_df['T+1 收益率'] = results_df['T+1 收益率'].replace([np.inf, -np.inf], 0.0).fillna(0.0)
         cumulative_return = (results_df['T+1 收益率'] / 100 + 1).product() - 1
         wins = (results_df['T+1 收益率'] > 0).sum()
@@ -453,17 +487,18 @@ def run_simple_backtest(days, params):
         st.dataframe(results_df, use_container_width=True)
 
 # ----------------------------------------------------
-# 实时选股模块
+# 实时选股模块 (保持与 V2.0 一致)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
     
-    # 回测参数 (FINAL_POOL 限制在 300 已经在 run_scoring_for_date 内部实现)
-    fdf_full = run_scoring_for_date(
-        last_trade, params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], 
-        params['MAX_PRICE'], params['MIN_TURNOVER'], params['MIN_AMOUNT'], 
-        params['VOL_SPIKE_MULT'], params['VOLATILITY_MAX'], params['HIGH_PCT_THRESHOLD']
+    score_params_tuple = (
+        params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], params['MAX_PRICE'], 
+        params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['VOL_SPIKE_MULT'], 
+        params['VOLATILITY_MAX'], params['HIGH_PCT_THRESHOLD']
     )
+    
+    fdf_full = run_scoring_for_date(last_trade, *score_params_tuple)
 
     if fdf_full.empty:
         st.error("清洗和评分后没有候选，建议放宽条件或检查接口权限。")
@@ -496,8 +531,6 @@ def run_live_selection(last_trade, params):
 # ----------------------------------------------------
 # 主程序控制逻辑
 # ----------------------------------------------------
-
-# 将所有参数打包成一个字典
 params = {
     'INITIAL_TOP_N': INITIAL_TOP_N, 'FINAL_POOL': FINAL_POOL, 'TOP_DISPLAY': TOP_DISPLAY,
     'MIN_PRICE': MIN_PRICE, 'MAX_PRICE': MAX_PRICE, 'MIN_TURNOVER': MIN_TURNOVER,
@@ -505,16 +538,11 @@ params = {
     'HIGH_PCT_THRESHOLD': HIGH_PCT_THRESHOLD
 }
 
-# 检查是否需要运行回测
 if st.session_state.get('run_backtest', False):
-    # 调用回测函数，将结果固定在当前位置
     run_simple_backtest(BACKTEST_DAYS, params)
     
-# 实时选股（只有当 run_selection 为 True 时运行）
 elif st.session_state.get('run_selection', False):
     run_live_selection(last_trade, params)
     
-# 初始状态或运行结束后，给出提示
 else:
     st.info("请点击上方的按钮开始运行。")
-
