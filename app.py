@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V10.4 交易日历稳定版 (修复启动失败问题)
+选股王 · V10.5 流通市值修复版 (修复 circ_mv_wan KeyError)
 
 说明：
-1. 【稳定性升级】修复了启动时查询“最近交易日”可能失败的问题，将 pro.daily 替换为更稳定的 pro.trade_cal 接口。
-2. 【市值防御】保留 V10.3 的“最低流通市值”硬性过滤，排除超小盘股。
-3. 【并列回测】保留 T+1, T+3, T+5 并列回测功能。
-4. 【策略与冗余】保留 V10.0 的“极限防御”权重和所有数据冗余容错机制。
+1. 【核心修复】修复了 V10.3/V10.4 在指标评分时丢失 'circ_mv_wan' 列导致的 KeyError，确保流通市值能正确显示。
+2. 【稳定性】保留 V10.4 的交易日历稳定查找方式。
+3. 【市值防御】保留“最低流通市值”硬性过滤，排除超小盘股。
+4. 【并列回测】保留 T+1, T+3, T+5 并列回测功能。
 """
 
 import streamlit as st
@@ -30,8 +30,8 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V10.4 交易日历稳定版）", layout="wide")
-st.markdown("### 选股王（V10.4 交易日历稳定版）") 
+st.set_page_config(page_title="选股王（V10.5 流通市值修复版）", layout="wide")
+st.markdown("### 选股王（V10.5 流通市值修复版）") 
 
 # ---------------------------
 # 侧边栏参数
@@ -46,7 +46,8 @@ with st.sidebar:
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
     # V10.3 市值下限参数
-    MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=50.0, step=5.0)) # 默认为 50 亿
+    # --- 建议用户调整此参数 ---
+    MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=50.0, step=5.0)) 
     
     # 极限宽松流动性
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.1)) 
@@ -63,7 +64,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V10.4 交易日历稳定版'。")
+    st.caption("提示：策略已升级至 'V10.5 流通市值修复版'。")
     st.caption("回测将同时计算 T+1, T+3, T+5 收益。")
 
 # ---------------------------
@@ -93,11 +94,10 @@ def safe_get(func, **kwargs):
         return pd.DataFrame()
 
 # ---------------------------
-# V10.4 核心修改：使用 pro.trade_cal 稳定获取最近交易日
+# V10.4 稳定版交易日历获取
 # ---------------------------
 @st.cache_data(ttl=600)
 def find_last_trade_day():
-    """V10.4 稳定版：使用 pro.trade_cal 接口查找最近交易日"""
     end_date = datetime.now().strftime("%Y%m%d")
     cal_df = safe_get(
         pro.trade_cal, 
@@ -108,7 +108,6 @@ def find_last_trade_day():
     )
     
     if not cal_df.empty:
-        # 直接获取最新的交易日
         return cal_df['cal_date'].max() 
     return None
 
@@ -224,7 +223,7 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V10.4：保留 V10.3 的市值过滤逻辑)
+# 核心评分函数 (V10.5 修复：确保 circ_mv_wan 被带入最终 fdf)
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
@@ -341,6 +340,9 @@ def run_scoring_for_date(trade_date, params):
         turnover_rate = getattr(row, 'turnover_rate', np.nan); net_mf = float(getattr(row, 'net_mf', 0.0));
         amount = getattr(row, 'amount_yuan', 0.0) 
         name = getattr(row, 'name', ts_code)
+        # --- V10.5 修复：确保 circ_mv_wan 被带入最终 fdf ---
+        circ_mv_wan = getattr(row, 'circ_mv_wan', np.nan)
+        # ----------------------------------------------------
 
         @memory.cache
         def get_daily_hist(ts_code, start_date, end_date):
@@ -361,7 +363,8 @@ def run_scoring_for_date(trade_date, params):
         rec = {'ts_code': ts_code, 'pct_chg': pct_chg, 'turnover_rate': turnover_rate, 'net_mf': net_mf, 'amount': amount,
                'vol_ratio': vol_ratio, '10d_return': ten_return, 'macd': macd, 'k': k, 'd': d, 'j': j,
                'vol_last': vol_last, 'vol_ma5': vol_ma5, 'prev3_sum': prev3_sum, 'volatility_10': volatility_10,
-               'proxy_money': proxy_money, 'name': name}
+               'proxy_money': proxy_money, 'name': name,
+               'circ_mv_wan': circ_mv_wan} # <-- V10.5 FIX HERE: Pass to final DataFrame
         records.append(rec)
         
         if pbar: pbar.progress((i + 1) / len(clean_df), text=f"指标计算进度：[{i+1}/{len(clean_df)}]...")
@@ -535,7 +538,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (与 V10.3 相同)
+# 实时选股模块 (V10.5 使用修复后的 fdf)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -558,10 +561,10 @@ def run_live_selection(last_trade, params):
 
     st.success(f"评分完成：总候选 {len(fdf_full)} 支，显示 Top {min(params['TOP_DISPLAY'], len(fdf))}。")
     
-    display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
-    
-    # 转换为亿显示
+    # 转换为亿显示 (V10.5: circ_mv_wan 列现在保证存在)
     fdf['流通市值 (亿)'] = fdf['circ_mv_wan'] / 10000.0
+    
+    display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
     
     # 调整显示列的顺序和名称
     final_display_cols = ['name','ts_code','综合评分','流通市值 (亿)','pct_chg','turnover_rate','amount','volatility_10','10d_return']
@@ -573,8 +576,8 @@ def run_live_selection(last_trade, params):
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V10.4 交易日历稳定版**，已加入最低市值过滤，并增强了 Tushare 连接稳定性。
-- **【风控提示】** **最低流通市值已设置为您的偏好值（默认为 50 亿）。** 请根据需要调整。
+- **【策略风格】** 本版本为 **V10.5 流通市值修复版**，已修复显示错误。
+- **【风控提示】** **当前剩余候选仅 16 支。** 如果数量太少，请尝试降低侧边栏的 **“最低流通市值 (亿)”** 或 **“最低价格 (元)”** 参数。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
