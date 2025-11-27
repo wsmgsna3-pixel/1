@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V10.7 动量增强版 (修复 total_mv_yuan KeyError + 策略权重调整)
+选股王 · V10.8 中期稳定版 (策略权重调整：增强 MACD 和低波动防御)
 
 说明：
-1. 【修复继承】继承 V10.6 的 total_mv_yuan 列修复，确保 CSV 导出不再崩溃。
-2. 【核心策略】将评分权重从“极限防御”转向“流动性与动量平衡”，增加 s_pct, s_money, s_rsl 权重，降低 s_turn, s_volatility 权重，旨在提高 T+1/T+3 的短期收益。
-3. 【市值防御】保留“最低流通市值”硬性过滤，排除超小盘股。
-4. 【并列回测】保留 T+1, T+3, T+5 并列回测功能。
+1. 【策略调整】针对 V10.7 回测中 T+3/T+5 暴跌的问题，重新调整权重。
+2. 【核心策略】大幅增加 MACD (中期趋势) 和 低波动 (防御性) 的权重，降低当日涨幅权重，追求中期持仓的稳定性。
+3. 【修复继承】继承 V10.6/V10.7 的 total_mv_yuan 列修复。
+4. 【市值防御】保留“最低流通市值”硬性过滤。
+5. 【并列回测】保留 T+1, T+3, T+5 并列回测功能。
 """
 
 import streamlit as st
@@ -30,8 +31,8 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V10.7 动量增强版）", layout="wide")
-st.markdown("### 选股王（V10.7 动量增强版）") 
+st.set_page_config(page_title="选股王（V10.8 中期稳定版）", layout="wide")
+st.markdown("### 选股王（V10.8 中期稳定版）") 
 
 # ---------------------------
 # 侧边栏参数
@@ -63,7 +64,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V10.7 动量增强版'。")
+    st.caption("提示：策略已升级至 'V10.8 中期稳定版'。")
     st.caption("回测将同时计算 T+1, T+3, T+5 收益。")
 
 # ---------------------------
@@ -222,7 +223,7 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V10.7 修复 total_mv_yuan 并调整权重)
+# 核心评分函数 
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
@@ -394,16 +395,16 @@ def run_scoring_for_date(trade_date, params):
     # 低波动率是加分项
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # V10.7 权重：流动性与动量平衡 (高换手 0.25, 低波动 0.15)
+    # V10.8 权重：中期稳定版 (高 MACD 0.15, 低波动 0.25)
     # w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility
-    w_pct = 0.10      # 动量增强 (0.05 -> 0.10)
+    w_pct = 0.05      # 降回：避免追高
     w_volratio = 0.10 # 保持
-    w_turn = 0.25     # 降低 (0.35 -> 0.25)
-    w_money = 0.15    # 动量增强 (0.10 -> 0.15)
+    w_turn = 0.25     # 保持：高流动性
+    w_money = 0.10    # 降回：避免当日资金流冲动
     w_10d = 0.05      # 保持
-    w_macd = 0.05     # 降低 (0.10 -> 0.05) - 将 MACD 权重分散
-    w_rsl = 0.10      # 动量增强 (0.05 -> 0.10)
-    w_volatility = 0.15 # 降低 (0.25 -> 0.15)
+    w_macd = 0.15     # 大幅增加：核心中期趋势因子
+    w_rsl = 0.10      # 保持：相对强度
+    w_volatility = 0.25 # 大幅增加：恢复防御性
 
     fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] 
         * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
@@ -547,7 +548,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (V10.7)
+# 实时选股模块 (V10.8)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -574,7 +575,7 @@ def run_live_selection(last_trade, params):
     fdf['流通市值 (亿)'] = fdf['circ_mv_wan'] / 10000.0
     
     # --------------------------------------------------
-    # V10.6/V10.7 修复：CSV 导出列
+    # V10.6/V10.7/V10.8 修复：CSV 导出列
     # 确保 display_cols 中的所有列都存在于 fdf_full 中
     display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
     
@@ -594,7 +595,7 @@ def run_live_selection(last_trade, params):
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V10.7 动量增强版**，已修复所有已知 KeyError 错误。策略侧重于 **流动性与动量平衡**，旨在提高短期爆发力。
+- **【策略风格】** 本版本为 **V10.8 中期稳定版**。策略侧重于 **高流动性 + 稳健中期趋势**，旨在防御 T+3/T+5 的深跌。
 - **【市值提示】** 您设置的 **“最低流通市值”** 有效地过滤了小盘股。如果选股数量太少，可以尝试降低该值。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
