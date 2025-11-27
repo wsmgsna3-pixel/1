@@ -397,13 +397,12 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
     fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # 7. 综合评分 (V8.0 权重调整：稳定与流动性至上)
-    # V8.0 权重: w_pct (0.10), w_volratio (0.10), w_turn (0.25), w_money (0.10), w_10d (0.10), w_macd (0.10), w_rsl (0.10), w_volatility (0.15)
-    w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.10, 0.10, 0.25, 0.10, 0.10, 0.10, 0.10, 0.15
+        # 7. 综合评分 (V9.0 权重调整：极限防御：w_turn (0.35), w_volatility (0.25))
+    # V9.0 权重: w_pct (0.05), w_volratio (0.10), w_turn (0.35), w_money (0.10), w_10d (0.05), w_macd (0.10), w_rsl (0.05), w_volatility (0.25)
+    w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.05, 0.10, 0.35, 0.10, 0.05, 0.10, 0.05, 0.25
     
     fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] * w_money + fdf['s_10d'] * w_10d + fdf['s_macd'] * w_macd + fdf['s_rsl'] * w_rsl + fdf['s_volatility'] * w_volatility)
-    
-    return fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
+
 
 
 # ----------------------------------------------------
