@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V10.2 多周期并列回测版 (T+1, T+3, T+5 同时展示)
+选股王 · V10.3 市值下限防御版 (增加最低流通市值过滤)
 
 说明：
-1. 【回测升级】一次运行，同时展示 T+1, T+3, T+5 收益率，便于横向比较。
-2. 【价格逻辑】买入价：T+1 开盘价；卖出价：T+N 收盘价 (更接近实战)。
-3. 【稳定性】保留 V10.0 的所有数据冗余和容错机制，保证接口故障时不至于清零。
+1. 【市值优化】新增“最低流通市值”硬性过滤，排除 7亿-18亿 的超小盘股。
+2. 【回测功能】保留 V10.2 的 T+1, T+3, T+5 并列回测功能。
+3. 【策略风格】保留 V10.0 的“极限防御”权重（高换手/低波动）。
+4. 【稳定性】保留 V10.0 的所有数据冗余和容错机制。
 """
 
 import streamlit as st
@@ -24,17 +25,16 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 CACHE_DIR = "data_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
-# joblib 封装 Tushare 接口，实现磁盘持久化缓存
 memory = joblib.Memory(CACHE_DIR, verbose=0)
 
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V10.2 多周期并列回测版）", layout="wide")
-st.markdown("### 选股王（V10.2 多周期并列回测版）") 
+st.set_page_config(page_title="选股王（V10.3 市值下限防御版）", layout="wide")
+st.markdown("### 选股王（V10.3 市值下限防御版）") 
 
 # ---------------------------
-# 侧边栏参数（保留 V10.0 策略参数）
+# 侧边栏参数（新增 MIN_CIRC_MV_Billion）
 # ---------------------------
 with st.sidebar:
     st.header("可调参数（实时）")
@@ -45,22 +45,25 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
+    # ***V10.3 新增参数：最低流通市值***
+    MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=50.0, step=5.0)) # 默认为 50 亿
+    
     # 极限宽松流动性
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.1)) 
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=20_000_000.0, step=5_000_000.0)) # 2000万
     
-    # 风控参数保留，但仅用于评分
+    # 风控参数保留
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.4, step=0.1)) 
     VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.0, step=0.5)) 
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
     
     st.markdown("---")
     
-    # ***回测天数 N***
+    # 回测天数 N
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V10.2 多周期并列回测版'。")
+    st.caption("提示：策略已升级至 'V10.3 市值下限防御版'。")
     st.caption("回测将同时计算 T+1, T+3, T+5 收益。")
 
 # ---------------------------
@@ -78,7 +81,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ---------------------------
-# 依赖函数：数据安全获取和交易日查找
+# 依赖函数：数据安全获取和交易日查找 (与 V10.2 相同)
 # ---------------------------
 def safe_get(func, **kwargs):
     try:
@@ -108,7 +111,7 @@ st.info(f"参考最近交易日：{last_trade}")
 
 
 # ----------------------------------------------------
-# 按钮控制模块
+# 按钮控制模块 (与 V10.2 相同)
 # ----------------------------------------------------
 if 'run_selection' not in st.session_state: st.session_state['run_selection'] = False
 if 'run_backtest' not in st.session_state: st.session_state['run_backtest'] = False
@@ -135,8 +138,9 @@ with col2:
 st.markdown("---")
 
 # ---------------------------
-# 指标计算和归一化 (V10.0 完整版)
+# 指标计算和归一化 (与 V10.2 完整版相同，此处不再重复全部辅助函数)
 # ---------------------------
+# ... (compute_indicators, safe_merge_pool, norm_col functions remain the same as V10.2) ...
 def compute_indicators(df):
     res = {}
     if df.empty or len(df) < 3: return res
@@ -212,28 +216,23 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V10.0 完整版，包含冗余容错逻辑)
+# 核心评分函数 (V10.3 修改：增加市值下限过滤)
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
-    """
-    V10.0 评分函数：加强数据冗余和容错。
-    """
     
     # 解包参数
-    initial_top_n, final_pool_limit, min_price, max_price, min_turnover, min_amount = \
+    initial_top_n, final_pool_limit, min_price, max_price, min_turnover, min_amount, min_circ_mv_billion = \
         params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], params['MAX_PRICE'], \
-        params['MIN_TURNOVER'], params['MIN_AMOUNT']
+        params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['MIN_CIRC_MV_Billion']
     
     # 1. 拉取当日涨幅榜初筛
     daily_all = safe_get(pro.daily, trade_date=trade_date)
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
     
-    # --- 诊断 1：检查 Tushare 数据是否拉取成功 ---
     if daily_all.empty: 
-        if trade_date == last_trade:
-             st.error(f"诊断：Tushare 无法获取 {trade_date} 的日线数据，请检查 Token 权限或网络。")
+        if trade_date == last_trade: st.error(f"诊断：Tushare 无法获取 {trade_date} 的日线数据，请检查 Token 权限或网络。")
         return pd.DataFrame()
     
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
@@ -260,13 +259,15 @@ def run_scoring_for_date(trade_date, params):
     except: pool_merged['net_mf'] = 0.0
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
     
-    # V10.0 核心冗余：使用 daily_all 的 amount 字段（万）作为主要成交额数据源，并转换为元
+    # 成交额数据清洗和转换 (V10.0 冗余保留)
     if 'amount' in pool_merged.columns:
         pool_merged['amount'] = pool_merged['amount'].apply(lambda amt: amt * 10000.0 if not pd.isna(amt) and amt > 0 and amt < 1e5 else amt)
     else:
         pool_merged['amount'] = pool_merged['amount_db'].apply(lambda amt: amt * 10000.0 if not pd.isna(amt) and amt > 0 and amt < 1e5 else amt)
     
     pool_merged['amount_yuan'] = pool_merged['amount']
+    # 流通市值和总市值（单位：万，Tushare 单位）
+    pool_merged['circ_mv_wan'] = pool_merged['circ_mv'].fillna(0)
     pool_merged['total_mv_yuan'] = pool_merged['total_mv'].apply(
         lambda tv: tv * 10000.0 if not pd.isna(tv) and tv > 1e6 else tv)
 
@@ -275,10 +276,10 @@ def run_scoring_for_date(trade_date, params):
     if trade_date == last_trade:
         st.info(f"诊断：原始涨幅榜初筛并合并后，股票数量: **{len(pool_merged)}** 支。")
     
-    # 3. 清洗 (V10.0 冗余容错过滤)
+    # 3. 清洗 (V10.3：新增流通市值下限过滤)
     clean_df = pool_merged.copy()
     
-    # 价格、ST、停牌过滤 (保留)
+    # 价格、ST、停牌过滤 
     clean_df = clean_df[~(
         (clean_df['close'].isna()) | 
         (clean_df['close'] < min_price) | 
@@ -286,16 +287,19 @@ def run_scoring_for_date(trade_date, params):
         (clean_df['name'].str.contains('ST|退', case=False, na=False))
     )]
     
-    # 涨跌幅过滤 (当日上涨) (保留)
+    # 涨跌幅过滤 (当日上涨)
     clean_df = clean_df[~((clean_df['pct_chg'].isna()) | (clean_df['pct_chg'] < 0))]
     
+    # --- V10.3 核心修改：流通市值下限过滤 ---
+    min_circ_mv_wan = min_circ_mv_billion * 10000.0 # 将用户输入的亿转为 Tushare 的万单位
     
-    # V10.0 核心容错流动性过滤：
-    
-    # 1. 成交额硬性过滤 (依赖 pro.daily 数据的 amount_yuan，数据可靠性高)
+    # 过滤掉流通市值低于 min_circ_mv_wan 的股票
+    clean_df = clean_df[clean_df['circ_mv_wan'].notna() & (clean_df['circ_mv_wan'] >= min_circ_mv_wan)]
+
+    # 1. 成交额硬性过滤
     clean_df = clean_df[clean_df['amount_yuan'].notna() & (clean_df['amount_yuan'] >= min_amount)]
     
-    # 2. 换手率硬性过滤 (容错：如果 turnover_rate 缺失，则跳过此过滤)
+    # 2. 换手率硬性过滤
     turnover_filter_cond = (
         clean_df['turnover_rate'].notna() & 
         (clean_df['turnover_rate'] < min_turnover)
@@ -392,9 +396,7 @@ def run_scoring_for_date(trade_date, params):
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     
-    # ***V10.2 核心修改：定义需要回测的周期列表***
     HOLDING_PERIODS = [1, 3, 5] 
-    
     status = st.session_state['backtest_status']
     
     container = st.empty()
@@ -407,10 +409,8 @@ def run_simple_backtest(days, params):
             return
 
         max_holding = max(HOLDING_PERIODS)
-        # 确保有足够的数据来计算最长周期的收益
         trade_dates = trade_dates_df['cal_date'].sort_values(ascending=False).head(days + max_holding).tolist() 
         trade_dates.reverse() 
-        # 最后一个选股日必须保证后面有 max_holding 天来计算收益
         total_iterations = len(trade_dates) - max_holding 
         
         if total_iterations < 1:
@@ -432,16 +432,16 @@ def run_simple_backtest(days, params):
             'INITIAL_TOP_N': params['INITIAL_TOP_N'], 'FINAL_POOL': params['FINAL_POOL'], 'MIN_PRICE': params['MIN_PRICE'], 
             'MAX_PRICE': params['MAX_PRICE'], 'MIN_TURNOVER': params['MIN_TURNOVER'], 'MIN_AMOUNT': params['MIN_AMOUNT'], 
             'VOL_SPIKE_MULT': params['VOL_SPIKE_MULT'], 'VOLATILITY_MAX': params['VOLATILITY_MAX'], 
-            'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD']
+            'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD'],
+            'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'] # V10.3 新增参数
         }
         
         for i in range(start_index, total_iterations):
             select_date = trade_dates[i]
-            next_trade_date = trade_dates[i+1] # T+1 日，用于买入
+            next_trade_date = trade_dates[i+1] 
             
             select_df_full = run_scoring_for_date(select_date, score_params) 
 
-            # 初始化结果
             result = {
                 '选股日': select_date, 
                 '股票': '无符合条件', 
@@ -457,7 +457,6 @@ def run_simple_backtest(days, params):
                 top_pick = select_df_full.iloc[0] 
                 ts_code = top_pick['ts_code']
                 
-                # --- 获取 T+1 买入价 ---
                 buy_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
                 buy_price = buy_day_data.iloc[0]['open'] if not buy_day_data.empty and 'open' in buy_day_data.columns else np.nan
                 
@@ -467,9 +466,8 @@ def run_simple_backtest(days, params):
                 
                 if buy_price > 0 and not pd.isna(buy_price):
                     
-                    # --- 循环计算 T+N 收益 ---
                     for N in HOLDING_PERIODS:
-                        sell_trade_date = trade_dates[i+N] # T+N 日
+                        sell_trade_date = trade_dates[i+N] 
                         
                         sell_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=sell_trade_date)
                         
@@ -481,14 +479,12 @@ def run_simple_backtest(days, params):
                                 return_pct = (sell_price / buy_price) - 1.0
                                 result[f'T+{N} 收益率 (%)'] = return_pct * 100
                         
-            # 5. 更新状态和进度条
             status['results'].append(result)
             status['current_index'] = i + 1
             status['progress'] = (i + 1) / total_iterations
             
             pbar.progress(status['progress'], text=f"正在回测 {select_date}... [{i+1}/{total_iterations}]")
             
-            # 每 2 次迭代或回测完成时，刷新界面，实现断点续传效果
             if (i+1) % 2 == 0 or (i + 1) == total_iterations: 
                  st.rerun() 
         
@@ -496,7 +492,6 @@ def run_simple_backtest(days, params):
         status['current_index'] = total_iterations
         pbar.progress(1.0, text="回测完成。")
         
-        # 6. 结果展示 (修改累计收益计算)
         results_df = pd.DataFrame(status['results'])
         
         if results_df.empty:
@@ -523,7 +518,6 @@ def run_simple_backtest(days, params):
         st.markdown("---")
         st.subheader("📋 每日交易记录")
         
-        # 整理显示列
         display_cols = ['选股日', '股票', '评分', '买入价 (T+1 开盘)']
         for N in HOLDING_PERIODS:
             display_cols.append(f'T+{N} 收益率 (%)')
@@ -533,7 +527,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (V10.0 完整版)
+# 实时选股模块 (与 V10.2 完整版相同)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -542,7 +536,8 @@ def run_live_selection(last_trade, params):
         'INITIAL_TOP_N': params['INITIAL_TOP_N'], 'FINAL_POOL': params['FINAL_POOL'], 'MIN_PRICE': params['MIN_PRICE'], 
         'MAX_PRICE': params['MAX_PRICE'], 'MIN_TURNOVER': params['MIN_TURNOVER'], 'MIN_AMOUNT': params['MIN_AMOUNT'], 
         'VOL_SPIKE_MULT': params['VOL_SPIKE_MULT'], 'VOLATILITY_MAX': params['VOLATILITY_MAX'], 
-        'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD']
+        'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD'],
+        'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'] # V10.3 新增参数
     }
     fdf_full = run_scoring_for_date(last_trade, params_dict)
 
@@ -554,19 +549,27 @@ def run_live_selection(last_trade, params):
     fdf.index = fdf.index + 1
 
     st.success(f"评分完成：总候选 {len(fdf_full)} 支，显示 Top {min(params['TOP_DISPLAY'], len(fdf))}。")
-    display_cols = ['name','ts_code','综合评分','pct_chg','vol_ratio','turnover_rate','net_mf','proxy_money','amount','10d_return','macd','k','d','j','rsl','volatility_10']
+    # 注意：这里需要显示市值信息
+    display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
+    # 增加流通市值列的显示
     for c in display_cols:
         if c not in fdf.columns: fdf[c] = np.nan
-
-    st.dataframe(fdf[display_cols], use_container_width=True)
+    
+    # 转换为亿显示
+    fdf['流通市值 (亿)'] = fdf['circ_mv_wan'] / 10000.0
+    
+    # 调整显示列的顺序和名称
+    final_display_cols = ['name','ts_code','综合评分','流通市值 (亿)','pct_chg','turnover_rate','amount','volatility_10','10d_return']
+    
+    st.dataframe(fdf[final_display_cols], use_container_width=True)
 
     out_csv = fdf_full[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
     st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V10.2 多周期并列回测版**，专注于高换手/低波动，并支持多周期回测。
-- **【风控提示】** 风控指标已全部纳入**评分体系**。
+- **【策略风格】** 本版本为 **V10.3 市值下限防御版**，已加入最低市值过滤，确保选股质量。
+- **【风控提示】** **最低流通市值默认为 50 亿。** 如需更严格风控，请调高此参数。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
@@ -578,7 +581,8 @@ params = {
     'INITIAL_TOP_N': INITIAL_TOP_N, 'FINAL_POOL': FINAL_POOL, 'TOP_DISPLAY': TOP_DISPLAY,
     'MIN_PRICE': MIN_PRICE, 'MAX_PRICE': MAX_PRICE, 'MIN_TURNOVER': MIN_TURNOVER,
     'MIN_AMOUNT': MIN_AMOUNT, 'VOL_SPIKE_MULT': VOL_SPIKE_MULT, 'VOLATILITY_MAX': VOLATILITY_MAX,
-    'HIGH_PCT_THRESHOLD': HIGH_PCT_THRESHOLD
+    'HIGH_PCT_THRESHOLD': HIGH_PCT_THRESHOLD,
+    'MIN_CIRC_MV_Billion': MIN_CIRC_MV_Billion # V10.3 新增参数
 }
 
 if st.session_state.get('run_backtest', False):
