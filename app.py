@@ -484,8 +484,8 @@ def run_simple_backtest(days, params):
                 st.error("批量历史数据获取失败，请检查 Tushare Token 权限。")
                 return
             
-            st.success(f"数据预加载完成！共获取 {len(all_codes)} 支股票在 {start_date_hist} 至 {final_end_date} 
-间的数据。")
+            # 修复 f-string 语法错误
+            st.success(f"数据预加载完成！共获取 {len(all_codes)} 支股票在 {start_date_hist} 至 {final_end_date} 间的数据。")
             st.rerun() # 预加载完成后强制刷新，进入正式回测阶段
 
         # 3. 正式回测流程
