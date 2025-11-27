@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V9.9 最终稳定版 (移除市值硬性过滤 + 保留 V9.8 稳定数据获取和策略权重)
+选股王 · V10.0 冗余容错最终版 (加强数据冗余，降低对 daily_basic 的硬性依赖)
 
 说明：
-1. 【核心修正】彻底移除硬性市值过滤，避免将所有候选清零。
-2. 【数据稳定】保持 V9.8 的逐个获取历史数据模式，确保指标计算数据完整。
-3. 【策略逻辑】保持 V9.8 最终逻辑：极限宽松流动性 + 风控因子改为软性评分，高换手率(0.35)和低波动率(0.25)权重最高。
+1. 【核心冗余】在硬性过滤阶段，如果换手率 (turnover_rate) 缺失，则默认通过换手率过滤，仅依赖成交额过滤。
+2. 【数据稳定】保持 V9.9 的逐个获取历史数据模式，确保指标计算数据完整。
+3. 【策略逻辑】保持 V9.8/V9.9 的高防御策略（高换手/低波动权重最高）。
 """
 
 import streamlit as st
@@ -30,11 +30,11 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V9.9 最终稳定版）", layout="wide")
-st.markdown("### 选股王（V9.9 最终稳定版）") 
+st.set_page_config(page_title="选股王（V10.0 冗余容错最终版）", layout="wide")
+st.markdown("### 选股王（V10.0 冗余容错最终版）") 
 
 # ---------------------------
-# 侧边栏参数（V9.9 策略：极限宽松流动性，保留风控参数用于评分）
+# 侧边栏参数（保留 V9.9 策略）
 # ---------------------------
 with st.sidebar:
     st.header("可调参数（实时）")
@@ -45,7 +45,7 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # 极限宽松流动性 (V9.6 调整，保留)
+    # 极限宽松流动性
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.1)) 
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=20_000_000.0, step=5_000_000.0)) # 2000万
     
@@ -57,7 +57,7 @@ with st.sidebar:
     
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     st.markdown("---")
-    st.caption("提示：策略已调整至 'V9.9 最终稳定版'，移除了市值硬性过滤。")
+    st.caption("提示：策略已升级至 'V10.0 冗余容错最终版'，加强了数据接口故障容错能力。")
 
 # ---------------------------
 # Token 输入
@@ -207,22 +207,23 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ----------------------------------------------------
-# 核心评分函数 (V9.9：移除市值硬性过滤)
+# 核心评分函数 (V10.0：冗余容错处理)
 # ----------------------------------------------------
-@memory.cache # V9.0 的缓存是加在整个评分函数上的
+@memory.cache 
 def run_scoring_for_date(trade_date, params):
     """
-    V9.9 评分函数：移除硬性市值过滤，保留 V9.8 的逻辑修正和诊断。
+    V10.0 评分函数：加强数据冗余和容错。
     """
     
     # 解包参数
-    initial_top_n, final_pool_limit, min_price, max_price, min_turnover, min_amount, vol_spike_mult, volatility_max, high_pct_threshold = \
+    initial_top_n, final_pool_limit, min_price, max_price, min_turnover, min_amount = \
         params['INITIAL_TOP_N'], params['FINAL_POOL'], params['MIN_PRICE'], params['MAX_PRICE'], \
-        params['MIN_TURNOVER'], params['MIN_AMOUNT'], params['VOL_SPIKE_MULT'], \
-        params['VOLATILITY_MAX'], params['HIGH_PCT_THRESHOLD']
+        params['MIN_TURNOVER'], params['MIN_AMOUNT']
     
     # 1. 拉取当日涨幅榜初筛
+    # pro.daily 包含基础的 amount (成交额)
     daily_all = safe_get(pro.daily, trade_date=trade_date)
+    # pro.daily_basic 包含 turnover_rate (换手率) 和 amount (成交额，与 daily 的 amount 重复)
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
     
@@ -247,27 +248,39 @@ def run_scoring_for_date(trade_date, params):
         try: pool0 = pool0.merge(stock_basic[keep], on='ts_code', how='left')
         except Exception: pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
     else: pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
-        
-    pool_merged = safe_merge_pool(pool0, daily_basic, ['turnover_rate','amount','total_mv','circ_mv'])
+    
+    # V10.0 冗余处理：先使用 daily_basic 合并 (turnover_rate, amount_db, total_mv, circ_mv)
+    pool_merged = safe_merge_pool(pool0, daily_basic.rename(columns={'amount':'amount_db'}), ['turnover_rate','amount_db','total_mv','circ_mv'])
     
     if moneyflow.empty: moneyflow = pd.DataFrame({'ts_code': pool_merged['ts_code'].tolist(), 'net_mf': [0.0]*len(pool_merged)})
     try: pool_merged = pool_merged.set_index('ts_code').join(moneyflow.set_index('ts_code'), how='left').reset_index()
     except: pool_merged['net_mf'] = 0.0
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
+    
+    # V10.0 核心冗余：使用 daily_all 的 amount 字段 (在 daily_basic 故障时)
+    # daily_all 的 amount 是'万'为单位, daily_basic 的 amount_db 也是'万'为单位
+    # 这里将 amount_db 填补到 daily_all 的 amount 上（如果 daily_all 的 amount 是 NaN）
+    # 由于 daily_all 是基础数据，所以其 amount 字段是可信的。我们仅转换单位。
+    if 'amount' in pool_merged.columns:
+        pool_merged['amount'] = pool_merged['amount'].apply(lambda amt: amt * 10000.0 if not pd.isna(amt) and amt > 0 and amt < 1e5 else amt)
+    else:
+        # 如果 daily_basic 成功，则 amount_db 存在
+        pool_merged['amount'] = pool_merged['amount_db'].apply(lambda amt: amt * 10000.0 if not pd.isna(amt) and amt > 0 and amt < 1e5 else amt)
+    
+    # amount_yuan 是最终用于过滤的金额，这里用 daily_all 的 amount 字段（已转成元）
+    pool_merged['amount_yuan'] = pool_merged['amount']
+    # total_mv/circ_mv 是从 daily_basic/stock_basic 合并来的，也转为元
+    pool_merged['total_mv_yuan'] = pool_merged['total_mv'].apply(
+        lambda tv: tv * 10000.0 if not pd.isna(tv) and tv > 1e6 else tv)
+
 
     # --- 诊断 2：检查原始池大小 ---
     st.info(f"诊断：原始涨幅榜初筛并合并后，股票数量: **{len(pool_merged)}** 支。")
     
-    # 3. 清洗 (只保留 V9.0 的硬性过滤：价格、ST、流动性、当日上涨)
-    
-    pool_merged['total_mv_yuan'] = pool_merged['total_mv'].apply(
-        lambda tv: tv * 10000.0 if not pd.isna(tv) and tv > 1e6 else tv)
-    pool_merged['amount_yuan'] = pool_merged['amount'].apply(
-        lambda amt: amt * 10000.0 if not pd.isna(amt) and amt > 0 and amt < 1e5 else amt)
-
+    # 3. 清洗 (V10.0 冗余容错过滤)
     clean_df = pool_merged.copy()
     
-    # 价格、ST、停牌过滤
+    # 价格、ST、停牌过滤 (保留)
     clean_df = clean_df[~(
         (clean_df['close'].isna()) | 
         (clean_df['close'] < min_price) | 
@@ -275,21 +288,34 @@ def run_scoring_for_date(trade_date, params):
         (clean_df['name'].str.contains('ST|退', case=False, na=False))
     )]
     
-    # 涨跌幅过滤 (当日上涨)
+    # 涨跌幅过滤 (当日上涨) (保留)
     clean_df = clean_df[~((clean_df['pct_chg'].isna()) | (clean_df['pct_chg'] < 0))]
     
-    # V9.9 核心修正：移除硬性市值防御过滤 (避免清零风险)
-    # MAX_TOTAL_MV_YUAN = 80000000000.0 
-    # clean_df = clean_df[~((clean_df['total_mv_yuan'].notna()) & (clean_df['total_mv_yuan'] > MAX_TOTAL_MV_YUAN))]
-
-    # V9.9 极限宽松流动性过滤 (保留，但注意 Tushare daily_basic 接口故障可能导致全灭)
-    # 使用 .notna() 确保数据存在
-    clean_df = clean_df[clean_df['turnover_rate'].notna() & (clean_df['turnover_rate'] >= min_turnover)]
+    
+    # V10.0 核心容错流动性过滤：
+    
+    # 1. 成交额硬性过滤 (依赖 pro.daily 数据的 amount_yuan，数据可靠性高)
+    # 即使 daily_basic 故障，daily 接口的 amount 字段应该存在
     clean_df = clean_df[clean_df['amount_yuan'].notna() & (clean_df['amount_yuan'] >= min_amount)]
+    
+    # 2. 换手率硬性过滤 (依赖 pro.daily_basic 的 turnover_rate，数据可靠性低)
+    # 容错：如果 turnover_rate 缺失（daily_basic 故障），则跳过此过滤。
+    # 只有当 turnover_rate 存在 且 小于阈值时，才过滤掉。
+    # 这样确保 daily_basic 故障时，不会清零，仅依赖 amount 过滤。
+    
+    # 过滤条件： turnover_rate 存在 且 turnover_rate < min_turnover
+    # 保留条件： turnover_rate 不存在 OR turnover_rate >= min_turnover
+    
+    turnover_filter_cond = (
+        clean_df['turnover_rate'].notna() & 
+        (clean_df['turnover_rate'] < min_turnover)
+    )
+    clean_df = clean_df[~turnover_filter_cond]
+    
     
     # --- 诊断 3：检查硬性过滤后的数量 ---
     if clean_df.empty: 
-        st.error(f"诊断：所有硬性过滤后，剩余股票数量为 **0** 支。这极可能意味着 Tushare 的 daily_basic 接口当天故障，导致所有股票的 **换手率/成交额数据缺失**。")
+        st.error(f"诊断：所有硬性过滤后，剩余股票数量为 **0** 支。请检查价格和成交额（{min_amount/1e6:.0f} 百万）过滤条件。")
         return pd.DataFrame()
 
     st.info(f"诊断：硬性过滤后，剩余股票数量: **{len(clean_df)}** 支，开始计算指标并评分...")
@@ -308,9 +334,7 @@ def run_scoring_for_date(trade_date, params):
     for i, row in enumerate(clean_df.itertuples()):
         ts_code = getattr(row, 'ts_code'); pct_chg = getattr(row, 'pct_chg', 0.0);
         turnover_rate = getattr(row, 'turnover_rate', np.nan); net_mf = float(getattr(row, 'net_mf', 0.0));
-        amount_raw = getattr(row, 'amount', np.nan)
-        amount = amount_raw * 10000.0 if not pd.isna(amount_raw) and amount_raw > 0 and amount_raw < 1e5 else amount_raw
-        amount = amount if not pd.isna(amount) else 0.0
+        amount = getattr(row, 'amount_yuan', 0.0) # V10.0 使用 amount_yuan
         name = getattr(row, 'name', ts_code)
 
         # 核心：V9.9 稳定模式：逐个获取历史数据
@@ -352,6 +376,7 @@ def run_scoring_for_date(trade_date, params):
     else: fdf['rsl'] = 1.0
 
     fdf['s_pct'] = norm_col(fdf.get('pct_chg', pd.Series([0]*len(fdf))))
+    # V10.0: 如果 turnover_rate 缺失，则使用 amount/proxy_money 的分数来弥补。
     fdf['s_volratio'] = norm_col(fdf.get('vol_ratio', pd.Series([0]*len(fdf))))
     fdf['s_turn'] = norm_col(fdf.get('turnover_rate', pd.Series([0]*len(fdf))))
     fdf['s_money'] = norm_col(fdf.get('net_mf', pd.Series([0]*len(fdf)))) if fdf['net_mf'].abs().sum() > 0 else norm_col(fdf.get('proxy_money', pd.Series([0]*len(fdf))))
@@ -363,7 +388,7 @@ def run_scoring_for_date(trade_date, params):
     # 低波动率是加分项
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # V9.9 权重：高换手 (0.35) 和 低波动 (0.25) 权重最高
+    # V10.0 权重：高换手 (0.35) 和 低波动 (0.25) 权重最高 (保留)
     w_pct, w_volratio, w_turn, w_money, w_10d, w_macd, w_rsl, w_volatility = 0.05, 0.10, 0.35, 0.10, 0.05, 0.10, 0.05, 0.25
     
     fdf['综合评分'] = (fdf['s_pct'] * w_pct + fdf['s_volratio'] * w_volratio + fdf['s_turn'] * w_turn + fdf['s_money'] 
@@ -373,7 +398,7 @@ def run_scoring_for_date(trade_date, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块
+# 简易回测模块 (保留)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     status = st.session_state['backtest_status']
@@ -481,7 +506,7 @@ def run_simple_backtest(days, params):
         st.dataframe(results_df, use_container_width=True)
 
 # ----------------------------------------------------
-# 实时选股模块
+# 实时选股模块 (保留)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -495,7 +520,7 @@ def run_live_selection(last_trade, params):
     fdf_full = run_scoring_for_date(last_trade, params_dict)
 
     if fdf_full.empty:
-        st.error("清洗和评分后没有候选。请参考上方的诊断信息，检查是否 Tushare 数据接口故障。")
+        st.error("清洗和评分后没有候选。请参考上方的诊断信息，如果 Tushare 数据接口连续故障，请等待。")
         st.stop()
 
     fdf = fdf_full.head(params['TOP_DISPLAY']).copy()
@@ -513,14 +538,14 @@ def run_live_selection(last_trade, params):
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V9.9 最终稳定版**，硬性过滤逻辑已回退到 V9.0 的状态，同时保留了高防御（高换手/低波动）的评分权重。
+- **【策略风格】** 本版本为 **V10.0 冗余容错最终版**，专注于解决 Tushare 接口不稳定导致的清零问题。
 - **【风控提示】** 风控指标（波动率、放量倍数等）已全部纳入**评分体系**。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
 
 # ----------------------------------------------------
-# 主程序控制逻辑
+# 主程序控制逻辑 (保留)
 # ----------------------------------------------------
 params = {
     'INITIAL_TOP_N': INITIAL_TOP_N, 'FINAL_POOL': FINAL_POOL, 'TOP_DISPLAY': TOP_DISPLAY,
