@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V10.3 市值下限防御版 (增加最低流通市值过滤)
+选股王 · V10.4 交易日历稳定版 (修复启动失败问题)
 
 说明：
-1. 【市值优化】新增“最低流通市值”硬性过滤，排除 7亿-18亿 的超小盘股。
-2. 【回测功能】保留 V10.2 的 T+1, T+3, T+5 并列回测功能。
-3. 【策略风格】保留 V10.0 的“极限防御”权重（高换手/低波动）。
-4. 【稳定性】保留 V10.0 的所有数据冗余和容错机制。
+1. 【稳定性升级】修复了启动时查询“最近交易日”可能失败的问题，将 pro.daily 替换为更稳定的 pro.trade_cal 接口。
+2. 【市值防御】保留 V10.3 的“最低流通市值”硬性过滤，排除超小盘股。
+3. 【并列回测】保留 T+1, T+3, T+5 并列回测功能。
+4. 【策略与冗余】保留 V10.0 的“极限防御”权重和所有数据冗余容错机制。
 """
 
 import streamlit as st
@@ -30,11 +30,11 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V10.3 市值下限防御版）", layout="wide")
-st.markdown("### 选股王（V10.3 市值下限防御版）") 
+st.set_page_config(page_title="选股王（V10.4 交易日历稳定版）", layout="wide")
+st.markdown("### 选股王（V10.4 交易日历稳定版）") 
 
 # ---------------------------
-# 侧边栏参数（新增 MIN_CIRC_MV_Billion）
+# 侧边栏参数
 # ---------------------------
 with st.sidebar:
     st.header("可调参数（实时）")
@@ -45,14 +45,14 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # ***V10.3 新增参数：最低流通市值***
+    # V10.3 市值下限参数
     MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=50.0, step=5.0)) # 默认为 50 亿
     
     # 极限宽松流动性
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.1)) 
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=20_000_000.0, step=5_000_000.0)) # 2000万
     
-    # 风控参数保留
+    # 风控参数
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.4, step=0.1)) 
     VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=6.0, step=0.5)) 
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
@@ -63,7 +63,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V10.3 市值下限防御版'。")
+    st.caption("提示：策略已升级至 'V10.4 交易日历稳定版'。")
     st.caption("回测将同时计算 T+1, T+3, T+5 收益。")
 
 # ---------------------------
@@ -81,7 +81,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ---------------------------
-# 依赖函数：数据安全获取和交易日查找 (与 V10.2 相同)
+# 依赖函数：数据安全获取
 # ---------------------------
 def safe_get(func, **kwargs):
     try:
@@ -92,15 +92,24 @@ def safe_get(func, **kwargs):
     except Exception:
         return pd.DataFrame()
 
+# ---------------------------
+# V10.4 核心修改：使用 pro.trade_cal 稳定获取最近交易日
+# ---------------------------
 @st.cache_data(ttl=600)
-def find_last_trade_day(max_days=20):
-    today = datetime.now().date()
-    for i in range(max_days):
-        d = today - timedelta(days=i)
-        ds = d.strftime("%Y%m%d")
-        df = safe_get(pro.daily, trade_date=ds)
-        if not df.empty:
-            return ds
+def find_last_trade_day():
+    """V10.4 稳定版：使用 pro.trade_cal 接口查找最近交易日"""
+    end_date = datetime.now().strftime("%Y%m%d")
+    cal_df = safe_get(
+        pro.trade_cal, 
+        exchange='SSE', 
+        is_open='1', 
+        end_date=end_date, 
+        fields='cal_date'
+    )
+    
+    if not cal_df.empty:
+        # 直接获取最新的交易日
+        return cal_df['cal_date'].max() 
     return None
 
 last_trade = find_last_trade_day()
@@ -111,7 +120,7 @@ st.info(f"参考最近交易日：{last_trade}")
 
 
 # ----------------------------------------------------
-# 按钮控制模块 (与 V10.2 相同)
+# 按钮控制模块 (与 V10.3 相同)
 # ----------------------------------------------------
 if 'run_selection' not in st.session_state: st.session_state['run_selection'] = False
 if 'run_backtest' not in st.session_state: st.session_state['run_backtest'] = False
@@ -138,9 +147,8 @@ with col2:
 st.markdown("---")
 
 # ---------------------------
-# 指标计算和归一化 (与 V10.2 完整版相同，此处不再重复全部辅助函数)
+# 指标计算和归一化 (与 V10.3 完整版相同)
 # ---------------------------
-# ... (compute_indicators, safe_merge_pool, norm_col functions remain the same as V10.2) ...
 def compute_indicators(df):
     res = {}
     if df.empty or len(df) < 3: return res
@@ -216,7 +224,7 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V10.3 修改：增加市值下限过滤)
+# 核心评分函数 (V10.4：保留 V10.3 的市值过滤逻辑)
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
@@ -392,7 +400,7 @@ def run_scoring_for_date(trade_date, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块 (V10.2 核心修改：实现 T+1, T+3, T+5 并列)
+# 简易回测模块 (与 V10.3 相同)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     
@@ -403,6 +411,7 @@ def run_simple_backtest(days, params):
     with container.container():
         st.subheader(f"📈 简易历史回测结果 (T+{', T+'.join(map(str, HOLDING_PERIODS))} 并列)")
         
+        # 使用 pro.trade_cal 获取交易日历，确保稳定性
         trade_dates_df = safe_get(pro.trade_cal, exchange='SSE', is_open='1', end_date=find_last_trade_day(), fields='cal_date')
         if trade_dates_df.empty:
             st.error("无法获取历史交易日历。")
@@ -427,13 +436,12 @@ def run_simple_backtest(days, params):
 
         pbar = st.progress(status['progress'], text=f"回测进度：[{status['current_index']}/{status['total_days']}]...")
         
-        # 传递给评分函数的参数 
         score_params = {
             'INITIAL_TOP_N': params['INITIAL_TOP_N'], 'FINAL_POOL': params['FINAL_POOL'], 'MIN_PRICE': params['MIN_PRICE'], 
             'MAX_PRICE': params['MAX_PRICE'], 'MIN_TURNOVER': params['MIN_TURNOVER'], 'MIN_AMOUNT': params['MIN_AMOUNT'], 
             'VOL_SPIKE_MULT': params['VOL_SPIKE_MULT'], 'VOLATILITY_MAX': params['VOLATILITY_MAX'], 
             'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD'],
-            'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'] # V10.3 新增参数
+            'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'] 
         }
         
         for i in range(start_index, total_iterations):
@@ -527,7 +535,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (与 V10.2 完整版相同)
+# 实时选股模块 (与 V10.3 相同)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近交易日：{last_trade}）...")
@@ -537,7 +545,7 @@ def run_live_selection(last_trade, params):
         'MAX_PRICE': params['MAX_PRICE'], 'MIN_TURNOVER': params['MIN_TURNOVER'], 'MIN_AMOUNT': params['MIN_AMOUNT'], 
         'VOL_SPIKE_MULT': params['VOL_SPIKE_MULT'], 'VOLATILITY_MAX': params['VOLATILITY_MAX'], 
         'HIGH_PCT_THRESHOLD': params['HIGH_PCT_THRESHOLD'],
-        'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'] # V10.3 新增参数
+        'MIN_CIRC_MV_Billion': params['MIN_CIRC_MV_Billion'] 
     }
     fdf_full = run_scoring_for_date(last_trade, params_dict)
 
@@ -549,11 +557,8 @@ def run_live_selection(last_trade, params):
     fdf.index = fdf.index + 1
 
     st.success(f"评分完成：总候选 {len(fdf_full)} 支，显示 Top {min(params['TOP_DISPLAY'], len(fdf))}。")
-    # 注意：这里需要显示市值信息
+    
     display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','amount','circ_mv_wan','total_mv_yuan','volatility_10','net_mf','10d_return']
-    # 增加流通市值列的显示
-    for c in display_cols:
-        if c not in fdf.columns: fdf[c] = np.nan
     
     # 转换为亿显示
     fdf['流通市值 (亿)'] = fdf['circ_mv_wan'] / 10000.0
@@ -568,8 +573,8 @@ def run_live_selection(last_trade, params):
 
     st.markdown("### 小结与操作提示（简洁）")
     st.markdown("""
-- **【策略风格】** 本版本为 **V10.3 市值下限防御版**，已加入最低市值过滤，确保选股质量。
-- **【风控提示】** **最低流通市值默认为 50 亿。** 如需更严格风控，请调高此参数。
+- **【策略风格】** 本版本为 **V10.4 交易日历稳定版**，已加入最低市值过滤，并增强了 Tushare 连接稳定性。
+- **【风控提示】** **最低流通市值已设置为您的偏好值（默认为 50 亿）。** 请根据需要调整。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
@@ -582,7 +587,7 @@ params = {
     'MIN_PRICE': MIN_PRICE, 'MAX_PRICE': MAX_PRICE, 'MIN_TURNOVER': MIN_TURNOVER,
     'MIN_AMOUNT': MIN_AMOUNT, 'VOL_SPIKE_MULT': VOL_SPIKE_MULT, 'VOLATILITY_MAX': VOLATILITY_MAX,
     'HIGH_PCT_THRESHOLD': HIGH_PCT_THRESHOLD,
-    'MIN_CIRC_MV_Billion': MIN_CIRC_MV_Billion # V10.3 新增参数
+    'MIN_CIRC_MV_Billion': MIN_CIRC_MV_Billion 
 }
 
 if st.session_state.get('run_backtest', False):
