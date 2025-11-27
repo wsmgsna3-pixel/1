@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V9.1 最终版 (已修正：800亿市值上限 + 换手率/波动率默认值放宽)
+选股王 · V9.1 最终版 (已修正：800亿市值上限 + 换手率/波动率默认值彻底放宽)
 说明：
 1. 【核心修复】**市值上限硬编码**：将市值上限设置为 **800 亿人民币**，并加入了对 **total_mv NaN** 值的防御（解决了立讯精密问题）。
-2. 【参数放宽】将侧边栏的 **最低换手率** 默认值从 3.5% 降至 2.0%。将 **波动率 std 阈值** 默认值从 6.0% 升至 8.0%。
+2. 【参数彻底放宽】将侧边栏的 **最低换手率** 默认值从 3.5% 降至 **1.0%**。将 **波动率 std 阈值** 默认值从 6.0% 升至 **10.0%**。将 **最低成交额** 降至 **1 亿**。
 3. 【策略保持】保留 V9.0 极限防御策略权重。
 """
 
@@ -39,7 +39,7 @@ st.set_page_config(page_title="选股王（V9.1 最终版）", layout="wide")
 st.markdown("### 选股王（V9.1 最终版 · 800亿上限）") 
 
 # ---------------------------
-# 侧边栏参数（V9.1 修正默认值）
+# 侧边栏参数（V9.1 彻底修正默认值）
 # ---------------------------
 with st.sidebar:
     st.header("可调参数（实时）")
@@ -50,13 +50,14 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     
-    # ⚠️ 修正：最低换手率默认值从 3.5 降至 2.0 (放宽流动性)
-    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=2.0, step=0.5)) 
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0))
+    # ⚠️ 修正：最低换手率默认值降至 1.0 (彻底放宽流动性)
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=1.0, step=0.5)) 
+    # ⚠️ 修正：最低成交额默认值降至 100M
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=100_000_000.0, step=50_000_000.0))
     
-    # ⚠️ 修正：波动率阈值从 6.0 升至 8.0 (放宽安全性)
+    # ⚠️ 修正：波动率阈值升至 10.0 (彻底放宽安全性)
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.4, step=0.1)) 
-    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5)) 
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=10.0, step=0.5)) 
     
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
     
@@ -335,13 +336,15 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
             continue
         # ------------------------------------------------------------------
         
-        # V6.0/V9.1 使用调整后的参数 (注意：这里使用侧边栏传入的参数，默认值已放宽)
+        # V9.1 使用调整后的宽松参数
         if not pd.isna(turnover) and float(turnover) < min_turnover: continue
         if not pd.isna(amount):
             amt = amount; 
             if amt > 0 and amt < 1e5: amt = amt * 10000.0
             if amt < min_amount: continue
-        if not pd.isna(pct) and float(pct) < 0: continue
+            
+        # ⚠️ 注意这里：只选当日上涨的股票，如果弱市中这一条是零结果的最终原因，则需要注释掉
+        if not pd.isna(pct) and float(pct) < 0: continue 
         
         clean_list.append(r)
 
@@ -395,10 +398,10 @@ def run_scoring_for_date(trade_date, all_daily_data, params):
         fdf = fdf[~((fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > high_pct_threshold))]
     if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
         fdf = fdf[~((fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > high_pct_threshold))]
-    # V6.0/V9.1 使用调整后的侧边栏参数：vol_spike_mult
+    # V9.1 使用调整后的侧边栏参数：vol_spike_mult
     if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
         fdf = fdf[~((fdf['vol_last'] > (fdf['vol_ma5'] * vol_spike_mult)))]
-    # V6.0/V9.1 使用调整后的侧边栏参数：volatility_max
+    # V9.1 使用调整后的侧边栏参数：volatility_max
     if 'volatility_10' in fdf.columns:
         fdf = fdf[~(fdf['volatility_10'] > volatility_max)]
 
@@ -630,7 +633,7 @@ def run_live_selection(last_trade, params):
     st.markdown("""
 - **【策略风格】** 本版本为 **极限防御模式**，极度偏爱高换手率和低波动率。
 - **【核心升级】** 已实施 **800 亿市值上限**和**数据缺失防御**，大幅降低选中超大盘股的风险。
-- **【风控提示】** 侧边栏参数已调整为更容易选出股票的默认值。
+- **【风控提示】** 侧边栏参数已调整为**最宽松**的默认值，更容易选出股票。
 - **【重要纪律】** 9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入。
 """)
 
