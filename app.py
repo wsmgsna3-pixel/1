@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V13.9（缓存修复稳定版）
-核心：修复 Streamlit 缓存错误 (UnhashableParamError)。从缓存函数中移除 Tushare API 参数，直接使用全局 pro 变量。
+选股王 · V13.10（硬性过滤诊断增强版）
+核心：放松默认的流动性参数，并增加零结果时的详细硬性过滤参数总结，帮助用户定位问题。
 """
 import streamlit as st
 import pandas as pd
@@ -26,11 +26,11 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王（V13.9 缓存修复稳定版）", layout="wide")
-st.markdown("### 选股王（V13.9 缓存修复稳定版）- 修复缓存错误") 
+st.set_page_config(page_title="选股王（V13.10 诊断增强版）", layout="wide")
+st.markdown("### 选股王（V13.10 诊断增强版）- 修复硬性过滤过于严格问题") 
 
 # ---------------------------
-# 默认参数定义 (保持不变)
+# 默认参数定义 (V13.10: 放松流动性要求)
 # ---------------------------
 DEFAULT_FINAL_POOL = 500
 DEFAULT_TOP_DISPLAY = 30
@@ -38,8 +38,8 @@ DEFAULT_MIN_PRICE = 10.0
 DEFAULT_MAX_PRICE = 200.0
 DEFAULT_MIN_CIRC_MV_B = 40.0 
 DEFAULT_MAX_CIRC_MV_B = 500.0 
-DEFAULT_MIN_TURNOVER = 3.0 
-DEFAULT_MIN_AMOUNT = 200_000_000.0 
+DEFAULT_MIN_TURNOVER = 1.0 # 默认值降低：从 3.0% 降至 1.0%
+DEFAULT_MIN_AMOUNT = 50_000_000.0 # 默认值降低：从 2亿 降至 5000万
 DEFAULT_MA_PERIOD = 20
 DEFAULT_MIN_LIST_DAYS = 180
 DEFAULT_BACKTEST_DAYS = 10
@@ -52,7 +52,7 @@ DEFAULT_MAX_VOLATILITY_10D = 8.0
 # 侧边栏参数 
 # ---------------------------
 with st.sidebar:
-    st.header("可调参数（V13.9 默认值）")
+    st.header("可调参数（V13.10 默认值）")
     INITIAL_TOP_N = 99999 
     
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=DEFAULT_FINAL_POOL, step=50))
@@ -84,7 +84,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=DEFAULT_BACKTEST_DAYS, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V13.9 缓存修复稳定版'。")
+    st.caption("提示：策略已升级至 'V13.10 诊断增强版'。")
 
 
 # ---------------------------
@@ -115,7 +115,7 @@ def safe_get(func, **kwargs):
         return pd.DataFrame()
 
 # ----------------------------------------------------
-# 交易日历获取 (保持 V13.8 逻辑)
+# 交易日历获取 
 # ----------------------------------------------------
 @st.cache_data(ttl=600)
 def get_trade_cal_dates():
@@ -133,10 +133,10 @@ def get_trade_cal_dates():
     return cal_df['cal_date'].sort_values(ascending=False).tolist()
 
 # ----------------------------------------------------
-# 核心修正：数据校验回溯函数 (V13.9 修正 UnhashableParamError)
+# 核心修正：数据校验回溯函数 
 # ----------------------------------------------------
 @st.cache_data(ttl=3600)
-def find_last_trade_day_robust(): # ❌ 移除 pro_api 参数
+def find_last_trade_day_robust(): 
     """
     V13.9 核心修正：迭代最近交易日，直到找到 Tushare 接口实际能提供数据的日期。
     """
@@ -156,10 +156,10 @@ def find_last_trade_day_robust(): # ❌ 移除 pro_api 参数
             # 找到有数据的日期，返回
             return date_str
         
-    return None # 5 天内都没有数据，返回 None
+    return None 
 
-# V13.9 运行稳定的日期函数
-last_trade = find_last_trade_day_robust() # ❌ 不再传递 pro 参数
+# V13.10 运行稳定的日期函数
+last_trade = find_last_trade_day_robust() 
 
 if not last_trade:
     st.error("无法获取最近交易日。已尝试回溯最近 5 个交易日，但 Tushare 接口均无数据。请检查 Tushare Token 或等待数据更新。")
@@ -168,7 +168,7 @@ st.info(f"参考最近交易日（经数据校验）：**{last_trade}**")
 
 
 # ----------------------------------------------------
-# 按钮控制模块 (保持不变)
+# 按钮控制模块 
 # ----------------------------------------------------
 if 'run_selection' not in st.session_state: st.session_state['run_selection'] = False
 if 'run_backtest' not in st.session_state: st.session_state['run_backtest'] = False
@@ -195,7 +195,7 @@ with col2:
 st.markdown("---")
 
 # ---------------------------
-# 辅助函数 (保持不变)
+# 辅助函数 
 # ---------------------------
 def safe_merge_pool(pool_df, other_df, cols):
     pool = pool_df.set_index('ts_code').copy()
@@ -230,7 +230,7 @@ def norm_col(s):
 
 
 # ---------------------------
-# V13.9 增强：指标计算和归一化 (保持不变)
+# 指标计算和归一化 
 # ---------------------------
 def compute_indicators(df, ma_period):
     res = {}
@@ -300,7 +300,7 @@ def compute_indicators(df, ma_period):
     return res
 
 # ----------------------------------------------------
-# 核心评分函数 (保持不变)
+# 核心评分函数 (V13.10: 增强零结果诊断)
 # ----------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=600)
 def run_scoring_for_date(trade_date, params):
@@ -360,7 +360,7 @@ def run_scoring_for_date(trade_date, params):
     pool_merged['circ_mv_wan'] = pool_merged['circ_mv'].fillna(0)
 
 
-    # 3. V13.9 硬性过滤
+    # 3. V13.10 硬性过滤
     clean_df = pool_merged.copy()
     
     # 基础风险过滤 (ST, 价格, 北交所)
@@ -388,7 +388,7 @@ def run_scoring_for_date(trade_date, params):
     clean_df['days_since_list'] = (current_date - clean_df['list_date']).dt.days
     clean_df = clean_df[clean_df['days_since_list'].notna() & (clean_df['days_since_list'] >= min_list_days)]
     
-    # 流通市值上下限过滤 (这是您要关注的核心范围)
+    # 流通市值上下限过滤
     min_circ_mv_wan = min_circ_mv_billion * 10000.0 
     max_circ_mv_wan = max_circ_mv_billion * 10000.0 
     clean_df = clean_df[clean_df['circ_mv_wan'].notna() & 
@@ -400,14 +400,29 @@ def run_scoring_for_date(trade_date, params):
     clean_df = clean_df[clean_df['turnover_rate'].notna() & (clean_df['turnover_rate'] >= min_turnover)]
     
     
+    # V13.10 增强诊断：如果股票数量为 0，打印详细参数
     if clean_df.empty: 
-        if trade_date == last_trade: st.error(f"诊断：所有硬性过滤后，剩余股票数量为 **0** 支。请检查侧边栏参数。")
+        if trade_date == last_trade:
+            st.error(f"诊断：所有硬性过滤后，剩余股票数量为 **0** 支。")
+            st.markdown(f"""
+            <div style='border: 1px solid #ff4b4b; padding: 10px; border-radius: 5px;'>
+            <p style='color: #ff4b4b; font-weight: bold;'>⚠️ **硬性过滤参数总结：**</p>
+            <ul>
+                <li>价格范围：{min_price}元 - {max_price}元 (已排除ST/退市/北交所)</li>
+                <li><span style='color: yellow;'>市值范围：{min_circ_mv_billion}亿 - {max_circ_mv_billion}亿</span></li>
+                <li>必须上涨：今日 **pct_chg > 0** (已排除一字板)</li>
+                <li><span style='color: yellow;'>流动性要求：最低换手率 **{min_turnover}%** | 最低成交额 **{min_amount:,.0f}元**</span></li>
+                <li>上市天数：>{min_list_days}天</li>
+            </ul>
+            <p><strong>操作建议：</strong>请尝试在左侧边栏 <span style='color: yellow;'>**大幅放宽**</span> **最低换手率** (例如设为 0.5) 或 **最低成交额** (例如设为 10,000,000.0)。</p>
+            </div>
+            """, unsafe_allow_html=True)
         return pd.DataFrame()
 
     if trade_date == last_trade:
         st.info(f"诊断：硬性过滤 (已包含次新股、市值收紧) 后，剩余股票数量: **{len(clean_df)}** 支，开始计算指标...")
         
-    # 4. 指标计算与 MA 趋势硬性过滤 
+    # 4. 指标计算与 MA 趋势硬性过滤 (略，与 V13.9 相同)
     score_pool = clean_df.sort_values('pct_chg', ascending=False).head(min(len(clean_df), 300)).copy().reset_index(drop=True)
 
     records = []
@@ -468,7 +483,7 @@ def run_scoring_for_date(trade_date, params):
         st.info(f"诊断：通过 {ma_trend_period} 日均线趋势过滤后，剩余股票数量: **{len(fdf)}** 支，开始高级风险过滤...")
         
     
-    # 5. V13.9 高级风险过滤
+    # 5. 高级风险过滤 (略，与 V13.9 相同)
     try:
         before_cnt = len(fdf)
         
@@ -497,7 +512,7 @@ def run_scoring_for_date(trade_date, params):
     if fdf.empty: return pd.DataFrame()
 
 
-    # 6. RSL（相对强弱）计算
+    # 6. RSL（相对强弱）计算 (略，与 V13.9 相同)
     if '10d_return' in fdf.columns:
         try:
             fdf['proxy_money'] = (abs(fdf['pct_chg']) + 1e-9) * fdf['vol_ratio'].fillna(0) * fdf['turnover_rate'].fillna(0)
@@ -514,7 +529,7 @@ def run_scoring_for_date(trade_date, params):
         fdf['proxy_money'] = 0.0
 
 
-    # 7. 归一化
+    # 7. 归一化 (略，与 V13.9 相同)
     fdf['s_pct'] = norm_col(fdf.get('pct_chg', pd.Series([0]*len(fdf))))
     fdf['s_volratio'] = norm_col(fdf.get('vol_ratio', pd.Series([0]*len(fdf))))
     fdf['s_turn'] = norm_col(fdf.get('turnover_rate', pd.Series([0]*len(fdf))))
@@ -531,7 +546,7 @@ def run_scoring_for_date(trade_date, params):
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf)))) 
     
     
-    # 8. 综合评分
+    # 8. 综合评分 (略，与 V13.9 相同)
     w_pct = 0.18        
     w_volratio = 0.18   
     w_turn = 0.12       
@@ -565,7 +580,7 @@ def run_simple_backtest(days, params):
     
     container = st.empty()
     with container.container():
-        st.subheader(f"📈 简易历史回测结果 (V13.9 稳定版)")
+        st.subheader(f"📈 简易历史回测结果 (V13.10 稳定版)")
         
         trade_dates_all = get_trade_cal_dates()
         
@@ -715,7 +730,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (V13.9)
+# 实时选股模块 
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近有效交易日：{last_trade}）...")
@@ -738,6 +753,7 @@ def run_live_selection(last_trade, params):
     fdf_full = run_scoring_for_date(last_trade, params_dict)
 
     if fdf_full.empty:
+        # V13.10 增强诊断信息在 run_scoring_for_date 中，此处只需处理空集
         st.error(f"清洗和评分后没有候选。请检查硬性过滤参数是否过于严格。")
         st.stop()
 
@@ -765,14 +781,14 @@ def run_live_selection(last_trade, params):
 
     download_cols = [c for c in fdf_full.columns if c not in ['list_date', 'days_since_list', 'circ_mv_wan']]
     out_csv = fdf_full[download_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
-    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_9.csv", mime="text/csv")
+    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_10.csv", mime="text/csv")
 
-    st.markdown("### 小结与操作提示（V13.9 缓存修复稳定版）")
+    st.markdown("### 小结与操作提示（V13.10 诊断增强版）")
     st.markdown(f"""
-- **【核心修正】** 已修复 Streamlit **缓存错误**，程序现在可以正常启动和运行。
+- **【核心修正】** 默认流动性参数已放宽：最低换手率 **{DEFAULT_MIN_TURNOVER}%**，最低成交额 **{DEFAULT_MIN_AMOUNT:,.0f}元**。
 - **【日期稳定】** 当前选股日 **{last_trade}** 已经过数据校验，保证 Tushare 有数据可用。
 - **【市值范围】** 当前流通市值范围：**{params_dict['MIN_CIRC_MV_Billion']} 亿 到 {params_dict['MAX_CIRC_MV_Billion']} 亿**。
-- **【操作建议】** 如果选股结果太少，请尝试放宽左侧边栏的 **流通市值范围** 或 **最低成交额/换手率**。
+- **【操作建议】** 如果结果仍为 0，请查看上方的 **红色警告框** 中的详细参数总结，并尝试大幅放宽最低换手率/成交额。
 """)
 
 
