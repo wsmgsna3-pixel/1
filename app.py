@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.5 (激进重构版：D+5 必须为正)
+选股王 · 全市场扫描增强版 V3.5 (激进重构 + 错误修复版)
 更新说明：
-1. 【激进重构】：大幅削弱所有当日短线指标权重。
-2. 【核心强化】：巨幅提升 10日趋势 (w_trend)、稳定性反向 (w_volatility) 和 60日位置反向 (w_position) 权重。
-3. 目标：强制 Top 3 排序发生变化，筛选出持续性最强、波动性最低的非高位股。
+1. 【**错误修复**】：在 get_future_prices 函数中增加了对 'trade_date' 列的强力检查，彻底修复了 Tushare 返回空或错误数据结构时导致的 KeyError 崩溃。
+2. 【**激进重构权重**】：采用 V3.5 激进权重（巨幅提升 10日趋势/稳定性权重，大幅削弱短线动能权重），旨在将 D+5 收益强制转正。
+3. 【功能优化】：D+30 回测已移除，专注于 1-5 天持股周期。
 """
 
 import streamlit as st
@@ -19,11 +19,11 @@ warnings.filterwarnings("ignore")
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 · V3.5 激进重构版", layout="wide")
-st.title("选股王 · V3.5 激进重构版（最终 D+5 稳定模型）")
-st.markdown("🔥 **当前版本采用 V3.5 激进权重，大幅提升趋势与稳定性权重。**")
+st.title("选股王 · V3.5 激进重构版（最终稳定模型）")
+st.markdown("🔥 **当前版本已修复数据错误，采用 V3.5 激进权重。**")
 
 # ---------------------------
-# 辅助函数 (保持不变)
+# 辅助函数
 # ---------------------------
 def safe_get(func, **kwargs):
     """安全调用 Tushare API，在出错或返回空时返回带 'ts_code' 的空 DataFrame"""
@@ -57,21 +57,35 @@ def get_selection_date(backtest_date_input, max_days=20):
 @st.cache_data(ttl=600)
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     """拉取选股日之后 N 个交易日的收盘价，用于回测"""
+    
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
+
     hist = safe_get(pro.daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
+    
+    # 【V3.5 修复：强制检查 trade_date 列是否存在】
+    if hist.empty or 'trade_date' not in hist.columns:
+        results = {}
+        for n in days_ahead: results[f'Return_D{n}'] = np.nan
+        return results
+    # ---------------------------------------------
+
     hist = hist.sort_values('trade_date').reset_index(drop=True)
+    
     results = {}
+    
     if hist.empty:
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
+
     for n in days_ahead:
         col_name = f'Return_D{n}'
         if len(hist) >= n:
             results[col_name] = hist.iloc[n-1]['close']
         else:
             results[col_name] = np.nan
+
     return results
 
 # ---------------------------
@@ -306,14 +320,14 @@ fdf['s_trend'] = normalize(fdf['10d_return'])
 fdf['s_position'] = fdf['position_60d'] / 100 
 
 # V3.5 激进重构权重配置
-w_pct = 0.02        # 极低
-w_turn = 0.05       # 大幅降低
-w_vol = 0.03        # 极低
-w_mf = 0.05         # 大幅降低
-w_macd = 0.10       # 保持
+w_pct = 0.02        
+w_turn = 0.05       
+w_vol = 0.03        
+w_mf = 0.05         
+w_macd = 0.10       
 w_trend = 0.30      # 巨幅提升
 w_volatility = 0.25 # 巨幅提升
-w_position = 0.20   # 保持高位
+w_position = 0.20   
 
 # 确保总和为 1.00
 score = (
