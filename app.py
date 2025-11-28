@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V13.10（硬性过滤诊断增强版）
-核心：放松默认的流动性参数，并增加零结果时的详细硬性过滤参数总结，帮助用户定位问题。
+选股王 · V13.11（平衡过滤 & 回测指标修正版）
+核心：
+1. 稳定 V13.10 的硬性过滤。
+2. 略微放松默认的“巨量冲高”和“极端波动”过滤，以避免过滤掉真正的强势股。
+3. 优化回测模块，确保 T+N 收益率计算的准确性。
 """
 import streamlit as st
 import pandas as pd
@@ -26,11 +29,11 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王（V13.10 诊断增强版）", layout="wide")
-st.markdown("### 选股王（V13.10 诊断增强版）- 修复硬性过滤过于严格问题") 
+st.set_page_config(page_title="选股王（V13.11 平衡过滤版）", layout="wide")
+st.markdown("### 选股王（V13.11 平衡过滤版）- 优化风险过滤与回测") 
 
 # ---------------------------
-# 默认参数定义 (V13.10: 放松流动性要求)
+# 默认参数定义 (V13.11: 微调风险过滤默认值)
 # ---------------------------
 DEFAULT_FINAL_POOL = 500
 DEFAULT_TOP_DISPLAY = 30
@@ -38,21 +41,21 @@ DEFAULT_MIN_PRICE = 10.0
 DEFAULT_MAX_PRICE = 200.0
 DEFAULT_MIN_CIRC_MV_B = 40.0 
 DEFAULT_MAX_CIRC_MV_B = 500.0 
-DEFAULT_MIN_TURNOVER = 1.0 # 默认值降低：从 3.0% 降至 1.0%
-DEFAULT_MIN_AMOUNT = 50_000_000.0 # 默认值降低：从 2亿 降至 5000万
+DEFAULT_MIN_TURNOVER = 1.0 
+DEFAULT_MIN_AMOUNT = 50_000_000.0 
 DEFAULT_MA_PERIOD = 20
 DEFAULT_MIN_LIST_DAYS = 180
 DEFAULT_BACKTEST_DAYS = 10
 
-DEFAULT_VOL_SPIKE_MULT = 1.7
-DEFAULT_HIGH_PCT_THRESHOLD = 6.0
-DEFAULT_MAX_VOLATILITY_10D = 8.0 
+DEFAULT_VOL_SPIKE_MULT = 1.8 # 略微放宽：允许更大量的成交
+DEFAULT_HIGH_PCT_THRESHOLD = 6.0 
+DEFAULT_MAX_VOLATILITY_10D = 9.0 # 略微放宽：允许稍大波动
 
 # ---------------------------
 # 侧边栏参数 
 # ---------------------------
 with st.sidebar:
-    st.header("可调参数（V13.10 默认值）")
+    st.header("可调参数（V13.11 默认值）")
     INITIAL_TOP_N = 99999 
     
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=DEFAULT_FINAL_POOL, step=50))
@@ -84,7 +87,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=DEFAULT_BACKTEST_DAYS, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V13.10 诊断增强版'。")
+    st.caption("提示：策略已升级至 'V13.11 平衡过滤版'。")
 
 
 # ---------------------------
@@ -120,7 +123,6 @@ def safe_get(func, **kwargs):
 @st.cache_data(ttl=600)
 def get_trade_cal_dates():
     """安全地从 Tushare 获取所有开放交易日，并按降序排列。"""
-    # 此处依赖全局 pro 对象
     end_date = datetime.now().strftime("%Y%m%d")
     cal_df = safe_get(
         pro.trade_cal, 
@@ -140,20 +142,16 @@ def find_last_trade_day_robust():
     """
     V13.9 核心修正：迭代最近交易日，直到找到 Tushare 接口实际能提供数据的日期。
     """
-    global pro # 声明使用全局 pro 对象
+    global pro 
 
     trade_dates = get_trade_cal_dates()
     
     if not trade_dates: return None
     
-    # 尝试最近的 5 个交易日
     for date_str in trade_dates[:5]: 
-        
-        # 尝试拉取全市场日线数据，直接使用全局 pro
         daily_all = safe_get(pro.daily, trade_date=date_str)
         
         if not daily_all.empty:
-            # 找到有数据的日期，返回
             return date_str
         
     return None 
@@ -188,6 +186,7 @@ with col2:
     if st.button(f"✅ 运行历史回测 ({BACKTEST_DAYS} 日)", use_container_width=True):
         st.session_state['run_backtest'] = True
         st.session_state['run_selection'] = False
+        # 重置回测状态，除非回测已经完成
         if st.session_state['backtest_status']['progress'] == 1.0 or st.session_state['backtest_status']['total_days'] == 0:
              st.session_state['backtest_status'] = {'progress': 0.0, 'results': [], 'current_index': 0, 'total_days': 0}
         st.rerun()
@@ -300,7 +299,7 @@ def compute_indicators(df, ma_period):
     return res
 
 # ----------------------------------------------------
-# 核心评分函数 (V13.10: 增强零结果诊断)
+# 核心评分函数 
 # ----------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=600)
 def run_scoring_for_date(trade_date, params):
@@ -360,7 +359,7 @@ def run_scoring_for_date(trade_date, params):
     pool_merged['circ_mv_wan'] = pool_merged['circ_mv'].fillna(0)
 
 
-    # 3. V13.10 硬性过滤
+    # 3. V13.11 硬性过滤
     clean_df = pool_merged.copy()
     
     # 基础风险过滤 (ST, 价格, 北交所)
@@ -400,7 +399,7 @@ def run_scoring_for_date(trade_date, params):
     clean_df = clean_df[clean_df['turnover_rate'].notna() & (clean_df['turnover_rate'] >= min_turnover)]
     
     
-    # V13.10 增强诊断：如果股票数量为 0，打印详细参数
+    # V13.11 增强诊断：如果股票数量为 0，打印详细参数
     if clean_df.empty: 
         if trade_date == last_trade:
             st.error(f"诊断：所有硬性过滤后，剩余股票数量为 **0** 支。")
@@ -414,7 +413,7 @@ def run_scoring_for_date(trade_date, params):
                 <li><span style='color: yellow;'>流动性要求：最低换手率 **{min_turnover}%** | 最低成交额 **{min_amount:,.0f}元**</span></li>
                 <li>上市天数：>{min_list_days}天</li>
             </ul>
-            <p><strong>操作建议：</strong>请尝试在左侧边栏 <span style='color: yellow;'>**大幅放宽**</span> **最低换手率** (例如设为 0.5) 或 **最低成交额** (例如设为 10,000,000.0)。</p>
+            <p><strong>操作建议：</strong>如果结果仍为 0，请尝试在左侧边栏 <span style='color: yellow;'>**大幅放宽**</span> **最低换手率** 或 **最低成交额**。</p>
             </div>
             """, unsafe_allow_html=True)
         return pd.DataFrame()
@@ -422,7 +421,7 @@ def run_scoring_for_date(trade_date, params):
     if trade_date == last_trade:
         st.info(f"诊断：硬性过滤 (已包含次新股、市值收紧) 后，剩余股票数量: **{len(clean_df)}** 支，开始计算指标...")
         
-    # 4. 指标计算与 MA 趋势硬性过滤 (略，与 V13.9 相同)
+    # 4. 指标计算与 MA 趋势硬性过滤 
     score_pool = clean_df.sort_values('pct_chg', ascending=False).head(min(len(clean_df), 300)).copy().reset_index(drop=True)
 
     records = []
@@ -483,22 +482,28 @@ def run_scoring_for_date(trade_date, params):
         st.info(f"诊断：通过 {ma_trend_period} 日均线趋势过滤后，剩余股票数量: **{len(fdf)}** 支，开始高级风险过滤...")
         
     
-    # 5. 高级风险过滤 (略，与 V13.9 相同)
+    # 5. 高级风险过滤 (V13.11: 使用微调后的默认参数)
     try:
         before_cnt = len(fdf)
         
+        # A: 高位大阳线
         if all(c in fdf.columns for c in [f'ma{ma_trend_period}','last_close','pct_chg']):
+            # MA 偏离 10% 且涨幅大于阈值
             mask_high_big = (fdf['last_close'] > fdf[f'ma{ma_trend_period}'] * 1.10) & (fdf['pct_chg'] > high_pct_threshold)
             fdf = fdf[~mask_high_big.fillna(False)]
 
+        # B: 下跌途中反抽
         if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
+            # 前 3 天累计下跌且今日大阳
             mask_down_rebound = (fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > high_pct_threshold)
             fdf = fdf[~mask_down_rebound.fillna(False)]
 
+        # C: 巨量冲高（V13.11 略微放宽 VOL_SPIKE_MULT）
         if 'vol_ratio' in fdf.columns:
             mask_vol_spike = (fdf['vol_ratio'] > vol_spike_mult)
             fdf = fdf[~mask_vol_spike.fillna(False)]
 
+        # D: 极端波动（V13.11 略微放宽 MAX_VOLATILITY_10D）
         if 'volatility_10' in fdf.columns:
             mask_volatility = fdf['volatility_10'] > max_volatility_10d
             fdf = fdf[~mask_volatility.fillna(False)]
@@ -512,7 +517,7 @@ def run_scoring_for_date(trade_date, params):
     if fdf.empty: return pd.DataFrame()
 
 
-    # 6. RSL（相对强弱）计算 (略，与 V13.9 相同)
+    # 6. RSL（相对强弱）计算 
     if '10d_return' in fdf.columns:
         try:
             fdf['proxy_money'] = (abs(fdf['pct_chg']) + 1e-9) * fdf['vol_ratio'].fillna(0) * fdf['turnover_rate'].fillna(0)
@@ -529,7 +534,7 @@ def run_scoring_for_date(trade_date, params):
         fdf['proxy_money'] = 0.0
 
 
-    # 7. 归一化 (略，与 V13.9 相同)
+    # 7. 归一化 
     fdf['s_pct'] = norm_col(fdf.get('pct_chg', pd.Series([0]*len(fdf))))
     fdf['s_volratio'] = norm_col(fdf.get('vol_ratio', pd.Series([0]*len(fdf))))
     fdf['s_turn'] = norm_col(fdf.get('turnover_rate', pd.Series([0]*len(fdf))))
@@ -546,7 +551,7 @@ def run_scoring_for_date(trade_date, params):
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf)))) 
     
     
-    # 8. 综合评分 (略，与 V13.9 相同)
+    # 8. 综合评分
     w_pct = 0.18        
     w_volratio = 0.18   
     w_turn = 0.12       
@@ -571,7 +576,7 @@ def run_scoring_for_date(trade_date, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块 (保持不变)
+# 简易回测模块 (V13.11: 修正回测日期逻辑)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     
@@ -580,7 +585,7 @@ def run_simple_backtest(days, params):
     
     container = st.empty()
     with container.container():
-        st.subheader(f"📈 简易历史回测结果 (V13.10 稳定版)")
+        st.subheader(f"📈 简易历史回测结果 (V13.11 稳定版)")
         
         trade_dates_all = get_trade_cal_dates()
         
@@ -590,7 +595,7 @@ def run_simple_backtest(days, params):
 
         try:
             current_trade_idx = trade_dates_all.index(last_trade)
-            # 确保 trade_dates_all 的第一个日期就是 last_trade，只保留有数据的日期
+            # 选取包含 last_trade 及其之前的交易日
             trade_dates_all = trade_dates_all[current_trade_idx:]
         except ValueError:
             st.error(f"内部错误：无法定位最近有效交易日 {last_trade}。")
@@ -598,21 +603,30 @@ def run_simple_backtest(days, params):
 
 
         max_holding = max(HOLDING_PERIODS)
-        trade_dates = trade_dates_all[:days + max_holding]
-        trade_dates.reverse() 
-        total_iterations = len(trade_dates) - max_holding 
+        # 选取需要进行选股的交易日，从历史到最近
+        # 需要确保有足够的后续日期来计算 T+N 收益
+        select_dates_needed = trade_dates_all[max_holding : days + max_holding]
+        select_dates_needed.reverse() # 从最早的选股日开始
+
+        # 确保回测需要的总日期数足够
+        if len(select_dates_needed) < days:
+             # 如果实际能回测的天数不足，调整 days
+             days = len(select_dates_needed)
+             select_dates_needed = trade_dates_all[max_holding : days + max_holding]
+             select_dates_needed.reverse() 
         
-        if total_iterations < 1:
-            st.warning(f"交易日不足 {max_holding + 1} 天，无法进行回测。")
-            return
-            
+        total_iterations = days
         status['total_days'] = total_iterations
         start_index = status['current_index']
         
+        if total_iterations < 1:
+            st.warning("交易日不足，无法进行回测。")
+            return
+
         if start_index >= total_iterations:
              st.success(f"回测已完成。累计收益率请查看下方。")
         else:
-             st.info(f"回测周期：**{trade_dates[0]}** 至 **{trade_dates[total_iterations-1]}**。正在从第 {start_index+1} 天继续...")
+             st.info(f"回测周期：**{select_dates_needed[0]}** 至 **{select_dates_needed[-1]}**。正在从第 {start_index+1} 天继续...")
 
         pbar = st.progress(status['progress'], text=f"回测进度：[{status['current_index']}/{status['total_days']}]...")
         
@@ -632,9 +646,15 @@ def run_simple_backtest(days, params):
         }
         
         for i in range(start_index, total_iterations):
-            select_date = trade_dates[i]
-            next_trade_date = trade_dates[i+1] 
+            select_date = select_dates_needed[i]
             
+            # 在 trade_dates_all 中找到 select_date 的索引 (select_dates_needed 是反序的，trade_dates_all 是降序的)
+            try:
+                # 在降序的 trade_dates_all 中查找 select_date
+                base_idx = trade_dates_all.index(select_date)
+            except ValueError:
+                continue
+
             select_df_full = run_scoring_for_date(select_date, score_params) 
 
             result = {
@@ -653,14 +673,16 @@ def run_simple_backtest(days, params):
                 top_pick = select_df_full.iloc[0] 
                 ts_code = top_pick['ts_code']
                 
-                max_retries = 3 
-                buy_day_data = pd.DataFrame()
-                for attempt in range(max_retries):
+                # T+1 日期用于买入价（开盘价）: 降序列表的下一项
+                if base_idx + 1 < len(trade_dates_all):
+                    next_trade_date = trade_dates_all[base_idx + 1] 
+                else:
+                    next_trade_date = None
+                
+                buy_price = np.nan
+                if next_trade_date:
                     buy_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
-                    if not buy_day_data.empty: break
-                    time.sleep(1) 
-                    
-                buy_price = buy_day_data.iloc[0]['open'] if not buy_day_data.empty and 'open' in buy_day_data.columns else np.nan
+                    buy_price = buy_day_data.iloc[0]['open'] if not buy_day_data.empty and 'open' in buy_day_data.columns else np.nan
                 
                 result['股票'] = f"{top_pick.get('name', 'N/A')}({ts_code})"
                 result['买入价 (T+1 开盘)'] = buy_price
@@ -670,7 +692,11 @@ def run_simple_backtest(days, params):
                 if buy_price > 0 and not pd.isna(buy_price):
                     
                     for N in HOLDING_PERIODS:
-                        sell_trade_date = trade_dates[i+N] 
+                        # T+N 日期用于卖出价（收盘价）: 降序列表的第 N 项
+                        if base_idx + N < len(trade_dates_all):
+                             sell_trade_date = trade_dates_all[base_idx + N] 
+                        else:
+                             continue # 卖出日超出回测范围
                         
                         sell_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=sell_trade_date)
                         
@@ -680,6 +706,7 @@ def run_simple_backtest(days, params):
                             
                             if not pd.isna(sell_price):
                                 return_pct = (sell_price / buy_price) - 1.0
+                                # 假设单日跌停限制在 10%
                                 return_pct = max(-0.10, return_pct) 
                                 result[f'T+{N} 收益率 (%)'] = return_pct * 100
                         
@@ -689,6 +716,7 @@ def run_simple_backtest(days, params):
             
             pbar.progress(status['progress'], text=f"正在回测 {select_date}... [{i+1}/{total_iterations}]")
             
+            # 每隔 2 步刷新或最后一步刷新
             if (i+1) % 2 == 0 or (i + 1) == total_iterations: 
                  st.rerun() 
         
@@ -710,9 +738,15 @@ def run_simple_backtest(days, params):
         for idx, N in enumerate(HOLDING_PERIODS):
             col_name = f'T+{N} 收益率 (%)'
             results_df[col_name] = results_df[col_name].replace([np.inf, -np.inf], 0.0).fillna(0.0)
-            cumulative_return = (results_df[col_name] / 100 + 1).product() - 1
-            wins = (results_df[col_name] > 0).sum()
-            total_trades = len(results_df)
+            
+            # 计算累计收益率，只对有买入价的交易计算
+            valid_trades = results_df[results_df['买入价 (T+1 开盘)'].notna()]
+            
+            # 使用几何平均法计算累计收益 (1+r1)*(1+r2)*... - 1
+            cumulative_return = (valid_trades[col_name] / 100 + 1).product() - 1
+            
+            wins = (valid_trades[col_name] > 0).sum()
+            total_trades = len(valid_trades)
             win_rate = wins / total_trades if total_trades > 0 else 0
 
             with cols_metrics[idx]:
@@ -753,7 +787,6 @@ def run_live_selection(last_trade, params):
     fdf_full = run_scoring_for_date(last_trade, params_dict)
 
     if fdf_full.empty:
-        # V13.10 增强诊断信息在 run_scoring_for_date 中，此处只需处理空集
         st.error(f"清洗和评分后没有候选。请检查硬性过滤参数是否过于严格。")
         st.stop()
 
@@ -769,26 +802,30 @@ def run_live_selection(last_trade, params):
         'vol_ratio','10d_return','net_mf_amount','macd','volatility_10'
     ]
     
+    fdf['净流入 (亿)'] = fdf['net_mf_amount'] / 1e8
+    final_display_cols[final_display_cols.index('net_mf_amount')] = '净流入 (亿)'
+    
+    # 确保所有列都存在，避免 KeyError
     for c in final_display_cols:
         if c not in fdf.columns: fdf[c] = np.nan
     
-    if 'net_mf_amount' in fdf.columns:
-        fdf['净流入 (亿)'] = fdf['net_mf_amount'] / 1e8
-        final_display_cols[final_display_cols.index('net_mf_amount')] = '净流入 (亿)'
-        
-    
     st.dataframe(fdf[final_display_cols], use_container_width=True, height=500)
 
+    # 修复下载时可能出现的 KeyError (V13.11 确保下载的列也经过了预处理)
     download_cols = [c for c in fdf_full.columns if c not in ['list_date', 'days_since_list', 'circ_mv_wan']]
-    out_csv = fdf_full[download_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
-    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_10.csv", mime="text/csv")
+    if 'net_mf_amount' in download_cols: 
+        fdf_full['净流入 (亿)'] = fdf_full['net_mf_amount'] / 1e8
+        download_cols.remove('net_mf_amount')
+        download_cols.append('净流入 (亿)')
 
-    st.markdown("### 小结与操作提示（V13.10 诊断增强版）")
+    out_csv = fdf_full[download_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
+    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_11.csv", mime="text/csv")
+
+    st.markdown("### 小结与操作提示（V13.11 平衡过滤版）")
     st.markdown(f"""
-- **【核心修正】** 默认流动性参数已放宽：最低换手率 **{DEFAULT_MIN_TURNOVER}%**，最低成交额 **{DEFAULT_MIN_AMOUNT:,.0f}元**。
-- **【日期稳定】** 当前选股日 **{last_trade}** 已经过数据校验，保证 Tushare 有数据可用。
-- **【市值范围】** 当前流通市值范围：**{params_dict['MIN_CIRC_MV_Billion']} 亿 到 {params_dict['MAX_CIRC_MV_Billion']} 亿**。
-- **【操作建议】** 如果结果仍为 0，请查看上方的 **红色警告框** 中的详细参数总结，并尝试大幅放宽最低换手率/成交额。
+- **【结果稳定】** 硬性过滤已通过，总候选 **{len(fdf_full)}** 支，硬性过滤参数已维持 V13.10 的放宽设置。
+- **【过滤优化】** **巨量冲高** (当前阈值：**{DEFAULT_VOL_SPIKE_MULT}**) 和 **极端波动** (当前阈值：**{DEFAULT_MAX_VOLATILITY_10D}%**) 阈值已略微放宽，以减少对强势股的误杀。
+- **【后续步骤】** 现在您可以运行 **“🚀 运行当日选股”** 查看最新结果，或运行 **“✅ 运行历史回测”** 来测试 V13.11 优化后的效果。
 """)
 
 
