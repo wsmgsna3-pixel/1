@@ -28,21 +28,20 @@ def init_tushare(token):
     """
     try:
         ts.set_token(token)
-        # 核心修复点：设置 timeout=30 秒，防止 Streamlit Cloud 连接超时
+        # 设置 timeout=30 秒
         return ts.pro_api(timeout=30) 
     except Exception as e:
         st.error(f"Token 设置失败: {e}")
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (已包含重试机制)
+# 2. 核心数据获取逻辑 (已移除硬性数值筛选)
 # ==========================================
 
-@st.cache_data(ttl=3600) # 缓存1小时，避免重复请求
+@st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    第一步：基础池筛选（市值、价格、非ST、非北交所）
-    *** 已扩大默认硬性筛选范围 ***
+    第一步：基础池筛选。只保留风险排除（非ST/非北交所），移除所有数值硬性筛选。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -79,37 +78,34 @@ def get_base_pool(token_input):
     # 合并数据
     df = pd.merge(df_basic, df_daily, on='ts_code', how='inner')
     
-    # --- 核心筛选逻辑 Step 1：基础池筛选 ---
+    # --- 核心筛选逻辑 Step 1：只保留风险排除 ---
     
-    # 1. 排除北交所 (Market != 北京 / 代码不以8/4/9开头)
+    # 1. 排除北交所 
     df = df[~df['market'].str.contains('北|BJE', na=False)] 
     
     # 2. 排除ST
     df = df[~df['name'].str.contains('ST|退', na=False)]
     
-    # 3. 市值筛选 (10亿 - 1000亿) - 单位是万元
-    # *** V3 修复点: 扩大默认市值范围 ***
-    df = df[(df['total_mv'] >= 100000) & (df['total_mv'] <= 10000000)]
+    # 3. **V4 核心修改：移除硬性数值筛选 (市值/价格)，让所有非ST股进入下一步 **
     
-    # 4. 价格筛选 (5元 - 300元)
-    # *** V3 修复点: 扩大默认价格范围 ***
-    df = df[(df['close'] >= 5) & (df['close'] <= 300)]
+    # 4. **新增安全检查：** 剔除价格或市值为空/0的异常数据点，以防数据不全导致问题
+    df = df.dropna(subset=['close', 'total_mv'])
+    df = df[(df['close'] > 0) & (df['total_mv'] > 0)]
     
-    status_text.success(f"基础数据获取和清洗完成！符合【市值+价格+非ST】的股票共：{len(df)} 只")
+    status_text.success(f"基础数据获取和清洗完成！符合【非ST非北交所】的股票共：{len(df)} 只")
     return df, trade_date
 
 def get_technical_and_flow(pro, ts_code, end_date):
     """
     获取单个股票的技术面和资金流数据
     """
-    # 获取过去60个交易日数据（用于计算均线和RSI）
     start_date = (datetime.strptime(end_date, '%Y%m%d') - timedelta(days=120)).strftime('%Y%m%d')
     
     # 1. 日线行情
     df_daily = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
-    if len(df_daily) < 60: return None, None # 数据不足60天，无法计算MA60
+    if len(df_daily) < 60: return None, None 
     
-    df_daily = df_daily.sort_values('trade_date') # 按日期升序
+    df_daily = df_daily.sort_values('trade_date') 
     
     # 2. 资金流向 (10000积分特权接口)
     df_flow = pro.moneyflow(ts_code=ts_code, start_date=start_date, end_date=end_date)
@@ -118,7 +114,7 @@ def get_technical_and_flow(pro, ts_code, end_date):
     return df_daily, df_flow
 
 # ==========================================
-# 3. 策略计算与回测逻辑
+# 3. 策略计算与回测逻辑 (保持不变)
 # ==========================================
 
 def calculate_strategy(df_daily, df_flow):
@@ -135,7 +131,6 @@ def calculate_strategy(df_daily, df_flow):
     delta = pd.Series(close).diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    # 避免除以零
     rs = gain / loss.replace(0, np.nan) 
     rsi = 100 - (100 / (1 + rs))
     current_rsi = rsi.values[-1]
@@ -153,7 +148,6 @@ def calculate_strategy(df_daily, df_flow):
     
     # C. 资金流向 (最近3天主力净流入累计为正)
     if not df_flow.empty:
-        # net_mf_amount: 主力净流入额(万元)
         recent_flow = df_flow.tail(3)['net_mf_amount'].sum()
         is_money_in = recent_flow > 0
     else:
@@ -209,12 +203,11 @@ st.markdown("策略：**20-500亿市值 + 趋势向上 + 资金流入 + 排除�
 
 with st.sidebar:
     st.header("⚙️ 设置")
-    # 默认值留空，让用户输入
     token = st.text_input("请输入 TuShare Token", type="password")
     
     st.divider()
     st.write("📊 **筛选参数微调**")
-    # 侧边栏滑块的默认值不变，但硬性筛选范围变宽
+    # V4 侧边栏滑块的范围与 V3 保持一致
     mkt_cap_min, mkt_cap_max = st.slider("市值范围 (亿元)", 10, 1000, (20, 500))
     price_min, price_max = st.slider("价格范围 (元)", 5, 300, (10, 200))
     
@@ -224,14 +217,14 @@ if run_btn and token:
     pro = init_tushare(token)
     
     # 1. 获取基础池
-    # 注意：这里调用时，会先使用缓存数据，如果缓存失效才会重新运行
     df_base, trade_date = get_base_pool(token)
     
     if df_base.empty:
+        st.error("数据获取失败，或当前交易日无非ST/非北交所股票数据。")
         st.stop()
         
-    # 应用侧边栏的动态过滤
-    # 侧边栏的筛选比 get_base_pool 的硬性筛选更精确
+    # 应用侧边栏的动态过滤 (所有数值筛选都在这里完成)
+    # total_mv 单位为万元
     df_pool = df_base[
         (df_base['total_mv'] >= mkt_cap_min * 10000) & 
         (df_base['total_mv'] <= mkt_cap_max * 10000) &
@@ -239,12 +232,17 @@ if run_btn and token:
         (df_base['close'] <= price_max)
     ]
     
+    if df_pool.empty:
+        st.warning(f"初筛（非ST）后，没有股票满足您设置的市值 ({mkt_cap_min}-{mkt_cap_max}亿) 和价格 ({price_min}-{price_max}元) 范围。请调整侧边栏滑块。")
+        st.stop()
+
+    
     st.write(f"📅 数据日期: {trade_date} | 初筛后剩余: {len(df_pool)} 只 | 正在进行深度分析...")
     
     # 2. 循环处理 (添加进度条)
     final_results = []
     
-    # 选取换手率较高的前 200 只进行深度扫描，以提高短线效率
+    # 选取换手率较高的前 200 只进行深度扫描
     target_pool = df_pool.sort_values('turnover_rate', ascending=False).head(200)
     
     total_scan = len(target_pool)
@@ -302,7 +300,7 @@ if run_btn and token:
             column_order=['代码', '名称', '现价', '主力净流入(万)', 'T+3平均收益(%)', '3日历史胜率', '行业', 'RSI', '20日涨幅(%)']
         )
         
-        # 详细图表展示区
+        # 详细图表展示区 (保持不变)
         st.divider()
         st.subheader("📈 个股详情分析")
         selected_stock = st.selectbox("选择一只股票查看 K 线图", df_res['代码'].astype(str) + " | " + df_res['名称'])
@@ -324,7 +322,7 @@ if run_btn and token:
             st.info("💡 交易建议：请参考 **T+3平均收益(%)** 和 **3日历史胜率** 来确定您的持股时间。")
             
     else:
-        st.warning(f"初筛后剩余 {len(df_pool)} 只，但没有股票完全符合所有【趋势+资金+安全】条件。建议放宽市值或价格范围，或者换个交易日再试。")
+        st.warning(f"初筛（非ST）后剩余 {len(df_pool)} 只，但没有股票完全符合所有【趋势+资金+安全】条件。建议调整侧边栏参数或换个交易日再试。")
 
 elif run_btn and not token:
     st.error("请先在左侧输入 TuShare Token")
