@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V13.3 日期修正版 (核心：解决 Tushare 返回未来交易日的问题)
+选股王 · V13.4 最终日期优化版 (核心：解决 find_last_trade_day() 卡顿问题)
 
 说明：
-1. 【日期修复】修正 find_last_trade_day 逻辑，确保返回的日期是已收盘的、可查询到数据的日期。
+1. 【优化日期】简化 find_last_trade_day 逻辑，不再进行慢速的逐日数据验证，而是基于 Tushare 返回的日期进行安全回退。
 2. 【保留 V13.2 核心风控】包含次新股过滤、市值收紧、理性权重。
 """
 import streamlit as st
@@ -15,6 +15,7 @@ import warnings
 import joblib 
 import os
 import math
+import time 
 
 warnings.filterwarnings("ignore")
 
@@ -28,14 +29,14 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置 (UI 空间最大化)
 # ---------------------------
-st.set_page_config(page_title="选股王（V13.3 日期修正版）", layout="wide")
-st.markdown("### 选股王（V13.3 日期修正版）") 
+st.set_page_config(page_title="选股王（V13.4 最终日期优化版）", layout="wide")
+st.markdown("### 选股王（V13.4 最终日期优化版）") 
 
 # ---------------------------
 # 侧边栏参数 
 # ---------------------------
 with st.sidebar:
-    st.header("可调参数（V13.3 默认值）")
+    st.header("可调参数（V13.4 默认值）")
     INITIAL_TOP_N = 99999 
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
@@ -64,8 +65,8 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=10, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V13.3 日期修正版'。")
-    st.caption("核心：修复了 Tushare 返回未来日期导致的选股失败。")
+    st.caption("提示：策略已升级至 'V13.4 最终日期优化版'。")
+    st.caption("核心：解决了 Tushare 返回未来日期和启动卡顿的问题。")
 
 # ---------------------------
 # Token 输入
@@ -94,35 +95,64 @@ def safe_get(func, **kwargs):
         return pd.DataFrame()
 
 # ---------------------------
-# 交易日历获取 (V13.3 修正)
+# 交易日历获取 (V13.4 优化)
 # ---------------------------
 @st.cache_data(ttl=600)
-def find_last_trade_day():
-    # 尝试获取最近的交易日
-    today_date = datetime.now().strftime("%Y%m%d")
+def get_trade_cal_dates():
+    # 获取最近20个交易日，用于快速判断
+    end_date = datetime.now().strftime("%Y%m%d")
     cal_df = safe_get(
         pro.trade_cal, 
         exchange='SSE', 
         is_open='1', 
-        end_date=today_date, 
+        end_date=end_date, 
         fields='cal_date'
     )
-    
-    if cal_df.empty: return None
+    if cal_df.empty: return []
+    return cal_df['cal_date'].sort_values(ascending=False).tolist()
 
-    # 获取所有交易日，并降序排列
-    trade_dates = cal_df['cal_date'].sort_values(ascending=False).tolist()
+
+def find_last_trade_day_optimized():
+    trade_dates = get_trade_cal_dates()
     
-    # 确保返回的日期的数据已经可以获取
-    for trade_date in trade_dates:
-        # 简单检查该日期是否有数据 (例如检查沪深300指数数据)
-        test_df = safe_get(pro.daily, ts_code='000300.SH', trade_date=trade_date)
-        if not test_df.empty:
-            return trade_date
+    if not trade_dates: return None
+    
+    # Tushare 返回的第一个日期就是最新的交易日
+    latest_date_str = trade_dates[0]
+    latest_date = datetime.strptime(latest_date_str, "%Y%m%d")
+    
+    # 当前时间（以北京时间简单推算）
+    now = datetime.utcnow() + timedelta(hours=8)
+    today_str = now.strftime("%Y%m%d")
+    
+    # 场景 1: Tushare 返回未来日期 (例如：今天是 27 日，它返回 28 日)
+    if latest_date > now.replace(hour=0, minute=0, second=0, microsecond=0):
+        # 回退到前一个交易日
+        if len(trade_dates) > 1:
+            return trade_dates[1]
+        else:
+            # 如果只有一个日期，且是未来日期，则返回 None
+            return None
             
-    return None # 无法找到任何有数据的交易日
+    # 场景 2: Tushare 返回当日日期 (例如：今天是 27 日，它返回 27 日)
+    elif latest_date_str == today_str:
+        # 如果时间已过收盘时间（例如 16:00），则认为数据已可用
+        if now.hour >= 16: 
+            return latest_date_str
+        else:
+            # 如果还没收盘，则应该使用前一个交易日的数据进行选股
+            if len(trade_dates) > 1:
+                return trade_dates[1]
+            else:
+                return None
+    
+    # 场景 3: Tushare 返回前一个交易日 (最常见且安全的情况)
+    else:
+        return latest_date_str
 
-last_trade = find_last_trade_day()
+# V13.4 运行新的日期函数
+last_trade = find_last_trade_day_optimized()
+
 if not last_trade:
     st.error("无法找到最近交易日，检查网络或 Token 权限。")
     st.stop()
@@ -157,7 +187,7 @@ with col2:
 st.markdown("---")
 
 # ---------------------------
-# 指标计算和归一化 (保持不变)
+# 指标计算和归一化 (保持 V13.2 逻辑)
 # ---------------------------
 def compute_indicators(df, ma_period):
     res = {}
@@ -218,7 +248,7 @@ def norm_col(s):
 
 
 # ----------------------------------------------------
-# 核心评分函数 (V13.3 = V13.2 逻辑)
+# 核心评分函数 (V13.4 = V13.2 逻辑)
 # ----------------------------------------------------
 @memory.cache 
 def run_scoring_for_date(trade_date, params):
@@ -232,8 +262,10 @@ def run_scoring_for_date(trade_date, params):
     daily_all = safe_get(pro.daily, trade_date=trade_date)
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     
+    # **日期修正后的关键检查点**
     if daily_all.empty: 
-        if trade_date == last_trade: st.error(f"诊断：Tushare 无法获取 {trade_date} 的日线数据。")
+        if trade_date == last_trade: 
+            st.error(f"诊断：Tushare 无法获取 {trade_date} 的日线数据。请检查 Token 权限或等待数据更新。")
         return pd.DataFrame()
     
     pool0 = daily_all.copy().reset_index(drop=True)
@@ -388,16 +420,26 @@ def run_simple_backtest(days, params):
     
     container = st.empty()
     with container.container():
-        st.subheader(f"📈 简易历史回测结果 (V13.3 日期修正版)")
+        st.subheader(f"📈 简易历史回测结果 (V13.4 日期修正版)")
         
-        trade_dates_df = safe_get(pro.trade_cal, exchange='SSE', is_open='1', end_date=find_last_trade_day(), fields='cal_date')
-        if trade_dates_df.empty:
-            st.error("无法获取历史交易日历。")
-            return
+        # 使用优化的日期函数获取交易日历
+        trade_dates_all = get_trade_cal_dates()
+        
+        # 确保第一个日期是已收盘的，否则回退，确保回测的基准日期是正确的
+        if trade_dates_all[0] == last_trade:
+            # 最后一个有效选股日
+            pass
+        elif len(trade_dates_all) > 1 and trade_dates_all[1] == last_trade:
+            # Tushare 返回了未来日期，我们回退到了前一个日期
+            trade_dates_all = trade_dates_all[1:]
+        
+        if not trade_dates_all:
+             st.error("无法获取历史交易日历。")
+             return
 
         max_holding = max(HOLDING_PERIODS)
-        trade_dates = trade_dates_df['cal_date'].sort_values(ascending=False).head(days + max_holding).tolist() 
-        trade_dates.reverse() 
+        trade_dates = trade_dates_all[:days + max_holding]
+        trade_dates.reverse() # 倒序是为了让回测从最早的一天开始
         total_iterations = len(trade_dates) - max_holding 
         
         if total_iterations < 1:
@@ -445,7 +487,14 @@ def run_simple_backtest(days, params):
                 top_pick = select_df_full.iloc[0] 
                 ts_code = top_pick['ts_code']
                 
-                buy_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
+                # 必须等待 T+1 的数据
+                max_retries = 3 
+                buy_day_data = pd.DataFrame()
+                for attempt in range(max_retries):
+                    buy_day_data = safe_get(pro.daily, ts_code=ts_code, trade_date=next_trade_date)
+                    if not buy_day_data.empty: break
+                    time.sleep(1) # 增加延迟以避免 API 限流
+                    
                 buy_price = buy_day_data.iloc[0]['open'] if not buy_day_data.empty and 'open' in buy_day_data.columns else np.nan
                 
                 result['股票'] = f"{top_pick.get('name', 'N/A')}({ts_code})"
@@ -554,9 +603,9 @@ def run_live_selection(last_trade, params):
     st.dataframe(fdf[final_display_cols], use_container_width=True)
 
     out_csv = fdf_full[display_cols_full].head(200).to_csv(index=True, encoding='utf-8-sig')
-    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_3.csv", mime="text/csv")
+    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_4.csv", mime="text/csv")
 
-    st.markdown("### 小结与操作提示（V13.3 日期修正版）")
+    st.markdown("### 小结与操作提示（V13.4 最终日期优化版）")
     st.markdown(f"""
 - **【市值范围】** 流通市值已收紧到 **{params['MIN_CIRC_MV_Billion']} 亿 到 {params['MAX_CIRC_MV_Billion']} 亿** 之间。
 - **【风控已修复】** 次新股（上市不足 {params['MIN_LIST_DAYS']} 天）已被强制排除。
