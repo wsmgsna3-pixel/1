@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.6 (最终平衡版：D+5 攻坚)
+选股王 · 全市场扫描增强版 V3.7 (终极稳定版：D+5 极致保守)
 更新说明：
-1. 【**稳定基准**】：恢复 V3.4 的稳定权重结构，放弃 V3.5 的激进调整。
-2. 【**D+5 攻坚**】：精准打击 D+5 痛点，通过提高 60日位置反向 (w_position) 权重，确保选出的股票有足够的上涨空间，以防止 D+3 后的回吐。
+1. 【**极致保守**】：将稳定性反向 (w_volatility) 和 60日位置反向 (w_position) 权重提升至 65% (0.30 + 0.35)。
+2. 【**D+5 攻坚**】：彻底削弱短期动能权重，确保选出的 Top 3 具有绝对的安全边际和上涨空间，目标是强制 D+5 收益为正。
 3. 【错误修复】：保留 get_future_prices 函数中的 Key Error 修复。
 """
 
@@ -18,9 +18,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.6 最终平衡版", layout="wide")
-st.title("选股王 · V3.6 最终平衡版（D+5 攻坚模型）")
-st.markdown("🔥 **当前版本采用 V3.6 最终权重，重点提升了对低位股的偏好。**")
+st.set_page_config(page_title="选股王 · V3.7 终极稳定版", layout="wide")
+st.title("选股王 · V3.7 终极稳定版（D+5 极致保守模型）")
+st.markdown("🔥 **当前版本采用 V3.7 终极权重，最大化稳定性和低位优势 (65%)。**")
 
 # ---------------------------
 # 辅助函数
@@ -64,13 +64,12 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 
     hist = safe_get(pro.daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
     
-    # 【V3.6 修复：强制检查 trade_date 列是否存在】
+    # V3.7 修复：强制检查 trade_date 列是否存在
     if hist.empty or 'trade_date' not in hist.columns:
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
-    # ---------------------------------------------
-
+    
     hist = hist.sort_values('trade_date').reset_index(drop=True)
     
     results = {}
@@ -100,6 +99,7 @@ with st.sidebar:
     )
     st.markdown("---")
     st.header("核心参数")
+    # ！！！注意：请将此参数调回 300 以保证数据环境稳定
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=300, step=50, help="为了速度，建议控制在300-500以内"))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=50, step=10))
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1, help="仅回测分析这前 K 名股票的平均收益。"))
@@ -298,7 +298,7 @@ for i, row in enumerate(final_candidates.itertuples()):
     my_bar.progress((i + 1) / total_c)
 
 # ---------------------------
-# 第六步：归一化与打分 (V3.6 最终平衡权重)
+# 第六步：归一化与打分 (V3.7 极致保守权重)
 # ---------------------------
 fdf = pd.DataFrame(records)
 if fdf.empty:
@@ -319,15 +319,15 @@ fdf['s_macd'] = normalize(fdf['macd'])
 fdf['s_trend'] = normalize(fdf['10d_return'])
 fdf['s_position'] = fdf['position_60d'] / 100 
 
-# V3.6 最终平衡权重配置
+# V3.7 极致保守权重配置
 w_pct = 0.05        
-w_turn = 0.10       
+w_turn = 0.05       
 w_vol = 0.05        
-w_mf = 0.10         
-w_macd = 0.10       
-w_trend = 0.20      
-w_volatility = 0.15 # 略微降低
-w_position = 0.25   # 提升惩罚力度
+w_mf = 0.05         
+w_macd = 0.05       
+w_trend = 0.15      
+w_volatility = 0.30 # 极致提升
+w_position = 0.35   # 最大化低位偏好
 
 # 确保总和为 1.00
 score = (
@@ -375,4 +375,4 @@ st.dataframe(fdf[cols_show].head(TOP_DISPLAY), use_container_width=True, column_
     "turnover": st.column_config.NumberColumn("换手率(%)", format="%.2f")
 })
 
-st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.6_结果_{last_trade}.csv")
+st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.7_结果_{last_trade}.csv")
