@@ -7,10 +7,10 @@ from datetime import datetime, timedelta
 import time
 
 # 定义版本号
-APP_VERSION = "V12" 
+APP_VERSION = "V14" 
 
-# TuShare 接口一次性查询最大限制 (V12中不再使用，但保留定义)
-CHUNK_SIZE = 900 
+# Tushare 单次查询限制 (用于分页循环)
+LIMIT_SIZE = 5000 
 
 # ==========================================
 # 1. 页面配置与工具函数
@@ -41,16 +41,15 @@ def init_tushare(token):
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (V12: 官方全量查询 Daily Basic)
+# 2. 核心数据获取逻辑 (V14: Tushare 分页循环查询)
 # ==========================================
 
 @st.cache_data(show_spinner=False) 
 def get_stock_basic_data(_pro):
     """
-    独立函数：获取全市场股票代码列表 (V12: 忽略 _pro 参数缓存)
+    独立函数：获取全市场股票代码列表 (V14)
     """
     try:
-        # V12 字段增加 total_mv 用于更精确的过滤
         df_basic = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
         if df_basic.empty:
              st.error("【错误定位 A】: pro.stock_basic 接口返回为空。Token 可能无法访问基础信息。")
@@ -62,7 +61,7 @@ def get_stock_basic_data(_pro):
 @st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    V12 核心：直接使用 trade_date 查询 daily_basic 全量最新数据。
+    V14 核心：使用 Tushare 分页（limit/offset）查询 daily_basic 全量最新数据。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -72,7 +71,7 @@ def get_base_pool(token_input):
 
     # --- 尝试获取基础数据和交易日历 ---
     max_retries = 3
-    df_basic, trade_date = pd.DataFrame(), ""
+    df_basic_filtered, trade_date = pd.DataFrame(), ""
 
     for attempt in range(max_retries):
         try:
@@ -80,36 +79,62 @@ def get_base_pool(token_input):
             cal = pro.trade_cal(exchange='', is_open='1', end_date=datetime.now().strftime('%Y%m%d'), fields='cal_date')
             trade_date = cal['cal_date'].values[-1]
             
-            # 2. 获取基础信息（调用独立函数）
+            # 2. 获取基础信息并排除 ST/北交所
             df_basic = get_stock_basic_data(pro)
             if df_basic.empty:
                 return pd.DataFrame(), ""
 
-            # 3. 排除北交所和ST
-            df_basic = df_basic[~df_basic['market'].str.contains('北|BJE', na=False)] 
-            df_basic = df_basic[~df_basic['name'].str.contains('ST|退', na=False)]
+            df_basic_filtered = df_basic[~df_basic['market'].str.contains('北|BJE', na=False)] 
+            df_basic_filtered = df_basic_filtered[~df_basic_filtered['name'].str.contains('ST|退', na=False)]
             
-            # V12 增加：如果基础代码池为空，则提前报错
-            if df_basic.empty:
-                status_text.error("【错误定位 B】: 基础代码池过滤后为空。请检查 pro.stock_basic 返回的数据是否包含有效A股。")
+            if df_basic_filtered.empty:
+                status_text.error("【错误定位 B】: 基础代码池过滤后为空。")
                 return pd.DataFrame(), ""
 
-            status_text.info(f"基础代码池包含 {len(df_basic)} 只股票。正在获取最新日线指标...")
+            # 3. V14 核心逻辑：分页查询 daily_basic
+            status_text.info(f"基础代码池包含 {len(df_basic_filtered)} 只股票。正在分页获取最新日线指标...")
             
-            # 4. V12 核心逻辑：直接按日期查询全量 daily_basic
-            # 不传入 ts_code，依赖 Tushare 自动返回该日所有股票数据
-            daily_basic_fields = 'ts_code,close,turnover_rate,total_mv,circ_mv' 
+            df_daily_basic_chunks = []
+            offset = 0
             
-            # Tushare 官方方法：按日期查询全市场数据
-            df_daily_data = pro.daily_basic(trade_date=trade_date, fields=daily_basic_fields)
-            
-            if df_daily_data.empty:
-                status_text.error("【错误定位 C】: pro.daily_basic 按日期查询未返回任何最新日线数据。Token 可能缺乏访问最新数据的权限。")
+            while True:
+                daily_basic_fields = 'ts_code,close,turnover_rate,total_mv,circ_mv'
+                
+                # 使用 limit 和 offset 进行分页查询
+                chunk_df = pro.daily_basic(
+                    trade_date=trade_date, 
+                    fields=daily_basic_fields,
+                    limit=LIMIT_SIZE, 
+                    offset=offset
+                )
+                
+                if chunk_df is None or chunk_df.empty:
+                    # 退出循环的条件：API 返回空数据
+                    break
+                    
+                df_daily_basic_chunks.append(chunk_df)
+                status_text.info(f"已获取到 {offset + len(chunk_df)} 条数据...")
+                
+                # 如果返回的数据量小于限制，说明是最后一页
+                if len(chunk_df) < LIMIT_SIZE:
+                    break
+                
+                offset += LIMIT_SIZE
+                time.sleep(1.2) # 避免 API 频率超限
+
+            # 合并所有批次的数据
+            if not df_daily_basic_chunks:
+                status_text.error("【错误定位 C】: pro.daily_basic 分页查询未返回任何最新日线数据。请确认 Token 权限。")
                 return pd.DataFrame(), ""
                 
-            # 5. 整合数据
+            df_daily_data = pd.concat(df_daily_basic_chunks, ignore_index=True)
+            
+            # 报告实际从 Tushare 获取到数据的数量
+            st.info(f"Tushare 实际返回【最新价格/市值】数据的股票数量：{len(df_daily_data)} 只。")
+
+            # 4. 整合数据
             # 只有同时拥有基础信息和最新价格的股票才能留下
-            df = pd.merge(df_basic, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
+            df = pd.merge(df_basic_filtered, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
 
             break
         except Exception as e:
@@ -126,17 +151,16 @@ def get_base_pool(token_input):
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
     df['total_mv'] = pd.to_numeric(df['total_mv'], errors='coerce') 
     
-    # total_mv 单位是万元，我们转换为亿元，以匹配滑块 (10000 万元 = 1 亿元)
+    # total_mv 单位是万元，我们转换为亿元
     df['total_mv_billion'] = df['total_mv'] / 10000
     
-    # 剔除价格或市值为空/0的异常数据点
+    # 剔除价格或市值为空的NaN值
     df = df.dropna(subset=['close', 'total_mv_billion', 'turnover_rate'])
-    df = df[(df['close'] > 0) & (df['total_mv_billion'] > 0)]
-
+    
     status_text.success(f"基础数据获取和清洗完成！符合【非ST非北交所】的股票共：{len(df)} 只")
     return df, trade_date
 
-# 其余函数（get_technical_and_flow, calculate_strategy, simple_backtest, 主界面逻辑）保持 V11 不变
+# 其余函数（get_technical_and_flow, calculate_strategy, simple_backtest, 主界面逻辑）保持不变
 
 def get_technical_and_flow(pro, ts_code, end_date):
     """
@@ -262,7 +286,6 @@ if run_btn and token:
     pro = init_tushare(token)
     df_base, trade_date = get_base_pool(token)
     
-    # V11 增加：如果 df_base 为空，直接停在这里并显示错误信息
     if df_base.empty:
         st.error("数据获取失败，或当前交易日无非ST/非北交所股票数据。请检查 Tushare Token 积分和权限。")
         st.stop()
@@ -270,10 +293,10 @@ if run_btn and token:
     # 应用侧边栏的动态过滤 
     # total_mv_billion 单位是亿元
     df_pool = df_base[
-        (df_base['total_mv_billion'] >= mkt_cap_min) & 
-        (df_base['total_mv_billion'] <= mkt_cap_max) &
-        (df_base['close'] >= price_min) &
-        (df_base['close'] <= price_max)
+        (df_base['total_mv_billion'].fillna(0) >= mkt_cap_min) & 
+        (df_base['total_mv_billion'].fillna(0) <= mkt_cap_max) &
+        (df_base['close'].fillna(0) >= price_min) &
+        (df_base['close'].fillna(0) <= price_max)
     ]
     
     if df_pool.empty:
