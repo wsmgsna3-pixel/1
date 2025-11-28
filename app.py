@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.2 (位置过滤旗舰版)
+选股王 · 全市场扫描增强版 V3.3 (极致 D+5 稳定版)
 更新说明：
-1. 核心修复：集成 **60日相对价格位置 (Position_60d)** 指标，并赋予高额反向权重，解决“红彤彤大涨后持续下跌”的高位陷阱问题。
-2. 回测优化：新增 **“回测分析 Top K”** 参数，让回测结果更符合你的实际交易习惯（Top 3）。
-3. 其余功能（双轨选股、D+30回测、健壮性）保持不变。
+1. 【最终权重】：采用 V3.3 权重（降低 Position 权重，提高 Trend 权重），优化 D+5 稳定性。
+2. 【效率优化】：彻底移除 D+30 交易日的回测逻辑，专注于 D+1, D+3, D+5。
+3. 【功能保留】：保留 60日位置过滤、动态 Top K 回测、双轨选股等所有 V3.2 功能。
 """
 
 import streamlit as st
@@ -18,12 +18,12 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.2 位置过滤旗舰版", layout="wide")
-st.title("选股王 · V3.2 位置过滤旗舰版（高位陷阱终结者）")
-st.markdown("🔥 **核心升级：引入 60日价格位置过滤。回测分析范围可自定义。**")
+st.set_page_config(page_title="选股王 · V3.3 极致 D+5 稳定版", layout="wide")
+st.title("选股王 · V3.3 极致 D+5 稳定版（持股 1-5 天专用）")
+st.markdown("🔥 **当前版本专注于 D+5 周期内的稳定收益，已移除 D+30 冗余回测。**")
 
 # ---------------------------
-# 辅助函数（必须定义在调用之前）
+# 辅助函数
 # ---------------------------
 def safe_get(func, **kwargs):
     """安全调用 Tushare API，在出错或返回空时返回带 'ts_code' 的空 DataFrame"""
@@ -55,12 +55,12 @@ def get_selection_date(backtest_date_input, max_days=20):
     return None, False
 
 @st.cache_data(ttl=600)
-def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5, 30]):
+def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]): # 【移除 30】
     """拉取选股日之后 N 个交易日的收盘价，用于回测"""
     
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    end_date = (d0 + timedelta(days=45)).strftime("%Y%m%d")
+    end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d") # 【日期缩短，更高效】
 
     hist = safe_get(pro.daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
     hist = hist.sort_values('trade_date').reset_index(drop=True)
@@ -97,7 +97,6 @@ with st.sidebar:
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=300, step=50, help="为了速度，建议控制在300-500以内"))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=50, step=10))
     
-    # 【新增回测分析范围参数】
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1, help="仅回测分析这前 K 名股票的平均收益。"))
     
     st.markdown("---")
@@ -216,12 +215,11 @@ final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
 st.write(f"  -> 最终入围评分：{len(final_candidates)} 只（含 {len(df_pct)} 只高涨幅，{len(df_turn)} 只高活跃潜伏）")
 
 # ---------------------------
-# 第五步：拉取历史 + 深度评分 (新增 Position_60d 计算)
+# 第五步：拉取历史 + 深度评分 (计算 Position_60d)
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_hist(ts_code, end_date, days=60):
     try:
-        # 拉取 60 个交易日数据，约 120 个日历日
         start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
         df = safe_get(pro.daily, ts_code=ts_code, start_date=start, end_date=end_date)
         if df.empty: return pd.DataFrame()
@@ -235,10 +233,9 @@ def compute_indicators(df):
         return res
         
     close = df['close'].astype(float)
-    
     res['last_close'] = close.iloc[-1]
     
-    # MACD, KDJ, 量比, 10日涨幅, 波动率 (逻辑不变)
+    # MACD
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -248,6 +245,7 @@ def compute_indicators(df):
     else:
         res['macd_val'] = np.nan
         
+    # KDJ
     n = 9
     if len(close) >= n:
         low_n = df['low'].rolling(window=n).min()
@@ -258,16 +256,20 @@ def compute_indicators(df):
     else:
         res['k'] = np.nan
         
+    # 量比
     vols = df['vol'].astype(float).tolist()
     if len(vols) >= 6:
         res['vol_ratio'] = vols[-1] / (np.mean(vols[-6:-1]) + 1e-9)
     else:
         res['vol_ratio'] = np.nan
         
+    # 10日涨幅
     res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 else 0
+    
+    # 波动率
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
-    # 【V3.2 新增指标】 60日相对价格位置
+    # 60日相对价格位置
     if len(df) >= 60:
         hist_60 = df.tail(60)
         min_low = hist_60['low'].min()
@@ -275,12 +277,11 @@ def compute_indicators(df):
         current_close = hist_60['close'].iloc[-1]
         
         if max_high == min_low:
-            res['position_60d'] = 50.0 # 波动为零，设为中性
+            res['position_60d'] = 50.0 
         else:
-            # Position = (收盘价 - 60日最低价) / (60日最高价 - 60日最低价) * 100
             res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
     else:
-        res['position_60d'] = np.nan # 数据不足
+        res['position_60d'] = np.nan 
     
     return res
 
@@ -310,14 +311,15 @@ for i, row in enumerate(final_candidates.itertuples()):
         'k': ind.get('k', 50),
         '10d_return': ind.get('10d_return', 0),
         'volatility': ind.get('volatility', 0),
-        'position_60d': ind.get('position_60d', np.nan) # 【新增指标】
+        'position_60d': ind.get('position_60d', np.nan)
     })
     
+    # 回测计算 (仅 D+1, D+3, D+5)
     if is_backtest:
         rec['selection_price'] = ind.get('last_close', np.nan)
         future_prices = get_future_prices(ts_code, last_trade)
         
-        for n in [1, 3, 5, 30]:
+        for n in [1, 3, 5]: # 【移除 30】
             future_price = future_prices.get(f'Return_D{n}', np.nan)
             
             if pd.notna(rec['selection_price']) and pd.notna(future_price):
@@ -329,7 +331,7 @@ for i, row in enumerate(final_candidates.itertuples()):
     my_bar.progress((i + 1) / total_c)
 
 # ---------------------------
-# 第六步：归一化与打分 (V3.2 位置过滤权重)
+# 第六步：归一化与打分 (V3.3 极致 D+5 稳定权重)
 # ---------------------------
 fdf = pd.DataFrame(records)
 if fdf.empty:
@@ -348,17 +350,17 @@ fdf['s_vol'] = normalize(fdf['vol_ratio'])
 fdf['s_mf'] = normalize(fdf['net_mf'])
 fdf['s_macd'] = normalize(fdf['macd'])
 fdf['s_trend'] = normalize(fdf['10d_return'])
-fdf['s_position'] = fdf['position_60d'] / 100 # 将 0-100% 转化为 0-1
+fdf['s_position'] = fdf['position_60d'] / 100 
 
-# V3.2 稳定趋势 + 位置过滤权重配置
-w_pct = 0.05        # 【大幅降低】 当日涨幅权重，削弱追高风险
-w_turn = 0.15       # 换手率权重 
-w_vol = 0.05        # 量比权重
+# V3.3 极致 D+5 稳定权重配置
+w_pct = 0.05        # 当日涨幅权重（极低）
+w_turn = 0.10       # 【降低】 换手率权重 
+w_vol = 0.05        # 量比权重（极低）
 w_mf = 0.15         # 资金流向权重（核心指标）
 w_macd = 0.10       # MACD形态权重
-w_trend = 0.15      # 10日涨幅权重 (看重持续趋势)
-w_volatility = 0.10 # 波动率反向（稳定性）权重
-w_position = 0.25   # 【极高】 60日位置反向权重 (过滤高位股)
+w_trend = 0.20      # 【提高】 10日涨幅权重 (看重持续趋势)
+w_volatility = 0.15 # 波动率反向（稳定性）权重
+w_position = 0.20   # 【降低】 60日位置反向权重 (避免过度惩罚突破股)
 
 # 确保总和为 1.00
 score = (
@@ -368,8 +370,8 @@ score = (
     fdf['s_mf'] * w_mf +        
     fdf['s_macd'] * w_macd +      
     fdf['s_trend'] * w_trend +     
-    (1 - normalize(fdf['volatility'])) * w_volatility + # 稳定性是反向指标
-    (1 - fdf['s_position']) * w_position                # 【新增】 价格位置是反向指标
+    (1 - normalize(fdf['volatility'])) * w_volatility + 
+    (1 - fdf['s_position']) * w_position                
 )
 fdf['综合评分'] = score * 100
 
@@ -377,7 +379,7 @@ fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
 fdf.index += 1
 
 # ---------------------------
-# 第七步：展示结果 (使用 TOP_BACKTEST 参数)
+# 第七步：展示结果
 # ---------------------------
 st.success(f"计算完成！共评分 {len(fdf)} 只。")
 
@@ -385,10 +387,9 @@ cols_show = ['name', 'ts_code', '综合评分', 'Source_Type', 'pct_chg', 'turno
 
 if is_backtest:
     st.header(f"回测结果分析（Top {TOP_BACKTEST}）")
-    # 【使用动态参数 TOP_BACKTEST】
     top_k = fdf.head(TOP_BACKTEST) 
     
-    for n in [1, 3, 5, 30]:
+    for n in [1, 3, 5]: # 【移除 30】
         col = f'Return_D{n}'
         if col in top_k.columns:
             avg_return = top_k[col].mean()
@@ -401,11 +402,10 @@ st.dataframe(fdf[cols_show].head(TOP_DISPLAY), use_container_width=True, column_
     "Return_D1": st.column_config.NumberColumn("D+1 回报率(%)", format="%.2f"),
     "Return_D3": st.column_config.NumberColumn("D+3 回报率(%)", format="%.2f"),
     "Return_D5": st.column_config.NumberColumn("D+5 回报率(%)", format="%.2f"),
-    "Return_D30": st.column_config.NumberColumn("D+30 回报率(%)", format="%.2f"),
-    "position_60d": st.column_config.NumberColumn("60日位置(%)", format="%.1f"), # 新增列展示
+    "position_60d": st.column_config.NumberColumn("60日位置(%)", format="%.1f"), 
     "综合评分": st.column_config.ProgressColumn("综合评分", format="%.1f", min_value=0, max_value=100),
     "pct_chg": st.column_config.NumberColumn("当日涨幅(%)", format="%.2f"),
     "turnover": st.column_config.NumberColumn("换手率(%)", format="%.2f")
 })
 
-st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.2_结果_{last_trade}.csv")
+st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.3_结果_{last_trade}.csv")
