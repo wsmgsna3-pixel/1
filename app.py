@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import time
 
 # 定义版本号
-APP_VERSION = "V9" 
+APP_VERSION = "V10" 
 
 # TuShare 接口一次性查询最大限制
 CHUNK_SIZE = 900 
@@ -41,17 +41,17 @@ def init_tushare(token):
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (V9: 增强错误定位)
+# 2. 核心数据获取逻辑 (V10: 解决缓存冲突)
 # ==========================================
 
-# 移除 TTL 缓存，强制每次都获取最新数据
+# 解决缓存冲突：参数名前加下划线，让 Streamlit 忽略对它的哈希
 @st.cache_data(show_spinner=False) 
-def get_stock_basic_data(pro):
+def get_stock_basic_data(_pro): # <--- 核心修改：pro 变为 _pro
     """
-    独立函数：获取全市场股票代码列表 (V9: 无缓存)
+    独立函数：获取全市场股票代码列表 (V10: 忽略 _pro 参数缓存)
     """
     try:
-        df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
+        df_basic = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
         if df_basic.empty:
              st.error("【错误定位】: pro.stock_basic 接口返回为空。请检查 Token 权限或 Tushare 服务状态。")
         return df_basic
@@ -62,7 +62,7 @@ def get_stock_basic_data(pro):
 @st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    V9 核心：分块查询 daily_basic，并改进错误反馈。
+    V10 核心：分块查询 daily_basic，并解决 Streamlit 缓存问题。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -80,8 +80,8 @@ def get_base_pool(token_input):
             cal = pro.trade_cal(exchange='', is_open='1', end_date=datetime.now().strftime('%Y%m%d'), fields='cal_date')
             trade_date = cal['cal_date'].values[-1]
             
-            # 2. 获取基础信息（调用独立函数，不使用TTL缓存）
-            df_basic = get_stock_basic_data(pro)
+            # 2. 获取基础信息（调用独立函数）
+            df_basic = get_stock_basic_data(pro) # <--- 核心修改：调用时传入 pro
             if df_basic.empty:
                 return pd.DataFrame(), ""
 
@@ -91,17 +91,17 @@ def get_base_pool(token_input):
             
             ts_code_list = df_basic['ts_code'].tolist()
             
-            # 4. V9 核心逻辑：实现 daily_basic 分块查询
+            # 4. V10 核心逻辑：实现 daily_basic 分块查询
             df_daily_basic_chunks = []
             daily_basic_fields = 'ts_code,close,turnover_rate,total_mv,circ_mv' 
             
             # 循环遍历代码列表，每 900 个分一块
             for i in range(0, len(ts_code_list), CHUNK_SIZE):
                 chunk_list = ts_code_list[i:i + CHUNK_SIZE]
-                chunk_codes = ','.join(chunk_list)
-                
-                # 查询当前块的数据
-                chunk_df = pro.daily_basic(ts_code=chunk_codes, trade_date=trade_date, fields=daily_basic_fields)
+                # chunk_codes = ','.join(chunk_list) # 注释掉，因为 pro.daily_basic 接收的是 list 或 DataFrame
+
+                # 查询当前块的数据：pro.daily_basic 可以接受 list
+                chunk_df = pro.daily_basic(ts_code=chunk_list, trade_date=trade_date, fields=daily_basic_fields)
                 if chunk_df is not None:
                     df_daily_basic_chunks.append(chunk_df)
                 
@@ -117,8 +117,6 @@ def get_base_pool(token_input):
             df_daily_data = pd.concat(df_daily_basic_chunks, ignore_index=True)
 
             # 5. 整合数据
-            # V9: 使用左连接 (left join)，如果 daily_basic 缺失数据，我们先保留 basic info
-            # 修正：继续使用内连接，只有同时拥有基础信息和最新价格的股票才有分析价值
             df = pd.merge(df_basic, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
 
             break
@@ -127,14 +125,14 @@ def get_base_pool(token_input):
                 status_text.warning(f"获取数据失败，正在重试 ({attempt+1}/{max_retries})...")
                 time.sleep(2) 
             else:
-                st.error(f"【致命错误】: 在分块查询过程中发生异常，可能原因是网络或 Token 权限不足。\n错误详情（已隐藏部分）：{e}")
+                st.error(f"【致命错误】: 在分块查询过程中发生异常，可能原因是网络或 Token 权限不足。\n错误详情：{e}")
                 return pd.DataFrame(), ""
     
     # --- 核心数据清洗 ---
     
     # 强制转换数据类型
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    df['total_mv'] = pd.to_numeric(df['total_mv'], errors='coerce') # V8 带来的 total_mv (单位: 万元)
+    df['total_mv'] = pd.to_numeric(df['total_mv'], errors='coerce') 
     
     # total_mv 单位是万元，我们转换为亿元，以匹配滑块 (10000 万元 = 1 亿元)
     df['total_mv_billion'] = df['total_mv'] / 10000
