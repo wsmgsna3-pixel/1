@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V13.13 市值中和版 (加入流通市值因子)
+选股王 · V13.12 战略调整版 (降低爆发权重，提升 RSL/波动率权重)
 说明：
 - 修复了下载时 KeyError 的隐患。
-- 评分权重调整：新增 's_circ_mv' (归一化的流通市值) 作为正向因子，权重 0.10。
-- 目标：强制打破评分模型对“最低市值股”的天然偏见，推选出不同市值区间的优质股票。
+- 评分权重调整：降低当日涨幅和放量倍数的权重 (0.18 -> 0.15)，大幅提升 RSL（相对强弱）和 波动率反向（风险压制）的权重 (0.08 -> 0.12 / 0.12 -> 0.18)。
+- 目标：确保评分模型能在更大的市值池中，选出质量更高、持续性更强的股票。
 """
 
 import streamlit as st
@@ -18,8 +18,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V13.13 市值中和版", layout="wide")
-st.title("选股王 · V13.13 市值中和版")
+st.set_page_config(page_title="选股王 · V13.12 战略调整版", layout="wide")
+st.title("选股王 · V13.12 战略调整版")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -31,7 +31,7 @@ with st.sidebar:
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
     
-    # 调整市值参数：用户可自行设置
+    # 调整市值参数：用户可自行设置，但我们要求测试 20 亿最小值
     st.markdown("---")
     st.caption("当前测试：验证评分模型强度。请将最低市值设为 20.0")
     MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=20.0, step=5.0))
@@ -107,7 +107,6 @@ pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
 # 尝试加载高级接口（有权限时启用）
 # ---------------------------
 st.write("尝试加载 stock_basic / daily_basic / moneyflow 等高级接口（若权限允许）...")
-# 确保 circ_mv 在 stock_basic 中被拉取
 stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,list_date,total_mv,circ_mv')
 daily_basic = safe_get(pro.daily_basic, trade_date=last_trade, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
 mf_raw = safe_get(pro.moneyflow, trade_date=last_trade)
@@ -196,10 +195,6 @@ st.write("对初筛池进行清洗（ST/停牌/价格/市值/一字板/换手/�
 clean_list = []
 pbar = st.progress(0)
 total_rows = len(pool_merged)
-# 新增一个字段用于存储 Circ_MV_Billion
-if 'circ_mv_billion' not in pool_merged.columns:
-    pool_merged['circ_mv_billion'] = np.nan
-
 for i, r in enumerate(pool_merged.itertuples()):
     ts = getattr(r, 'ts_code')
     # ---------- 直接从合并表里读取字段 ----------
@@ -239,24 +234,21 @@ for i, r in enumerate(pool_merged.itertuples()):
         pass
 
     # market cap filter (新增：流通市值过滤)
-    cv_billion = np.nan
     try:
         cv = circ_mv
         if not pd.isna(cv) and cv > 0:
             # Tushare MV/CircMV usually in 10k yuan, convert to 100 million yuan (亿) for comparison
-            if cv < 1e5: # if it's too small, assume it's in 10k
+            # Assuming Tushare circ_mv is in 10k units (万), so divide by 10000 to get in 亿
+            if cv < 1e5: # if it's too small, assume it's in 万
                 cv_billion = cv / 10000.0 
-            else: # if it's large, assume it's already in the larger unit
+            else: # if it's large, assume it's already in 亿 or a large base unit, use raw circ_mv for large caps if unit is inconsistent
                 cv_billion = cv
             
             if cv_billion < MIN_CIRC_MV_Billion or cv_billion > MAX_CIRC_MV_Billion:
                 pbar.progress((i+1)/total_rows); continue
     except:
         pass
-    
-    # Store the calculated circ_mv_billion back to the row object for later use
-    r_dict = r._asdict()
-    r_dict['circ_mv_billion'] = cv_billion
+
 
     # turnover
     if not pd.isna(turnover):
@@ -278,13 +270,12 @@ for i, r in enumerate(pool_merged.itertuples()):
     except:
         pass
 
-    # Append the modified record (as dict or tuple)
-    clean_list.append(r_dict)
+    clean_list.append(r)
     pbar.progress((i+1)/total_rows)
 
 pbar.progress(1.0)
-# build clean_df from dicts
-clean_df = pd.DataFrame(clean_list)
+# build clean_df from tuples
+clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
 st.write(f"清洗后候选数量：{len(clean_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
 if len(clean_df) == 0:
     st.error("清洗后没有候选，建议放宽条件或检查接口权限。")
@@ -409,8 +400,6 @@ for idx, row in enumerate(clean_df.itertuples()):
 
     turnover_rate = getattr(row, 'turnover_rate', np.nan)
     net_mf = float(getattr(row, 'net_mf', 0.0))
-    # 新增：获取流通市值（亿）
-    circ_mv_billion = getattr(row, 'circ_mv_billion', np.nan)
 
     hist = get_hist(ts_code, last_trade, days=60)
     ind = compute_indicators(hist)
@@ -445,8 +434,7 @@ for idx, row in enumerate(clean_df.itertuples()):
         'macd': macd, 'k': k, 'd': d, 'j': j,
         'last_close': last_close, 'vol_last': vol_last, 'vol_ma5': vol_ma5,
         'prev3_sum': prev3_sum, 'volatility_10': volatility_10,
-        'proxy_money': proxy_money,
-        'circ_mv_billion': circ_mv_billion # 新增字段
+        'proxy_money': proxy_money
     }
 
     records.append(rec)
@@ -510,7 +498,6 @@ def norm_col(s):
     s = s.fillna(0.0).replace([np.inf,-np.inf], np.nan).fillna(0.0)
     mn = s.min(); mx = s.max()
     if mx - mn < 1e-9:
-        # If range is too small, return middle score 0.5
         return pd.Series([0.5]*len(s), index=s.index)
     return (s - mn) / (mx - mn)
 
@@ -527,25 +514,21 @@ fdf['s_10d'] = norm_col(fdf.get('10d_return', pd.Series([0]*len(fdf))))
 fdf['s_macd'] = norm_col(fdf.get('macd', pd.Series([0]*len(fdf))))
 fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
 fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
-# 新增市值因子
-fdf['s_circ_mv'] = norm_col(fdf.get('circ_mv_billion', pd.Series([0]*len(fdf))))
 
 # ---------------------------
-# 综合评分（V13.13 战略调整权重 + 市值中和）
+# 综合评分（V13.12 战略调整权重）
+#    降低 B (爆发) 权重，提升 C (持续) / 风险权重
 # ---------------------------
-w_circ_mv = 0.10 # NEW: 市值因子
-w_pct = 0.14
-w_volratio = 0.14
-w_turn = 0.10
-w_money = 0.14
-w_10d = 0.10
-w_macd = 0.06
-w_rsl = 0.14
-w_volatility = 0.08
-# (Sum: 1.00)
+w_pct = 0.15 # 降低 (0.18 -> 0.15)
+w_volratio = 0.15 # 降低 (0.18 -> 0.15)
+w_turn = 0.12 # 不变
+w_money = 0.14 # 不变
+w_10d = 0.12 # 不变
+w_macd = 0.06 # 不变
+w_rsl = 0.18 # 提升 (0.12 -> 0.18)
+w_volatility = 0.12 # 提升 (0.08 -> 0.12)
 
 fdf['综合评分'] = (
-    fdf['s_circ_mv'] * w_circ_mv + # NEW FACTOR
     fdf['s_pct'] * w_pct +
     fdf['s_volratio'] * w_volratio +
     fdf['s_turn'] * w_turn +
@@ -563,7 +546,7 @@ fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
 fdf.index = fdf.index + 1
 
 st.success(f"评分完成：总候选 {len(fdf)} 支，显示 Top {min(TOP_DISPLAY, len(fdf))}。")
-display_cols = ['name','ts_code','综合评分','circ_mv_billion','pct_chg','vol_ratio','turnover_rate','net_mf','proxy_money','amount','10d_return','macd','k','d','j','rsl','volatility_10']
+display_cols = ['name','ts_code','综合评分','pct_chg','vol_ratio','turnover_rate','net_mf','proxy_money','amount','10d_return','macd','k','d','j','rsl','volatility_10']
 # 修复 KeyError 隐患
 fdf_full = fdf.copy()
 for c in display_cols:
@@ -581,10 +564,10 @@ st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **当前版本：V13.13 市值中和版。** 评分模型加入了**流通市值**因子，目标是强制消除“紧贴最低市值”的偏见，推选出多样化的优质股。  
-- **当前目标：** 使用最低市值 **20.0 亿**，验证 Top 10 中是否出现了 **40 亿、80 亿甚至更高的市值**，而非全部是 20 亿至 30 亿的股票。  
+- **当前版本：V13.12 战略调整版。** 评分权重已调整，降低了当日爆发权重，提升了持续强度和风险压制权重。  
+- **当前目标：** 验证新的评分模型是否能在大池子（最低市值 20 亿）中选出高质量股票。  
 - 实战纪律（必须遵守）：**9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入**。  
 - 若今日候选普遍翻绿，请保持空仓。  
 """)
 
-st.info("请使用最低市值 **20.0 亿**，运行 **V13.13 版本**，并将新的 Top 10 结果发给我。")
+st.info("请使用最低市值 20.0 运行 V13.12 版本，并将新的 Top 10 结果发给我。")
