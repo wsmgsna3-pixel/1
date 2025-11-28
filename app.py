@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import time
 
 # 定义版本号
-APP_VERSION = "V5" 
+APP_VERSION = "V6" 
 
 # ==========================================
 # 1. 页面配置与工具函数
@@ -38,13 +38,13 @@ def init_tushare(token):
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (V5: 强化数据清洗)
+# 2. 核心数据获取逻辑 (V6: 绕过 daily_basic)
 # ==========================================
 
 @st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    第一步：基础池筛选。只保留风险排除，并增加数据类型检查。
+    V6 核心：先获取所有代码，然后使用 list_in_stock 接口获取价格/市值。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -52,52 +52,57 @@ def get_base_pool(token_input):
     status_text = st.empty()
     status_text.info("正在建立连接，获取全市场基础数据...")
 
-    # --- 增加重试逻辑 ---
+    # --- 尝试获取数据 ---
     max_retries = 3
-    df_basic, df_daily, trade_date = pd.DataFrame(), pd.DataFrame(), ""
-    
+    df_basic, trade_date = pd.DataFrame(), ""
+
     for attempt in range(max_retries):
         try:
-            # 尝试获取交易日历
+            # 1. 获取交易日历
             cal = pro.trade_cal(exchange='', is_open='1', end_date=datetime.now().strftime('%Y%m%d'), fields='cal_date')
             trade_date = cal['cal_date'].values[-1]
             
-            # 尝试获取每日指标（包含市值、换手率、量比、价格）
-            df_daily = pro.daily_basic(trade_date=trade_date, fields='ts_code,close,turnover_rate,volume_ratio,circ_mv,total_mv,pe,pb')
-            
-            # 尝试获取基础信息（用于排除ST和北交所）
+            # 2. 获取基础信息（所有A股代码和名称）
             df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
             
-            # 如果成功，跳出循环
+            # 3. 排除北交所和ST
+            df_basic = df_basic[~df_basic['market'].str.contains('北|BJE', na=False)] 
+            df_basic = df_basic[~df_basic['name'].str.contains('ST|退', na=False)]
+            
+            # 4. 获取最新的日线行情数据（包含收盘价和市值）
+            # 使用 daily 接口批量查询，而不是 daily_basic
+            ts_code_list = df_basic['ts_code'].tolist()
+            # Tushare 接口限制，一次只能查询有限数量，这里用 Tushare 的 list_in_stock 功能
+            # 注意：这个接口需要更高的积分 (5000+)，如果积分不足可能会报错
+            df_daily_data = pro.daily(ts_code=','.join(ts_code_list), trade_date=trade_date)
+            
+            # 5. 整合数据
+            df = pd.merge(df_basic, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
+
             break
         except Exception as e:
             if attempt < max_retries - 1:
-                status_text.warning(f"网络连接尝试失败，正在重试 ({attempt+1}/{max_retries})...")
-                time.sleep(2) # 休息两秒再试
+                status_text.warning(f"获取数据失败，正在重试 ({attempt+1}/{max_retries})...")
+                time.sleep(2) 
             else:
-                st.error(f"网络连接超时，请检查 Token 是否正确，或刷新页面重试。\n错误详情（已隐藏部分）：{e}")
+                st.error(f"数据获取失败，请检查 Tushare Token 权限（可能每日基础数据接口积分不够）。\n错误详情（已隐藏部分）：{e}")
                 return pd.DataFrame(), ""
-
-    # 合并数据
-    # V5 核心修改 1: 合并前先清洗并转换数据类型，确保数据可用性
-    df_daily['close'] = pd.to_numeric(df_daily['close'], errors='coerce')
-    df_daily['total_mv'] = pd.to_numeric(df_daily['total_mv'], errors='coerce')
     
-    # 内连接：确保股票在两个表中都存在
-    df = pd.merge(df_basic, df_daily, on='ts_code', how='inner')
+    # --- 核心数据清洗 ---
     
-    # --- 核心筛选逻辑 Step 1：只保留风险排除 ---
+    # 强制转换数据类型
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    # total_share 是 daily 接口中的流通股本 (万股)，需要计算市值
+    df['total_mv'] = df['circ_share'] * df['close'] / 100 # 近似计算市值 (亿元)
     
-    # 1. 排除北交所 
-    df = df[~df['market'].str.contains('北|BJE', na=False)] 
-    
-    # 2. 排除ST
-    df = df[~df['name'].str.contains('ST|退', na=False)]
-    
-    # 3. 剔除价格或市值为空/0的异常数据点 (V4 已有，V5 确认保留)
+    # 剔除价格或市值为空/0的异常数据点
     df = df.dropna(subset=['close', 'total_mv'])
     df = df[(df['close'] > 0) & (df['total_mv'] > 0)]
-    
+
+    # 重新添加 daily_basic 中缺失的关键字段 (用0或NaN填充，防止后续计算出错)
+    if 'turnover_rate' not in df.columns:
+         df['turnover_rate'] = 0 
+
     status_text.success(f"基础数据获取和清洗完成！符合【非ST非北交所】的股票共：{len(df)} 只")
     return df, trade_date
 
@@ -224,19 +229,20 @@ if run_btn and token:
     df_base, trade_date = get_base_pool(token)
     
     if df_base.empty:
-        st.error("数据获取失败，或当前交易日无非ST/非北交所股票数据。")
+        st.error("数据获取失败，或当前交易日无非ST/非北交所股票数据。请检查 Tushare Token 积分和权限。")
         st.stop()
         
-    # 应用侧边栏的动态过滤 (所有数值筛选都在这里完成)
+    # 应用侧边栏的动态过滤 
+    # total_mv 单位现在是亿元
     df_pool = df_base[
-        (df_base['total_mv'] >= mkt_cap_min * 10000) & 
-        (df_base['total_mv'] <= mkt_cap_max * 10000) &
+        (df_base['total_mv'] >= mkt_cap_min) & # V6: 单位是亿元，无需 * 10000
+        (df_base['total_mv'] <= mkt_cap_max) &
         (df_base['close'] >= price_min) &
         (df_base['close'] <= price_max)
     ]
     
     if df_pool.empty:
-        st.warning(f"初筛（非ST）后，没有股票满足您设置的市值 ({mkt_cap_min}-{mkt_cap_max}亿) 和价格 ({price_min}-{price_max}元) 范围。请调整侧边栏滑块。")
+        st.warning(f"基础池规模 {len(df_base)} 只。没有股票满足您设置的市值 ({mkt_cap_min}-{mkt_cap_max}亿) 和价格 ({price_min}-{price_max}元) 范围。请调整侧边栏滑块。")
         st.stop()
 
     
@@ -246,7 +252,11 @@ if run_btn and token:
     final_results = []
     
     # 选取换手率较高的前 200 只进行深度扫描
-    target_pool = df_pool.sort_values('turnover_rate', ascending=False).head(200)
+    # 注意：V6 依赖 daily 接口，可能缺失 turnover_rate，需要处理
+    if 'turnover_rate' in df_pool.columns and not df_pool['turnover_rate'].isnull().all():
+         target_pool = df_pool.sort_values('turnover_rate', ascending=False).head(200)
+    else:
+         target_pool = df_pool.head(200) # 如果没有换手率，就取前200只
     
     total_scan = len(target_pool)
     progress_bar = st.progress(0, text=f"扫描进度：0/{total_scan} 只股票")
@@ -258,7 +268,7 @@ if run_btn and token:
             
             df_daily, df_flow = get_technical_and_flow(pro, row.ts_code, trade_date)
             
-            if df_daily is not None:
+            if df_daily is not None and len(df_daily) >= 60:
                 res = calculate_strategy(df_daily, df_flow)
                 
                 # 核心筛选条件 (趋势向上 AND 安全区间 AND 资金流入)
