@@ -7,9 +7,9 @@ from datetime import datetime, timedelta
 import time
 
 # 定义版本号
-APP_VERSION = "V11" 
+APP_VERSION = "V12" 
 
-# TuShare 接口一次性查询最大限制
+# TuShare 接口一次性查询最大限制 (V12中不再使用，但保留定义)
 CHUNK_SIZE = 900 
 
 # ==========================================
@@ -41,15 +41,16 @@ def init_tushare(token):
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (V11: 增强错误定位反馈)
+# 2. 核心数据获取逻辑 (V12: 官方全量查询 Daily Basic)
 # ==========================================
 
 @st.cache_data(show_spinner=False) 
 def get_stock_basic_data(_pro):
     """
-    独立函数：获取全市场股票代码列表 (V11: 忽略 _pro 参数缓存)
+    独立函数：获取全市场股票代码列表 (V12: 忽略 _pro 参数缓存)
     """
     try:
+        # V12 字段增加 total_mv 用于更精确的过滤
         df_basic = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
         if df_basic.empty:
              st.error("【错误定位 A】: pro.stock_basic 接口返回为空。Token 可能无法访问基础信息。")
@@ -61,7 +62,7 @@ def get_stock_basic_data(_pro):
 @st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    V11 核心：分块查询 daily_basic，并返回基础池规模，帮助定位问题。
+    V12 核心：直接使用 trade_date 查询 daily_basic 全量最新数据。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -88,37 +89,24 @@ def get_base_pool(token_input):
             df_basic = df_basic[~df_basic['market'].str.contains('北|BJE', na=False)] 
             df_basic = df_basic[~df_basic['name'].str.contains('ST|退', na=False)]
             
-            ts_code_list = df_basic['ts_code'].tolist()
-            
-            # V11 增加：如果基础代码池为空，则提前报错
-            if not ts_code_list:
+            # V12 增加：如果基础代码池为空，则提前报错
+            if df_basic.empty:
                 status_text.error("【错误定位 B】: 基础代码池过滤后为空。请检查 pro.stock_basic 返回的数据是否包含有效A股。")
                 return pd.DataFrame(), ""
 
-            # 4. V11 核心逻辑：实现 daily_basic 分块查询
-            df_daily_basic_chunks = []
+            status_text.info(f"基础代码池包含 {len(df_basic)} 只股票。正在获取最新日线指标...")
+            
+            # 4. V12 核心逻辑：直接按日期查询全量 daily_basic
+            # 不传入 ts_code，依赖 Tushare 自动返回该日所有股票数据
             daily_basic_fields = 'ts_code,close,turnover_rate,total_mv,circ_mv' 
             
-            # 循环遍历代码列表，每 900 个分一块
-            for i in range(0, len(ts_code_list), CHUNK_SIZE):
-                chunk_list = ts_code_list[i:i + CHUNK_SIZE]
-                
-                # 查询当前块的数据
-                chunk_df = pro.daily_basic(ts_code=chunk_list, trade_date=trade_date, fields=daily_basic_fields)
-                if chunk_df is not None:
-                    df_daily_basic_chunks.append(chunk_df)
-                
-                # 提示用户进度，并避免 API 频率超限 
-                status_text.info(f"正在分批获取市值/价格数据：已完成 {i//CHUNK_SIZE + 1} / {len(ts_code_list)//CHUNK_SIZE + 1} 批次 (基础池规模 {len(ts_code_list)})...")
-                time.sleep(1.2) 
-
-            # 合并所有批次的数据
-            if not df_daily_basic_chunks:
-                status_text.error("【错误定位 C】: pro.daily_basic 分块查询未返回任何最新日线数据。Token 可能缺乏访问最新数据的权限。")
+            # Tushare 官方方法：按日期查询全市场数据
+            df_daily_data = pro.daily_basic(trade_date=trade_date, fields=daily_basic_fields)
+            
+            if df_daily_data.empty:
+                status_text.error("【错误定位 C】: pro.daily_basic 按日期查询未返回任何最新日线数据。Token 可能缺乏访问最新数据的权限。")
                 return pd.DataFrame(), ""
                 
-            df_daily_data = pd.concat(df_daily_basic_chunks, ignore_index=True)
-
             # 5. 整合数据
             # 只有同时拥有基础信息和最新价格的股票才能留下
             df = pd.merge(df_basic, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
@@ -129,7 +117,7 @@ def get_base_pool(token_input):
                 status_text.warning(f"获取数据失败，正在重试 ({attempt+1}/{max_retries})...")
                 time.sleep(2) 
             else:
-                status_text.error(f"【致命错误】: 在分块查询过程中发生异常，可能原因是网络或 Token 权限不足。\n错误详情：{e}")
+                status_text.error(f"【致命错误】: 在获取最新日线指标过程中发生异常。\n错误详情：{e}")
                 return pd.DataFrame(), ""
     
     # --- 核心数据清洗 ---
@@ -148,6 +136,8 @@ def get_base_pool(token_input):
     status_text.success(f"基础数据获取和清洗完成！符合【非ST非北交所】的股票共：{len(df)} 只")
     return df, trade_date
 
+# 其余函数（get_technical_and_flow, calculate_strategy, simple_backtest, 主界面逻辑）保持 V11 不变
+
 def get_technical_and_flow(pro, ts_code, end_date):
     """
     获取单个股票的技术面和资金流数据
@@ -165,10 +155,6 @@ def get_technical_and_flow(pro, ts_code, end_date):
     df_flow = df_flow.sort_values('trade_date')
     
     return df_daily, df_flow
-
-# ==========================================
-# 3. 策略计算与回测逻辑 (保持不变)
-# ==========================================
 
 def calculate_strategy(df_daily, df_flow):
     """
