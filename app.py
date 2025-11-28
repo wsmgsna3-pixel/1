@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.5 (激进重构 + 错误修复版)
+选股王 · 全市场扫描增强版 V3.6 (最终平衡版：D+5 攻坚)
 更新说明：
-1. 【**错误修复**】：在 get_future_prices 函数中增加了对 'trade_date' 列的强力检查，彻底修复了 Tushare 返回空或错误数据结构时导致的 KeyError 崩溃。
-2. 【**激进重构权重**】：采用 V3.5 激进权重（巨幅提升 10日趋势/稳定性权重，大幅削弱短线动能权重），旨在将 D+5 收益强制转正。
-3. 【功能优化】：D+30 回测已移除，专注于 1-5 天持股周期。
+1. 【**稳定基准**】：恢复 V3.4 的稳定权重结构，放弃 V3.5 的激进调整。
+2. 【**D+5 攻坚**】：精准打击 D+5 痛点，通过提高 60日位置反向 (w_position) 权重，确保选出的股票有足够的上涨空间，以防止 D+3 后的回吐。
+3. 【错误修复】：保留 get_future_prices 函数中的 Key Error 修复。
 """
 
 import streamlit as st
@@ -18,9 +18,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.5 激进重构版", layout="wide")
-st.title("选股王 · V3.5 激进重构版（最终稳定模型）")
-st.markdown("🔥 **当前版本已修复数据错误，采用 V3.5 激进权重。**")
+st.set_page_config(page_title="选股王 · V3.6 最终平衡版", layout="wide")
+st.title("选股王 · V3.6 最终平衡版（D+5 攻坚模型）")
+st.markdown("🔥 **当前版本采用 V3.6 最终权重，重点提升了对低位股的偏好。**")
 
 # ---------------------------
 # 辅助函数
@@ -64,7 +64,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 
     hist = safe_get(pro.daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
     
-    # 【V3.5 修复：强制检查 trade_date 列是否存在】
+    # 【V3.6 修复：强制检查 trade_date 列是否存在】
     if hist.empty or 'trade_date' not in hist.columns:
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
@@ -298,7 +298,7 @@ for i, row in enumerate(final_candidates.itertuples()):
     my_bar.progress((i + 1) / total_c)
 
 # ---------------------------
-# 第六步：归一化与打分 (V3.5 激进重构权重)
+# 第六步：归一化与打分 (V3.6 最终平衡权重)
 # ---------------------------
 fdf = pd.DataFrame(records)
 if fdf.empty:
@@ -319,15 +319,15 @@ fdf['s_macd'] = normalize(fdf['macd'])
 fdf['s_trend'] = normalize(fdf['10d_return'])
 fdf['s_position'] = fdf['position_60d'] / 100 
 
-# V3.5 激进重构权重配置
-w_pct = 0.02        
-w_turn = 0.05       
-w_vol = 0.03        
-w_mf = 0.05         
+# V3.6 最终平衡权重配置
+w_pct = 0.05        
+w_turn = 0.10       
+w_vol = 0.05        
+w_mf = 0.10         
 w_macd = 0.10       
-w_trend = 0.30      # 巨幅提升
-w_volatility = 0.25 # 巨幅提升
-w_position = 0.20   
+w_trend = 0.20      
+w_volatility = 0.15 # 略微降低
+w_position = 0.25   # 提升惩罚力度
 
 # 确保总和为 1.00
 score = (
@@ -375,4 +375,4 @@ st.dataframe(fdf[cols_show].head(TOP_DISPLAY), use_container_width=True, column_
     "turnover": st.column_config.NumberColumn("换手率(%)", format="%.2f")
 })
 
-st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.5_结果_{last_trade}.csv")
+st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.6_结果_{last_trade}.csv")
