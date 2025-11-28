@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V13.8（数据校验稳定版）
-核心：修复日期获取逻辑。采用 '数据校验回溯法'，确保选股日是 Tushare 接口实际有数据的最近日期。
+选股王 · V13.9（缓存修复稳定版）
+核心：修复 Streamlit 缓存错误 (UnhashableParamError)。从缓存函数中移除 Tushare API 参数，直接使用全局 pro 变量。
 """
 import streamlit as st
 import pandas as pd
@@ -26,11 +26,11 @@ memory = joblib.Memory(CACHE_DIR, verbose=0)
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王（V13.8 数据校验稳定版）", layout="wide")
-st.markdown("### 选股王（V13.8 数据校验稳定版）- 修复未来日期问题") 
+st.set_page_config(page_title="选股王（V13.9 缓存修复稳定版）", layout="wide")
+st.markdown("### 选股王（V13.9 缓存修复稳定版）- 修复缓存错误") 
 
 # ---------------------------
-# 默认参数定义 (保持 V13.6/V13.7)
+# 默认参数定义 (保持不变)
 # ---------------------------
 DEFAULT_FINAL_POOL = 500
 DEFAULT_TOP_DISPLAY = 30
@@ -52,7 +52,7 @@ DEFAULT_MAX_VOLATILITY_10D = 8.0
 # 侧边栏参数 
 # ---------------------------
 with st.sidebar:
-    st.header("可调参数（V13.8 默认值）")
+    st.header("可调参数（V13.9 默认值）")
     INITIAL_TOP_N = 99999 
     
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=DEFAULT_FINAL_POOL, step=50))
@@ -63,7 +63,6 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=DEFAULT_MIN_PRICE, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=DEFAULT_MAX_PRICE, step=10.0))
     
-    # 请根据需要调整流通市值范围
     MIN_CIRC_MV_Billion = float(st.number_input("最低流通市值 (亿)", value=DEFAULT_MIN_CIRC_MV_B, step=5.0)) 
     MAX_CIRC_MV_Billion = float(st.number_input("最高流通市值 (亿)", value=DEFAULT_MAX_CIRC_MV_B, step=50.0)) 
     
@@ -85,7 +84,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测：最近 N 个交易日", value=DEFAULT_BACKTEST_DAYS, step=1))
     
     st.markdown("---")
-    st.caption("提示：策略已升级至 'V13.8 数据校验稳定版'。")
+    st.caption("提示：策略已升级至 'V13.9 缓存修复稳定版'。")
 
 
 # ---------------------------
@@ -100,7 +99,7 @@ if not TS_TOKEN:
 
 # 初始化 tushare
 ts.set_token(TS_TOKEN)
-pro = ts.pro_api()
+pro = ts.pro_api() # 全局 Tushare API 对象
 
 # ---------------------------
 # 依赖函数：数据安全获取
@@ -116,11 +115,12 @@ def safe_get(func, **kwargs):
         return pd.DataFrame()
 
 # ----------------------------------------------------
-# 交易日历获取 (V13.8: 获取日历的逻辑不变，但用于稳定校验)
+# 交易日历获取 (保持 V13.8 逻辑)
 # ----------------------------------------------------
 @st.cache_data(ttl=600)
 def get_trade_cal_dates():
     """安全地从 Tushare 获取所有开放交易日，并按降序排列。"""
+    # 此处依赖全局 pro 对象
     end_date = datetime.now().strftime("%Y%m%d")
     cal_df = safe_get(
         pro.trade_cal, 
@@ -133,13 +133,15 @@ def get_trade_cal_dates():
     return cal_df['cal_date'].sort_values(ascending=False).tolist()
 
 # ----------------------------------------------------
-# 核心修正：数据校验回溯函数 (V13.8 新增)
+# 核心修正：数据校验回溯函数 (V13.9 修正 UnhashableParamError)
 # ----------------------------------------------------
 @st.cache_data(ttl=3600)
-def find_last_trade_day_robust(pro_api):
+def find_last_trade_day_robust(): # ❌ 移除 pro_api 参数
     """
-    V13.8 核心修正：迭代最近交易日，直到找到 Tushare 接口实际能提供数据的日期。
+    V13.9 核心修正：迭代最近交易日，直到找到 Tushare 接口实际能提供数据的日期。
     """
+    global pro # 声明使用全局 pro 对象
+
     trade_dates = get_trade_cal_dates()
     
     if not trade_dates: return None
@@ -147,19 +149,17 @@ def find_last_trade_day_robust(pro_api):
     # 尝试最近的 5 个交易日
     for date_str in trade_dates[:5]: 
         
-        # 尝试拉取全市场日线数据
-        daily_all = safe_get(pro_api.daily, trade_date=date_str)
+        # 尝试拉取全市场日线数据，直接使用全局 pro
+        daily_all = safe_get(pro.daily, trade_date=date_str)
         
         if not daily_all.empty:
             # 找到有数据的日期，返回
             return date_str
         
-        # 否则，继续回溯到前一个日期
-            
     return None # 5 天内都没有数据，返回 None
 
-# V13.8 运行稳定的日期函数
-last_trade = find_last_trade_day_robust(pro)
+# V13.9 运行稳定的日期函数
+last_trade = find_last_trade_day_robust() # ❌ 不再传递 pro 参数
 
 if not last_trade:
     st.error("无法获取最近交易日。已尝试回溯最近 5 个交易日，但 Tushare 接口均无数据。请检查 Tushare Token 或等待数据更新。")
@@ -168,7 +168,7 @@ st.info(f"参考最近交易日（经数据校验）：**{last_trade}**")
 
 
 # ----------------------------------------------------
-# 按钮控制模块 
+# 按钮控制模块 (保持不变)
 # ----------------------------------------------------
 if 'run_selection' not in st.session_state: st.session_state['run_selection'] = False
 if 'run_backtest' not in st.session_state: st.session_state['run_backtest'] = False
@@ -195,7 +195,7 @@ with col2:
 st.markdown("---")
 
 # ---------------------------
-# 辅助函数 (保持 V13.7 逻辑)
+# 辅助函数 (保持不变)
 # ---------------------------
 def safe_merge_pool(pool_df, other_df, cols):
     pool = pool_df.set_index('ts_code').copy()
@@ -230,7 +230,7 @@ def norm_col(s):
 
 
 # ---------------------------
-# V13.8 增强：指标计算和归一化 (保持 V13.7 逻辑)
+# V13.9 增强：指标计算和归一化 (保持不变)
 # ---------------------------
 def compute_indicators(df, ma_period):
     res = {}
@@ -300,7 +300,7 @@ def compute_indicators(df, ma_period):
     return res
 
 # ----------------------------------------------------
-# 核心评分函数 (V13.8: 逻辑保持 V13.7)
+# 核心评分函数 (保持不变)
 # ----------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=600)
 def run_scoring_for_date(trade_date, params):
@@ -326,9 +326,7 @@ def run_scoring_for_date(trade_date, params):
     moneyflow = safe_get(pro.moneyflow, trade_date=trade_date, fields='ts_code,net_mf_amount') 
 
     if daily_all.empty: 
-        # V13.8: 只有在选股日不等于全局 last_trade (即回测中调用) 才会警告
         if trade_date == last_trade: 
-             # 理论上被 find_last_trade_day_robust 过滤了，此处为双重保险
              st.error(f"诊断：Tushare 无法获取 {trade_date} 的日线数据。请检查 Token 权限或等待数据更新。")
         return pd.DataFrame()
     
@@ -362,7 +360,7 @@ def run_scoring_for_date(trade_date, params):
     pool_merged['circ_mv_wan'] = pool_merged['circ_mv'].fillna(0)
 
 
-    # 3. V13.8 硬性过滤
+    # 3. V13.9 硬性过滤
     clean_df = pool_merged.copy()
     
     # 基础风险过滤 (ST, 价格, 北交所)
@@ -470,7 +468,7 @@ def run_scoring_for_date(trade_date, params):
         st.info(f"诊断：通过 {ma_trend_period} 日均线趋势过滤后，剩余股票数量: **{len(fdf)}** 支，开始高级风险过滤...")
         
     
-    # 5. V13.8 高级风险过滤
+    # 5. V13.9 高级风险过滤
     try:
         before_cnt = len(fdf)
         
@@ -558,7 +556,7 @@ def run_scoring_for_date(trade_date, params):
 
 
 # ----------------------------------------------------
-# 简易回测模块 (保持 V13.7 逻辑)
+# 简易回测模块 (保持不变)
 # ----------------------------------------------------
 def run_simple_backtest(days, params):
     
@@ -567,7 +565,7 @@ def run_simple_backtest(days, params):
     
     container = st.empty()
     with container.container():
-        st.subheader(f"📈 简易历史回测结果 (V13.8 数据校验稳定版)")
+        st.subheader(f"📈 简易历史回测结果 (V13.9 稳定版)")
         
         trade_dates_all = get_trade_cal_dates()
         
@@ -717,7 +715,7 @@ def run_simple_backtest(days, params):
 
 
 # ----------------------------------------------------
-# 实时选股模块 (V13.8)
+# 实时选股模块 (V13.9)
 # ----------------------------------------------------
 def run_live_selection(last_trade, params):
     st.write(f"正在运行实时选股（最近有效交易日：{last_trade}）...")
@@ -767,16 +765,14 @@ def run_live_selection(last_trade, params):
 
     download_cols = [c for c in fdf_full.columns if c not in ['list_date', 'days_since_list', 'circ_mv_wan']]
     out_csv = fdf_full[download_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
-    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_8.csv", mime="text/csv")
+    st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_V13_9.csv", mime="text/csv")
 
-    st.markdown("### 小结与操作提示（V13.8 数据校验稳定版）")
+    st.markdown("### 小结与操作提示（V13.9 缓存修复稳定版）")
     st.markdown(f"""
-- **【核心修正】** 已修复“未来日期”问题，现在选股日 **{last_trade}** 是 Tushare 接口实际有数据可用的日期。
+- **【核心修正】** 已修复 Streamlit **缓存错误**，程序现在可以正常启动和运行。
+- **【日期稳定】** 当前选股日 **{last_trade}** 已经过数据校验，保证 Tushare 有数据可用。
 - **【市值范围】** 当前流通市值范围：**{params_dict['MIN_CIRC_MV_Billion']} 亿 到 {params_dict['MAX_CIRC_MV_Billion']} 亿**。
-- **【操作建议】** **如果您仍未看到 100 亿 - 200 亿的股票**，请在左侧边栏将参数调整为：
-    - 最低流通市值 (亿) = **100.0**
-    - 最高流通市值 (亿) = **200.0**
-    - 然后重新运行。
+- **【操作建议】** 如果选股结果太少，请尝试放宽左侧边栏的 **流通市值范围** 或 **最低成交额/换手率**。
 """)
 
 
