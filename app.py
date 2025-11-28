@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import time
 
 # 定义版本号
-APP_VERSION = "V10" 
+APP_VERSION = "V11" 
 
 # TuShare 接口一次性查询最大限制
 CHUNK_SIZE = 900 
@@ -41,28 +41,27 @@ def init_tushare(token):
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (V10: 解决缓存冲突)
+# 2. 核心数据获取逻辑 (V11: 增强错误定位反馈)
 # ==========================================
 
-# 解决缓存冲突：参数名前加下划线，让 Streamlit 忽略对它的哈希
 @st.cache_data(show_spinner=False) 
-def get_stock_basic_data(_pro): # <--- 核心修改：pro 变为 _pro
+def get_stock_basic_data(_pro):
     """
-    独立函数：获取全市场股票代码列表 (V10: 忽略 _pro 参数缓存)
+    独立函数：获取全市场股票代码列表 (V11: 忽略 _pro 参数缓存)
     """
     try:
         df_basic = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
         if df_basic.empty:
-             st.error("【错误定位】: pro.stock_basic 接口返回为空。请检查 Token 权限或 Tushare 服务状态。")
+             st.error("【错误定位 A】: pro.stock_basic 接口返回为空。Token 可能无法访问基础信息。")
         return df_basic
     except Exception as e:
-        st.error(f"【致命错误】: pro.stock_basic 接口调用失败。错误: {e}")
+        st.error(f"【致命错误】: pro.stock_basic 接口调用失败。请检查 Token。\n错误详情：{e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    V10 核心：分块查询 daily_basic，并解决 Streamlit 缓存问题。
+    V11 核心：分块查询 daily_basic，并返回基础池规模，帮助定位问题。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -81,7 +80,7 @@ def get_base_pool(token_input):
             trade_date = cal['cal_date'].values[-1]
             
             # 2. 获取基础信息（调用独立函数）
-            df_basic = get_stock_basic_data(pro) # <--- 核心修改：调用时传入 pro
+            df_basic = get_stock_basic_data(pro)
             if df_basic.empty:
                 return pd.DataFrame(), ""
 
@@ -91,32 +90,37 @@ def get_base_pool(token_input):
             
             ts_code_list = df_basic['ts_code'].tolist()
             
-            # 4. V10 核心逻辑：实现 daily_basic 分块查询
+            # V11 增加：如果基础代码池为空，则提前报错
+            if not ts_code_list:
+                status_text.error("【错误定位 B】: 基础代码池过滤后为空。请检查 pro.stock_basic 返回的数据是否包含有效A股。")
+                return pd.DataFrame(), ""
+
+            # 4. V11 核心逻辑：实现 daily_basic 分块查询
             df_daily_basic_chunks = []
             daily_basic_fields = 'ts_code,close,turnover_rate,total_mv,circ_mv' 
             
             # 循环遍历代码列表，每 900 个分一块
             for i in range(0, len(ts_code_list), CHUNK_SIZE):
                 chunk_list = ts_code_list[i:i + CHUNK_SIZE]
-                # chunk_codes = ','.join(chunk_list) # 注释掉，因为 pro.daily_basic 接收的是 list 或 DataFrame
-
-                # 查询当前块的数据：pro.daily_basic 可以接受 list
+                
+                # 查询当前块的数据
                 chunk_df = pro.daily_basic(ts_code=chunk_list, trade_date=trade_date, fields=daily_basic_fields)
                 if chunk_df is not None:
                     df_daily_basic_chunks.append(chunk_df)
                 
                 # 提示用户进度，并避免 API 频率超限 
-                status_text.info(f"正在分批获取市值/价格数据：已完成 {i//CHUNK_SIZE + 1} / {len(ts_code_list)//CHUNK_SIZE + 1} 批次...")
+                status_text.info(f"正在分批获取市值/价格数据：已完成 {i//CHUNK_SIZE + 1} / {len(ts_code_list)//CHUNK_SIZE + 1} 批次 (基础池规模 {len(ts_code_list)})...")
                 time.sleep(1.2) 
 
             # 合并所有批次的数据
             if not df_daily_basic_chunks:
-                st.error("【错误定位】: pro.daily_basic 分块查询未返回任何数据。请检查 Token 权限。")
+                status_text.error("【错误定位 C】: pro.daily_basic 分块查询未返回任何最新日线数据。Token 可能缺乏访问最新数据的权限。")
                 return pd.DataFrame(), ""
                 
             df_daily_data = pd.concat(df_daily_basic_chunks, ignore_index=True)
 
             # 5. 整合数据
+            # 只有同时拥有基础信息和最新价格的股票才能留下
             df = pd.merge(df_basic, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
 
             break
@@ -125,7 +129,7 @@ def get_base_pool(token_input):
                 status_text.warning(f"获取数据失败，正在重试 ({attempt+1}/{max_retries})...")
                 time.sleep(2) 
             else:
-                st.error(f"【致命错误】: 在分块查询过程中发生异常，可能原因是网络或 Token 权限不足。\n错误详情：{e}")
+                status_text.error(f"【致命错误】: 在分块查询过程中发生异常，可能原因是网络或 Token 权限不足。\n错误详情：{e}")
                 return pd.DataFrame(), ""
     
     # --- 核心数据清洗 ---
@@ -272,6 +276,7 @@ if run_btn and token:
     pro = init_tushare(token)
     df_base, trade_date = get_base_pool(token)
     
+    # V11 增加：如果 df_base 为空，直接停在这里并显示错误信息
     if df_base.empty:
         st.error("数据获取失败，或当前交易日无非ST/非北交所股票数据。请检查 Tushare Token 积分和权限。")
         st.stop()
