@@ -7,7 +7,10 @@ from datetime import datetime, timedelta
 import time
 
 # 定义版本号
-APP_VERSION = "V6" 
+APP_VERSION = "V7" 
+
+# TuShare 接口一次性查询最大限制
+CHUNK_SIZE = 900 # 设置为900，比1000少一点，更安全
 
 # ==========================================
 # 1. 页面配置与工具函数
@@ -38,13 +41,13 @@ def init_tushare(token):
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (V6: 绕过 daily_basic)
+# 2. 核心数据获取逻辑 (V7: 分块查询)
 # ==========================================
 
 @st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    V6 核心：先获取所有代码，然后使用 list_in_stock 接口获取价格/市值。
+    V7 核心：先获取所有代码，然后通过分块查询 (CHUNK_SIZE) 来获取最新日线行情。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -69,13 +72,27 @@ def get_base_pool(token_input):
             df_basic = df_basic[~df_basic['market'].str.contains('北|BJE', na=False)] 
             df_basic = df_basic[~df_basic['name'].str.contains('ST|退', na=False)]
             
-            # 4. 获取最新的日线行情数据（包含收盘价和市值）
-            # 使用 daily 接口批量查询，而不是 daily_basic
             ts_code_list = df_basic['ts_code'].tolist()
-            # Tushare 接口限制，一次只能查询有限数量，这里用 Tushare 的 list_in_stock 功能
-            # 注意：这个接口需要更高的积分 (5000+)，如果积分不足可能会报错
-            df_daily_data = pro.daily(ts_code=','.join(ts_code_list), trade_date=trade_date)
             
+            # 4. V7 核心逻辑：实现分块查询
+            df_daily_data_chunks = []
+            
+            # 循环遍历代码列表，每 900 个分一块
+            for i in range(0, len(ts_code_list), CHUNK_SIZE):
+                chunk_list = ts_code_list[i:i + CHUNK_SIZE]
+                chunk_codes = ','.join(chunk_list)
+                
+                # 查询当前块的数据
+                chunk_df = pro.daily(ts_code=chunk_codes, trade_date=trade_date)
+                df_daily_data_chunks.append(chunk_df)
+                
+                # 提示用户进度，并避免 API 频率超限 (Tushare Pro 默认 5000次/分钟)
+                status_text.info(f"正在分批获取日线行情：已完成 {i//CHUNK_SIZE + 1} / {len(ts_code_list)//CHUNK_SIZE + 1} 批次...")
+                time.sleep(1.2) # 增加延迟，确保 API 不超频
+
+            # 合并所有批次的数据
+            df_daily_data = pd.concat(df_daily_data_chunks, ignore_index=True)
+
             # 5. 整合数据
             df = pd.merge(df_basic, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
 
@@ -85,14 +102,15 @@ def get_base_pool(token_input):
                 status_text.warning(f"获取数据失败，正在重试 ({attempt+1}/{max_retries})...")
                 time.sleep(2) 
             else:
-                st.error(f"数据获取失败，请检查 Tushare Token 权限（可能每日基础数据接口积分不够）。\n错误详情（已隐藏部分）：{e}")
+                st.error(f"数据获取失败，请检查 Tushare Token 权限或网络连接。\n错误详情（已隐藏部分）：{e}")
                 return pd.DataFrame(), ""
     
     # --- 核心数据清洗 ---
     
     # 强制转换数据类型
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
-    # total_share 是 daily 接口中的流通股本 (万股)，需要计算市值
+    # 计算市值 (total_mv 单位是亿元)
+    # circ_share 是流通股本 (万股)，收盘价 close (元)
     df['total_mv'] = df['circ_share'] * df['close'] / 100 # 近似计算市值 (亿元)
     
     # 剔除价格或市值为空/0的异常数据点
@@ -102,6 +120,8 @@ def get_base_pool(token_input):
     # 重新添加 daily_basic 中缺失的关键字段 (用0或NaN填充，防止后续计算出错)
     if 'turnover_rate' not in df.columns:
          df['turnover_rate'] = 0 
+    if 'volume_ratio' not in df.columns:
+         df['volume_ratio'] = 0 # 缺失量比，设为0或后续忽略
 
     status_text.success(f"基础数据获取和清洗完成！符合【非ST非北交所】的股票共：{len(df)} 只")
     return df, trade_date
@@ -127,6 +147,8 @@ def get_technical_and_flow(pro, ts_code, end_date):
 # ==========================================
 # 3. 策略计算与回测逻辑 (保持不变)
 # ==========================================
+
+# ... (calculate_strategy 和 simple_backtest 函数代码保持 V6 一致)
 
 def calculate_strategy(df_daily, df_flow):
     """
@@ -206,7 +228,7 @@ def simple_backtest(df_daily):
     return avg_1d, avg_3d, avg_5d, win_rate
 
 # ==========================================
-# 4. 主界面逻辑
+# 4. 主界面逻辑 (保持不变)
 # ==========================================
 
 st.title(f"🚀 A股智能选股 - 趋势接力版 {APP_VERSION}")
@@ -235,7 +257,7 @@ if run_btn and token:
     # 应用侧边栏的动态过滤 
     # total_mv 单位现在是亿元
     df_pool = df_base[
-        (df_base['total_mv'] >= mkt_cap_min) & # V6: 单位是亿元，无需 * 10000
+        (df_base['total_mv'] >= mkt_cap_min) & # V6/V7: 单位是亿元
         (df_base['total_mv'] <= mkt_cap_max) &
         (df_base['close'] >= price_min) &
         (df_base['close'] <= price_max)
@@ -252,7 +274,6 @@ if run_btn and token:
     final_results = []
     
     # 选取换手率较高的前 200 只进行深度扫描
-    # 注意：V6 依赖 daily 接口，可能缺失 turnover_rate，需要处理
     if 'turnover_rate' in df_pool.columns and not df_pool['turnover_rate'].isnull().all():
          target_pool = df_pool.sort_values('turnover_rate', ascending=False).head(200)
     else:
