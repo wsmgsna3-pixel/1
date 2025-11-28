@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.4 (D+5 收益为正版)
+选股王 · 全市场扫描增强版 V3.5 (激进重构版：D+5 必须为正)
 更新说明：
-1. 【最终稳定权重】：采用 V3.4 权重，降低资金流向 (w_mf) 权重，提高稳定性反向 (w_volatility) 权重，旨在将 D+5 收益从 -0.34% 提升至正值。
-2. 其余所有功能（D+30移除、Top K回测、60日位置过滤）保持不变。
+1. 【激进重构】：大幅削弱所有当日短线指标权重。
+2. 【核心强化】：巨幅提升 10日趋势 (w_trend)、稳定性反向 (w_volatility) 和 60日位置反向 (w_position) 权重。
+3. 目标：强制 Top 3 排序发生变化，筛选出持续性最强、波动性最低的非高位股。
 """
 
 import streamlit as st
@@ -17,9 +18,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.4 D+5 收益为正版", layout="wide")
-st.title("选股王 · V3.4 D+5 收益为正版（最终稳定模型）")
-st.markdown("🔥 **当前版本采用 V3.4 最终权重，旨在将 D+5 收益提升至正值。**")
+st.set_page_config(page_title="选股王 · V3.5 激进重构版", layout="wide")
+st.title("选股王 · V3.5 激进重构版（最终 D+5 稳定模型）")
+st.markdown("🔥 **当前版本采用 V3.5 激进权重，大幅提升趋势与稳定性权重。**")
 
 # ---------------------------
 # 辅助函数 (保持不变)
@@ -56,27 +57,21 @@ def get_selection_date(backtest_date_input, max_days=20):
 @st.cache_data(ttl=600)
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     """拉取选股日之后 N 个交易日的收盘价，用于回测"""
-    
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
-
     hist = safe_get(pro.daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
     hist = hist.sort_values('trade_date').reset_index(drop=True)
-    
     results = {}
-    
     if hist.empty:
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
-
     for n in days_ahead:
         col_name = f'Return_D{n}'
         if len(hist) >= n:
             results[col_name] = hist.iloc[n-1]['close']
         else:
             results[col_name] = np.nan
-
     return results
 
 # ---------------------------
@@ -84,27 +79,22 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 # ---------------------------
 with st.sidebar:
     st.header("模式与日期选择")
-    
     backtest_date = st.date_input(
         "选择**选股日** (留空为最新交易日)", 
         value=None, 
         max_value=datetime.now().date()
     )
-    
     st.markdown("---")
     st.header("核心参数")
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=300, step=50, help="为了速度，建议控制在300-500以内"))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=50, step=10))
-    
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1, help="仅回测分析这前 K 名股票的平均收益。"))
-    
     st.markdown("---")
     st.header("硬性过滤条件")
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=8.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5, help="低于此换手说明无人关注，直接剔除"))
     MIN_AMOUNT = float(st.number_input("最低成交额 (亿)", value=2.0, step=0.5)) * 100000000
-    
     st.markdown("---")
     st.header("评分与风控")
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值", value=1.7, step=0.1))
@@ -117,25 +107,20 @@ TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password
 if not TS_TOKEN:
     st.warning("请输入 Tushare Token 才能运行脚本。")
     st.stop()
-
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
-
 
 # ---------------------------
 # 核心调用：获取选股日 (保持不变)
 # ---------------------------
 last_trade, is_backtest = get_selection_date(backtest_date)
-
 if not last_trade:
     st.error("无法找到最近交易日。")
     st.stop()
-    
 if is_backtest:
     st.info(f"✅ 当前模式：**历史回测**，选股日：{last_trade}")
 else:
     st.success(f"🚀 当前模式：**实盘选股**，选股日：{last_trade}")
-
 
 # ---------------------------
 # 第一至第四步：数据拉取、清洗、双轨入围（保持不变）
@@ -148,7 +133,6 @@ if daily_all.empty or 'ts_code' not in daily_all.columns:
 pool_raw = daily_all.reset_index(drop=True) 
 st.write(f"  -> 获取到 {len(pool_raw)} 只股票，准备全量清洗。")
 
-# 第二步：合并必要数据
 st.write("2. 合并基本面数据（市值、换手、主力流向）...")
 stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,list_date,total_mv,circ_mv')
 REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount','total_mv','circ_mv']
@@ -180,7 +164,6 @@ if not moneyflow.empty:
 pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
 pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
 
-# 第三步：极速初筛
 st.write("3. 执行硬性条件过滤（剔除 ST、低价、无量股）...")
 df = pool_merged.copy()
 df['close'] = pd.to_numeric(df['close'], errors='coerce')
@@ -201,7 +184,6 @@ if len(df) == 0:
     st.error("过滤后无股票，请放宽条件。")
     st.stop()
 
-# 第四步：双轨选股
 st.write("4. 遴选决赛名单（涨幅榜 Top + 潜伏榜 Top）...")
 limit_pct = int(FINAL_POOL * 0.7)
 df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
@@ -232,15 +214,13 @@ def compute_indicators(df):
     close = df['close'].astype(float)
     res['last_close'] = close.iloc[-1]
     
-    # MACD, KDJ, 量比, 10日涨幅, 波动率
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         diff = ema12 - ema26
         dea = diff.ewm(span=9, adjust=False).mean()
         res['macd_val'] = ((diff - dea) * 2).iloc[-1]
-    else:
-        res['macd_val'] = np.nan
+    else: res['macd_val'] = np.nan
         
     n = 9
     if len(close) >= n:
@@ -249,31 +229,25 @@ def compute_indicators(df):
         rsv = (close - low_n) / (high_n - low_n + 1e-9) * 100
         k = rsv.ewm(alpha=1/3, adjust=False).mean()
         res['k'] = k.iloc[-1]
-    else:
-        res['k'] = np.nan
+    else: res['k'] = np.nan
         
     vols = df['vol'].astype(float).tolist()
     if len(vols) >= 6:
         res['vol_ratio'] = vols[-1] / (np.mean(vols[-6:-1]) + 1e-9)
-    else:
-        res['vol_ratio'] = np.nan
+    else: res['vol_ratio'] = np.nan
         
     res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 else 0
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
-    # 60日相对价格位置
     if len(df) >= 60:
         hist_60 = df.tail(60)
         min_low = hist_60['low'].min()
         max_high = hist_60['high'].max()
         current_close = hist_60['close'].iloc[-1]
         
-        if max_high == min_low:
-            res['position_60d'] = 50.0 
-        else:
-            res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
-    else:
-        res['position_60d'] = np.nan 
+        if max_high == min_low: res['position_60d'] = 50.0 
+        else: res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
+    else: res['position_60d'] = np.nan 
     
     return res
 
@@ -284,46 +258,33 @@ total_c = len(final_candidates)
 
 for i, row in enumerate(final_candidates.itertuples()):
     ts_code = row.ts_code
-    
     rec = {
-        'ts_code': ts_code, 
-        'name': getattr(row, 'name', ts_code),
-        'pct_chg': getattr(row, 'pct_chg', 0),
-        'turnover': getattr(row, 'turnover_rate', 0),
-        'net_mf': getattr(row, 'net_mf', 0),
-        'amount': getattr(row, 'amount', 0),
+        'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
+        'pct_chg': getattr(row, 'pct_chg', 0), 'turnover': getattr(row, 'turnover_rate', 0),
+        'net_mf': getattr(row, 'net_mf', 0), 'amount': getattr(row, 'amount', 0),
         'Source_Type': getattr(row, 'Source_Type', '未知') 
     }
-    
     hist = get_hist(ts_code, last_trade)
     ind = compute_indicators(hist)
     rec.update({
-        'vol_ratio': ind.get('vol_ratio', 0),
-        'macd': ind.get('macd_val', 0),
-        'k': ind.get('k', 50),
-        '10d_return': ind.get('10d_return', 0),
-        'volatility': ind.get('volatility', 0),
-        'position_60d': ind.get('position_60d', np.nan)
+        'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
+        'k': ind.get('k', 50), '10d_return': ind.get('10d_return', 0),
+        'volatility': ind.get('volatility', 0), 'position_60d': ind.get('position_60d', np.nan)
     })
     
-    # 回测计算 (仅 D+1, D+3, D+5)
     if is_backtest:
         rec['selection_price'] = ind.get('last_close', np.nan)
         future_prices = get_future_prices(ts_code, last_trade)
-        
         for n in [1, 3, 5]: 
             future_price = future_prices.get(f'Return_D{n}', np.nan)
-            
             if pd.notna(rec['selection_price']) and pd.notna(future_price):
                 rec[f'Return_D{n}'] = (future_price / rec['selection_price'] - 1) * 100
-            else:
-                rec[f'Return_D{n}'] = np.nan
-    
+            else: rec[f'Return_D{n}'] = np.nan
     records.append(rec)
     my_bar.progress((i + 1) / total_c)
 
 # ---------------------------
-# 第六步：归一化与打分 (V3.4 最终稳定权重)
+# 第六步：归一化与打分 (V3.5 激进重构权重)
 # ---------------------------
 fdf = pd.DataFrame(records)
 if fdf.empty:
@@ -344,15 +305,15 @@ fdf['s_macd'] = normalize(fdf['macd'])
 fdf['s_trend'] = normalize(fdf['10d_return'])
 fdf['s_position'] = fdf['position_60d'] / 100 
 
-# V3.4 最终稳定权重配置
-w_pct = 0.05        
-w_turn = 0.10       
-w_vol = 0.05        
-w_mf = 0.10         # 【下降】资金流向权重
-w_macd = 0.10       
-w_trend = 0.20      # 10日涨幅权重 
-w_volatility = 0.20 # 【上升】波动率反向权重
-w_position = 0.20   # 60日位置反向权重
+# V3.5 激进重构权重配置
+w_pct = 0.02        # 极低
+w_turn = 0.05       # 大幅降低
+w_vol = 0.03        # 极低
+w_mf = 0.05         # 大幅降低
+w_macd = 0.10       # 保持
+w_trend = 0.30      # 巨幅提升
+w_volatility = 0.25 # 巨幅提升
+w_position = 0.20   # 保持高位
 
 # 确保总和为 1.00
 score = (
@@ -371,7 +332,7 @@ fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
 fdf.index += 1
 
 # ---------------------------
-# 第七步：展示结果
+# 第七步：展示结果 (保持不变)
 # ---------------------------
 st.success(f"计算完成！共评分 {len(fdf)} 只。")
 
@@ -400,4 +361,4 @@ st.dataframe(fdf[cols_show].head(TOP_DISPLAY), use_container_width=True, column_
     "turnover": st.column_config.NumberColumn("换手率(%)", format="%.2f")
 })
 
-st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.4_结果_{last_trade}.csv")
+st.download_button("下载完整CSV", fdf.to_csv(index=True).encode('utf-8-sig'), f"选股王_V3.5_结果_{last_trade}.csv")
