@@ -7,10 +7,9 @@ from datetime import datetime, timedelta
 import time
 
 # 定义版本号
-APP_VERSION = "V8" 
+APP_VERSION = "V9" 
 
 # TuShare 接口一次性查询最大限制
-# daily_basic 接口也存在查询代码数量限制，保持分块
 CHUNK_SIZE = 900 
 
 # ==========================================
@@ -42,13 +41,28 @@ def init_tushare(token):
         return None
 
 # ==========================================
-# 2. 核心数据获取逻辑 (V8: 分块查询 daily_basic)
+# 2. 核心数据获取逻辑 (V9: 增强错误定位)
 # ==========================================
+
+# 移除 TTL 缓存，强制每次都获取最新数据
+@st.cache_data(show_spinner=False) 
+def get_stock_basic_data(pro):
+    """
+    独立函数：获取全市场股票代码列表 (V9: 无缓存)
+    """
+    try:
+        df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
+        if df_basic.empty:
+             st.error("【错误定位】: pro.stock_basic 接口返回为空。请检查 Token 权限或 Tushare 服务状态。")
+        return df_basic
+    except Exception as e:
+        st.error(f"【致命错误】: pro.stock_basic 接口调用失败。错误: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=3600) # 缓存1小时
 def get_base_pool(token_input):
     """
-    V8 核心：获取所有代码，然后通过分块查询 daily_basic 来获取价格、市值和换手率。
+    V9 核心：分块查询 daily_basic，并改进错误反馈。
     """
     pro = init_tushare(token_input)
     if not pro: return pd.DataFrame(), "" 
@@ -66,18 +80,20 @@ def get_base_pool(token_input):
             cal = pro.trade_cal(exchange='', is_open='1', end_date=datetime.now().strftime('%Y%m%d'), fields='cal_date')
             trade_date = cal['cal_date'].values[-1]
             
-            # 2. 获取基础信息（所有A股代码和名称）
-            df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market,list_date')
-            
+            # 2. 获取基础信息（调用独立函数，不使用TTL缓存）
+            df_basic = get_stock_basic_data(pro)
+            if df_basic.empty:
+                return pd.DataFrame(), ""
+
             # 3. 排除北交所和ST
             df_basic = df_basic[~df_basic['market'].str.contains('北|BJE', na=False)] 
             df_basic = df_basic[~df_basic['name'].str.contains('ST|退', na=False)]
             
             ts_code_list = df_basic['ts_code'].tolist()
             
-            # 4. V8 核心逻辑：实现 daily_basic 分块查询
+            # 4. V9 核心逻辑：实现 daily_basic 分块查询
             df_daily_basic_chunks = []
-            daily_basic_fields = 'ts_code,close,turnover_rate,total_mv,circ_mv' # 确保获取市值和价格
+            daily_basic_fields = 'ts_code,close,turnover_rate,total_mv,circ_mv' 
             
             # 循环遍历代码列表，每 900 个分一块
             for i in range(0, len(ts_code_list), CHUNK_SIZE):
@@ -85,19 +101,24 @@ def get_base_pool(token_input):
                 chunk_codes = ','.join(chunk_list)
                 
                 # 查询当前块的数据
-                # 使用 list_in_stock 功能查询 daily_basic
                 chunk_df = pro.daily_basic(ts_code=chunk_codes, trade_date=trade_date, fields=daily_basic_fields)
-                df_daily_basic_chunks.append(chunk_df)
+                if chunk_df is not None:
+                    df_daily_basic_chunks.append(chunk_df)
                 
                 # 提示用户进度，并避免 API 频率超限 
                 status_text.info(f"正在分批获取市值/价格数据：已完成 {i//CHUNK_SIZE + 1} / {len(ts_code_list)//CHUNK_SIZE + 1} 批次...")
                 time.sleep(1.2) 
 
             # 合并所有批次的数据
+            if not df_daily_basic_chunks:
+                st.error("【错误定位】: pro.daily_basic 分块查询未返回任何数据。请检查 Token 权限。")
+                return pd.DataFrame(), ""
+                
             df_daily_data = pd.concat(df_daily_basic_chunks, ignore_index=True)
 
             # 5. 整合数据
-            # 使用内连接：确保我们只保留既有基础信息又有市值价格数据的股票
+            # V9: 使用左连接 (left join)，如果 daily_basic 缺失数据，我们先保留 basic info
+            # 修正：继续使用内连接，只有同时拥有基础信息和最新价格的股票才有分析价值
             df = pd.merge(df_basic, df_daily_data, on='ts_code', how='inner', suffixes=('_basic', '_daily'))
 
             break
@@ -106,13 +127,15 @@ def get_base_pool(token_input):
                 status_text.warning(f"获取数据失败，正在重试 ({attempt+1}/{max_retries})...")
                 time.sleep(2) 
             else:
-                st.error(f"数据获取失败，请检查 Tushare Token 权限或网络连接。\n错误详情（已隐藏部分）：{e}")
+                st.error(f"【致命错误】: 在分块查询过程中发生异常，可能原因是网络或 Token 权限不足。\n错误详情（已隐藏部分）：{e}")
                 return pd.DataFrame(), ""
     
     # --- 核心数据清洗 ---
     
     # 强制转换数据类型
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    df['total_mv'] = pd.to_numeric(df['total_mv'], errors='coerce') # V8 带来的 total_mv (单位: 万元)
+    
     # total_mv 单位是万元，我们转换为亿元，以匹配滑块 (10000 万元 = 1 亿元)
     df['total_mv_billion'] = df['total_mv'] / 10000
     
@@ -136,7 +159,6 @@ def get_technical_and_flow(pro, ts_code, end_date):
     df_daily = df_daily.sort_values('trade_date') 
     
     # 2. 资金流向 (10000积分特权接口)
-    # V8: 保持 moneyflow 调用不变
     df_flow = pro.moneyflow(ts_code=ts_code, start_date=start_date, end_date=end_date)
     df_flow = df_flow.sort_values('trade_date')
     
@@ -145,8 +167,6 @@ def get_technical_and_flow(pro, ts_code, end_date):
 # ==========================================
 # 3. 策略计算与回测逻辑 (保持不变)
 # ==========================================
-
-# ... (calculate_strategy 和 simple_backtest 函数代码保持 V7 一致)
 
 def calculate_strategy(df_daily, df_flow):
     """
@@ -172,7 +192,7 @@ def calculate_strategy(df_daily, df_flow):
     # --- 策略判断逻辑 ---
     
     # A. 趋势判断：收盘价 > 20日线 > 60日线 (多头排列，非下跌趋势)
-    is_trend_up = (close[-1] > ma20[-1]) and (ma20[-1][-1] > ma60[-1]) # 修正：ma20[-1] > ma60[-1]
+    is_trend_up = (close[-1] > ma20[-1]) and (ma20[-1] > ma60[-1]) 
     
     # B. 排除反弹/超买：RSI < 75 且 20日涨幅 < 80% (非近期翻倍/非超买)
     is_safe_zone = (current_rsi < 75) and (pct_change_20 < 80)
@@ -236,6 +256,12 @@ with st.sidebar:
     st.header("⚙️ 设置")
     token = st.text_input("请输入 TuShare Token", type="password")
     
+    # 增加清除缓存按钮
+    if st.button("清除缓存并重置", key="clear_cache"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.experimental_rerun()
+        
     st.divider()
     st.write("📊 **筛选参数微调**")
     mkt_cap_min, mkt_cap_max = st.slider("市值范围 (亿元)", 10, 1000, (20, 500))
@@ -272,7 +298,6 @@ if run_btn and token:
     final_results = []
     
     # 选取换手率较高的前 200 只进行深度扫描
-    # turnover_rate 字段现在来自 daily_basic，应该可靠
     target_pool = df_pool.sort_values('turnover_rate', ascending=False).head(200)
     
     total_scan = len(target_pool)
@@ -283,7 +308,6 @@ if run_btn and token:
             # 更新进度条
             progress_bar.progress((i + 1) / total_scan, text=f"扫描进度：{i+1}/{total_scan} 只股票 - 正在分析 {row.name}...")
             
-            # 注意：get_technical_and_flow 仍然使用 pro.daily 和 pro.moneyflow，需要足够积分
             df_daily, df_flow = get_technical_and_flow(pro, row.ts_code, trade_date)
             
             if df_daily is not None and len(df_daily) >= 60:
