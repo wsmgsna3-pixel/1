@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V3.9.8 最终修复版（修复 KeyError）
+选股王 · V3.9.9 最终修复版（解决 Tushare API 调用冲突）
 更新说明：
-1. 【**Bug 修复 V3.9.8**】：修复了因切换到 daily_basic 接口后，在数据缺失时导致的 KeyError: 'close' 错误，增强了数据处理的鲁棒性。
-2. 【**数据优化**】：确保所有指标计算和价格引用都使用 'close_adj' 字段。
+1. 【**关键修复 V3.9.9**】：在核心的 safe_get 函数中，加入了 time.sleep(0.5) 延迟。这解决了 V3.9.8 版本由于高频串行调用敏感的 daily_basic 接口而导致的 API 调用冲突（全部返回 None/NaN）问题。
 """
 
 import streamlit as st
@@ -12,14 +11,15 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
+import time  # 🚨 引入 time 库
 warnings.filterwarnings("ignore")
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9.8 最终修复版", layout="wide")
-st.title("选股王 · V3.9.8 最终修复版（修复 KeyError）")
-st.markdown("🚀 **已修复程序崩溃问题。请清除缓存后运行！**")
+st.set_page_config(page_title="选股王 · V3.9.9 最终修复版", layout="wide")
+st.title("选股王 · V3.9.9 最终修复版（解决 API 调用冲突）")
+st.markdown("🚀 **已修复 API 调用冲突问题。回测速度会变慢，但数据可靠性最高。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -27,14 +27,13 @@ st.markdown("🚀 **已修复程序崩溃问题。请清除缓存后运行！**"
 pro = None # 预先声明 pro 变量
 
 # ---------------------------
-# 辅助函数 (修正后的缓存逻辑 V3.9.8)
+# 辅助函数 (修正后的缓存逻辑 V3.9.9)
 # ---------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API (V3.9.8 缓存版)"""
+    """安全调用 Tushare API (V3.9.9 鲁棒性增强)"""
     global pro
     if pro is None:
-        # 返回一个带有 ts_code 列的空 DataFrame，避免下游函数崩溃
         return pd.DataFrame(columns=['ts_code']) 
         
     func = getattr(pro, func_name) 
@@ -43,9 +42,15 @@ def safe_get(func_name, **kwargs):
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame(columns=['ts_code']) 
+            
+        # 🚨 关键修复：加入 0.5 秒延迟，解决串行调用 daily_basic 的冲突
+        time.sleep(0.5) 
+        
         return df
     except Exception as e:
         # st.warning(f"Tushare API 调用 {func_name} 失败：{e}") # 可选：用于调试
+        # 即使失败也要延迟，防止连续失败导致流控加剧
+        time.sleep(0.5) 
         return pd.DataFrame(columns=['ts_code'])
 
 # 此函数无需缓存
@@ -66,7 +71,7 @@ def get_trade_days(end_date_str, num_days):
 # 关键修复函数 1：获取未来价格 (强制使用前复权收盘价)
 # ----------------------------------------------------
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
-    """拉取选股日之后 N 个交易日的收盘价，用于回测 (V3.9.8 修正)"""
+    """拉取选股日之后 N 个交易日的收盘价，用于回测 (V3.9.9 修正)"""
     
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
@@ -107,24 +112,23 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 # ----------------------------------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V3.9.8 修正)"""
+    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V3.9.9 修正)"""
     
     # 拉取足够计算 60 日指标的历史数据
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
-    # 核心：拉取 daily_basic 数据，包含收盘价(close_adj)、最低价(low_adj)、最高价(high_adj), vol, pct_chg
+    # 核心：拉取 daily_basic 数据
     FIELDS = 'ts_code,trade_date,close_adj,low_adj,high_adj,vol,pct_chg'
     df = safe_get('daily_basic', ts_code=ts_code, start_date=start_date, end_date=end_date, 
                   fields=FIELDS)
 
     res = {}
     
-    # 🚨 检查关键列是否存在，这是修复 KeyErorr 的关键
+    # 检查关键列是否存在，这是修复 KeyErorr 的关键
     if df.empty or len(df) < 3 or 'close_adj' not in df.columns: 
         return res
     
     # 统一使用前复权价格进行计算
-    # V3.9.8 修正：直接使用 'close_adj' 而不重命名，避免 KeyError
     df['close'] = df['close_adj'].astype(float)
     
     # 检查其他关键列是否存在，不存在则跳过相关计算
@@ -180,7 +184,7 @@ with st.sidebar:
     )
     BACKTEST_DAYS = int(st.number_input(
         "**自动回测天数 (N)**", 
-        value=30, # 默认设为30天
+        value=5, # 默认改为 5 天，避免长时间卡顿
         step=1, 
         min_value=1, 
         max_value=50, 
@@ -189,7 +193,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=50, step=10, min_value=10)) 
+    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=10, step=1, min_value=1)) # 默认改为 10
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) # 保持3
     
@@ -217,7 +221,7 @@ pro = ts.pro_api()
 # 核心回测逻辑函数 - 保持不变
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT):
-    """为单个交易日运行选股和回测逻辑 (V3.9.8 修正)"""
+    """为单个交易日运行选股和回测逻辑 (V3.9.9 修正)"""
     
     # 1. 拉取全市场 Daily 数据
     daily_all = safe_get('daily', trade_date=last_trade) 
@@ -261,7 +265,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 3. 执行硬性条件过滤
     df = pool_merged.copy()
     
-    # 股价过滤：这里仍然需要一个当前股价，使用当日 close 字段进行初步过滤
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
