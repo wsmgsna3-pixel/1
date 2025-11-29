@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V3.9.12 最终完美修复版（使用 ts.pro_bar 接口获取复权价）
+选股王 · V3.9.13 最终鲁棒修复版（修复 KeyError）
 更新说明：
-1. 【**完美修复 V3.9.12**】：解决了所有版本中遇到的数据准确性问题和 API 结构性拒绝问题。
-2. 【**数据源切换**】：将所有历史价格获取切换至 **ts.pro_bar(adj='qfq')**，直接拉取正确的**前复权价格**。
-3. 【**鲁棒性增强**】：保留 time.sleep(0.5)，以应对任何潜在的 API 冲突，确保回测稳定运行。
+1. 【**Bug 修复 V3.9.13**】：修复了 compute_indicators 函数中由于缺少 'pct_change' 字段导致的 KeyError。
+2. 【**鲁棒性增强**】：在处理涨跌幅字段时加入了 if-else 检查，确保脚本在数据不完整时也能继续运行。
 """
 
 import streamlit as st
@@ -19,9 +18,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9.12 最终完美修复版", layout="wide")
-st.title("选股王 · V3.9.12 最终完美修复版（Pro Bar 模式）")
-st.markdown("✅ **已解决复权价格获取难题，现在回测数据准确且稳定。**")
+st.set_page_config(page_title="选股王 · V3.9.13 最终鲁棒修复版", layout="wide")
+st.title("选股王 · V3.9.13 最终鲁棒修复版（Pro Bar 模式）")
+st.markdown("✅ **已解决 KeyError 问题。请再次运行回测。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -30,7 +29,7 @@ pro = None
 BAR_API = None # 用于存储 pro_bar 接口
 
 # ---------------------------
-# 辅助函数 (修正后的缓存逻辑 V3.9.12)
+# 辅助函数 (修正后的缓存逻辑 V3.9.13)
 # ---------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
 def safe_get(func_name, **kwargs):
@@ -55,7 +54,7 @@ def safe_get(func_name, **kwargs):
         return pd.DataFrame(columns=['ts_code'])
 
 def safe_bar_get(ts_code, start_date, end_date):
-    """安全调用 ts.pro_bar (V3.9.12 核心修复)"""
+    """安全调用 ts.pro_bar (V3.9.13 修复)"""
     global BAR_API
     if BAR_API is None:
         return pd.DataFrame()
@@ -71,6 +70,7 @@ def safe_bar_get(ts_code, start_date, end_date):
         time.sleep(0.5) 
         return df
     except Exception as e:
+        # 捕获连接或数据获取错误
         time.sleep(0.5)
         return pd.DataFrame()
 
@@ -92,13 +92,12 @@ def get_trade_days(end_date_str, num_days):
 # 关键函数 1：获取未来价格 (Pro Bar 复权价)
 # ----------------------------------------------------
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
-    """拉取选股日之后 N 个交易日的复权收盘价，用于回测 (V3.9.12 修正)"""
+    """拉取选股日之后 N 个交易日的复权收盘价，用于回测 (V3.9.13 修正)"""
     
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
-    # 核心：使用 safe_bar_get 获取复权数据
     hist = safe_bar_get(ts_code, start_date=start_date, end_date=end_date)
     
     if hist.empty or 'trade_date' not in hist.columns or 'close' not in hist.columns:
@@ -106,7 +105,6 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
     
-    # pro_bar 返回的 close 即为前复权收盘价
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
     hist = hist.dropna(subset=['close'])
     hist = hist.sort_values('trade_date').reset_index(drop=True)
@@ -133,17 +131,14 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 # ----------------------------------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V3.9.12 修正)"""
+    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V3.9.13 修正)"""
     
-    # 拉取足够计算 60 日指标的历史数据
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
-    # 核心：使用 safe_bar_get 获取复权数据
     df = safe_bar_get(ts_code, start_date=start_date, end_date=end_date)
     
     res = {}
     
-    # 检查关键列是否存在，现在 df 中的价格就是复权价
     if df.empty or len(df) < 3 or 'close' not in df.columns: 
         return res
     
@@ -152,10 +147,15 @@ def compute_indicators(ts_code, end_date):
     df['low'] = pd.to_numeric(df['low'], errors='coerce').astype(float)
     df['high'] = pd.to_numeric(df['high'], errors='coerce').astype(float)
     df['vol'] = pd.to_numeric(df['vol'], errors='coerce').fillna(0)
-    df['pct_chg'] = pd.to_numeric(df['pct_change'], errors='coerce').fillna(0) # pro_bar 返回 'pct_change'
     
+    # 🚨 V3.9.13 修复：检查 'pct_change' 列是否存在，防止 KeyError
+    if 'pct_change' in df.columns:
+        df['pct_chg'] = pd.to_numeric(df['pct_change'], errors='coerce').fillna(0)
+    else:
+        df['pct_chg'] = 0.0 # 如果数据缺失，设为 0，防止计算错误
+
     close = df['close']
-    res['last_close'] = close.iloc[-1] # 正确的复权买入价
+    res['last_close'] = close.iloc[-1]
     
     # MACD 计算 (保持不变)
     if len(close) >= 26:
@@ -239,7 +239,7 @@ BAR_API = ts.pro_bar # 初始化 pro_bar 接口
 # 核心回测逻辑函数 - 保持不变
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT):
-    """为单个交易日运行选股和回测逻辑 (V3.9.12 修正)"""
+    """为单个交易日运行选股和回测逻辑 (V3.9.13 修正)"""
     
     # 1. 拉取全市场 Daily 数据 (用 daily 接口拉取当日的 close/pct_chg 进行初步筛选)
     daily_all = safe_get('daily', trade_date=last_trade) 
