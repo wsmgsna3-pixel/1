@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.9.2 (最终稳定版)
+选股王 · V3.9.3 缓存与稳定优化版
 更新说明：
-1. 【**功能升级**】：将股价、成交额、换手率等过滤参数移至侧边栏。
-2. 【**修复 V3.9.1**】：修复了 get_future_prices 函数和主函数中收益计算的致命 bug。
-3. 【**修复 V3.9.2**】：在最终汇总计算时，增加了收益过滤机制（自动剔除 >50% 或 <-50% 的异常 Tushare 数据），确保平均收益结果真实可靠。
-4. 【**策略保持**】：核心 V3.7 权重 (极致保守) 保持不变。
+1. 【**稳定修复 V3.9.3**】：重新引入 @st.cache_data 装饰器，将 Tushare API 的核心数据拉取进行缓存，解决回测时间过长导致的内存溢出或超时退出问题。
 """
 
 import streamlit as st
@@ -19,27 +16,29 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9.2 最终稳定版", layout="wide")
-st.title("选股王 · V3.9.2 最终稳定版（灵活过滤与多日验证）")
-st.markdown("🚀 **当前版本已集成收益过滤，确保回测结果的真实性。**")
+st.set_page_config(page_title="选股王 · V3.9.3 缓存优化版", layout="wide")
+st.title("选股王 · V3.9.3 缓存优化版（解决回测中断问题）")
+st.markdown("🚀 **当前版本已加入数据缓存，请先清除缓存后再运行！**")
 
 # ---------------------------
-# 辅助函数 (移除了 @st.cache_data)
+# 辅助函数 (加入缓存)
 # ---------------------------
+@st.cache_data(ttl=3600*12) # 缓存12小时
 def safe_get(func, **kwargs):
-    """安全调用 Tushare API"""
+    """安全调用 Tushare API (缓存版)"""
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame(columns=['ts_code']) 
         return df
     except Exception:
+        # 如果是因为 Token 错误导致的失败，这里会捕获，但缓存无法解决 Token 问题
         return pd.DataFrame(columns=['ts_code'])
 
+# 此函数无需缓存，因为每次运行的结束日期不同
 def get_trade_days(end_date_str, num_days):
     """获取 num_days 个交易日作为选股日"""
     
-    # 获取一个较长时间范围内的交易日历
     start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
     cal = safe_get(ts.pro_api().trade_cal, start_date=start_date, end_date=end_date_str)
     
@@ -48,16 +47,16 @@ def get_trade_days(end_date_str, num_days):
         return []
 
     trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
-    
-    # 过滤掉结束日期之后的日期（如果用户选择了未来日期）
     trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
     
-    # 取最近的 num_days 个交易日作为选股日
     return trade_days_df['cal_date'].head(num_days).tolist()
 
+
 # ----------------------------------------------------
-# ⚠️ 修复后的未来价格获取函数 (V3.9.1)
+# ⚠️ 修复后的未来价格获取函数 (V3.9.3 - 加入缓存)
 # ----------------------------------------------------
+# 注意：此函数不加 @st.cache_data，因为它依赖于 selection_date，如果加了，每次选择新日期都需要清缓存。
+# 我们通过缓存 safe_get 来间接加速。
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     """拉取选股日之后 N 个交易日的收盘价，用于回测 (V3.9.1 修复版)"""
     
@@ -65,7 +64,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
-    # 1. 尝试从日线数据拉取未来价格
+    # 1. 尝试从日线数据拉取未来价格 (通过 safe_get 间接缓存)
     hist = safe_get(ts.pro_api().daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
     
     if hist.empty or 'trade_date' not in hist.columns:
@@ -73,20 +72,17 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
     
-    # 2. 确保价格数据是数值类型
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
     hist = hist.dropna(subset=['close'])
-    
     hist = hist.sort_values('trade_date').reset_index(drop=True)
     
     results = {}
     
     for n in days_ahead:
         col_name = f'Return_D{n}'
-        # 3. 严格检查是否有足够的交易日数据
         if len(hist) >= n:
             future_price = hist.iloc[n-1]['close']
-            if future_price == 0: # 避免除以零或异常低价
+            if future_price == 0: 
                 results[col_name] = np.nan 
             else:
                 results[col_name] = future_price
@@ -97,8 +93,9 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 # ----------------------------------------------------
 
 
+@st.cache_data(ttl=3600*12) # 缓存12小时
 def compute_indicators(df):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标"""
+    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (缓存版)"""
     res = {}
     if df.empty or len(df) < 3: return res
     close = df['close'].astype(float)
@@ -144,7 +141,7 @@ with st.sidebar:
     )
     BACKTEST_DAYS = int(st.number_input(
         "**自动回测天数 (N)**", 
-        value=5, # 默认设为5天，方便观察
+        value=20, # 默认设为20天
         step=1, 
         min_value=1, 
         max_value=50, 
@@ -153,21 +150,16 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=50, step=10, min_value=10)) # 默认为50，保障稳定
+    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=50, step=10, min_value=10)) 
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
-    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) # 默认设为3
+    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) # 保持3
     
     st.markdown("---")
     st.header("🛒 灵活过滤条件 (V3.9)")
     
-    # 股价区间 (用户要求 10-300)
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1)
     MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
-    
-    # 最低换手率
     MIN_TURNOVER = st.number_input("最低换手率 (%)", value=3.0, step=0.5, min_value=0.1)
-    
-    # 最低成交额 (用户要求 20亿市值，故改为 0.6 亿)
     MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
     st.markdown(f"> *当前设置下，最低流通市值约为：{(MIN_AMOUNT/100000000)/ (MIN_TURNOVER/100):.1f} 亿*")
@@ -188,14 +180,14 @@ pro = ts.pro_api()
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT):
     """为单个交易日运行选股和回测逻辑"""
     
-    # 1. 拉取全市场 Daily 数据
+    # 1. 拉取全市场 Daily 数据 (通过 safe_get 缓存)
     daily_all = safe_get(pro.daily, trade_date=last_trade) 
     if daily_all.empty or 'ts_code' not in daily_all.columns:
         return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
 
     pool_raw = daily_all.reset_index(drop=True) 
 
-    # 2. 合并基本面数据
+    # 2. 合并基本面数据 (通过 safe_get 缓存)
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry')
     REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount']
     daily_basic = safe_get(pro.daily_basic, trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
@@ -234,21 +226,20 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 # 转换为万元
     df['name'] = df['name'].astype(str)
     
-    # 过滤规则 (使用侧边栏传入的参数)
     mask_st = df['name'].str.contains('ST|退', case=False, na=False)
     df = df[~mask_st]
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER
     df = df[mask_turn]
-    mask_amt = df['amount'] * 1000 >= MIN_AMOUNT # 确保使用传入的 MIN_AMOUNT
+    mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
     df = df.reset_index(drop=True)
 
     if len(df) == 0:
         return pd.DataFrame(), f"过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单 (保持 V3.8 逻辑)
+    # 4. 遴选决赛名单
     limit_pct = int(FINAL_POOL * 0.7)
     df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
     limit_turn = FINAL_POOL - len(df_pct)
@@ -265,6 +256,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'pct_chg': getattr(row, 'pct_chg', 0), 'turnover': getattr(row, 'turnover_rate', 0),
             'net_mf': getattr(row, 'net_mf', 0)
         }
+        # ⚠️ 此处调用 compute_indicators，函数内部调用 safe_get(pro.daily)，实现历史数据缓存
         hist = safe_get(pro.daily, ts_code=ts_code, end_date=last_trade) 
         ind = compute_indicators(hist)
         rec.update({
@@ -276,22 +268,21 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         rec['selection_price'] = ind.get('last_close', np.nan)
         future_prices = get_future_prices(ts_code, last_trade)
         
-        # ⚠️ 修复后的收益计算逻辑 (V3.9.1)
+        # 收益计算逻辑
         for n in [1, 3, 5]: 
             future_price = future_prices.get(f'Return_D{n}', np.nan)
             
-            # 防御性检查：确保 P0 > 0.01 且价格不为 NaN
             if pd.notna(rec['selection_price']) and pd.notna(future_price) and rec['selection_price'] > 0.01:
                 rec[f'Return_D{n}'] = (future_price / rec['selection_price'] - 1) * 100
             else: 
-                rec[f'Return_D{n}'] = np.nan # 价格异常或数据缺失，标记为 NaN
+                rec[f'Return_D{n}'] = np.nan 
 
         records.append(rec)
     
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V3.7 评分 (权重保持不变)
+    # 6. 归一化与 V3.7 评分
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -319,7 +310,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
     fdf.index += 1
 
-    # 返回 Top K 的回测结果
     return fdf.head(TOP_BACKTEST).copy(), None
 
 # ---------------------------
@@ -343,7 +333,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     for i, trade_date in enumerate(trade_days_str):
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
         
-        # 运行单日回测
         daily_result_df, error = run_backtest_for_a_day(
             trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT
         )
@@ -368,17 +357,13 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     # 最终汇总计算
     st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {total_days} 个交易日)")
     
-    # V3.9.2 最终修复：引入收益过滤机制 (剔除超过 50% 的异常值)
     for n in [1, 3, 5]:
         col = f'Return_D{n}'
         
-        # 1. 复制数据，用于安全过滤
         filtered_returns = all_results.copy()
-        
-        # 2. 移除 NaN 值，确保只对有效数据进行操作
         valid_returns = filtered_returns.dropna(subset=[col])
 
-        # 3. 过滤异常值：收益率必须在 -50% 到 50% 之间（排除不可能的 Tushare 错误数据）
+        # 过滤异常值：收益率必须在 -50% 到 50% 之间
         if not valid_returns.empty:
             valid_returns = valid_returns[
                 (valid_returns[col] > -50) & 
@@ -386,7 +371,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             ]
             avg_return = valid_returns[col].mean()
             
-            # 重新计算准确率 (基于过滤后的数据)
             hit_rate = (valid_returns[col] > 0).sum() / len(valid_returns) * 100
             total_count = len(valid_returns)
         else:
@@ -400,4 +384,3 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
 
     st.header("📋 每日回测详情 (Top K 明细)")
     st.dataframe(all_results[['Trade_Date', 'name', 'ts_code', '综合评分', 'selection_price', 'Return_D1', 'Return_D3', 'Return_D5']].sort_values('Trade_Date', ascending=False), use_container_width=True)
-
