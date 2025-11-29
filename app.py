@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V3.9.5 最终稳定版（彻底解决缓存 UnhashableParamError）
+选股王 · V3.9.6 最终稳定版（排除北交所）
 更新说明：
-1. 【**最终修复 V3.9.5**】：将 Tushare 的 pro API 对象从所有 @st.cache_data 装饰的函数的参数中移除，避免 Streamlit 尝试对复杂对象进行哈希导致的 UnhashableParamError。
-2. 【**调用修正**】：所有函数现在都依赖全局的 pro 对象，并直接传入 API 名称（字符串）作为第一个参数。
+1. 【**功能修正 V3.9.6**】：在硬性过滤条件中新增规则，排除所有 ts_code 以 '92' 开头（即北交所）的股票，使回测结果更符合主板/创业板/科创板的交易环境。
 """
 
 import streamlit as st
@@ -17,12 +16,12 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9.5 最终稳定版", layout="wide")
-st.title("选股王 · V3.9.5 最终稳定版（彻底解决缓存错误）")
-st.markdown("🚀 **请先清除缓存，运行 V3.9.5 解决中断问题！**")
+st.set_page_config(page_title="选股王 · V3.9.6 最终稳定版", layout="wide")
+st.title("选股王 · V3.9.6 最终稳定版（排除北交所股票）")
+st.markdown("🚀 **当前版本已排除 ST 股和北交所股票。请清除缓存后运行！**")
 
 # ---------------------------
-# 全局变量初始化 (必须在函数定义前)
+# 全局变量初始化
 # ---------------------------
 pro = None # 预先声明 pro 变量，稍后会赋值
 
@@ -33,6 +32,7 @@ pro = None # 预先声明 pro 变量，稍后会赋值
 def safe_get(func_name, **kwargs):
     """安全调用 Tushare API (V3.9.5 缓存版 - 消除 pro 对象依赖)"""
     # 依赖全局的 pro 对象
+    global pro
     if pro is None:
         return pd.DataFrame(columns=['ts_code']) 
         
@@ -52,7 +52,7 @@ def get_trade_days(end_date_str, num_days):
     
     start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
     
-    # ⚠️ 修正：调用 safe_get 时不再传入 pro 对象
+    # 修正：调用 safe_get 时不再传入 pro 对象
     cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
     
     if cal.empty or 'is_open' not in cal.columns:
@@ -75,7 +75,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
-    # ⚠️ 修正：调用 safe_get 时不再传入 pro 对象
+    # 修正：调用 safe_get 时不再传入 pro 对象
     hist = safe_get('daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
     
     if hist.empty or 'trade_date' not in hist.columns:
@@ -108,7 +108,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 def compute_indicators(ts_code, end_date):
     """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V3.9.5 修正)"""
     
-    # ⚠️ 修正：在 compute_indicators 内部调用 safe_get 获取历史数据
+    # 修正：在 compute_indicators 内部调用 safe_get 获取历史数据
     df = safe_get('daily', ts_code=ts_code, end_date=end_date)
 
     res = {}
@@ -194,7 +194,7 @@ pro = ts.pro_api() # 全局 pro 对象赋值完成，供 safe_get 使用
 # 核心回测逻辑函数
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT):
-    """为单个交易日运行选股和回测逻辑 (V3.9.5 修正)"""
+    """为单个交易日运行选股和回测逻辑 (V3.9.6 修正)"""
     
     # 1. 拉取全市场 Daily 数据
     daily_all = safe_get('daily', trade_date=last_trade) 
@@ -242,12 +242,21 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 # 转换为万元
     df['name'] = df['name'].astype(str)
     
+    # 过滤 ST 股/退市股
     mask_st = df['name'].str.contains('ST|退', case=False, na=False)
     df = df[~mask_st]
+    
+    # 🚨 V3.9.6 新增过滤：排除北交所股票 (代码 '92' 开头)
+    mask_bj = df['ts_code'].str.startswith('92') 
+    df = df[~mask_bj]
+    
+    # 过滤价格
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
+    # 过滤换手率
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER
     df = df[mask_turn]
+    # 过滤成交额
     mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
     df = df.reset_index(drop=True)
@@ -273,7 +282,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'net_mf': getattr(row, 'net_mf', 0)
         }
         
-        # ⚠️ 修正：调用 compute_indicators，不再传入 pro 对象
+        # 调用 compute_indicators，不再传入 pro 对象
         ind = compute_indicators(ts_code, last_trade)
         rec.update({
             'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
@@ -282,7 +291,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         })
         
         rec['selection_price'] = ind.get('last_close', np.nan)
-        # ⚠️ 修正：调用 get_future_prices，不再传入 pro 对象
+        # 调用 get_future_prices，不再传入 pro 对象
         future_prices = get_future_prices(ts_code, last_trade)
         
         for n in [1, 3, 5]: 
@@ -332,7 +341,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    # ⚠️ 修正：调用 get_trade_days，不再传入 pro 对象
+    # 调用 get_trade_days，不再传入 pro 对象
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
         st.error("无法获取交易日列表，请检查日期或 Token。")
@@ -349,7 +358,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     for i, trade_date in enumerate(trade_days_str):
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
         
-        # ⚠️ 修正：调用 run_backtest_for_a_day，不再传入 pro 对象
+        # 调用 run_backtest_for_a_day，不再传入 pro 对象
         daily_result_df, error = run_backtest_for_a_day(
             trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT
         )
