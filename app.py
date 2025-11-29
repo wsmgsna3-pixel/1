@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V3.9.7 最终修正版（强制使用前复权价格）
+选股王 · V3.9.8 最终修复版（修复 KeyError）
 更新说明：
-1. 【**核心修复 V3.9.7**】：将所有历史价格数据拉取改为依赖 Tushare 的 **pro.daily_basic** 接口，并强制使用 **close_adj**（前复权收盘价），彻底解决平潭发展等股票出现的“历史价格分裂”和“收益率异常”问题。
-2. 【**调用修正**】：修改 safe_get 逻辑以适应 daily_basic 接口。
+1. 【**Bug 修复 V3.9.8**】：修复了因切换到 daily_basic 接口后，在数据缺失时导致的 KeyError: 'close' 错误，增强了数据处理的鲁棒性。
+2. 【**数据优化**】：确保所有指标计算和价格引用都使用 'close_adj' 字段。
 """
 
 import streamlit as st
@@ -17,9 +17,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9.7 最终修正版", layout="wide")
-st.title("选股王 · V3.9.7 最终修正版（强制使用前复权价格）")
-st.markdown("🚀 **已修复 Tushare 历史价格数据分裂问题。请清除缓存后运行！**")
+st.set_page_config(page_title="选股王 · V3.9.8 最终修复版", layout="wide")
+st.title("选股王 · V3.9.8 最终修复版（修复 KeyError）")
+st.markdown("🚀 **已修复程序崩溃问题。请清除缓存后运行！**")
 
 # ---------------------------
 # 全局变量初始化
@@ -27,13 +27,14 @@ st.markdown("🚀 **已修复 Tushare 历史价格数据分裂问题。请清除
 pro = None # 预先声明 pro 变量
 
 # ---------------------------
-# 辅助函数 (修正后的缓存逻辑 V3.9.7)
+# 辅助函数 (修正后的缓存逻辑 V3.9.8)
 # ---------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API (V3.9.7 缓存版)"""
+    """安全调用 Tushare API (V3.9.8 缓存版)"""
     global pro
     if pro is None:
+        # 返回一个带有 ts_code 列的空 DataFrame，避免下游函数崩溃
         return pd.DataFrame(columns=['ts_code']) 
         
     func = getattr(pro, func_name) 
@@ -43,7 +44,8 @@ def safe_get(func_name, **kwargs):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame(columns=['ts_code']) 
         return df
-    except Exception:
+    except Exception as e:
+        # st.warning(f"Tushare API 调用 {func_name} 失败：{e}") # 可选：用于调试
         return pd.DataFrame(columns=['ts_code'])
 
 # 此函数无需缓存
@@ -64,16 +66,16 @@ def get_trade_days(end_date_str, num_days):
 # 关键修复函数 1：获取未来价格 (强制使用前复权收盘价)
 # ----------------------------------------------------
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
-    """拉取选股日之后 N 个交易日的收盘价，用于回测 (V3.9.7 修正)"""
+    """拉取选股日之后 N 个交易日的收盘价，用于回测 (V3.9.8 修正)"""
     
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
-    # 🚨 核心修复：使用 daily_basic 接口，字段 close_adj 表示前复权收盘价
+    # 核心：使用 daily_basic 接口，字段 close_adj 表示前复权收盘价
     hist = safe_get('daily_basic', ts_code=ts_code, start_date=start_date, end_date=end_date, fields='ts_code,trade_date,close_adj')
     
-    if hist.empty or 'trade_date' not in hist.columns:
+    if hist.empty or 'trade_date' not in hist.columns or 'close_adj' not in hist.columns:
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
@@ -105,23 +107,31 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 # ----------------------------------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V3.9.7 修正)"""
+    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V3.9.8 修正)"""
     
     # 拉取足够计算 60 日指标的历史数据
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
-    # 🚨 核心修复：拉取 daily_basic 数据，包含收盘价(close_adj)、最低价(low_adj)、最高价(high_adj)
+    # 核心：拉取 daily_basic 数据，包含收盘价(close_adj)、最低价(low_adj)、最高价(high_adj), vol, pct_chg
+    FIELDS = 'ts_code,trade_date,close_adj,low_adj,high_adj,vol,pct_chg'
     df = safe_get('daily_basic', ts_code=ts_code, start_date=start_date, end_date=end_date, 
-                  fields='ts_code,trade_date,close_adj,low_adj,high_adj,vol,pct_chg')
+                  fields=FIELDS)
 
     res = {}
-    if df.empty or len(df) < 3: return res
+    
+    # 🚨 检查关键列是否存在，这是修复 KeyErorr 的关键
+    if df.empty or len(df) < 3 or 'close_adj' not in df.columns: 
+        return res
     
     # 统一使用前复权价格进行计算
-    df = df.rename(columns={'close_adj': 'close', 'low_adj': 'low', 'high_adj': 'high'})
-    df['close'] = df['close'].astype(float)
-    df['low'] = df['low'].astype(float)
-    df['high'] = df['high'].astype(float)
+    # V3.9.8 修正：直接使用 'close_adj' 而不重命名，避免 KeyError
+    df['close'] = df['close_adj'].astype(float)
+    
+    # 检查其他关键列是否存在，不存在则跳过相关计算
+    df['low'] = df['low_adj'].astype(float) if 'low_adj' in df.columns else df['close']
+    df['high'] = df['high_adj'].astype(float) if 'high_adj' in df.columns else df['close']
+    df['vol'] = df['vol'].astype(float) if 'vol' in df.columns else 0
+    df['pct_chg'] = df['pct_chg'].astype(float) if 'pct_chg' in df.columns else 0
     
     close = df['close']
     res['last_close'] = close.iloc[-1]
@@ -135,17 +145,17 @@ def compute_indicators(ts_code, end_date):
         res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     else: res['macd_val'] = np.nan
         
-    # 量比计算 (VOL 字段来自 daily_basic)
-    vols = df['vol'].astype(float).tolist()
-    if len(vols) >= 6:
-        res['vol_ratio'] = vols[-1] / (np.mean(vols[-6:-1]) + 1e-9)
+    # 量比计算 
+    vols = df['vol'].tolist()
+    if len(vols) >= 6 and vols[-6:-1] and np.mean(vols[-6:-1]) > 1e-9:
+        res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
     else: res['vol_ratio'] = np.nan
         
-    # 10日回报、波动率计算 (基于复权收盘价)
-    res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 else 0
+    # 10日回报、波动率计算 
+    res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 and close.iloc[-10]!=0 else 0
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
-    # 60日位置计算 (基于复权最高价/最低价)
+    # 60日位置计算 
     if len(df) >= 60:
         hist_60 = df.tail(60)
         min_low = hist_60['low'].min()
@@ -159,7 +169,7 @@ def compute_indicators(ts_code, end_date):
     return res
 
 # ----------------------------------------------------
-# 侧边栏参数 (V3.9 灵活配置) - **保持不变**
+# 侧边栏参数 (V3.9 灵活配置) - 保持不变
 # ----------------------------------------------------
 with st.sidebar:
     st.header("模式与日期选择")
@@ -204,13 +214,12 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ---------------------------
-# 核心回测逻辑函数 - **保持不变 (但内部调用的函数已更新)**
+# 核心回测逻辑函数 - 保持不变
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT):
-    """为单个交易日运行选股和回测逻辑 (V3.9.7 修正)"""
+    """为单个交易日运行选股和回测逻辑 (V3.9.8 修正)"""
     
     # 1. 拉取全市场 Daily 数据
-    # 🚨 注意：拉取 daily 仍然用 daily 接口，但价格指标计算和未来收益计算都已切换到 daily_basic
     daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty or 'ts_code' not in daily_all.columns:
         return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
@@ -220,7 +229,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 2. 合并基本面数据
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,industry')
     REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount']
-    # 🚨 注意：daily_basic 用于拉取基础数据，其中的 amount 和 turnover_rate 字段是准确的
     daily_basic = safe_get('daily_basic', trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
     pool_merged = pool_raw.copy()
@@ -253,9 +261,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 3. 执行硬性条件过滤
     df = pool_merged.copy()
     
-    # 🚨 股价过滤：这里仍然需要一个当前股价，我们从 daily 接口拉取，但需要注意它的准确性不如 compute_indicators 内部使用的复权价
-    # 最佳实践是将股价过滤放在 compute_indicators 之前，但为了不二次拉取数据，我们先保留这里的过滤。
-    # 实际买入价由 compute_indicators 内部的复权价决定。
+    # 股价过滤：这里仍然需要一个当前股价，使用当日 close 字段进行初步过滤
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
@@ -270,7 +276,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mask_bj = df['ts_code'].str.startswith('92') 
     df = df[~mask_bj]
     
-    # 过滤价格 (使用当日 close 字段进行初步过滤)
+    # 过滤价格
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
     # 过滤换手率
@@ -284,7 +290,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if len(df) == 0:
         return pd.DataFrame(), f"过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单 (不变)
+    # 4. 遴选决赛名单
     limit_pct = int(FINAL_POOL * 0.7)
     df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
     limit_turn = FINAL_POOL - len(df_pct)
@@ -310,7 +316,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'volatility': ind.get('volatility', 0), 'position_60d': ind.get('position_60d', np.nan)
         })
         
-        # 🚨 使用 compute_indicators 返回的复权价作为准确的买入价
+        # 使用 compute_indicators 返回的复权价作为准确的买入价
         rec['selection_price'] = ind.get('last_close', np.nan) 
         
         # 调用 get_future_prices (内部使用复权价)
