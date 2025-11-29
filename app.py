@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V3.9.3 缓存与稳定优化版
+选股王 · V3.9.4 最终稳定版（解决缓存错误）
 更新说明：
-1. 【**稳定修复 V3.9.3**】：重新引入 @st.cache_data 装饰器，将 Tushare API 的核心数据拉取进行缓存，解决回测时间过长导致的内存溢出或超时退出问题。
+1. 【**致命修复 V3.9.4**】：修正了 @st.cache_data 函数 safe_get 的调用方式，不再传递不可哈希的 Tushare API 方法对象，彻底解决 UnhashableParamError 导致的程序中断问题。
 """
 
 import streamlit as st
@@ -16,31 +16,35 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9.3 缓存优化版", layout="wide")
-st.title("选股王 · V3.9.3 缓存优化版（解决回测中断问题）")
-st.markdown("🚀 **当前版本已加入数据缓存，请先清除缓存后再运行！**")
+st.set_page_config(page_title="选股王 · V3.9.4 最终稳定版", layout="wide")
+st.title("选股王 · V3.9.4 最终稳定版（解决缓存错误问题）")
+st.markdown("🚀 **当前版本已修复缓存错误，请先清除缓存后再运行！**")
 
 # ---------------------------
-# 辅助函数 (加入缓存)
+# 辅助函数 (修正后的缓存逻辑)
 # ---------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
-def safe_get(func, **kwargs):
-    """安全调用 Tushare API (缓存版)"""
+def safe_get(pro_api_instance, func_name, **kwargs):
+    """安全调用 Tushare API (修正缓存版)"""
+    # 动态获取 pro_api_instance 上的方法
+    func = getattr(pro_api_instance, func_name) 
+    
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame(columns=['ts_code']) 
         return df
     except Exception:
-        # 如果是因为 Token 错误导致的失败，这里会捕获，但缓存无法解决 Token 问题
         return pd.DataFrame(columns=['ts_code'])
 
-# 此函数无需缓存，因为每次运行的结束日期不同
-def get_trade_days(end_date_str, num_days):
+# 此函数无需缓存
+def get_trade_days(end_date_str, num_days, pro_api_instance):
     """获取 num_days 个交易日作为选股日"""
     
     start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
-    cal = safe_get(ts.pro_api().trade_cal, start_date=start_date, end_date=end_date_str)
+    
+    # ⚠️ 修正：调用 safe_get 时传入 pro 对象和 'trade_cal' 字符串
+    cal = safe_get(pro_api_instance, 'trade_cal', start_date=start_date, end_date=end_date_str)
     
     if cal.empty or 'is_open' not in cal.columns:
         st.error("无法获取交易日历，请检查 Token 或 Tushare 权限。")
@@ -53,19 +57,17 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------
-# ⚠️ 修复后的未来价格获取函数 (V3.9.3 - 加入缓存)
+# 未来价格获取函数 (此函数不加缓存)
 # ----------------------------------------------------
-# 注意：此函数不加 @st.cache_data，因为它依赖于 selection_date，如果加了，每次选择新日期都需要清缓存。
-# 我们通过缓存 safe_get 来间接加速。
-def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
-    """拉取选股日之后 N 个交易日的收盘价，用于回测 (V3.9.1 修复版)"""
+def get_future_prices(ts_code, selection_date, pro_api_instance, days_ahead=[1, 3, 5]):
+    """拉取选股日之后 N 个交易日的收盘价，用于回测"""
     
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
-    # 1. 尝试从日线数据拉取未来价格 (通过 safe_get 间接缓存)
-    hist = safe_get(ts.pro_api().daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
+    # ⚠️ 修正：调用 safe_get 时传入 pro 对象和 'daily' 字符串
+    hist = safe_get(pro_api_instance, 'daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
     
     if hist.empty or 'trade_date' not in hist.columns:
         results = {}
@@ -94,13 +96,18 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 
 
 @st.cache_data(ttl=3600*12) # 缓存12小时
-def compute_indicators(df):
+def compute_indicators(pro_api_instance, ts_code, end_date):
     """计算 MACD, 10日回报, 波动率, 60日位置等指标 (缓存版)"""
+    
+    # ⚠️ 修正：在 compute_indicators 内部调用 safe_get 获取历史数据
+    df = safe_get(pro_api_instance, 'daily', ts_code=ts_code, end_date=end_date)
+
     res = {}
     if df.empty or len(df) < 3: return res
     close = df['close'].astype(float)
     res['last_close'] = close.iloc[-1]
     
+    # ... (其余指标计算逻辑不变)
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -172,26 +179,26 @@ if not TS_TOKEN:
     st.warning("请输入 Tushare Token 才能运行脚本。")
     st.stop()
 ts.set_token(TS_TOKEN)
-pro = ts.pro_api()
+pro = ts.pro_api() # pro 对象只需要初始化一次
 
 # ---------------------------
 # 核心回测逻辑函数
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, pro_api_instance):
     """为单个交易日运行选股和回测逻辑"""
     
-    # 1. 拉取全市场 Daily 数据 (通过 safe_get 缓存)
-    daily_all = safe_get(pro.daily, trade_date=last_trade) 
+    # 1. 拉取全市场 Daily 数据
+    daily_all = safe_get(pro_api_instance, 'daily', trade_date=last_trade) 
     if daily_all.empty or 'ts_code' not in daily_all.columns:
         return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
 
     pool_raw = daily_all.reset_index(drop=True) 
 
-    # 2. 合并基本面数据 (通过 safe_get 缓存)
-    stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry')
+    # 2. 合并基本面数据
+    stock_basic = safe_get(pro_api_instance, 'stock_basic', list_status='L', fields='ts_code,name,industry')
     REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount']
-    daily_basic = safe_get(pro.daily_basic, trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
-    mf_raw = safe_get(pro.moneyflow, trade_date=last_trade)
+    daily_basic = safe_get(pro_api_instance, 'daily_basic', trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
+    mf_raw = safe_get(pro_api_instance, 'moneyflow', trade_date=last_trade)
     pool_merged = pool_raw.copy()
 
     if not stock_basic.empty and 'name' in stock_basic.columns:
@@ -256,9 +263,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'pct_chg': getattr(row, 'pct_chg', 0), 'turnover': getattr(row, 'turnover_rate', 0),
             'net_mf': getattr(row, 'net_mf', 0)
         }
-        # ⚠️ 此处调用 compute_indicators，函数内部调用 safe_get(pro.daily)，实现历史数据缓存
-        hist = safe_get(pro.daily, ts_code=ts_code, end_date=last_trade) 
-        ind = compute_indicators(hist)
+        
+        # ⚠️ 修正：调用 compute_indicators，传入 pro 对象
+        ind = compute_indicators(pro_api_instance, ts_code, last_trade)
         rec.update({
             'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
             '10d_return': ind.get('10d_return', 0),
@@ -266,9 +273,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         })
         
         rec['selection_price'] = ind.get('last_close', np.nan)
-        future_prices = get_future_prices(ts_code, last_trade)
+        # ⚠️ 修正：调用 get_future_prices，传入 pro 对象
+        future_prices = get_future_prices(ts_code, last_trade, pro_api_instance)
         
-        # 收益计算逻辑
         for n in [1, 3, 5]: 
             future_price = future_prices.get(f'Return_D{n}', np.nan)
             
@@ -296,7 +303,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_trend'] = normalize(fdf['10d_return'])
     fdf['s_position'] = fdf['position_60d'] / 100 
 
-    # V3.7 极致保守权重配置
     w_pct = 0.05; w_turn = 0.05; w_vol = 0.05; w_mf = 0.05; w_macd = 0.05; w_trend = 0.15      
     w_volatility = 0.30; w_position = 0.35   
     
@@ -317,7 +323,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
+    # ⚠️ 修正：调用 get_trade_days 传入 pro 对象
+    trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS, pro)
     if not trade_days_str:
         st.error("无法获取交易日列表，请检查日期或 Token。")
         st.stop()
@@ -333,8 +340,9 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     for i, trade_date in enumerate(trade_days_str):
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
         
+        # ⚠️ 修正：调用 run_backtest_for_a_day 传入 pro 对象
         daily_result_df, error = run_backtest_for_a_day(
-            trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT
+            trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, pro
         )
         
         if error:
