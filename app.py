@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.8 (自动回测终极版)
+选股王 · 全市场扫描增强版 V3.9 (灵活过滤版)
 更新说明：
-1. 【**核心升级**】：加入多日自动回测功能，用户可指定回测天数（例如 30 天）。
-2. 【**结构重构**】：为支持循环回测，移除了所有 st.cache_data 装饰器。
+1. 【**功能升级**】：将股价、成交额、换手率等过滤参数移至侧边栏。
+2. 【**默认设置**】：根据用户要求，默认值设置为：股价 10-300 元，最低成交额 0.6 亿（对应最低市值 20 亿）。
 3. 【**策略保持**】：核心 V3.7 权重 (极致保守) 保持不变。
-4. 【**性能警告**】：全量 30 天回测可能耗时 30-40 分钟，请耐心等待。
 """
 
 import streamlit as st
@@ -19,9 +18,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.8 自动回测终极版", layout="wide")
-st.title("选股王 · V3.8 自动回测终极版（多日验证）")
-st.markdown("🚀 **当前版本支持多日自动回测。请设置回测天数和起始日期，以验证 V3.7 策略的长期有效性。**")
+st.set_page_config(page_title="选股王 · V3.9 灵活过滤版", layout="wide")
+st.title("选股王 · V3.9 灵活过滤版（灵活过滤与多日验证）")
+st.markdown("🚀 **当前版本支持通过侧边栏调整股价、成交额和换手率等核心过滤参数。**")
 
 # ---------------------------
 # 辅助函数 (移除了 @st.cache_data)
@@ -119,7 +118,7 @@ def compute_indicators(df):
     return res
 
 # ---------------------------
-# 侧边栏参数
+# 侧边栏参数 (V3.9 灵活配置)
 # ---------------------------
 with st.sidebar:
     st.header("模式与日期选择")
@@ -128,7 +127,6 @@ with st.sidebar:
         value=datetime.now().date(), 
         max_value=datetime.now().date()
     )
-    # 新增回测天数参数
     BACKTEST_DAYS = int(st.number_input(
         "**自动回测天数 (N)**", 
         value=1, 
@@ -140,16 +138,24 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=300, step=50))
-    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=50, step=10))
+    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=50, step=10, min_value=10)) # 默认为50，保障稳定
+    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1))
     
-    # ... (其他过滤参数保持不变，但为了简洁代码已省略，假设用户已设置)
+    st.markdown("---")
+    st.header("🛒 灵活过滤条件 (V3.9)")
     
-    MIN_PRICE = 8.0
-    MAX_PRICE = 200.0
-    MIN_TURNOVER = 3.0
-    MIN_AMOUNT = 2.0 * 100000000
+    # 股价区间 (用户要求 10-300)
+    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1)
+    MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
+    
+    # 最低换手率
+    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=3.0, step=0.5, min_value=0.1)
+    
+    # 最低成交额 (用户要求 20亿市值，故改为 0.6 亿)
+    MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
+    MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
+    st.markdown(f"> *当前设置下，最低流通市值约为：{(MIN_AMOUNT/100000000)/ (MIN_TURNOVER/100):.1f} 亿*")
 
 # ---------------------------
 # Token 输入与初始化
@@ -206,26 +212,28 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
     pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
 
-    # 3. 执行硬性条件过滤
+    # 3. 执行硬性条件过滤 (使用侧边栏参数)
     df = pool_merged.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 # 转换为万元
     df['name'] = df['name'].astype(str)
+    
+    # 过滤规则 (使用侧边栏传入的参数)
     mask_st = df['name'].str.contains('ST|退', case=False, na=False)
     df = df[~mask_st]
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER
     df = df[mask_turn]
-    mask_amt = df['amount'] * 1000 >= MIN_AMOUNT # 确保这里使用用户输入值
+    mask_amt = df['amount'] * 1000 >= MIN_AMOUNT # 确保使用传入的 MIN_AMOUNT
     df = df[mask_amt]
     df = df.reset_index(drop=True)
 
     if len(df) == 0:
         return pd.DataFrame(), f"过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单
+    # 4. 遴选决赛名单 (保持 V3.8 逻辑)
     limit_pct = int(FINAL_POOL * 0.7)
     df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
     limit_turn = FINAL_POOL - len(df_pct)
@@ -242,7 +250,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'pct_chg': getattr(row, 'pct_chg', 0), 'turnover': getattr(row, 'turnover_rate', 0),
             'net_mf': getattr(row, 'net_mf', 0)
         }
-        hist = safe_get(pro.daily, ts_code=ts_code, end_date=last_trade) # 优化：只取到选股日
+        hist = safe_get(pro.daily, ts_code=ts_code, end_date=last_trade) 
         ind = compute_indicators(hist)
         rec.update({
             'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
@@ -262,7 +270,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V3.7 评分
+    # 6. 归一化与 V3.7 评分 (权重保持不变)
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -353,11 +361,4 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", f"{avg_return:.2f}%", help=f" Top {TOP_BACKTEST} 中有 {hit_rate:.1f}% 的股票在 {n} 个交易日内上涨。")
 
     st.header("📋 每日回测详情 (Top K 明细)")
-    st.dataframe(all_results[['Trade_Date', 'name', 'ts_code', '综合评分', 'Return_D1', 'Return_D3', 'Return_D5']].sort_values('Trade_Date', ascending=False), use_container_width=True)
-
-# ---------------------------
-# 单日/实时选股模式（保持 V3.7 逻辑，只在不运行自动回测时显示）
-# ---------------------------
-if not st.session_state.get('backtest_running', False) and BACKTEST_DAYS == 1:
-    # 这里可以添加回单日选股的逻辑，但为了避免代码冗余，我们假设用户会使用上面的自动回测功能或将其设置为 BACKTEST_DAYS=1 来查看最新结果。
-    pass 
+    st.dataframe(all_results[['Trade_Date', 'name', 'ts_code', '综合评分', 'Return_D1', 'Return_D3', 'Return_D5']].sort_values('Trade_Date', ascending=False).head(TOP_DISPLAY), use_container_width=True)
