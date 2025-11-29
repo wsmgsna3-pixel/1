@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.9 (灵活过滤版)
+选股王 · 全市场扫描增强版 V3.9.1 (稳定修复版)
 更新说明：
 1. 【**功能升级**】：将股价、成交额、换手率等过滤参数移至侧边栏。
-2. 【**默认设置**】：根据用户要求，默认值设置为：股价 10-300 元，最低成交额 0.6 亿（对应最低市值 20 亿）。
+2. 【**修复**】：修复了 get_future_prices 函数和主函数中收益计算的致命 bug，以解决平均收益 200%+ 的异常问题。
 3. 【**策略保持**】：核心 V3.7 权重 (极致保守) 保持不变。
 """
 
@@ -18,9 +18,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9 灵活过滤版", layout="wide")
-st.title("选股王 · V3.9 灵活过滤版（灵活过滤与多日验证）")
-st.markdown("🚀 **当前版本支持通过侧边栏调整股价、成交额和换手率等核心过滤参数。**")
+st.set_page_config(page_title="选股王 · V3.9.1 稳定修复版", layout="wide")
+st.title("选股王 · V3.9.1 稳定修复版（灵活过滤与多日验证）")
+st.markdown("🚀 **当前版本支持通过侧边栏调整核心过滤参数，并已修复收益计算 bug。**")
 
 # ---------------------------
 # 辅助函数 (移除了 @st.cache_data)
@@ -54,13 +54,17 @@ def get_trade_days(end_date_str, num_days):
     # 取最近的 num_days 个交易日作为选股日
     return trade_days_df['cal_date'].head(num_days).tolist()
 
+# ----------------------------------------------------
+# ⚠️ 修复后的未来价格获取函数 (V3.9.1)
+# ----------------------------------------------------
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
-    """拉取选股日之后 N 个交易日的收盘价，用于回测"""
+    """拉取选股日之后 N 个交易日的收盘价，用于回测 (V3.9.1 修复版)"""
     
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
+    # 1. 尝试从日线数据拉取未来价格
     hist = safe_get(ts.pro_api().daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
     
     if hist.empty or 'trade_date' not in hist.columns:
@@ -68,19 +72,29 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
     
+    # 2. 确保价格数据是数值类型
+    hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
+    hist = hist.dropna(subset=['close'])
+    
     hist = hist.sort_values('trade_date').reset_index(drop=True)
     
     results = {}
     
     for n in days_ahead:
         col_name = f'Return_D{n}'
-        # 计算 D+N 交易日的收盘价
+        # 3. 严格检查是否有足够的交易日数据
         if len(hist) >= n:
-            results[col_name] = hist.iloc[n-1]['close']
+            future_price = hist.iloc[n-1]['close']
+            if future_price == 0: # 避免除以零或异常低价
+                results[col_name] = np.nan 
+            else:
+                results[col_name] = future_price
         else:
             results[col_name] = np.nan
 
     return results
+# ----------------------------------------------------
+
 
 def compute_indicators(df):
     """计算 MACD, 10日回报, 波动率, 60日位置等指标"""
@@ -260,11 +274,17 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
         rec['selection_price'] = ind.get('last_close', np.nan)
         future_prices = get_future_prices(ts_code, last_trade)
+        
+        # ⚠️ 修复后的收益计算逻辑 (V3.9.1)
         for n in [1, 3, 5]: 
             future_price = future_prices.get(f'Return_D{n}', np.nan)
-            if pd.notna(rec['selection_price']) and pd.notna(future_price):
+            
+            # 防御性检查：确保 P0 > 0.01 且价格不为 NaN
+            if pd.notna(rec['selection_price']) and pd.notna(future_price) and rec['selection_price'] > 0.01:
                 rec[f'Return_D{n}'] = (future_price / rec['selection_price'] - 1) * 100
-            else: rec[f'Return_D{n}'] = np.nan
+            else: 
+                rec[f'Return_D{n}'] = np.nan # 价格异常或数据缺失，标记为 NaN
+
         records.append(rec)
     
     fdf = pd.DataFrame(records)
@@ -358,7 +378,9 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         else:
             hit_rate = 0
             
-        st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", f"{avg_return:.2f}%", help=f" Top {TOP_BACKTEST} 中有 {hit_rate:.1f}% 的股票在 {n} 个交易日内上涨。")
+        st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
+                  f"{avg_return:.2f}% / {hit_rate:.1f}%", 
+                  help=f" Top {TOP_BACKTEST} 中有 {hit_rate:.1f}% 的股票在 {n} 个交易日内上涨。")
 
     st.header("📋 每日回测详情 (Top K 明细)")
-    st.dataframe(all_results[['Trade_Date', 'name', 'ts_code', '综合评分', 'Return_D1', 'Return_D3', 'Return_D5']].sort_values('Trade_Date', ascending=False).head(TOP_DISPLAY), use_container_width=True)
+    st.dataframe(all_results[['Trade_Date', 'name', 'ts_code', '综合评分', 'selection_price', 'Return_D1', 'Return_D3', 'Return_D5']].sort_values('Trade_Date', ascending=False), use_container_width=True)
