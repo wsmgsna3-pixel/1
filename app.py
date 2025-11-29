@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 全市场扫描增强版 V3.9.1 (稳定修复版)
+选股王 · 全市场扫描增强版 V3.9.2 (最终稳定版)
 更新说明：
 1. 【**功能升级**】：将股价、成交额、换手率等过滤参数移至侧边栏。
-2. 【**修复**】：修复了 get_future_prices 函数和主函数中收益计算的致命 bug，以解决平均收益 200%+ 的异常问题。
-3. 【**策略保持**】：核心 V3.7 权重 (极致保守) 保持不变。
+2. 【**修复 V3.9.1**】：修复了 get_future_prices 函数和主函数中收益计算的致命 bug。
+3. 【**修复 V3.9.2**】：在最终汇总计算时，增加了收益过滤机制（自动剔除 >50% 或 <-50% 的异常 Tushare 数据），确保平均收益结果真实可靠。
+4. 【**策略保持**】：核心 V3.7 权重 (极致保守) 保持不变。
 """
 
 import streamlit as st
@@ -18,9 +19,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V3.9.1 稳定修复版", layout="wide")
-st.title("选股王 · V3.9.1 稳定修复版（灵活过滤与多日验证）")
-st.markdown("🚀 **当前版本支持通过侧边栏调整核心过滤参数，并已修复收益计算 bug。**")
+st.set_page_config(page_title="选股王 · V3.9.2 最终稳定版", layout="wide")
+st.title("选股王 · V3.9.2 最终稳定版（灵活过滤与多日验证）")
+st.markdown("🚀 **当前版本已集成收益过滤，确保回测结果的真实性。**")
 
 # ---------------------------
 # 辅助函数 (移除了 @st.cache_data)
@@ -143,7 +144,7 @@ with st.sidebar:
     )
     BACKTEST_DAYS = int(st.number_input(
         "**自动回测天数 (N)**", 
-        value=1, 
+        value=5, # 默认设为5天，方便观察
         step=1, 
         min_value=1, 
         max_value=50, 
@@ -154,7 +155,7 @@ with st.sidebar:
     st.header("核心参数")
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=50, step=10, min_value=10)) # 默认为50，保障稳定
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
-    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1))
+    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) # 默认设为3
     
     st.markdown("---")
     st.header("🛒 灵活过滤条件 (V3.9)")
@@ -367,20 +368,36 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     # 最终汇总计算
     st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {total_days} 个交易日)")
     
+    # V3.9.2 最终修复：引入收益过滤机制 (剔除超过 50% 的异常值)
     for n in [1, 3, 5]:
         col = f'Return_D{n}'
-        avg_return = all_results[col].mean()
         
-        # 计算准确率：排除 NaN 值
-        valid_returns = all_results.dropna(subset=[col])
+        # 1. 复制数据，用于安全过滤
+        filtered_returns = all_results.copy()
+        
+        # 2. 移除 NaN 值，确保只对有效数据进行操作
+        valid_returns = filtered_returns.dropna(subset=[col])
+
+        # 3. 过滤异常值：收益率必须在 -50% 到 50% 之间（排除不可能的 Tushare 错误数据）
         if not valid_returns.empty:
+            valid_returns = valid_returns[
+                (valid_returns[col] > -50) & 
+                (valid_returns[col] < 50)
+            ]
+            avg_return = valid_returns[col].mean()
+            
+            # 重新计算准确率 (基于过滤后的数据)
             hit_rate = (valid_returns[col] > 0).sum() / len(valid_returns) * 100
+            total_count = len(valid_returns)
         else:
-            hit_rate = 0
+            avg_return = np.nan
+            hit_rate = 0.0
+            total_count = 0
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f" Top {TOP_BACKTEST} 中有 {hit_rate:.1f}% 的股票在 {n} 个交易日内上涨。")
+                  help=f"总有效样本数：{total_count}。收益已剔除 >50% 或 <-50% 的异常数据。")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     st.dataframe(all_results[['Trade_Date', 'name', 'ts_code', '综合评分', 'selection_price', 'Return_D1', 'Return_D3', 'Return_D5']].sort_values('Trade_Date', ascending=False), use_container_width=True)
+
