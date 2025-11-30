@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V4.1h 动能修复与持续性加强版
+选股王 · V4.1i D+5 持续性攻坚版
 更新说明：
-1. 【**策略精调 V4.1h**】：核心变动：
-   - 目标：在 V4.1f 成功启动的基础上，通过强化趋势和资金确认，解决 D+3/D+5 持续性不足的问题。
-   - **MACD (趋势方向) 权重提升至 0.20**，以确保趋势方向的质量。
-   - **资金流 (w_mf) 权重提升至 0.15**，用真金白银的流入来确认持续性，防止假突破。
-   - **波动率 (w_volatility) 权重降至 0.10**，允许股票在启动时有更大的波动，避免错过强势股。
-   - **当日涨幅 (w_pct) 权重继续归零 (0.00)**。
+1. 【**策略精调 V4.1i**】：核心变动：
+   - 目标：锁定 D+3 盈利 (V4.1h 成果)，通过超强防御攻克 D+5 持续性，避免买在高位。
+   - **60 日位置 (w_position) 权重提升至 0.30**，成为核心防御指标，确保买入时具备最高的安全边际。
+   - **波动率 (w_volatility) 权重降至 0.05**，为 w_position 腾出空间。
+   - **MACD (0.20)，10日回报 (0.15)，资金流 (0.15)** 权重均保持，以维护 D+3 盈利的关键结构。
    
    新权重结构：动能/趋势 (0.35) + 安全/稳定 (0.35) + 活跃度 (0.30)
 2. 【**过滤 V4.1b**】：继续使用手动复权和市值硬过滤。
@@ -25,9 +24,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V4.1h 动能修复与持续性加强版", layout="wide")
-st.title("选股王 · V4.1h 动能修复与持续性加强版（资金确认防假突破）")
-st.markdown("✅ **V4.1h 策略：在 V4.1f 启动基础上，大幅强化 MACD 和资金流，以提高 D+3/D+5 持续性。**")
+st.set_page_config(page_title="选股王 · V4.1i D+5 持续性攻坚版", layout="wide")
+st.title("选股王 · V4.1i D+5 持续性攻坚版（超级防御攻克 D+5）")
+st.markdown("✅ **V4.1i 策略：超级强化 60 日位置 (0.30) 权重，以最高安全边际攻克 D+5 持续性问题。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -412,7 +411,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V4.1h 策略精调评分 (动能修复与持续性加强)
+    # 6. 归一化与 V4.1i 策略精调评分 (D+5 持续性攻坚版)
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -426,23 +425,23 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_trend'] = normalize(fdf['10d_return'])
     fdf['s_position'] = fdf['position_60d'] / 100 
 
-    # 🚨 V4.1h 策略精调：动能修复与持续性加强 (35% 动能 + 35% 安全/稳定 + 30% 活跃度)
+    # 🚨 V4.1i 策略精调：D+5 持续性攻坚版 (35% 动能 + 35% 安全/稳定 + 30% 活跃度)
     
     # 安全/稳定指标：总权重 35%
-    w_position = 0.25   # 25% - 60日位置 (核心安全边际 - 保持，防止买在山顶)
-    w_volatility = 0.10 # 10% - 波动率 (趋势稳定 - 削弱，允许启动波动)
+    w_position = 0.30   # 30% - 60日位置 (核心防御 - **超级加强**，攻克 D+5)
+    w_volatility = 0.05 # 5% - 波动率 (趋势稳定 - 削弱)
     
     # 趋势/动能指标：总权重 35%
-    w_trend = 0.15      # 15% - 10日回报 (短期动能 - 恢复 V4.1f 水平)
-    w_macd = 0.20       # 20% - MACD (趋势方向 - **加强**)
+    w_trend = 0.15      # 15% - 10日回报 (短期动能 - 保持)
+    w_macd = 0.20       # 20% - MACD (趋势方向 - 保持)
     
     # 活跃度指标：总权重 30%
     w_turn = 0.10       # 10% - 换手率 (保持)
-    w_mf = 0.15         # 15% - 资金流 (**加强，用于持续性确认**)
+    w_mf = 0.15         # 15% - 资金流 (持续性确认 - 保持)
     w_vol = 0.05        # 5% - 量比 (保持)
-    w_pct = 0.00        # 0% - 当日涨幅 (归零，不看昨日阴阳线)
+    w_pct = 0.00        # 0% - 当日涨幅 (归零)
     
-    # Sum: 0.25+0.10 + 0.15+0.20 + 0.10+0.15+0.05+0.00 = 1.00
+    # Sum: 0.30+0.05 + 0.15+0.20 + 0.10+0.15+0.05+0.00 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + fdf['s_vol'] * w_vol + fdf['s_mf'] * w_mf +        
@@ -461,7 +460,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V4.1h 版本已更换为动能修复与持续性加强策略，请确保回测天数 N 至少为 20。**")
+    st.warning("⚠️ **V4.1i 版本已更换为 D+5 攻坚策略，w_position 权重已超级强化至 0.30。**")
     
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -520,7 +519,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V4.1h 已应用动能修复与持续性加强策略。**")
+                  help=f"总有效样本数：{total_count}。**V4.1i 已应用 D+5 攻坚策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
