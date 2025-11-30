@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V4.1i D+5 持续性攻坚版
+选股王 · V4.1j 短期速度控制版
 更新说明：
-1. 【**策略精调 V4.1i**】：核心变动：
-   - 目标：锁定 D+3 盈利 (V4.1h 成果)，通过超强防御攻克 D+5 持续性，避免买在高位。
-   - **60 日位置 (w_position) 权重提升至 0.30**，成为核心防御指标，确保买入时具备最高的安全边际。
-   - **波动率 (w_volatility) 权重降至 0.05**，为 w_position 腾出空间。
-   - **MACD (0.20)，10日回报 (0.15)，资金流 (0.15)** 权重均保持，以维护 D+3 盈利的关键结构。
+1. 【**策略精调 V4.1j**】：核心变动：
+   - 目标：将用户的经验（避免追高超速股）量化，通过引入 5日回报指标进行惩罚。
+   - **60 日位置 (w_position)** 保持在 **0.30** (核心防御)。
+   - **NEW: 5日回报** 指标加入计算，并赋予 **0.05** 的负向权重。
+   - **10 日回报 (w_trend)** 权重从 0.15 降至 **0.10**，为 5日回报惩罚腾出空间。
+   - 其余成功指标（w_macd=0.20, w_mf=0.15）保持不变。
    
-   新权重结构：动能/趋势 (0.35) + 安全/稳定 (0.35) + 活跃度 (0.30)
-2. 【**过滤 V4.1b**】：继续使用手动复权和市值硬过滤。
+   新权重结构：安全性/速度控制 (0.40) + 趋势/动能 (0.30) + 活跃度 (0.30)
+2. 【**计算指标更新**】：在 compute_indicators 中新增 5d_return 的计算。
 """
 
 import streamlit as st
@@ -24,9 +25,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V4.1i D+5 持续性攻坚版", layout="wide")
-st.title("选股王 · V4.1i D+5 持续性攻坚版（超级防御攻克 D+5）")
-st.markdown("✅ **V4.1i 策略：超级强化 60 日位置 (0.30) 权重，以最高安全边际攻克 D+5 持续性问题。**")
+st.set_page_config(page_title="选股王 · V4.1j 短期速度控制版", layout="wide")
+st.title("选股王 · V4.1j 短期速度控制版（避免超速追高股）")
+st.markdown("✅ **V4.1j 策略：引入 5日回报率惩罚项，结合 60日位置 (0.30) 共同实现对超速追高股的精准过滤。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -167,11 +168,11 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 
 
 # ----------------------------------------------------
-# 关键函数 2：计算指标 
+# 关键函数 2：计算指标 (V4.1j 新增 5d_return)
 # ----------------------------------------------------
 @st.cache_data(ttl=3600*12) # 缓存12小时
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V4.0 使用 get_qfq_data_v4)"""
+    """计算 MACD, 10日回报, 5日回报, 波动率, 60日位置等指标"""
     
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
@@ -210,6 +211,9 @@ def compute_indicators(ts_code, end_date):
     # 10日回报、波动率计算
     res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 and close.iloc[-10]!=0 else 0
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
+    
+    # NEW: 5日回报
+    res['5d_return'] = close.iloc[-1]/close.iloc[-5] - 1 if len(close)>=5 and close.iloc[-5]!=0 else 0
     
     # 60日位置计算
     if len(df) >= 60:
@@ -373,7 +377,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df_turn = df[~df['ts_code'].isin(existing_codes)].sort_values('turnover_rate', ascending=False).head(limit_turn).copy()
     final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
 
-    # 5. 深度评分 (逻辑不变)
+    # 5. 深度评分 (V4.1j 新增 5d_return)
     records = []
     for row in final_candidates.itertuples():
         ts_code = row.ts_code
@@ -391,6 +395,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         rec.update({
             'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
             '10d_return': ind.get('10d_return', 0),
+            '5d_return': ind.get('5d_return', 0), # V4.1j 新增
             'volatility': ind.get('volatility', 0), 'position_60d': ind.get('position_60d', np.nan)
         })
         
@@ -411,7 +416,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V4.1i 策略精调评分 (D+5 持续性攻坚版)
+    # 6. 归一化与 V4.1j 策略精调评分 (短期速度控制版)
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -423,31 +428,34 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_mf'] = normalize(fdf['net_mf'])
     fdf['s_macd'] = normalize(fdf['macd'])
     fdf['s_trend'] = normalize(fdf['10d_return'])
+    fdf['s_5d_cap'] = normalize(fdf['5d_return']) # V4.1j 新增 5日回报归一化
     fdf['s_position'] = fdf['position_60d'] / 100 
 
-    # 🚨 V4.1i 策略精调：D+5 持续性攻坚版 (35% 动能 + 35% 安全/稳定 + 30% 活跃度)
+    # 🚨 V4.1j 策略精调：短期速度控制版
     
-    # 安全/稳定指标：总权重 35%
-    w_position = 0.30   # 30% - 60日位置 (核心防御 - **超级加强**，攻克 D+5)
-    w_volatility = 0.05 # 5% - 波动率 (趋势稳定 - 削弱)
+    # 安全/速度控制指标：总权重 40%
+    w_position = 0.30       # 30% - 60日位置 (核心防御 - 保持)
+    w_volatility = 0.05     # 5% - 波动率 (保持)
+    w_5d_cap = 0.05         # 5% - 5日回报 (**惩罚项** - 新增)
     
-    # 趋势/动能指标：总权重 35%
-    w_trend = 0.15      # 15% - 10日回报 (短期动能 - 保持)
-    w_macd = 0.20       # 20% - MACD (趋势方向 - 保持)
+    # 趋势/动能指标：总权重 30%
+    w_trend = 0.10          # 10% - 10日回报 (短期动能 - **削弱** from 0.15)
+    w_macd = 0.20           # 20% - MACD (趋势方向 - 保持)
     
     # 活跃度指标：总权重 30%
-    w_turn = 0.10       # 10% - 换手率 (保持)
-    w_mf = 0.15         # 15% - 资金流 (持续性确认 - 保持)
-    w_vol = 0.05        # 5% - 量比 (保持)
-    w_pct = 0.00        # 0% - 当日涨幅 (归零)
+    w_turn = 0.10           # 10% - 换手率 (保持)
+    w_mf = 0.15             # 15% - 资金流 (持续性确认 - 保持)
+    w_vol = 0.05            # 5% - 量比 (保持)
+    w_pct = 0.00            # 0% - 当日涨幅 (归零)
     
-    # Sum: 0.30+0.05 + 0.15+0.20 + 0.10+0.15+0.05+0.00 = 1.00
+    # Sum: 0.30+0.05+0.05 + 0.10+0.20 + 0.10+0.15+0.05+0.00 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + fdf['s_vol'] * w_vol + fdf['s_mf'] * w_mf +        
         fdf['s_macd'] * w_macd + fdf['s_trend'] * w_trend +     
         (1 - normalize(fdf['volatility'])) * w_volatility + # 低波动率得分高
-        (1 - fdf['s_position']) * w_position                # 低位置得分高
+        (1 - fdf['s_position']) * w_position +              # 低位置得分高 (核心防御)
+        (1 - fdf['s_5d_cap']) * w_5d_cap                    # 低 5日回报得分高 (惩罚超速)
     )
     fdf['综合评分'] = score * 100
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
@@ -460,7 +468,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V4.1i 版本已更换为 D+5 攻坚策略，w_position 权重已超级强化至 0.30。**")
+    st.warning("⚠️ **V4.1j 版本已更换为短期速度控制策略，引入 5日回报率惩罚项。**")
     
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -519,7 +527,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V4.1i 已应用 D+5 攻坚策略。**")
+                  help=f"总有效样本数：{total_count}。**V4.1j 已应用短期速度控制策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
