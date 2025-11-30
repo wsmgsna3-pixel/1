@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V4.1g 趋势质量加强版（专攻加速模式）
+选股王 · V4.1h 动能修复与持续性加强版
 更新说明：
-1. 【**策略精调 V4.1g**】：核心变动：
-   - 目标：牺牲短期爆发力，全力加强趋势的持续性和质量，以提高 D+3 和 D+5 收益。
-   - **MACD (趋势方向) 权重提升至 0.20**
-   - **波动率 (趋势稳定) 权重提升至 0.20**
-   - **10 日回报 (短期动能) 权重降至 0.10**
-   - **当日涨幅 (w_pct) 权重归零 (0.00)**，彻底贯彻“只看趋势，不看昨日阴阳线”的理念。
+1. 【**策略精调 V4.1h**】：核心变动：
+   - 目标：在 V4.1f 成功启动的基础上，通过强化趋势和资金确认，解决 D+3/D+5 持续性不足的问题。
+   - **MACD (趋势方向) 权重提升至 0.20**，以确保趋势方向的质量。
+   - **资金流 (w_mf) 权重提升至 0.15**，用真金白银的流入来确认持续性，防止假突破。
+   - **波动率 (w_volatility) 权重降至 0.10**，允许股票在启动时有更大的波动，避免错过强势股。
+   - **当日涨幅 (w_pct) 权重继续归零 (0.00)**。
+   
+   新权重结构：动能/趋势 (0.35) + 安全/稳定 (0.35) + 活跃度 (0.30)
 2. 【**过滤 V4.1b**】：继续使用手动复权和市值硬过滤。
 """
 
@@ -23,9 +25,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V4.1g 趋势质量加强版", layout="wide")
-st.title("选股王 · V4.1g 趋势质量加强版（专攻加速模式）")
-st.markdown("✅ **V4.1g 策略：已大幅强化 MACD 和波动率权重，聚焦于“总体趋势向上”和“持续性”。**")
+st.set_page_config(page_title="选股王 · V4.1h 动能修复与持续性加强版", layout="wide")
+st.title("选股王 · V4.1h 动能修复与持续性加强版（资金确认防假突破）")
+st.markdown("✅ **V4.1h 策略：在 V4.1f 启动基础上，大幅强化 MACD 和资金流，以提高 D+3/D+5 持续性。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -235,7 +237,7 @@ with st.sidebar:
     )
     BACKTEST_DAYS = int(st.number_input(
         "**自动回测天数 (N)**", 
-        value=20, # 默认值修改为 20，推荐值
+        value=20, # 默认值保持为 20
         step=1, 
         min_value=1, 
         max_value=50, 
@@ -410,7 +412,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V4.1g 策略精调评分 (趋势质量加强版)
+    # 6. 归一化与 V4.1h 策略精调评分 (动能修复与持续性加强)
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -424,23 +426,23 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_trend'] = normalize(fdf['10d_return'])
     fdf['s_position'] = fdf['position_60d'] / 100 
 
-    # 🚨 V4.1g 策略精调：趋势质量加强版 (30% 动能 + 45% 安全/稳定 + 25% 活跃度)
+    # 🚨 V4.1h 策略精调：动能修复与持续性加强 (35% 动能 + 35% 安全/稳定 + 30% 活跃度)
     
-    # 安全/稳定指标：总权重 45%
-    w_position = 0.25   # 25% - 60日位置 (低位置得分高 = 核心安全边际 - 保持)
-    w_volatility = 0.20 # 20% - 波动率 (低波动率得分高 = 趋势稳定 - **加强**)
+    # 安全/稳定指标：总权重 35%
+    w_position = 0.25   # 25% - 60日位置 (核心安全边际 - 保持，防止买在山顶)
+    w_volatility = 0.10 # 10% - 波动率 (趋势稳定 - 削弱，允许启动波动)
     
-    # 趋势/动能指标：总权重 30%
-    w_trend = 0.10      # 10% - 10日回报 (短期动能 - **削弱**)
+    # 趋势/动能指标：总权重 35%
+    w_trend = 0.15      # 15% - 10日回报 (短期动能 - 恢复 V4.1f 水平)
     w_macd = 0.20       # 20% - MACD (趋势方向 - **加强**)
     
-    # 活跃度指标：总权重 25%
-    w_turn = 0.10       # 10% - 换手率 (活跃度 - 保持)
-    w_mf = 0.10         # 10% - 资金流 (主力动向 - 保持)
+    # 活跃度指标：总权重 30%
+    w_turn = 0.10       # 10% - 换手率 (保持)
+    w_mf = 0.15         # 15% - 资金流 (**加强，用于持续性确认**)
     w_vol = 0.05        # 5% - 量比 (保持)
-    w_pct = 0.00        # 0% - 当日涨幅 (**归零**)
+    w_pct = 0.00        # 0% - 当日涨幅 (归零，不看昨日阴阳线)
     
-    # Sum: 0.25+0.20 + 0.10+0.20 + 0.10+0.10+0.05+0.00 = 1.00
+    # Sum: 0.25+0.10 + 0.15+0.20 + 0.10+0.15+0.05+0.00 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + fdf['s_vol'] * w_vol + fdf['s_mf'] * w_mf +        
@@ -459,7 +461,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V4.1g 版本已更换为趋势质量加强策略，请确保回测天数 N 至少为 20。**")
+    st.warning("⚠️ **V4.1h 版本已更换为动能修复与持续性加强策略，请确保回测天数 N 至少为 20。**")
     
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -518,7 +520,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V4.1g 已应用趋势质量加强策略。**")
+                  help=f"总有效样本数：{total_count}。**V4.1h 已应用动能修复与持续性加强策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
