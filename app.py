@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V4.1b 市值过滤增强版
+选股王 · V4.1d 弹性趋势跟随版
 更新说明：
-1. 【**市值过滤增强 V4.1b**】：新增“最低流通市值”参数，并在 run_backtest_for_a_day 函数中新增硬性过滤逻辑，确保选股池符合市值要求。
-2. 【**策略精调 V4.1a**】：继续使用手动复权和右侧启动策略权重。
+1. 【**策略精调 V4.1d**】：将评分权重调整为以“趋势强度”（10日回报, MACD）为主导 (65%)，同时保持较高的“弹性/抗跌性”（低波动率）权重 (35%)，以匹配用户“偏好上涨趋势股，规避无效突破”的思路。
+2. 【**市值过滤 V4.1b**】：继续使用手动复权和市值硬过滤。
 """
 
 import streamlit as st
@@ -18,9 +18,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V4.1b 市值过滤增强版", layout="wide")
-st.title("选股王 · V4.1b 市值过滤增强版（市值硬过滤）")
-st.markdown("✅ **V4.1b 策略：已引入最低流通市值硬性过滤条件。**")
+st.set_page_config(page_title="选股王 · V4.1d 弹性趋势跟随版", layout="wide")
+st.title("选股王 · V4.1d 弹性趋势跟随版（趋势强韧主导）")
+st.markdown("✅ **V4.1d 策略：已将评分权重调整为以“趋势强度”和“抗跌性”为主导 ($\text{65\%}/\text{35\%}$)。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -250,13 +250,12 @@ with st.sidebar:
     MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
     MIN_TURNOVER = st.number_input("最低换手率 (%)", value=3.0, step=0.5, min_value=0.1)
     
-    # 🚨 V4.1b 新增：最低流通市值
+    # V4.1b 新增：最低流通市值
     MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0, help="例如：输入 20 代表流通市值必须大于等于 20 亿元。")
 
     MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
     
-    # 调整提示信息
     st.markdown(f"> *提示：最低成交额/最低换手率的组合筛选，仍是一种强大的活跃度过滤方法。*")
 
 # ---------------------------
@@ -284,7 +283,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 
     # 2. 合并基本面数据
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
-    REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount','total_mv','circ_mv'] # 增加市值
+    REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount','total_mv','circ_mv'] 
     daily_basic = safe_get('daily_basic', trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
     pool_merged = pool_raw.copy()
@@ -321,7 +320,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 # 转换为万元
-    # 将市值从万元转换为亿元 (方便过滤和显示)
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
     
     df['name'] = df['name'].astype(str)
@@ -339,13 +337,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mask_new = df['days_listed'] < MIN_LIST_DAYS
     df = df[~((mask_cyb_kcb) & (mask_new))]
 
-    # 过滤条件 (调整顺序，将市值放在价格之后)
+    # 过滤条件 (V4.1b 增加市值过滤)
     
     # 过滤价格
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
     
-    # 🚨 V4.1b 新增：过滤流通市值
+    # V4.1b 过滤流通市值
     mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
     df = df[mask_circ_mv] 
     
@@ -407,7 +405,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V4.1a 策略精调评分 (强化右侧启动/动量)
+    # 6. 归一化与 V4.1d 策略精调评分 (强化趋势跟随/弹性)
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -421,15 +419,26 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_trend'] = normalize(fdf['10d_return'])
     fdf['s_position'] = fdf['position_60d'] / 100 
 
-    # 🚨 V4.1a 策略精调：强化右侧启动信号
-    # (权重分配：动量/趋势 65% + 均值回归 35%)
-    w_pct = 0.15; w_trend = 0.20; w_turn = 0.10; w_mf = 0.10; w_vol = 0.05; w_macd = 0.05 # 65%
-    w_volatility = 0.15; w_position = 0.15 # 35%
+    # 🚨 V4.1d 策略精调：强化趋势跟随/弹性信号 (65% 趋势 + 35% 弹性)
+    
+    # 趋势/动量/活跃度指标：总权重 65%
+    w_trend = 0.25      # 25% - 10日回报 (核心趋势强度)
+    w_macd = 0.10       # 10% - MACD (趋势信号确认)
+    w_turn = 0.10       # 10% - 换手率 (活跃度)
+    w_mf = 0.10         # 10% - 资金流 (主力动向)
+    w_pct = 0.05        # 5% - 当日涨幅 (右侧启动的第一信号 - 降低)
+    w_vol = 0.05        # 5% - 量比 
+    
+    # 弹性/安全边际指标：总权重 35%
+    w_volatility = 0.20 # 20% - 波动率 (低波动率得分高 = 趋势稳定，抗跌性)
+    w_position = 0.15   # 15% - 60日位置 (不选历史高位，留有空间)
+    
+    # Sum: 0.25+0.10+0.10+0.10+0.05+0.05 + 0.20+0.15 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + fdf['s_vol'] * w_vol + fdf['s_mf'] * w_mf +        
         fdf['s_macd'] * w_macd + fdf['s_trend'] * w_trend +     
-        (1 - normalize(fdf['volatility'])) * w_volatility +
+        (1 - normalize(fdf['volatility'])) * w_volatility + 
         (1 - fdf['s_position']) * w_position                
     )
     fdf['综合评分'] = score * 100
@@ -443,7 +452,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V4.1b 版本已新增最低流通市值过滤，请清除 Streamlit 缓存后运行，以确保所有过滤条件生效。**")
+    st.warning("⚠️ **V4.1d 版本已更换为弹性趋势跟随策略，请清除 Streamlit 缓存后运行，以使用新的权重计算评分。**")
     
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -461,7 +470,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     for i, trade_date in enumerate(trade_days_str):
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
         
-        # 🚨 V4.1b 核心改动：新增 MIN_CIRC_MV_BILLIONS 参数传递
         daily_result_df, error = run_backtest_for_a_day(
             trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS
         )
@@ -503,7 +511,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V4.1b 已应用市值硬过滤。**")
+                  help=f"总有效样本数：{total_count}。**V4.1d 已应用弹性趋势策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
