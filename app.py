@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V6.0 终极形态策略：超级横盘突破版
+选股王 · V7.0 终极情绪策略：极致动能 + 资金流版
 更新说明：
-1. 【**策略精调 V6.0**】：核心变动：
-   - 目标：彻底放弃“缓慢上涨趋势”，转向“横盘整理后的加速上涨”（底部吸筹突破）。
-   - **波动率 (w_volatility)** 权重提升至 **0.30** (核心形态确认：低波动，确保横盘)。
-   - **资金流 (w_mf)** 保持 **0.40** (核心启动确认：大资金突破)。
-   - **MACD (w_macd)**、**10日回报 (w_trend)** 归零。
-   - **60 日位置 (w_position)** 降至 **0.10** (只作底部区域参考，形态优先)。
-   - **换手率 (w_turn)** 提升至 **0.10** (确认突破当日的承接力)。
+1. 【**策略精调 V7.0**】：核心变动：
+   - 目标：彻底放弃所有中长期和形态指标，转向短线情绪爆发和动能交易。
+   - **当日涨幅 (w_pct)** 权重超级强化至 **0.30** (抓住当日最强情绪)。
+   - **资金流 (w_mf)** 保持在 **0.35** (确认动能背后的主力资金)。
+   - **换手率 (w_turn)** 强化至 **0.20** (高关注度确认)。
+   - **60 日位置 (w_position)** 和 **波动率 (w_volatility)** 权重**全部归零** (放弃防御和形态)。
    
-   新权重结构：核心形态(0.30) + 超级资金(0.40) + 活跃度/防御(0.30)
+   新权重结构：当日涨幅(0.30) + 资金流(0.35) + 换手率(0.20) + 其他动能(0.15) = 1.00
 """
 
 import streamlit as st
@@ -25,9 +24,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V6.0 终极形态策略", layout="wide")
-st.title("选股王 · V6.0 终极形态策略（超级横盘突破版）")
-st.markdown("✅ **V6.0 策略：彻底放弃趋势追踪，转向“极低波动率 ($\mathbf{0.30}$) + 超级资金流 ($\mathbf{0.40}$) 突破”形态选股。**")
+st.set_page_config(page_title="选股王 · V7.0 终极情绪策略", layout="wide")
+st.title("选股王 · V7.0 终极情绪策略（极致动能 + 资金流版）")
+st.markdown("✅ **V7.0 策略：彻底放弃所有防御和形态。将 $\mathbf{85\%}$ 权重分配给 $\mathbf{当日涨幅 (0.30)}$、$\mathbf{资金流 (0.35)}$ 和 $\mathbf{换手率 (0.20)}$，以极致短线动能为目标。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -35,7 +34,7 @@ st.markdown("✅ **V6.0 策略：彻底放弃趋势追踪，转向“极低波�
 pro = None 
 
 # ---------------------------
-# 辅助函数 (保持不变，省略部分重复代码)
+# 辅助函数 (保持 V6.0 代码结构，省略重复部分)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -192,7 +191,8 @@ with st.sidebar:
     st.header("🛒 灵活过滤条件")
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1)
     MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
-    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=3.0, step=0.5, min_value=0.1)
+    # V7.0 将换手率提升为核心指标，因此过滤条件可以适当放松，避免过度筛选。
+    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=2.0, step=0.5, min_value=0.1) 
     MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0, help="例如：输入 20 代表流通市值必须大于等于 20 亿元。")
     MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
@@ -257,6 +257,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
     df['name'] = df['name'].astype(str)
     
+    # 过滤 ST 股/退市股/北交所/次新股
     mask_st = df['name'].str.contains('ST|退', case=False, na=False)
     df = df[~mask_st]
     mask_bj = df['ts_code'].str.startswith('92') 
@@ -269,12 +270,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mask_new = df['days_listed'] < MIN_LIST_DAYS
     df = df[~((mask_cyb_kcb) & (mask_new))]
 
+    # 过滤价格
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
+    # 过滤流通市值
     mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
     df = df[mask_circ_mv] 
-    mask_turn = df['turnover_rate'] >= MIN_TURNOVER
+    # 过滤换手率
+    mask_turn = df['turnover_rate'] >= MIN_TURNOVER # 使用侧边栏参数 MIN_TURNOVER (V7.0 建议降低)
     df = df[mask_turn]
+    # 过滤成交额
     mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
     
@@ -282,7 +287,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单 (逻辑不变)
+    # 4. 遴选决赛名单 (基于当日涨幅和换手率的混合初筛)
     limit_pct = int(FINAL_POOL * 0.7)
     df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
     limit_turn = FINAL_POOL - len(df_pct)
@@ -323,7 +328,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V6.0 策略精调评分 
+    # 6. 归一化与 V7.0 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -338,30 +343,31 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_volatility'] = normalize(fdf['volatility'])
     fdf['s_position'] = fdf['position_60d'] / 100 
 
-    # 🚨 V6.0 终极形态策略：超级横盘突破版
+    # 🚨 V7.0 终极情绪策略：极致动能 + 资金流版
     
-    # 核心权重
-    w_mf = 0.40             # 40% - 资金流 (超级启动确认)
-    w_volatility = 0.30     # 30% - 波动率 (**核心形态：低波动得分高**)
+    # 核心权重：动能+资金，占比 85%
+    w_pct = 0.30            # 30% - 当日涨幅 (情绪最大化)
+    w_mf = 0.35             # 35% - 资金流 (启动确认)
+    w_turn = 0.20           # 20% - 换手率 (活跃度确认)
     
-    # 辅助权重
-    w_turn = 0.10           # 10% - 换手率 (突破活跃度)
-    w_vol = 0.05            # 5% - 量比 (量能辅助)
-    w_position = 0.10       # 10% - 60日位置 (底部区域防御，弱化)
+    # 辅助权重：其他动能，占比 15%
+    w_vol = 0.10            # 10% - 量比 (放量确认)
     w_trend = 0.05          # 5% - 10日回报 (弱动能辅助)
 
-    # 归零项
-    w_macd = 0.00           # 0% - MACD (归零)
-    w_pct = 0.00            # 0% - 当日涨幅 (归零)
+    # 彻底归零项
+    w_position = 0.00       # 0% - 60日位置 (放弃防御)
+    w_volatility = 0.00     # 0% - 波动率 (放弃形态)
+    w_macd = 0.00           # 0% - MACD (放弃滞后指标)
     
-    # Sum: 0.40+0.30 + 0.10+0.05+0.10+0.05 = 1.00
+    # Sum: 0.30+0.35+0.20+0.10+0.05 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + fdf['s_vol'] * w_vol + 
-        fdf['s_mf'] * w_mf + fdf['s_macd'] * w_macd + 
+        fdf['s_mf'] * w_mf + 
+        fdf['s_macd'] * w_macd + 
         fdf['s_trend'] * w_trend +     
-        (1 - fdf['s_volatility']) * w_volatility +          # **低波动率得分高 (形态确认)**
-        (1 - fdf['s_position']) * w_position                # 低位置得分高 (底部区域防御)
+        (1 - fdf['s_volatility']) * w_volatility +          # 归零
+        (1 - fdf['s_position']) * w_position                # 归零
     )
     fdf['综合评分'] = score * 100
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
@@ -374,7 +380,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V6.0 版本已更换为超级横盘突破策略，核心是低波动率 (0.30) + 资金流 (0.40)。**")
+    st.warning("⚠️ **V7.0 版本已更换为极致动能 + 资金流策略，放弃了所有防御指标。**")
     
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -432,7 +438,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V6.0 已应用超级横盘突破策略。**")
+                  help=f"总有效样本数：{total_count}。**V7.0 已应用极致动能 + 资金流策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
