@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V4.0 数据源重构增强版（手动复权）
+选股王 · V4.1b 市值过滤增强版
 更新说明：
-1. 【**数据源根本修复 V4.0**】：彻底弃用 ts.pro_bar(adj='qfq') 接口，改为使用 pro.daily() 和 pro.adj_factor() 手动计算前复权价格。
-   - 目的：从根本上解决极少数股票复权价为 0.00x 导致的收益率失真问题（例如 300% 异常）。
-2. 【**代码精简**】：移除所有 V3.x 版本中针对复权价异常的打补丁式代码。
-3. 【**指标计算优化**】：由于 pro.daily() 不返回涨跌幅，现已在 compute_indicators 中自动计算。
+1. 【**市值过滤增强 V4.1b**】：新增“最低流通市值”参数，并在 run_backtest_for_a_day 函数中新增硬性过滤逻辑，确保选股池符合市值要求。
+2. 【**策略精调 V4.1a**】：继续使用手动复权和右侧启动策略权重。
 """
 
 import streamlit as st
@@ -20,15 +18,14 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V4.0 数据源重构稳定版", layout="wide")
-st.title("选股王 · V4.0 数据源重构稳定版（手动复权）")
-st.markdown("✅ **已实施根本修复：弃用 ts.pro_bar，改为手动计算复权价。结果将更稳定可靠。**")
+st.set_page_config(page_title="选股王 · V4.1b 市值过滤增强版", layout="wide")
+st.title("选股王 · V4.1b 市值过滤增强版（市值硬过滤）")
+st.markdown("✅ **V4.1b 策略：已引入最低流通市值硬性过滤条件。**")
 
 # ---------------------------
 # 全局变量初始化
 # ---------------------------
 pro = None 
-# 注意：V4.0 已弃用 BAR_API = ts.pro_bar
 
 # ---------------------------
 # 辅助函数 
@@ -79,7 +76,6 @@ def get_adj_factor(ts_code, start_date, end_date):
     if df.empty or 'adj_factor' not in df.columns:
         return pd.DataFrame()
     df['adj_factor'] = pd.to_numeric(df['adj_factor'], errors='coerce').fillna(0)
-    # 使用 trade_date 作为索引，方便后续合并
     df = df.set_index('trade_date').sort_index() 
     return df['adj_factor']
 
@@ -102,32 +98,26 @@ def get_qfq_data_v4(ts_code, start_date, end_date):
                         left_index=True, right_index=True, how='left')
     df = df.dropna(subset=['adj_factor'])
     
-    # 如果没有数据点：
     if df.empty: return pd.DataFrame()
 
-    # 获取最新的复权因子作为基准 (用于前复权)
     latest_adj_factor = df['adj_factor'].iloc[-1]
     
     # 4. 手动计算前复权价格
-    # QFQ Price = 未复权价格 * (当日复权因子 / 最新复权因子)
     for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns:
-            # 确保 latest_adj_factor 不为零，避免除法错误
             if latest_adj_factor > 1e-9:
                 df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
             else:
-                df[col + '_qfq'] = df[col] # 如果因子异常，则使用原价 (但不合理，会被指标计算剔除)
+                df[col + '_qfq'] = df[col] 
             
     # 5. 清理并保留需要的 QFQ 价格，并使用 trade_date 排序
     df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
     df['trade_date'] = pd.to_datetime(df['trade_date_str'], format='%Y%m%d')
     df = df.sort_values('trade_date').set_index('trade_date_str')
 
-    # 将复权后的价格覆盖原列名
     for col in ['open', 'high', 'low', 'close']:
         df[col] = df[col + '_qfq']
     
-    # 只返回计算指标和收益率所需的数据 (减少内存占用)
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 # ----------------------------------------------------
 
@@ -142,7 +132,6 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
-    # 🚨 V4.0 核心改动：调用新的手动复权函数
     hist = get_qfq_data_v4(ts_code, start_date=start_date, end_date=end_date)
     
     if hist.empty or 'close' not in hist.columns:
@@ -152,7 +141,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
     hist = hist.dropna(subset=['close'])
-    hist = hist.reset_index(drop=True) # 已经是排序后的数据
+    hist = hist.reset_index(drop=True) 
     
     results = {}
     
@@ -178,10 +167,8 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 def compute_indicators(ts_code, end_date):
     """计算 MACD, 10日回报, 波动率, 60日位置等指标 (V4.0 使用 get_qfq_data_v4)"""
     
-    # 拉取历史数据，确保足够计算60日指标 (例如120天)
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
-    # 🚨 V4.0 核心改动：调用新的手动复权函数
     df = get_qfq_data_v4(ts_code, start_date=start_date, end_date=end_date)
     
     res = {}
@@ -194,11 +181,9 @@ def compute_indicators(ts_code, end_date):
     df['high'] = pd.to_numeric(df['high'], errors='coerce').astype(float)
     df['vol'] = pd.to_numeric(df['vol'], errors='coerce').fillna(0)
     
-    # V4.0: daily 接口不提供 pct_change，手动计算
     df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     
     close = df['close']
-    # 🚨 V4.0: 最后的复权收盘价 (用于计算收益率的分母)
     res['last_close'] = close.iloc[-1]
     
     # MACD 计算
@@ -210,7 +195,7 @@ def compute_indicators(ts_code, end_date):
         res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     else: res['macd_val'] = np.nan
         
-    # 量比计算 (注意：daily 接口不返回 turnover/amount，此处计算量比基于 vol)
+    # 量比计算
     vols = df['vol'].tolist()
     if len(vols) >= 6 and vols[-6:-1] and np.mean(vols[-6:-1]) > 1e-9:
         res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
@@ -264,9 +249,15 @@ with st.sidebar:
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1)
     MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
     MIN_TURNOVER = st.number_input("最低换手率 (%)", value=3.0, step=0.5, min_value=0.1)
+    
+    # 🚨 V4.1b 新增：最低流通市值
+    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0, help="例如：输入 20 代表流通市值必须大于等于 20 亿元。")
+
     MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
-    st.markdown(f"> *当前设置下，最低流通市值约为：{(MIN_AMOUNT/100000000)/ (MIN_TURNOVER/100):.1f} 亿*")
+    
+    # 调整提示信息
+    st.markdown(f"> *提示：最低成交额/最低换手率的组合筛选，仍是一种强大的活跃度过滤方法。*")
 
 # ---------------------------
 # Token 输入与初始化 
@@ -277,12 +268,11 @@ if not TS_TOKEN:
     st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
-# V4.0 不再需要 BAR_API
 
 # ---------------------------
 # 核心回测逻辑函数 
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS):
     """为单个交易日运行选股和回测逻辑"""
     
     # 1. 拉取全市场 Daily 数据
@@ -307,7 +297,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
     if not daily_basic.empty:
         cols_to_merge = [c for c in REQUIRED_BASIC_COLS if c in daily_basic.columns]
-        # 确保不重复合并 'amount'
         if 'amount' in pool_merged.columns and 'amount' in cols_to_merge: 
             pool_merged = pool_merged.drop(columns=['amount'])
         pool_merged = pool_merged.merge(daily_basic[cols_to_merge], on='ts_code', how='left')
@@ -332,48 +321,47 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 # 转换为万元
-    # V3.9.16: 将市值从万元转换为亿元 (方便显示)
+    # 将市值从万元转换为亿元 (方便过滤和显示)
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
     
     df['name'] = df['name'].astype(str)
     
-    # 过滤 ST 股/退市股
+    # 过滤 ST 股/退市股/北交所/次新股 (逻辑不变)
     mask_st = df['name'].str.contains('ST|退', case=False, na=False)
     df = df[~mask_st]
-    
-    # 排除北交所股票 (代码 '92' 开头)
     mask_bj = df['ts_code'].str.startswith('92') 
     df = df[~mask_bj]
-    
-    # 排除上市时间较短的创业板/科创板股票（次新股）
     TODAY = datetime.strptime(last_trade, "%Y%m%d")
-    MIN_LIST_DAYS = 120 # 至少上市天数
-    
+    MIN_LIST_DAYS = 120 
     df['list_date_dt'] = pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')
     df['days_listed'] = (TODAY - df['list_date_dt']).dt.days
-    
-    # 针对创业板 (30开头) 和科创板 (68开头) 进行次新股过滤
     mask_cyb_kcb = df['ts_code'].str.startswith(('30','68'))
     mask_new = df['days_listed'] < MIN_LIST_DAYS
-    
-    # 剔除满足以下两个条件的股票：是创业板/科创板 AND 上市时间不足 120 天
     df = df[~((mask_cyb_kcb) & (mask_new))]
 
+    # 过滤条件 (调整顺序，将市值放在价格之后)
+    
     # 过滤价格
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
+    
+    # 🚨 V4.1b 新增：过滤流通市值
+    mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
+    df = df[mask_circ_mv] 
+    
     # 过滤换手率
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER
     df = df[mask_turn]
     # 过滤成交额
     mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
+    
     df = df.reset_index(drop=True)
 
     if len(df) == 0:
         return pd.DataFrame(), f"过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单
+    # 4. 遴选决赛名单 (逻辑不变)
     limit_pct = int(FINAL_POOL * 0.7)
     df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
     limit_turn = FINAL_POOL - len(df_pct)
@@ -381,14 +369,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df_turn = df[~df['ts_code'].isin(existing_codes)].sort_values('turnover_rate', ascending=False).head(limit_turn).copy()
     final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
 
-    # 5. 深度评分
+    # 5. 深度评分 (逻辑不变)
     records = []
     for row in final_candidates.itertuples():
         ts_code = row.ts_code
         
         rec = {
             'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
-            'Close': getattr(row, 'close', np.nan), # 当日收盘价（未复权）
+            'Close': getattr(row, 'close', np.nan),
             'Circ_MV (亿)': getattr(row, 'circ_mv_billion', np.nan),
             'Pct_Chg (%)': getattr(row, 'pct_chg', 0), 
             'turnover': getattr(row, 'turnover_rate', 0),
@@ -402,7 +390,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'volatility': ind.get('volatility', 0), 'position_60d': ind.get('position_60d', np.nan)
         })
         
-        # ⚠️ 用于计算收益率的复权买入价
         selection_price_adj = ind.get('last_close', np.nan) 
         
         future_prices = get_future_prices(ts_code, last_trade)
@@ -410,7 +397,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         for n in [1, 3, 5]: 
             future_price = future_prices.get(f'Return_D{n}', np.nan)
             
-            # V4.0: 依赖新的 QFQ 数据源，不再需要检查 selection_price_adj < 0.1
             if pd.notna(selection_price_adj) and pd.notna(future_price) and selection_price_adj > 0.01:
                 rec[f'Return_D{n} (%)'] = (future_price / selection_price_adj - 1) * 100
             else: 
@@ -421,7 +407,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V3.7 评分
+    # 6. 归一化与 V4.1a 策略精调评分 (强化右侧启动/动量)
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -435,13 +421,15 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_trend'] = normalize(fdf['10d_return'])
     fdf['s_position'] = fdf['position_60d'] / 100 
 
-    w_pct = 0.05; w_turn = 0.05; w_vol = 0.05; w_mf = 0.05; w_macd = 0.05; w_trend = 0.15      
-    w_volatility = 0.30; w_position = 0.35   
+    # 🚨 V4.1a 策略精调：强化右侧启动信号
+    # (权重分配：动量/趋势 65% + 均值回归 35%)
+    w_pct = 0.15; w_trend = 0.20; w_turn = 0.10; w_mf = 0.10; w_vol = 0.05; w_macd = 0.05 # 65%
+    w_volatility = 0.15; w_position = 0.15 # 35%
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + fdf['s_vol'] * w_vol + fdf['s_mf'] * w_mf +        
         fdf['s_macd'] * w_macd + fdf['s_trend'] * w_trend +     
-        (1 - normalize(fdf['volatility'])) * w_volatility + 
+        (1 - normalize(fdf['volatility'])) * w_volatility +
         (1 - fdf['s_position']) * w_position                
     )
     fdf['综合评分'] = score * 100
@@ -455,8 +443,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    # 提醒用户清除 Streamlit 缓存
-    st.warning("⚠️ **V4.0 版本已更换数据源，建议清除 Streamlit 缓存后运行，以确保数据全部为手动复权数据。**")
+    st.warning("⚠️ **V4.1b 版本已新增最低流通市值过滤，请清除 Streamlit 缓存后运行，以确保所有过滤条件生效。**")
     
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -474,8 +461,9 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     for i, trade_date in enumerate(trade_days_str):
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
         
+        # 🚨 V4.1b 核心改动：新增 MIN_CIRC_MV_BILLIONS 参数传递
         daily_result_df, error = run_backtest_for_a_day(
-            trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT
+            trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS
         )
         
         if error:
@@ -495,11 +483,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         
     all_results = pd.concat(results_list)
     
-    # 最终汇总计算 (V4.0：不进行任何结果层面的过滤)
     st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {total_days} 个交易日)")
-    
-    # 🚨 注意：V4.0 依赖手动复权的准确性，不再对平均收益结果进行任何二次过滤。
-    # 极端异常值应该已在源头解决。
     
     for n in [1, 3, 5]:
         col = f'Return_D{n} (%)' 
@@ -510,7 +494,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         if not valid_returns.empty:
             avg_return = valid_returns[col].mean()
             
-            # 使用所有有效样本计算准确率
             hit_rate = (valid_returns[col] > 0).sum() / len(valid_returns) * 100 if len(valid_returns) > 0 else 0.0
             total_count = len(valid_returns)
         else:
@@ -520,7 +503,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V4.0 已从源头修复数据，结果未进行二次过滤。**")
+                  help=f"总有效样本数：{total_count}。**V4.1b 已应用市值硬过滤。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
