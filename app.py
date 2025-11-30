@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V10.0 极致胜率策略：资金流 + 极致低位安全边际版
+选股王 · V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
 更新说明：
-1. 【**策略精调 V10.0**】：核心变动：
-   - 目标：不计代价最大化准确率（胜率），旨在达到 60%+。
-   - **防御权重集体大幅提高：**
-     - **60 日位置 (w_position)** 从 0.15 提升至 **0.25** (策略第二核心)。
-     - **波动率 (w_volatility)** 从 0.10 提升至 **0.15** (强力风险控制)。
-   - **爆发力权重集体削弱：**
-     - **资金流 (w_mf)** 从 0.35 降至 **0.30**。
-     - **当日涨幅 (w_pct)** 从 0.15 降至 **0.10**。
-     - **换手率 (w_turn)** 从 0.15 降至 **0.10**。
+1. 【**策略精调 V11.0**】：核心变动：
+   - 目标：以 V9.0 为基础，精准修复 D+3 周期低胜率问题。
+   - **MACD (w_macd)** 从 0.10 大幅提升至 **0.20** (强化中期趋势共振，筛选能持续走高 3-5 天的股票)。
+   - **当日涨幅 (w_pct)** 和 **换手率 (w_turn)** 从 0.15 降至 **0.10** (为 MACD 腾出权重)。
+   - **资金流 (w_mf)**、**60日位置 (w_position)** 和 **波动率 (w_volatility)** 权重维持 V9.0 水平，保持核心动力和防御性。
    
-   新权重结构：资金流(0.30) + 防御(0.40) + 动能/趋势(0.30) = 1.00
+   新权重结构：资金流(0.35) + 趋势(0.20) + 防御(0.25) + 动能(0.20) = 1.00
 """
 
 import streamlit as st
@@ -27,9 +23,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V10.0 极致胜率策略", layout="wide")
-st.title("选股王 · V10.0 极致胜率策略（资金流 + 极致低位安全边际版）")
-st.markdown("🚨 **V10.0 策略：大幅提高防御指标权重 ($\mathbf{w\_position=0.25}$，$\mathbf{w\_volatility=0.15}$)，牺牲爆发力，只为将准确率推高到 $\mathbf{55\%}$ 以上。**")
+st.set_page_config(page_title="选股王 · V11.0 最终决战策略", layout="wide")
+st.title("选股王 · V11.0 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
+st.markdown("🎯 **V11.0 策略：在 $\mathbf{V9.0}$ 的基础上，将 $\mathbf{MACD}$ 权重提升到 $\mathbf{0.20}$，目标是巩固 $\mathbf{D+1}$ 胜率，并突破 $\mathbf{D+3}$ 胜率到 $\mathbf{50\%}$。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -37,7 +33,7 @@ st.markdown("🚨 **V10.0 策略：大幅提高防御指标权重 ($\mathbf{w\_p
 pro = None 
 
 # ---------------------------
-# 辅助函数 (保持 V9.0 代码结构，省略重复部分)
+# 辅助函数 (保持 V10.0 代码结构，省略重复部分)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -330,7 +326,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V10.0 策略精调评分 
+    # 6. 归一化与 V11.0 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -346,34 +342,34 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_position'] = fdf['position_60d'] / 100 
     
     # ----------------------------------------------------------------------------------
-    # 🚨 V10.0 极致胜率策略：资金流 + 极致低位安全边际版
+    # 🚨 V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
     
-    # 核心权重：资金流，占比 30%
-    w_mf = 0.30             # 30% - 资金流 (核心动力)
+    # 核心权重：资金流，占比 35%
+    w_mf = 0.35             # 35% - 资金流 (核心动力，保持 V9.0)
 
     # 动能权重：当日动能，占比 20%
     w_pct = 0.10            # 10% - 当日涨幅 (削弱)
     w_turn = 0.10           # 10% - 换手率 (削弱)
     
-    # 防御权重：安全边际与波动控制，占比 40%
-    w_position = 0.25       # 25% - 60日位置 (**极致防御，安全边际**)
-    w_volatility = 0.15     # 15% - 波动率 (**极致防御，风险控制**)
+    # 防御权重：安全边际与波动控制，占比 25%
+    w_position = 0.15       # 15% - 60日位置 (保持 V9.0)
+    w_volatility = 0.10     # 10% - 波动率 (保持 V9.0)
     
-    # 趋势权重：中期趋势，占比 10%
-    w_macd = 0.10           # 10% - MACD (趋势辅助)
+    # 趋势权重：中期趋势，占比 20%
+    w_macd = 0.20           # 20% - MACD (**大幅强化，目标改善 D+3**)
     
     # 彻底归零项
     w_vol = 0.00            # 0% - 量比 
     w_trend = 0.00          # 0% - 10日回报 
     
-    # Sum: 0.30+0.10+0.10+0.25+0.15+0.10 = 1.00
+    # Sum: 0.35+0.10+0.10+0.15+0.10+0.20 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + 
         fdf['s_mf'] * w_mf + 
         fdf['s_macd'] * w_macd + 
         
-        # 引入极致防御：60日位置越低越好 (1-s_position)，波动率越低越好 (1-s_volatility)
+        # 引入防御：60日位置越低越好 (1-s_position)，波动率越低越好 (1-s_volatility)
         (1 - fdf['s_position']) * w_position + 
         (1 - fdf['s_volatility']) * w_volatility + 
         
@@ -394,7 +390,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V10.0 版本已更换为极致防御策略，目标是牺牲爆发力来最大化胜率，如果本次胜率仍无提升，我们将使用硬性过滤条件。**")
+    st.warning("⚠️ **V11.0 版本已更换为 V9.0 框架 + 强化 MACD 趋势共振策略，目标是突破 D+3 胜率。**")
     
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -452,7 +448,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V10.0 已应用极致防御策略。**")
+                  help=f"总有效样本数：{total_count}。**V11.0 已应用 V9.0 框架 + 强化 MACD 趋势共振策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
