@@ -9,6 +9,8 @@
    - **资金流 (w_mf)**、**60日位置 (w_position)** 和 **波动率 (w_volatility)** 权重维持 V9.0 水平，保持核心动力和防御性。
    
    新权重结构：资金流(0.35) + 趋势(0.20) + 防御(0.25) + 动能(0.20) = 1.00
+
+【**日期安全修复**】：已修复在交易时段运行回测导致的日期数据缺失问题。
 """
 
 import streamlit as st
@@ -26,6 +28,7 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="选股王 · V11.0 最终决战策略", layout="wide")
 st.title("选股王 · V11.0 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
 st.markdown("🎯 **V11.0 策略：在 $\mathbf{V9.0}$ 的基础上，将 $\mathbf{MACD}$ 权重提升到 $\mathbf{0.20}$，目标是巩固 $\mathbf{D+1}$ 胜率，并突破 $\mathbf{D+3}$ 胜率到 $\mathbf{50\%}$。**")
+st.markdown("✅ **此版本已进行日期安全修复，回测将自动选择数据完整的交易日。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -33,7 +36,7 @@ st.markdown("🎯 **V11.0 策略：在 $\mathbf{V9.0}$ 的基础上，将 $\math
 pro = None 
 
 # ---------------------------
-# 辅助函数 (保持 V10.0 代码结构，省略重复部分)
+# 辅助函数 
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -63,6 +66,39 @@ def get_trade_days(end_date_str, num_days):
     trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
     trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
     return trade_days_df['cal_date'].head(num_days).tolist()
+
+# --------------------------------------------------------------------------------------
+# 【新增函数】日期安全阀门：寻找最近一个数据完整的交易日 (解决 20251201 错误)
+# --------------------------------------------------------------------------------------
+def find_last_trade_day(max_days=20):
+    """
+    通过实际拉取数据，倒推找到最近一个数据完整的交易日。
+    解决了在未收盘或API延迟导致数据缺失的问题。
+    """
+    global pro 
+    if pro is None:
+        return None
+        
+    today = datetime.now().date()
+    # 倒推查找，直到找到一个有daily数据的日子
+    for i in range(max_days):
+        d = today - timedelta(days=i)
+        ds = d.strftime("%Y%m%d")
+        
+        # 使用代码中已有的 safe_get 函数
+        try:
+            df = safe_get('daily', trade_date=ds) 
+            # 如果成功拉取到数据且不为空，则认为这是一个完整的交易日
+            if not df.empty:
+                return ds
+        except Exception:
+            # 忽略 Tushare 接口或网络错误
+            time.sleep(0.5)
+            continue
+            
+    return None
+# --------------------------------------------------------------------------------------
+
 
 @st.cache_data(ttl=3600*24)
 def get_adj_factor(ts_code, start_date, end_date):
@@ -178,7 +214,7 @@ def compute_indicators(ts_code, end_date):
 with st.sidebar:
     st.header("模式与日期选择")
     backtest_date_end = st.date_input("选择**回测结束日期**", value=datetime.now().date(), max_value=datetime.now().date())
-    BACKTEST_DAYS = int(st.number_input("**自动回测天数 (N)**", value=20, step=1, min_value=1, max_value=50, help="程序将自动回测最近 N 个交易日。建议设置为 20 天以获得更可靠的统计数据。"))
+    BACKTEST_DAYS = int(st.number_input("**自动回测天数 (N)**", value=20, step=1, min_value=1, max_value=50, help="程序将自动回测最近 N 个交易日。回测 N=1 即为当日选股。"))
     
     st.markdown("---")
     st.header("核心参数")
@@ -246,7 +282,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
     pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
-    
+   
     # 3. 执行硬性条件过滤
     df = pool_merged.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
@@ -345,7 +381,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 🚨 V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
     
     # 核心权重：资金流，占比 35%
-    w_mf = 0.35             # 35% - 资金流 (核心动力，保持 V9.0)
+    w_mf = 0.35            # 35% - 资金流 (核心动力，保持 V9.0)
 
     # 动能权重：当日动能，占比 20%
     w_pct = 0.10            # 10% - 当日涨幅 (削弱)
@@ -386,13 +422,31 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     return fdf.head(TOP_BACKTEST).copy(), None
 
 # ---------------------------
-# 主运行块 (保持不变)
+# 主运行块 
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
     st.warning("⚠️ **V11.0 版本已更换为 V9.0 框架 + 强化 MACD 趋势共振策略，目标是突破 D+3 胜率。**")
+   
+    # ----------------------------------------------------------------------------------
+    # 【修复核心】日期安全检查与修正
+    # ----------------------------------------------------------------------------------
+    safe_end_date_str = backtest_date_end.strftime("%Y%m%d")
+    last_closed_day = find_last_trade_day() 
+
+    if not last_closed_day:
+        st.error("无法找到最近的完整交易日数据。请检查 Tushare Token 或网络连接。")
+        st.stop()
+        
+    if safe_end_date_str > last_closed_day:
+        # 用户的选择日期（或默认日期）比 API 确认的完整日期晚，则自动修正
+        safe_end_date_str = last_closed_day
+        st.warning(f"⚠️ **自动修正回测结束日期：** 您的原始日期 ({backtest_date_end.strftime('%Y%m%d')}) 数据可能不完整。回测已自动调整到上一个完整交易日：**{last_closed_day}**")
     
-    trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
+    # ----------------------------------------------------------------------------------
+    
+    # 使用修正后的安全日期进行回测
+    trade_days_str = get_trade_days(safe_end_date_str, BACKTEST_DAYS)
     if not trade_days_str:
         st.error("无法获取交易日列表，请检查日期或 Token。")
         st.stop()
