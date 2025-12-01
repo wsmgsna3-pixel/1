@@ -33,11 +33,11 @@ st.markdown("🎯 **V11.0 策略：在 $\mathbf{V9.0}$ 的基础上，将 $\math
 pro = None
 
 # ---------------------------
-# 辅助函数 (关键优化点 1：等待时间调整至 0.1 秒，符合权限且兼顾稳定性)
+# 辅助函数 1: 用于全市场数据获取 (保留 0.1s 以确保大数据稳定)
 # ---------------------------
 @st.cache_data(ttl=3600*12)
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API，使用 0.1 秒等待时间来平衡速度和网络稳定性"""
+    """用于全市场日线、基本面等大数据获取，保留 0.1 秒等待以求稳定"""
     global pro
     if pro is None:
         return pd.DataFrame(columns=['ts_code'])
@@ -45,17 +45,39 @@ def safe_get(func_name, **kwargs):
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            time.sleep(0.1) # 调整为 0.1 秒
+            time.sleep(0.1) 
             return pd.DataFrame(columns=['ts_code'])
-        time.sleep(0.1) # 调整为 0.1 秒
+        time.sleep(0.1) 
         return df
     except Exception as e:
-        time.sleep(0.1) # 调整为 0.1 秒
+        time.sleep(0.1) 
+        return pd.DataFrame(columns=['ts_code'])
+        
+# ---------------------------
+# 辅助函数 2: 用于批量历史数据获取 (移除 time.sleep，追求极致速度)
+# ---------------------------
+@st.cache_data(ttl=3600*12)
+def safe_get_aggressive(func_name, **kwargs):
+    """用于批量获取单个股票的历史数据（复权因子、日线等），移除 time.sleep，追求极致速度"""
+    global pro
+    if pro is None:
+        return pd.DataFrame(columns=['ts_code'])
+    func = getattr(pro, func_name)
+    try:
+        df = func(**kwargs)
+        if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+            # 移除 time.sleep
+            return pd.DataFrame(columns=['ts_code'])
+        # 移除 time.sleep
+        return df
+    except Exception as e:
+        # 移除 time.sleep
         return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
     """获取 num_days 个交易日作为选股日"""
     start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
+    # 使用 safe_get (0.1s)
     cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
     if cal.empty or 'is_open' not in cal.columns:
         st.error("无法获取交易日历，请检查 Token 或 Tushare 权限。")
@@ -66,7 +88,8 @@ def get_trade_days(end_date_str, num_days):
 
 @st.cache_data(ttl=3600*24)
 def get_adj_factor(ts_code, start_date, end_date):
-    df = safe_get('adj_factor', ts_code=ts_code, start_date=start_date, end_date=end_date)
+    # 使用 safe_get_aggressive (0s)
+    df = safe_get_aggressive('adj_factor', ts_code=ts_code, start_date=start_date, end_date=end_date)
     if df.empty or 'adj_factor' not in df.columns: return pd.DataFrame()
     df['adj_factor'] = pd.to_numeric(df['adj_factor'], errors='coerce').fillna(0)
     df = df.set_index('trade_date').sort_index()
@@ -75,15 +98,16 @@ def get_adj_factor(ts_code, start_date, end_date):
 @st.cache_data(ttl=3600*12)
 def get_qfq_data_v4(ts_code, start_date, end_date, adj_factor_series=None):
     """
-    获取单个股票的前复权数据。在批量模式下，adj_factor_series 会预先传入。
+    获取单个股票的前复权数据。
     """
-    daily_df = safe_get('daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
+    # 使用 safe_get_aggressive (0s)
+    daily_df = safe_get_aggressive('daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
     if daily_df.empty: return pd.DataFrame()
     daily_df = daily_df.set_index('trade_date').sort_index()
     
     # 如果 adj_factor_series 未预先传入，则本地获取
     if adj_factor_series is None:
-        adj_factor_series = get_adj_factor(ts_code, start_date, end_date)
+        adj_factor_series = get_adj_factor(ts_code, start_date, end_date) # 这个函数内部已经调用了 safe_get_aggressive
 
     if adj_factor_series.empty: return pd.DataFrame()
     
@@ -128,6 +152,7 @@ def get_bulk_history_and_adj(ts_codes, selection_date):
     end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
     # 1. 批量获取复权因子 (Tushare adj_factor 接口不支持批量，仍需循环调用)
+    # 调用 get_adj_factor，内部使用 safe_get_aggressive (0s)
     adj_map = {
         ts_code: get_adj_factor(ts_code, start_hist, end_future)
         for ts_code in ts_codes
@@ -138,10 +163,8 @@ def get_bulk_history_and_adj(ts_codes, selection_date):
     for ts_code in ts_codes:
         adj_factor_series = adj_map.get(ts_code)
         
-        # 获取包含选股日及以前的历史数据（用于指标计算）
+        # 调用 get_qfq_data_v4，内部使用 safe_get_aggressive (0s)
         hist_df = get_qfq_data_v4(ts_code, start_hist, end_hist, adj_factor_series=adj_factor_series)
-        
-        # 获取选股日以后的未来价格数据（用于回测收益计算）
         future_df = get_qfq_data_v4(ts_code, start_future, end_future, adj_factor_series=adj_factor_series)
         
         data_map[ts_code] = {
@@ -281,7 +304,7 @@ pro = ts.pro_api()
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS):
     """为单个交易日运行选股和回测逻辑"""
     
-    # 1. 拉取全市场 Daily 数据 (这部分保留 API 调用，因为它必须在每次回测日获取新数据)
+    # 1. 拉取全市场 Daily 数据 (使用 safe_get, 0.1s)
     daily_all = safe_get('daily', trade_date=last_trade)
     if daily_all.empty or 'ts_code' not in daily_all.columns: return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
 
@@ -364,10 +387,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
     
     # =================================================================================
-    # 🚨 关键优化点 2.3：批量获取历史数据和未来收益数据，代替循环内的 API 调用
+    # 🚨 关键优化点 2.3：批量获取历史数据和未来收益数据 (内部调用 0s 等待)
     # =================================================================================
     final_ts_codes = final_candidates['ts_code'].tolist()
-    # 核心加速点：所有历史数据在这里一次性集中获取，利用缓存和更快的间隔
+    # 核心加速点：所有历史数据在这里一次性集中获取，利用缓存和 0s 间隔
     preloaded_data_map = get_bulk_history_and_adj(final_ts_codes, last_trade)
  
     # 5. 深度评分 (使用预加载的数据)
@@ -485,6 +508,9 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     progress_text = st.empty()
     my_bar = st.progress(0)
     
+    # 再次提醒用户检查 FINAL_POOL 的值
+    st.info("💡 **重要提示：** 请您检查左侧边栏的 **'最终入围评分数量 (M)'** (FINAL_POOL) 设置，它决定了每天需要进行批量获取的股票数量。如果您设置的值非常大（例如 200），这是导致耗时的根本原因。")
+
     for i, trade_date in enumerate(trade_days_str):
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
       
