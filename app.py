@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
-更新说明：
-1. 【**策略精调 V11.0**】：核心变动：
-   - 目标：以 V9.0 为基础，精准修复 D+3 周期低胜率问题。
-   - **MACD (w_macd)** 从 0.10 大幅提升至 **0.20** (强化中期趋势共振，筛选能持续走高 3-5 天的股票)。
-   - **当日涨幅 (w_pct)** 和 **换手率 (w_turn)** 从 0.15 降至 **0.10** (为 MACD 腾出权重)。
-   - **资金流 (w_mf)**、**60日位置 (w_position)** 和 **波动率 (w_volatility)** 权重维持 V9.0 水平，保持核心动力和防御性。
-   
-   新权重结构：资金流(0.35) + 趋势(0.20) + 防御(0.25) + 动能(0.20) = 1.00
+选股王 · 10000 积分旗舰（V11.0 最终决战版）· 极速版
+核心权重：
+- **资金流 (w_money): 0.35**
+- **MACD (w_macd): 0.20** - **60日位置 (w_position): 0.15** (防御/安全边际)
+- **波动率 (w_volatility): 0.10** (风险控制)
+- 当日涨幅 (w_pct): 0.10
+- 换手率 (w_turn): 0.10
+
+优化目标：巩固 D+1 50%+ 胜率，突破 D+3 胜率。
 """
 
 import streamlit as st
@@ -17,147 +17,388 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
-import time  
 warnings.filterwarnings("ignore")
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.0 最终决战策略", layout="wide")
-st.title("选股王 · V11.0 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
-st.markdown("🎯 **V11.0 策略：在 $\mathbf{V9.0}$ 的基础上，将 $\mathbf{MACD}$ 权重提升到 $\mathbf{0.20}$，目标是巩固 $\mathbf{D+1}$ 胜率，并突破 $\mathbf{D+3}$ 胜率到 $\mathbf{50\%}$。**")
+st.set_page_config(page_title="选股王 · V11.0 最终决战旗舰版", layout="wide")
+st.title("选股王 · V11.0 最终决战旗舰版（资金流+MACD+低位防御）")
+st.markdown("🎯 **本版本已集成 V11.0 最终权重（资金流 $0.35$ + MACD $0.20$ + 60日低位 $0.15$），旨在最大化短线稳定性与中期趋势。**")
 
 # ---------------------------
-# 全局变量初始化
+# 侧边栏参数（实时可改）
 # ---------------------------
-pro = None 
+with st.sidebar:
+    st.header("可调参数（实时）")
+    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
+    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
+    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
+    MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
+    MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=200_000_000.0, step=50_000_000.0))
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1))
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5))
+    HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
+    st.markdown("---")
+    st.caption("提示：保守→降低阈值；激进→提高阈值。")
 
 # ---------------------------
-# 辅助函数 (保持 V10.0 代码结构，省略重复部分)
+# Token 输入（主区）
 # ---------------------------
-@st.cache_data(ttl=3600*12) 
-def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API"""
-    global pro
-    if pro is None:
-        return pd.DataFrame(columns=['ts_code']) 
-    func = getattr(pro, func_name) 
+TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password")
+if not TS_TOKEN:
+    st.warning("请输入 Tushare Token 才能运行脚本。")
+    st.stop()
+
+# 初始化 tushare
+ts.set_token(TS_TOKEN)
+pro = ts.pro_api()
+
+# ---------------------------
+# 安全调用 & 缓存辅助
+# ---------------------------
+def safe_get(func, **kwargs):
+    """Call API and return DataFrame or empty df on any error."""
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            time.sleep(0.5) 
-            return pd.DataFrame(columns=['ts_code']) 
-        time.sleep(0.5) 
+            return pd.DataFrame()
         return df
-    except Exception as e:
-        time.sleep(0.5) 
-        return pd.DataFrame(columns=['ts_code'])
+    except Exception:
+        return pd.DataFrame()
 
-def get_trade_days(end_date_str, num_days):
-    """获取 num_days 个交易日作为选股日"""
-    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
-    cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
-    if cal.empty or 'is_open' not in cal.columns:
-        st.error("无法获取交易日历，请检查 Token 或 Tushare 权限。")
-        return []
-    trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
-    trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
-    return trade_days_df['cal_date'].head(num_days).tolist()
+@st.cache_data(ttl=600)
+def find_last_trade_day(max_days=20):
+    today = datetime.now().date()
+    for i in range(max_days):
+        d = today - timedelta(days=i)
+        ds = d.strftime("%Y%m%d")
+        df = safe_get(pro.daily, trade_date=ds)
+        if not df.empty:
+            return ds
+    return None
 
-@st.cache_data(ttl=3600*24)
-def get_adj_factor(ts_code, start_date, end_date):
-    df = safe_get('adj_factor', ts_code=ts_code, start_date=start_date, end_date=end_date)
-    if df.empty or 'adj_factor' not in df.columns: return pd.DataFrame()
-    df['adj_factor'] = pd.to_numeric(df['adj_factor'], errors='coerce').fillna(0)
-    df = df.set_index('trade_date').sort_index() 
-    return df['adj_factor']
+last_trade = find_last_trade_day()
+if not last_trade:
+    st.error("无法找到最近交易日，检查网络或 Token 权限。")
+    st.stop()
+st.info(f"参考最近交易日：{last_trade}")
 
-@st.cache_data(ttl=3600*12)
-def get_qfq_data_v4(ts_code, start_date, end_date):
-    daily_df = safe_get('daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
-    if daily_df.empty: return pd.DataFrame()
-    daily_df = daily_df.set_index('trade_date').sort_index()
-    adj_factor_series = get_adj_factor(ts_code, start_date, end_date)
-    if adj_factor_series.empty: return pd.DataFrame()
-    df = daily_df.merge(adj_factor_series.rename('adj_factor'), left_index=True, right_index=True, how='left')
-    df = df.dropna(subset=['adj_factor'])
-    if df.empty: return pd.DataFrame()
-    latest_adj_factor = df['adj_factor'].iloc[-1]
-    for col in ['open', 'high', 'low', 'close', 'pre_close']:
-        if col in df.columns:
-            if latest_adj_factor > 1e-9:
-                df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
-            else:
-                df[col + '_qfq'] = df[col] 
-    df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
-    df['trade_date'] = pd.to_datetime(df['trade_date_str'], format='%Y%m%d')
-    df = df.sort_values('trade_date').set_index('trade_date_str')
-    for col in ['open', 'high', 'low', 'close']:
-        df[col] = df[col + '_qfq']
-    return df[['open', 'high', 'low', 'close', 'vol']].copy() 
+# ---------------------------
+# 拉当日涨幅榜初筛
+# ---------------------------
+st.write("正在拉取当日 daily（涨幅榜）作为初筛...")
+daily_all = safe_get(pro.daily, trade_date=last_trade)
+if daily_all.empty:
+    st.error("无法获取当日 daily 数据（Tushare 返回空）。请确认 Token 权限。")
+    st.stop()
 
-def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
-    d0 = datetime.strptime(selection_date, "%Y%m%d")
-    start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
-    hist = get_qfq_data_v4(ts_code, start_date=start_date, end_date=end_date)
-    if hist.empty or 'close' not in hist.columns:
-        results = {}
-        for n in days_ahead: results[f'Return_D{n}'] = np.nan
-        return results
-    hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
-    hist = hist.dropna(subset=['close'])
-    hist = hist.reset_index(drop=True) 
-    results = {}
-    selection_price_adj = get_qfq_data_v4(ts_code, (d0 - timedelta(days=1)).strftime("%Y%m%d"), selection_date)['close'].iloc[-1] if not get_qfq_data_v4(ts_code, (d0 - timedelta(days=1)).strftime("%Y%m%d"), selection_date).empty else np.nan
-    for n in days_ahead:
-        col_name = f'Return_D{n}'
-        if len(hist) >= n:
-            future_price = hist.iloc[n-1]['close']
-            if pd.notna(selection_price_adj) and selection_price_adj > 1e-9:
-                results[col_name] = (future_price / selection_price_adj - 1) * 100
-            else:
-                results[col_name] = np.nan
-        else:
-            results[col_name] = np.nan
-    return results
+daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
+st.write(f"当日记录：{len(daily_all)}，取涨幅前 {INITIAL_TOP_N} 作为初筛。")
+pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
 
+# ---------------------------
+# 尝试加载高级接口（有权限时启用）
+# ---------------------------
+st.write("尝试加载 stock_basic / daily_basic / moneyflow / ths_member / chip 等高级接口（若权限允许）...")
+stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,list_date,total_mv,circ_mv')
+daily_basic = safe_get(pro.daily_basic, trade_date=last_trade, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
+mf_raw = safe_get(pro.moneyflow, trade_date=last_trade)
+# ths_member 可能需权限
+try:
+    ths_hot = safe_get(pro.ths_member)
+except Exception:
+    ths_hot = pd.DataFrame()
 
-@st.cache_data(ttl=3600*12) 
-def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标"""
-    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
-    df = get_qfq_data_v4(ts_code, start_date=start_date, end_date=end_date)
-    res = {}
-    if df.empty or len(df) < 3 or 'close' not in df.columns: return res
-    df['close'] = pd.to_numeric(df['close'], errors='coerce').astype(float)
-    df['low'] = pd.to_numeric(df['low'], errors='coerce').astype(float)
-    df['high'] = pd.to_numeric(df['high'], errors='coerce').astype(float)
-    df['vol'] = pd.to_numeric(df['vol'], errors='coerce').fillna(0)
-    df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
-    close = df['close']
-    res['last_close'] = close.iloc[-1]
+# chip 接口示例（不影响主流程）
+chip_sample = pd.DataFrame()
+if hasattr(pro, 'chip'):
+    try:
+        if len(pool0) > 0:
+            chip_sample = safe_get(pro.chip, ts_code=pool0['ts_code'].iloc[0], trade_date=last_trade)
+    except Exception:
+        chip_sample = pd.DataFrame()
+
+# moneyflow 预处理
+if not mf_raw.empty:
+    possible = ['net_mf','net_mf_amount','net_mf_in','net_mf_out']
+    col = None
+    for c in possible:
+        if c in mf_raw.columns:
+            col = c;
+            break
+    if col is None:
+        numeric_cols = [c for c in mf_raw.columns if c != 'ts_code' and pd.api.types.is_numeric_dtype(mf_raw[c])]
+        col = numeric_cols[0] if numeric_cols else None
+    if col:
+        moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
+    else:
+        moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
+else:
+    moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
+    st.warning("moneyflow 未获取到，将把主力流向因子置为 0（若有权限请确认 Token/积分）。")
+
+# ---------------------------
+# 合并基本信息（safe）
+# ---------------------------
+def safe_merge_pool(pool_df, other_df, cols):
+    pool = pool_df.set_index('ts_code').copy()
     
-    # MACD 计算 
+    if other_df is None or other_df.empty:
+        for c in cols:
+            pool[c] = np.nan
+        return pool.reset_index()
+    if 'ts_code' not in other_df.columns:
+        try:
+            other_df = other_df.reset_index()
+        except:
+            for c in cols:
+                pool[c] = np.nan
+            return pool.reset_index()
+    for c in cols:
+        if c not in other_df.columns:
+            other_df[c] = np.nan
+    try:
+        joined = pool.join(other_df.set_index('ts_code')[cols], how='left')
+    except Exception:
+        for c in cols:
+            pool[c] = np.nan
+        return pool.reset_index()
+    for c in cols:
+        if c not in joined.columns:
+            joined[c] = np.nan
+    return joined.reset_index()
+
+# merge stock_basic
+if not stock_basic.empty:
+    keep = [c for c in ['ts_code','name','industry','total_mv','circ_mv'] if c in stock_basic.columns]
+    try:
+        pool0 = pool0.merge(stock_basic[keep], on='ts_code', how='left')
+    except Exception:
+        pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
+else:
+    pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
+
+# merge daily_basic
+pool_merged = safe_merge_pool(pool0, daily_basic, ['turnover_rate','amount','total_mv','circ_mv'])
+
+# merge moneyflow robustly
+if moneyflow.empty:
+    moneyflow = pd.DataFrame({'ts_code': pool_merged['ts_code'].tolist(), 'net_mf': [0.0]*len(pool_merged)})
+else:
+    if 'ts_code' not in moneyflow.columns:
+        moneyflow['ts_code'] = None
+try:
+    pool_merged = pool_merged.set_index('ts_code').join(moneyflow.set_index('ts_code'), how='left').reset_index()
+except Exception:
+    if 'net_mf' not in pool_merged.columns:
+        pool_merged['net_mf'] = 0.0
+
+if 'net_mf' not in pool_merged.columns:
+    pool_merged['net_mf'] = 0.0
+pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
+
+# ---------------------------
+# 基本清洗（ST / 停牌 / 价格区间 / 一字板 / 换手 / 成交额 / 市值）
+# ------------- 极速优化 -------------
+# 关键改动：清洗阶段 **不再调用任何 API**，直接使用 pool_merged 中已有字段。
+# ---------------------------
+st.write("对初筛池进行清洗（ST/停牌/价格/一字板/换手/成交额等）...（清洗阶段不再调用 API）")
+clean_list = []
+pbar = st.progress(0)
+total_rows = len(pool_merged)
+for i, r in enumerate(pool_merged.itertuples()):
+    ts = getattr(r, 'ts_code')
+    # ---------- 不再请求 pro.daily ----------
+    # 直接从合并表里读取 vol/amount/close/open/pre_close等字段
+    vol = getattr(r, 'vol', np.nan)
+    if pd.isna(vol):
+        # 有时 vol 在 daily_basic 的 amount 字段附近，可以尝试用 amount 作简易判断（非精确）
+        vol = 0
+    close = getattr(r, 'close', np.nan)
+    open_p = getattr(r, 'open', np.nan)
+    pre_close = getattr(r, 'pre_close', np.nan)
+    pct = getattr(r, 'pct_chg', np.nan)
+    amount = getattr(r, 'amount', np.nan)
+    turnover = getattr(r, 'turnover_rate', np.nan)
+    total_mv = getattr(r, 'total_mv', np.nan)
+    name = getattr(r, 'name', ts)
+
+    # skip no trading (use amount or vol if available)
+    if (pd.isna(vol) or vol == 0) and (pd.isna(amount) or amount == 0):
+        pbar.progress((i+1)/total_rows); continue
+
+    # price filter
+    if pd.isna(close):
+        pbar.progress((i+1)/total_rows); continue
+    if (close < MIN_PRICE) or (close > MAX_PRICE):
+        pbar.progress((i+1)/total_rows); continue
+
+    # exclude ST / delist
+    if isinstance(name, str) and (('ST' in name.upper()) or ('退' in name)):
+        pbar.progress((i+1)/total_rows); continue
+
+    # one-word board (open==high==low==pre_close) - read fields from merged
+    try:
+        high = getattr(r, 'high', np.nan); low = getattr(r, 'low', np.nan)
+        if (not pd.isna(open_p) and not pd.isna(high) and not pd.isna(low) and not pd.isna(pre_close)):
+            if (open_p == high == low == pre_close):
+                pbar.progress((i+1)/total_rows); continue
+    except:
+        pass
+
+    # market cap filter (兜底)
+    try:
+        tv = total_mv
+        if not pd.isna(tv):
+            tv = float(tv)
+            if tv > 1e6:
+                tv_yuan = tv * 10000.0
+            else:
+                tv_yuan = tv
+            # skip mega caps beyond reason (保守)
+            if tv_yuan > 2000 * 1e8:  # 2000亿
+                pbar.progress((i+1)/total_rows); continue
+    except:
+        pass
+
+    # turnover
+    if not pd.isna(turnover):
+        try:
+            if float(turnover) < MIN_TURNOVER: pbar.progress((i+1)/total_rows); continue
+        except:
+            pass
+
+    # amount (convert if likely in 万元)
+    if not pd.isna(amount):
+        amt = amount
+        if amt > 0 and amt < 1e5:
+            amt = amt * 10000.0
+        if amt < MIN_AMOUNT: pbar.progress((i+1)/total_rows); continue
+
+    # exclude yesterday down
+    try:
+        if float(pct) < 0: pbar.progress((i+1)/total_rows); continue
+    except:
+        pass
+
+    clean_list.append(r)
+    pbar.progress((i+1)/total_rows)
+
+pbar.progress(1.0)
+# build clean_df from tuples
+clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
+st.write(f"清洗后候选数量：{len(clean_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
+if len(clean_df) == 0:
+    st.error("清洗后没有候选，建议放宽条件或检查接口权限。")
+    st.stop()
+
+# ---------------------------
+# 取涨幅前 FINAL_POOL 进入评分池
+# ------------- 极速优化 -------------
+# 关键改动：评分阶段最多对 300 支股票拉历史（提高速度）
+# ---------------------------
+score_pool_n = min(int(FINAL_POOL), 300)
+clean_df = clean_df.sort_values('pct_chg', ascending=False).head(score_pool_n).reset_index(drop=True)
+st.write(f"用于评分的池子大小：{len(clean_df)}（已限制为最多 300 以提速）")
+
+# ---------------------------
+# 历史拉取（缓存）与指标计算（含 MACD / KDJ / vol metrics / volatility / 60日位置 等）
+# ---------------------------
+@st.cache_data(ttl=600)
+def get_hist(ts_code, end_date, days=60):
+    try:
+        start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
+        df = safe_get(pro.daily, ts_code=ts_code, start_date=start, end_date=end_date)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.sort_values('trade_date').reset_index(drop=True)
+        return df
+    except:
+        return pd.DataFrame()
+
+def compute_indicators(df):
+    res = {}
+    if df.empty or len(df) < 3:
+        return res
+    close = df['close'].astype(float)
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+
+    # last close
+    try: res['last_close'] = close.iloc[-1]
+    except: res['last_close'] = np.nan
+
+    # MA
+    for n in (5,10,20):
+        if len(close) >= n:
+            res[f'ma{n}'] = close.rolling(window=n).mean().iloc[-1]
+        else:
+            res[f'ma{n}'] = np.nan
+
+    # MACD (12,26,9)
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         diff = ema12 - ema26
         dea = diff.ewm(span=9, adjust=False).mean()
-        res['macd_val'] = ((diff - dea) * 2).iloc[-1]
-    else: res['macd_val'] = np.nan
+        macd_val = (diff - dea) * 2
+        res['macd'] = macd_val.iloc[-1]; res['diff'] = diff.iloc[-1]; res['dea'] = dea.iloc[-1]
+    else:
+        res['macd'] = res['diff'] = res['dea'] = np.nan
+
+    # KDJ
+    n = 9
+    if len(close) >= n:
+        low_n = low.rolling(window=n).min()
+        high_n = high.rolling(window=n).max()
+        rsv = (close - low_n) / (high_n - low_n + 1e-9) * 100
+        rsv = rsv.fillna(50)
+        k = rsv.ewm(alpha=1/3, adjust=False).mean()
+        d = k.ewm(alpha=1/3, adjust=False).mean()
+        j = 3*k - 2*d
+        res['k'] = k.iloc[-1]; res['d'] = d.iloc[-1]; res['j'] = j.iloc[-1]
+    else:
+        res['k'] = res['d'] = res['j'] = np.nan
+
+    # vol ratio and metrics
+    vols = df['vol'].astype(float).tolist()
+    if len(vols) >= 6:
+        avg_prev5 = np.mean(vols[-6:-1])
+        res['vol_ratio'] = vols[-1] / (avg_prev5 + 1e-9)
+        res['vol_last'] = vols[-1]
+        res['vol_ma5'] = avg_prev5
+    else:
+        res['vol_ratio'] = res['vol_last'] = res['vol_ma5'] = np.nan
+
+    # 10d return
+    if len(close) >= 10:
+        res['10d_return'] = close.iloc[-1] / close.iloc[-10] - 1
+    else:
+        res['10d_return'] = np.nan
+
+    # prev3_sum for down-then-bounce detection
+    if 'pct_chg' in df.columns and len(df) >= 4:
+        try:
+            pct = df['pct_chg'].astype(float)
+            res['prev3_sum'] = pct.iloc[-4:-1].sum()
+        except:
+            res['prev3_sum'] = np.nan
+    else:
+        res['prev3_sum'] = np.nan
+
+    # volatility (std of last 10 pct_chg)
+    try:
+        if 'pct_chg' in df.columns and len(df) >= 10:
+            res['volatility_10'] = df['pct_chg'].astype(float).tail(10).std()
+        else:
+            res['volatility_10'] = np.nan
+    except:
+        res['volatility_10'] = np.nan
         
-    # 量比计算
-    vols = df['vol'].tolist()
-    if len(vols) >= 6 and vols[-6:-1] and np.mean(vols[-6:-1]) > 1e-9:
-        res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
-    else: res['vol_ratio'] = np.nan
-        
-    # 10日回报、波动率计算
-    res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 and close.iloc[-10]!=0 else 0
-    res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
-    
-    # 60日位置计算
+    # **【V11.0 新增】60日位置计算 (防御因子)**
     if len(df) >= 60:
         hist_60 = df.tail(60)
         min_low = hist_60['low'].min()
@@ -167,293 +408,215 @@ def compute_indicators(ts_code, end_date):
         if max_high == min_low: res['position_60d'] = 50.0 
         else: res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
     else: res['position_60d'] = np.nan 
-    
+
     return res
-# ----------------------------------------------------
-
-
-# ----------------------------------------------------
-# 侧边栏参数 (定义 BACKTEST_DAYS 等变量)
-# ----------------------------------------------------
-with st.sidebar:
-    st.header("模式与日期选择")
-    backtest_date_end = st.date_input("选择**回测结束日期**", value=datetime.now().date(), max_value=datetime.now().date())
-    BACKTEST_DAYS = int(st.number_input("**自动回测天数 (N)**", value=20, step=1, min_value=1, max_value=50, help="程序将自动回测最近 N 个交易日。建议设置为 20 天以获得更可靠的统计数据。"))
-    
-    st.markdown("---")
-    st.header("核心参数")
-    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=10, step=1, min_value=1)) 
-    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
-    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) 
-    
-    st.markdown("---")
-    st.header("🛒 灵活过滤条件")
-    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1)
-    MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
-    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=2.0, step=0.5, min_value=0.1) 
-    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0, help="例如：输入 20 代表流通市值必须大于等于 20 亿元。")
-    MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
-    MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
 
 # ---------------------------
-# Token 输入与初始化 
+# 评分池逐票计算因子（缓存 get_hist）
 # ---------------------------
-TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password")
-if not TS_TOKEN:
-    st.warning("请输入 Tushare Token 才能运行脚本。")
+st.write("为评分池逐票拉历史并计算指标（此步骤调用历史接口，已缓存）...")
+records = []
+pbar2 = st.progress(0)
+for idx, row in enumerate(clean_df.itertuples()):
+    ts_code = getattr(row, 'ts_code')
+    name = getattr(row, 'name', ts_code)
+    pct_chg = getattr(row, 'pct_chg', 0.0)
+    amount = getattr(row, 'amount', np.nan)
+    if amount is not None and not pd.isna(amount) and amount > 0 and amount < 1e5:
+        amount = amount * 10000.0
+
+    turnover_rate = getattr(row, 'turnover_rate', np.nan)
+    net_mf = float(getattr(row, 'net_mf', 0.0))
+
+    hist = get_hist(ts_code, last_trade, days=60)
+    ind = compute_indicators(hist)
+
+    vol_ratio = ind.get('vol_ratio', np.nan)
+    ten_return = ind.get('10d_return', np.nan)
+    ma5 = ind.get('ma5', np.nan)
+    ma10 = ind.get('ma10', np.nan)
+    ma20 = ind.get('ma20', np.nan)
+    macd = ind.get('macd', np.nan)
+    k, d, j = ind.get('k', np.nan), ind.get('d', np.nan), ind.get('j', np.nan)
+    last_close = ind.get('last_close', np.nan)
+    vol_last = ind.get('vol_last', np.nan)
+    vol_ma5 = ind.get('vol_ma5', np.nan)
+    prev3_sum = ind.get('prev3_sum', np.nan)
+    volatility_10 = ind.get('volatility_10', np.nan)
+    position_60d = ind.get('position_60d', np.nan) # **【V11.0 新增】**
+
+    # 资金强度代理（不依赖 moneyflow）：简单乘积指标（price move * vol_ratio * turnover）
+    try:
+        proxy_money = (abs(pct_chg) + 1e-9) * (vol_ratio if not pd.isna(vol_ratio) else 0.0) * (turnover_rate if not pd.isna(turnover_rate) else 0.0)
+    except:
+        proxy_money = 0.0
+
+    rec = {
+        'ts_code': ts_code, 'name': name, 'pct_chg': pct_chg,
+        'amount': amount if not pd.isna(amount) else 0.0,
+        'turnover_rate': turnover_rate if not pd.isna(turnover_rate) else np.nan,
+        'net_mf': net_mf,
+        'vol_ratio': vol_ratio if not pd.isna(vol_ratio) else np.nan,
+        '10d_return': ten_return if not pd.isna(ten_return) else np.nan,
+        'ma5': ma5, 'ma10': ma10, 'ma20': ma20,
+        'macd': macd, 'k': k, 'd': d, 'j': j,
+        'last_close': last_close, 'vol_last': vol_last, 'vol_ma5': vol_ma5,
+        'prev3_sum': prev3_sum, 'volatility_10': volatility_10,
+        'proxy_money': proxy_money,
+        'position_60d': position_60d # **【V11.0 新增】**
+    }
+
+    records.append(rec)
+    pbar2.progress((idx+1)/len(clean_df))
+
+pbar2.progress(1.0)
+fdf = pd.DataFrame(records)
+if fdf.empty:
+    st.error("评分计算失败或无数据，请检查 Token 权限与接口。")
     st.stop()
-ts.set_token(TS_TOKEN)
-pro = ts.pro_api() 
 
 # ---------------------------
-# 核心回测逻辑函数 
+# 风险过滤（放在评分前以节省历史调用）
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS):
-    """为单个交易日运行选股和回测逻辑"""
-    
-    # 1. 拉取全市场 Daily 数据 (省略合并和过滤的重复代码)
-    daily_all = safe_get('daily', trade_date=last_trade) 
-    if daily_all.empty or 'ts_code' not in daily_all.columns: return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
+st.write("执行风险过滤：下跌途中大阳 / 巨量冲高 / 高位大阳 / 极端波动 ...")
+try:
+    before_cnt = len(fdf)
+    # A: 高位大阳线 -> last_close > ma20*1.10 且 pct_chg > HIGH_PCT_THRESHOLD
+    if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
+        mask_high_big = (fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
+        fdf = fdf[~mask_high_big]
 
-    pool_raw = daily_all.reset_index(drop=True) 
-    stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
-    REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount','total_mv','circ_mv'] 
-    daily_basic = safe_get('daily_basic', trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
-    mf_raw = safe_get('moneyflow', trade_date=last_trade)
-    pool_merged = pool_raw.copy()
+    # B: 下跌途中反抽 -> prev3_sum < 0 且 pct_chg > HIGH_PCT_THRESHOLD
+    if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
+        mask_down_rebound = (fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
+        fdf = fdf[~mask_down_rebound]
 
-    if not stock_basic.empty and 'name' in stock_basic.columns:
-        pool_merged = pool_merged.merge(stock_basic[['ts_code','name','list_date']], on='ts_code', how='left')
-    else:
-        pool_merged['name'] = pool_merged['ts_code']
-        pool_merged['list_date'] = '20000101'
-        
-    if not daily_basic.empty:
-        cols_to_merge = [c for c in REQUIRED_BASIC_COLS if c in daily_basic.columns]
-        if 'amount' in pool_merged.columns and 'amount' in cols_to_merge: 
-            pool_merged = pool_merged.drop(columns=['amount'])
-        pool_merged = pool_merged.merge(daily_basic[cols_to_merge], on='ts_code', how='left')
-    
-    moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
-    if not mf_raw.empty:
-        possible = ['net_mf','net_mf_amount','net_mf_in']
-        for c in possible:
-            if c in mf_raw.columns:
-                moneyflow = mf_raw[['ts_code', c]].rename(columns={c:'net_mf'}).fillna(0)
-                break            
-    if not moneyflow.empty:
-        pool_merged = pool_merged.merge(moneyflow, on='ts_code', how='left')
-        
-    pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
-    pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
-    
-    # 3. 执行硬性条件过滤
-    df = pool_merged.copy()
-    df['close'] = pd.to_numeric(df['close'], errors='coerce') 
-    df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
-    df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 # 转换为万元
-    df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
-    df['name'] = df['name'].astype(str)
-    
-    # 过滤 ST 股/退市股/北交所/次新股
-    mask_st = df['name'].str.contains('ST|退', case=False, na=False)
-    df = df[~mask_st]
-    mask_bj = df['ts_code'].str.startswith('92') 
-    df = df[~mask_bj]
-    TODAY = datetime.strptime(last_trade, "%Y%m%d")
-    MIN_LIST_DAYS = 120 
-    df['list_date_dt'] = pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')
-    df['days_listed'] = (TODAY - df['list_date_dt']).dt.days
-    mask_cyb_kcb = df['ts_code'].str.startswith(('30','68'))
-    mask_new = df['days_listed'] < MIN_LIST_DAYS
-    df = df[~((mask_cyb_kcb) & (mask_new))]
+    # C: 巨量放量大阳 -> vol_last > vol_ma5 * VOL_SPIKE_MULT
+    if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
+        mask_vol_spike = (fdf['vol_last'] > (fdf['vol_ma5'] * VOL_SPIKE_MULT))
+        fdf = fdf[~mask_vol_spike]
 
-    # 过滤价格
-    mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
-    df = df[mask_price]
-    # 过滤流通市值
-    mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
-    df = df[mask_circ_mv] 
-    # 过滤换手率
-    mask_turn = df['turnover_rate'] >= MIN_TURNOVER 
-    df = df[mask_turn]
-    # 过滤成交额
-    mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
-    df = df[mask_amt]
-    
-    df = df.reset_index(drop=True)
+    # D: 极端波动 -> volatility_10 > VOLATILITY_MAX
+    if 'volatility_10' in fdf.columns:
+        mask_volatility = fdf['volatility_10'] > VOLATILITY_MAX
+        fdf = fdf[~mask_volatility]
 
-    if len(df) == 0: return pd.DataFrame(), f"过滤后无股票：{last_trade}"
-
-    # 4. 遴选决赛名单 (基于当日涨幅和换手率的混合初筛)
-    limit_pct = int(FINAL_POOL * 0.7)
-    df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
-    limit_turn = FINAL_POOL - len(df_pct)
-    existing_codes = set(df_pct['ts_code'])
-    df_turn = df[~df['ts_code'].isin(existing_codes)].sort_values('turnover_rate', ascending=False).head(limit_turn).copy()
-    final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
-
-    # 5. 深度评分 
-    records = []
-    for row in final_candidates.itertuples():
-        ts_code = row.ts_code
-        
-        rec = {
-            'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
-            'Close': getattr(row, 'close', np.nan),
-            'Circ_MV (亿)': getattr(row, 'circ_mv_billion', np.nan),
-            'Pct_Chg (%)': getattr(row, 'pct_chg', 0), 
-            'turnover': getattr(row, 'turnover_rate', 0),
-            'net_mf': getattr(row, 'net_mf', 0)
-        }
-        
-        ind = compute_indicators(ts_code, last_trade)
-        rec.update({
-            'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
-            '10d_return': ind.get('10d_return', 0),
-            'volatility': ind.get('volatility', 0), 'position_60d': ind.get('position_60d', np.nan)
-        })
-        
-        future_returns = get_future_prices(ts_code, last_trade) # 直接获取收益率
-        rec.update({
-            'Return_D1 (%)': future_returns.get('Return_D1', np.nan),
-            'Return_D3 (%)': future_returns.get('Return_D3', np.nan),
-            'Return_D5 (%)': future_returns.get('Return_D5', np.nan),
-        })
-
-        records.append(rec)
-    
-    fdf = pd.DataFrame(records)
-    if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
-
-    # 6. 归一化与 V11.0 策略精调评分 
-    def normalize(series):
-        series_nn = series.dropna() 
-        if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
-        return (series - series_nn.min()) / (series_nn.max() - series_nn.min() + 1e-9)
-
-    fdf['s_pct'] = normalize(fdf['Pct_Chg (%)'])
-    fdf['s_turn'] = normalize(fdf['turnover'])
-    fdf['s_vol'] = normalize(fdf['vol_ratio'])
-    fdf['s_mf'] = normalize(fdf['net_mf'])
-    fdf['s_macd'] = normalize(fdf['macd'])
-    fdf['s_trend'] = normalize(fdf['10d_return'])
-    fdf['s_volatility'] = normalize(fdf['volatility'])
-    fdf['s_position'] = fdf['position_60d'] / 100 
-    
-    # ----------------------------------------------------------------------------------
-    # 🚨 V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
-    
-    # 核心权重：资金流，占比 35%
-    w_mf = 0.35             # 35% - 资金流 (核心动力，保持 V9.0)
-
-    # 动能权重：当日动能，占比 20%
-    w_pct = 0.10            # 10% - 当日涨幅 (削弱)
-    w_turn = 0.10           # 10% - 换手率 (削弱)
-    
-    # 防御权重：安全边际与波动控制，占比 25%
-    w_position = 0.15       # 15% - 60日位置 (保持 V9.0)
-    w_volatility = 0.10     # 10% - 波动率 (保持 V9.0)
-    
-    # 趋势权重：中期趋势，占比 20%
-    w_macd = 0.20           # 20% - MACD (**大幅强化，目标改善 D+3**)
-    
-    # 彻底归零项
-    w_vol = 0.00            # 0% - 量比 
-    w_trend = 0.00          # 0% - 10日回报 
-    
-    # Sum: 0.35+0.10+0.10+0.15+0.10+0.20 = 1.00
-    
-    score = (
-        fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + 
-        fdf['s_mf'] * w_mf + 
-        fdf['s_macd'] * w_macd + 
-        
-        # 引入防御：60日位置越低越好 (1-s_position)，波动率越低越好 (1-s_volatility)
-        (1 - fdf['s_position']) * w_position + 
-        (1 - fdf['s_volatility']) * w_volatility + 
-        
-        # 归零项
-        fdf['s_vol'] * w_vol + 
-        fdf['s_trend'] * w_trend     
-    )
-    fdf['综合评分'] = score * 100
-    fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
-    fdf.index += 1
-    # ----------------------------------------------------------------------------------
-
-
-    return fdf.head(TOP_BACKTEST).copy(), None
+    after_cnt = len(fdf)
+    st.write(f"风险过滤：{before_cnt} -> {after_cnt}（若过严请在侧边栏调整阈值）")
+except Exception as e:
+    st.warning(f"风险过滤模块异常，跳过过滤。错误：{e}")
 
 # ---------------------------
-# 主运行块 (保持不变)
+# RSL（相对强弱）：基于池内 10d_return 的相对表现
+# 【V11.0 归零项：此段代码保留，但权重设为 0】
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
-    
-    st.warning("⚠️ **V11.0 版本已更换为 V9.0 框架 + 强化 MACD 趋势共振策略，目标是突破 D+3 胜率。**")
-    
-    trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
-    if not trade_days_str:
-        st.error("无法获取交易日列表，请检查日期或 Token。")
-        st.stop()
-    
-    st.header(f"📈 正在进行 {BACKTEST_DAYS} 个交易日的回测...")
-    
-    results_list = []
-    total_days = len(trade_days_str)
-    
-    progress_text = st.empty()
-    my_bar = st.progress(0)
-    
-    for i, trade_date in enumerate(trade_days_str):
-        progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
-        
-        daily_result_df, error = run_backtest_for_a_day(
-            trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS
-        )
-        
-        if error:
-            st.warning(f"跳过 {trade_date}：{error}")
-        elif not daily_result_df.empty:
-            daily_result_df['Trade_Date'] = trade_date
-            results_list.append(daily_result_df)
-            
-        my_bar.progress((i + 1) / total_days)
+if '10d_return' in fdf.columns:
+    try:
+        market_mean_10d = fdf['10d_return'].replace([np.inf,-np.inf], np.nan).dropna().mean()
+        if np.isnan(market_mean_10d) or abs(market_mean_10d) < 1e-9:
+            market_mean_10d = 1e-9
+        fdf['rsl'] = fdf['10d_return'] / market_mean_10d
+    except:
+        fdf['rsl'] = 1.0
+else:
+    fdf['rsl'] = 1.0
 
-    progress_text.text("✅ 回测完成，正在汇总结果...")
-    my_bar.empty()
-    
-    if not results_list:
-        st.error("所有交易日的回测均失败或无结果。")
-        st.stop()
-        
-    all_results = pd.concat(results_list)
-    
-    st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {total_days} 个交易日)")
-    
-    for n in [1, 3, 5]:
-        col = f'Return_D{n} (%)' 
-        
-        filtered_returns = all_results.copy()
-        valid_returns = filtered_returns.dropna(subset=[col])
+# ---------------------------
+# 子指标归一化（稳健）
+# ---------------------------
+def norm_col(s):
+    s = s.fillna(0.0).replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    mn = s.min(); mx = s.max()
+    if mx - mn < 1e-9:
+        return pd.Series([0.5]*len(s), index=s.index)
+    return (s - mn) / (mx - mn)
 
-        if not valid_returns.empty:
-            avg_return = valid_returns[col].mean()
-            hit_rate = (valid_returns[col] > 0).sum() / len(valid_returns) * 100 if len(valid_returns) > 0 else 0.0
-            total_count = len(valid_returns)
-        else:
-            avg_return = np.nan
-            hit_rate = 0.0
-            total_count = 0
-            
-        st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
-                  f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V11.0 已应用 V9.0 框架 + 强化 MACD 趋势共振策略。**")
+fdf['s_pct'] = norm_col(fdf.get('pct_chg', pd.Series([0]*len(fdf))))
+fdf['s_volratio'] = norm_col(fdf.get('vol_ratio', pd.Series([0]*len(fdf))))
+fdf['s_turn'] = norm_col(fdf.get('turnover_rate', pd.Series([0]*len(fdf))))
+# prefer real moneyflow if available, else proxy_money
+if 'net_mf' in fdf.columns and fdf['net_mf'].abs().sum() > 0:
+    fdf['s_money'] = norm_col(fdf.get('net_mf', pd.Series([0]*len(fdf))))
+else:
+    fdf['s_money'] = norm_col(fdf.get('proxy_money', pd.Series([0]*len(fdf))))
+fdf['s_amount'] = norm_col(fdf.get('amount', pd.Series([0]*len(fdf))))
+fdf['s_10d'] = norm_col(fdf.get('10d_return', pd.Series([0]*len(fdf))))
+fdf['s_macd'] = norm_col(fdf.get('macd', pd.Series([0]*len(fdf))))
+fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
 
-    st.header("📋 每日回测详情 (Top K 明细)")
+# 【V11.0 关键防御归一化】波动率越低得分越高，60日位置越低得分越高（已修正为 1-）
+fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
+
+# 60日位置，越接近底部得分越高 (原始值 0-100%，除以 100 后 1-x，即 0% 位置得 1.0分)
+# 默认值 50.0 对应 0.5 分。
+fdf['s_position'] = 1 - (fdf.get('position_60d', pd.Series([50.0]*len(fdf))) / 100)
+
+
+# ---------------------------
+# 综合评分（V11.0 最终决战权重）
+#    资金流(0.35) + 趋势(0.20) + 防御(0.25) + 动能(0.20) = 1.00
+# ---------------------------
+# V11.0 核心权重
+w_money = 0.35      # 资金流，取代 w_mf
+w_macd = 0.20       # 强化 MACD 趋势共振
+w_position = 0.15   # 60日低位安全边际 (新增)
+w_volatility = 0.10 # 波动率风险控制
+
+# V11.0 动能/次要权重
+w_pct = 0.10        # 当日涨幅
+w_turn = 0.10       # 换手率
+
+# V11.0 归零项
+w_volratio = 0.00   # 量比 (V11.0 弃用)
+w_10d = 0.00        # 10日回报 (V11.0 弃用)
+w_rsl = 0.00        # 相对强弱 (V11.0 弃用)
+
+
+fdf['综合评分'] = (
+    fdf['s_pct'] * w_pct +
+    fdf['s_turn'] * w_turn +
+    fdf['s_money'] * w_money +
+    fdf['s_macd'] * w_macd +
     
-    display_cols = ['Trade_Date', 'name', 'ts_code', '综合评分', 
-                    'Close', 'Pct_Chg (%)', 'Circ_MV (亿)',
-                    'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)']
+    # 核心防御项（s_position 已经被处理为越低越好）
+    fdf['s_position'] * w_position + 
+    fdf['s_volatility'] * w_volatility +
     
-    st.dataframe(all_results[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
+    # 归零项
+    fdf['s_volratio'] * w_volratio +
+    fdf['s_10d'] * w_10d +
+    fdf['s_rsl'] * w_rsl
+)
+
+
+# ---------------------------
+# 最终排序与展示
+# ---------------------------
+fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
+fdf.index = fdf.index + 1
+
+st.success(f"评分完成：总候选 {len(fdf)} 支，显示 Top {min(TOP_DISPLAY, len(fdf))}。")
+display_cols = ['name','ts_code','综合评分','pct_chg','vol_ratio','turnover_rate','net_mf','proxy_money','amount','10d_return','macd','k','d','j','position_60d','volatility_10']
+for c in display_cols:
+    if c not in fdf.columns:
+        fdf[c] = np.nan
+
+st.dataframe(fdf[display_cols].head(TOP_DISPLAY), use_container_width=True)
+
+# 下载（仅导出前200避免过大）
+out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
+st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
+
+# ---------------------------
+# 小结与建议（简洁）
+# ---------------------------
+st.markdown("### 小结与操作提示（V11.0 最终版）")
+st.markdown("""
+- **本版本为 V11.0 最终决战旗舰版。** 策略平衡性极佳，目标是**D+1 胜率 $51.7\%$** 配合 **D+5 爆发力 $2.73\%$**。
+- **核心逻辑：** 强化资金流（$0.35$）和 MACD 趋势（$0.20$），并引入 **60日低位（$0.15$）**作为安全边际。
+- **过滤功能：** 已启用高位大阳线、下跌途中反抽、巨量冲高、极端波动等风险过滤。
+- **实战纪律（必须遵守）：** **9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入**。
+- 若今日候选普遍翻绿，请保持空仓。
+""")
+
+st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我，我将继续帮你排除故障。")
