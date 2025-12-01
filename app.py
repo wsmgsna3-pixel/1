@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.5 (极速优化 + 结构稳定最终版)
+选股王 · V11.6 (极速优化 + 结构稳定最终修正版)
 更新说明：
-1. 【**Bug 修复 V11.5**】：修复了代码末尾的 `SyntaxError: invalid character '：'` 错误。
-2. 【**Bug 修复 V11.4**】：修复了 get_future_prices 函数中 Line 142 处的 `SyntaxError: closing parenthesis ']'...` 错误。
-3. 【**性能优化 V11.3**】：移除 safe_get 函数中所有 time.sleep(0.5) 强制等待。
-4. 【**Bug 修复 V11.2**】：修复了资金流数据缺失导致的 KeyError: 'net_mf' 错误。
+1. 【**Bug 修复 V11.6**】：**修复了致命的 NameError**：重新添加了在 V11.5 中遗漏的 `get_trade_days` 核心函数定义，确保程序可以正常运行。
+2. 【**Bug 修复 V11.5**】：修复了代码末尾的 `SyntaxError: invalid character '：'` 错误。
+3. 【**Bug 修复 V11.4**】：修复了 get_future_prices 函数中 Line 142 处的括号不匹配错误。
+4. 【**性能优化 V11.3**】：移除 safe_get 函数中所有 time.sleep(0.5) 强制等待，充分利用 10,000 积分高权限。
 """
 
 import streamlit as st
@@ -20,9 +20,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.5 最终决战策略 (高速稳定版)", layout="wide")
-st.title("选股王 · V11.5 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
-st.markdown("🚀 **V11.5 极速稳定版已就绪。请测试 M=100 的回测速度。**")
+st.set_page_config(page_title="选股王 · V11.6 最终决战策略 (高速稳定版)", layout="wide")
+st.title("选股王 · V11.6 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
+st.markdown("🚀 **V11.6 最终修正版已就绪，修复了 NameError。请测试 M=100 的回测速度。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -33,6 +33,55 @@ MAX_SEARCH_DAYS = 15 # 最大往前查找天数
 # ---------------------------
 # 辅助函数 
 # ---------------------------
+
+# 🚨 V11.6 重新添加：交易日获取及日期回退函数
+def get_trade_days(end_date_str, num_days, mode="backtest"):
+    """
+    获取交易日列表。
+    - 在 'select' 模式下，如果 end_date_str 的数据缺失，则自动向前回退。
+    - 在 'backtest' 模式下，不进行回退，使用 num_days。
+    """
+    
+    # 1. 获取日历
+    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=MAX_SEARCH_DAYS * 2)).strftime("%Y%m%d")
+    cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
+    
+    if cal.empty or 'is_open' not in cal.columns:
+        st.error("无法获取交易日历，请检查 Token 或 Tushare 权限。")
+        return []
+        
+    trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
+    trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
+    
+    if trade_days_df.empty:
+        return []
+
+    # 2. 自动回退逻辑 (仅在选股模式或单日回测时，且数据拉取失败才触发)
+    if mode == "select" or num_days == 1:
+        # 尝试往前找 MAX_SEARCH_DAYS 个交易日
+        for i in range(min(len(trade_days_df), MAX_SEARCH_DAYS)):
+            check_date = trade_days_df['cal_date'].iloc[i]
+            
+            # 尝试拉取当日数据，判断数据是否已更新
+            check_data = safe_get('daily', trade_date=check_date)
+            
+            if not check_data.empty:
+                # 找到第一个有数据的交易日，并将其作为新的 end_date_str
+                if check_date != end_date_str:
+                    st.warning(f"⚠️ 原始日期 {end_date_str} 数据缺失，自动回退到最新可用交易日：{check_date}。")
+                
+                # 重新计算 trade_days_df，以 check_date 为结束日期
+                trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
+                trade_days_df = trade_days_df[trade_days_df['cal_date'] <= check_date]
+                
+                return trade_days_df['cal_date'].head(num_days).tolist()
+                
+        st.error(f"在最近 {MAX_SEARCH_DAYS} 个交易日内，均无法获取到任何股票数据，请检查数据源或 Tushare 权限。")
+        return []
+    
+    # 3. 多日回测模式 (直接返回指定天数)
+    return trade_days_df['cal_date'].head(num_days).tolist()
+
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
     """安全调用 Tushare API - 已移除 time.sleep(0.5)"""
@@ -432,7 +481,7 @@ def execute_run(mode, backtest_days):
     else:
         st.header(f"📈 正在进行 {backtest_days} 个交易日的**回测**...")
 
-    # 这里的 get_trade_days 包含了自动回退逻辑
+    # 这里的 get_trade_days 包含了自动回退逻辑 (现在函数已定义)
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), backtest_days, mode=mode)
     
     if not trade_days_str:
@@ -526,11 +575,11 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("🚀 今日选股 (1日)", key='select_button', help="使用最新的可用交易日数据进行选股。"):
-        st.warning("⚠️ **V11.5 极速稳定版已上线。请注意观察速度变化！**")
+        st.warning("⚠️ **V11.6 最终修正版已上线。请注意观察速度变化！**")
         execute_run("select", 1)
 
 with col2:
     if st.button(f"⏳ 开始 {BACKTEST_DAYS} 日自动回测", key='backtest_button', help="使用指定日期和天数进行历史回测。"):
-        st.warning("⚠️ **V11.5 极速稳定版已上线。请注意观察速度变化！**")
+        st.warning("⚠️ **V11.6 最终修正版已上线。请注意观察速度变化！**")
         execute_run("backtest", BACKTEST_DAYS)
 
