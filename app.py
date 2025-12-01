@@ -11,6 +11,8 @@
 功能：
 1. 当日选股 (旗舰模式)
 2. 历史回测 (验证模式)
+
+**【重要修正】**：已移除 pct_chg > 0 的硬性过滤，允许当日下跌但满足低位和资金流条件的股票入选。
 """
 
 import streamlit as st
@@ -25,9 +27,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.0 最终决战旗舰版（含回测）", layout="wide")
-st.title("选股王 · V11.0 最终决战旗舰版（含回测）")
-st.markdown("🎯 **本版本已集成 V11.0 最终权重，并加入了历史回测模块。**")
+st.set_page_config(page_title="选股王 · V11.0 最终决战旗舰版（修正版）", layout="wide")
+st.title("选股王 · V11.0 最终决战旗舰版（修正版 - 含回测）")
+st.markdown("🎯 **本版本已集成 V11.0 最终权重，并移除了当日涨幅 > 0 的硬性过滤，允许逆势低位吸筹股入选。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -212,9 +214,13 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     # 1. 拉取全市场 Daily 数据
     daily_all = safe_get('daily', trade_date=trade_date) 
     if daily_all.empty or 'ts_code' not in daily_all.columns: return pd.DataFrame(), f"数据缺失或拉取失败：{trade_date}"
+    
+    if not is_backtest:
+        st.write(f"当日记录：{len(daily_all)}，取涨幅前 {INITIAL_TOP_N} 作为初筛。")
 
     # 2. 初筛与数据合并
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
+    # 【性能优化】只对涨幅靠前的股票进行初筛，以减少后续合并和拉取历史数据的量。
     pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
     
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date,total_mv,circ_mv')
@@ -244,7 +250,7 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     
     df = pool_merged.copy()
     
-    # 3. 执行硬性条件过滤（与旗舰版逻辑一致）
+    # 3. 执行硬性条件过滤
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0)
@@ -267,9 +273,8 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     mask_amt = df['amount'] >= MIN_AMOUNT
     df = df[mask_amt]
     
-    mask_pct_chg = df['pct_chg'] > 0 # 剔除当日下跌的
-    df = df[mask_pct_chg]
-
+    # 【已修正】移除 mask_pct_chg = df['pct_chg'] > 0 的硬性过滤，允许当日下跌的股票入选。
+    
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票：{trade_date}"
     
     # 4. 限制评分池大小并进行深度评分
@@ -279,6 +284,7 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     
     # 使用 st.progress 显示进度条，仅在非回测模式下
     if not is_backtest:
+        st.write(f"已通过硬性过滤股票 {len(clean_df)} 支（取涨幅前 {min(int(FINAL_POOL), 300)} 支进入深度评分）")
         pbar = st.progress(0)
     
     for idx, row in enumerate(clean_df.itertuples()):
@@ -387,6 +393,17 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
 # ---------------------------
 if mode == "当日选股 (旗舰)":
     
+    def find_last_trade_day(max_days=20):
+        """Helper for daily mode"""
+        today = datetime.now().date()
+        for i in range(max_days):
+            d = today - timedelta(days=i)
+            ds = d.strftime("%Y%m%d")
+            df = safe_get('daily', trade_date=ds)
+            if not df.empty:
+                return ds
+        return None
+        
     last_trade = find_last_trade_day(20) # 寻找最近交易日
     if not last_trade:
         st.error("无法找到最近交易日，请检查网络或 Token 权限。")
@@ -404,7 +421,7 @@ if mode == "当日选股 (旗舰)":
         st.error(f"选股失败：{error}")
     elif not scored_df.empty:
         st.success(f"评分完成：总候选 {len(scored_df)} 支，显示 Top {min(TOP_DISPLAY, len(scored_df))}。")
-        display_cols = ['name','ts_code','综合评分','pct_chg','vol_ratio','turnover_rate','net_mf','position_60d','volatility_10']
+        display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','net_mf','position_60d','volatility_10']
         
         st.dataframe(scored_df[display_cols].head(TOP_DISPLAY), use_container_width=True)
         
@@ -489,15 +506,3 @@ elif mode == "历史回测":
                         'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)']
         
         st.dataframe(all_results[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
-
-
-def find_last_trade_day(max_days=20):
-    """Helper for daily mode"""
-    today = datetime.now().date()
-    for i in range(max_days):
-        d = today - timedelta(days=i)
-        ds = d.strftime("%Y%m%d")
-        df = safe_get('daily', trade_date=ds)
-        if not df.empty:
-            return ds
-    return None
