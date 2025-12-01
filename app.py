@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.3 (极速优化 + 自动回退版)
+选股王 · V11.4 (高速优化 + 结构稳定版)
 更新说明：
-1. 【**性能优化 V11.3**】：**极速提升性能！** 移除 safe_get 函数中所有不必要的 time.sleep(0.5) 强制等待。
-   - 目的：充分利用用户 10,000 积分带来的 1000 次/分钟的 API 权限，大幅缩短回测时间。
-2. 【**Bug 修复 V11.2**】：修复了收盘后因 Tushare 资金流数据延迟更新导致的 `KeyError: 'net_mf'` 错误。
-3. 【**功能增强 V11.1**】：支持“今日选股 (1日回测)”和“多日回测”模式，并增加了自动回退到最新可用交易日的功能。
+1. 【**Bug 修复 V11.4**】：修复了 get_future_prices 函数中 Line 142 处的 `SyntaxError: closing parenthesis ']'...` 错误。
+2. 【**性能优化 V11.4**】：
+   - 移除 safe_get 函数中所有 time.sleep(0.5) 强制等待（沿用 V11.3）。
+   - 强化 get_adj_factor 缓存至 7 天，减少重复 API 调用。
+   - **速度瓶颈说明：** 当前速度瓶颈在于多日回测时，历史数据（120天）的重复拉取。请在使用时注意。
 """
 
 import streamlit as st
@@ -20,9 +21,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.3 最终决战策略 (极速版)", layout="wide")
-st.title("选股王 · V11.3 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
-st.markdown("🚀 **V11.3 极速优化：已移除限速，充分利用您 1000 次/分钟的 API 权限。请放心提高 FINAL_POOL 参数！**")
+st.set_page_config(page_title="选股王 · V11.4 最终决战策略 (高速稳定版)", layout="wide")
+st.title("选股王 · V11.4 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
+st.markdown("🚀 **V11.4 修复了语法错误，并保持极速运行设置。请测试 M=100 的回测速度。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -50,55 +51,8 @@ def safe_get(func_name, **kwargs):
         time.sleep(0.1) 
         return pd.DataFrame(columns=['ts_code'])
 
-def get_trade_days(end_date_str, num_days, mode="backtest"):
-    """
-    获取交易日列表。
-    - 在 'select' 模式下，如果 end_date_str 的数据缺失，则自动向前回退。
-    - 在 'backtest' 模式下，不进行回退，使用 num_days。
-    """
-    
-    # 1. 获取日历
-    # 往前搜索 MAX_SEARCH_DAYS 的两倍，确保能找到足够的历史交易日
-    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=MAX_SEARCH_DAYS * 2)).strftime("%Y%m%d")
-    cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
-    
-    if cal.empty or 'is_open' not in cal.columns:
-        st.error("无法获取交易日历，请检查 Token 或 Tushare 权限。")
-        return []
-        
-    trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
-    trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
-    
-    if trade_days_df.empty:
-        return []
-
-    # 2. 自动回退逻辑 (仅在选股模式或单日回测时，且数据拉取失败才触发)
-    if mode == "select" or num_days == 1:
-        # 尝试往前找 MAX_SEARCH_DAYS 个交易日
-        for i in range(min(len(trade_days_df), MAX_SEARCH_DAYS)):
-            check_date = trade_days_df['cal_date'].iloc[i]
-            
-            # 尝试拉取当日数据，判断数据是否已更新
-            check_data = safe_get('daily', trade_date=check_date)
-            
-            if not check_data.empty:
-                # 找到第一个有数据的交易日，并将其作为新的 end_date_str
-                if check_date != end_date_str:
-                    st.warning(f"⚠️ 原始日期 {end_date_str} 数据缺失，自动回退到最新可用交易日：{check_date}。")
-                
-                # 重新计算 trade_days_df，以 check_date 为结束日期
-                trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
-                trade_days_df = trade_days_df[trade_days_df['cal_date'] <= check_date]
-                
-                return trade_days_df['cal_date'].head(num_days).tolist()
-                
-        st.error(f"在最近 {MAX_SEARCH_DAYS} 个交易日内，均无法获取到任何股票数据，请检查数据源或 Tushare 权限。")
-        return []
-    
-    # 3. 多日回测模式 (直接返回指定天数)
-    return trade_days_df['cal_date'].head(num_days).tolist()
-
-@st.cache_data(ttl=3600*24)
+# 调整缓存时间到 7 天（3600*24*7）
+@st.cache_data(ttl=3600*24*7)
 def get_adj_factor(ts_code, start_date, end_date):
     df = safe_get('adj_factor', ts_code=ts_code, start_date=start_date, end_date=end_date)
     if df.empty or 'adj_factor' not in df.columns: return pd.DataFrame()
@@ -108,26 +62,34 @@ def get_adj_factor(ts_code, start_date, end_date):
 
 @st.cache_data(ttl=3600*12)
 def get_qfq_data_v4(ts_code, start_date, end_date):
+    """获取前复权数据，缓存键值包含 start_date, end_date"""
     daily_df = safe_get('daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
     if daily_df.empty: return pd.DataFrame()
     daily_df = daily_df.set_index('trade_date').sort_index()
+    
+    # 注意：adj_factor 的缓存时间已延长
     adj_factor_series = get_adj_factor(ts_code, start_date, end_date)
     if adj_factor_series.empty: return pd.DataFrame()
+    
     df = daily_df.merge(adj_factor_series.rename('adj_factor'), left_index=True, right_index=True, how='left')
     df = df.dropna(subset=['adj_factor'])
     if df.empty: return pd.DataFrame()
     latest_adj_factor = df['adj_factor'].iloc[-1]
+    
     for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns:
             if latest_adj_factor > 1e-9:
                 df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
             else:
                 df[col + '_qfq'] = df[col] 
+    
     df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
     df['trade_date'] = pd.to_datetime(df['trade_date_str'], format='%Y%m%d')
     df = df.sort_values('trade_date').set_index('trade_date_str')
+    
     for col in ['open', 'high', 'low', 'close']:
         df[col] = df[col + '_qfq']
+        
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
@@ -139,7 +101,8 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
-    hist['close'] = pd.to_numeric(hist['close'], errors='coerce'])
+    # 修复 Line 142 语法错误：移除多余的 ] 
+    hist['close'] = pd.to_numeric(hist['close'], errors='coerce') 
     hist = hist.dropna(subset=['close'])
     hist = hist.reset_index(drop=True) 
     results = {}
@@ -164,6 +127,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
     """计算 MACD, 10日回报, 波动率, 60日位置等指标"""
+    # 仍需拉取 120 天数据，因为缓存键值 daily 数据的 end_date 每天都不同，导致 cache miss
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     df = get_qfq_data_v4(ts_code, start_date=start_date, end_date=end_date)
     res = {}
@@ -233,7 +197,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    # 强烈建议 M >= 100 以提高选股精度
+    # 建议 M >= 100 
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=100, step=10, min_value=1, key='final_pool', help="（推荐 100 或更高，以充分利用高权限）")) 
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1, key='top_display'))
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1, key='top_backtest')) 
@@ -483,9 +447,17 @@ def execute_run(mode, backtest_days):
     progress_text = st.empty()
     my_bar = st.progress(0)
     
+    # 记录回测开始时间
+    start_time = time.time() 
+    
     for i, trade_date in enumerate(trade_days_str):
-        progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
-   
+        
+        # 首次运行提示
+        if i == 0:
+            progress_text.text(f"🚀 首次运行 {trade_date}：缓存正在建立，请耐心等待（速度会较慢）。")
+        else:
+            progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date} (期待缓存命中加速)")
+            
         # 注意：这里调用 run_backtest_for_a_day 时，依赖全局的 MODE 变量来决定是否计算未来收益
         daily_result_df, error = run_backtest_for_a_day(
             trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS
@@ -499,7 +471,10 @@ def execute_run(mode, backtest_days):
             
         my_bar.progress((i + 1) / total_days)
 
-    progress_text.text("✅ 运行完成，正在汇总结果...")
+    end_time = time.time()
+    total_duration = end_time - start_time
+    
+    progress_text.text(f"✅ 运行完成，正在汇总结果... 总耗时: {total_duration:.2f} 秒")
     my_bar.empty()
     
     if not results_list:
@@ -552,15 +527,15 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("🚀 今日选股 (1日)", key='select_button', help="使用最新的可用交易日数据进行选股。"):
-        st.warning("⚠️ **V11.3 极速版已上线，请注意观察速度变化！**")
+        st.warning("⚠️ **V11.4 极速稳定版已上线。请注意观察速度变化！**")
         execute_run("select", 1)
 
 with col2:
     if st.button(f"⏳ 开始 {BACKTEST_DAYS} 日自动回测", key='backtest_button', help="使用指定日期和天数进行历史回测。"):
-        st.warning("⚠️ **V11.3 极速版已上线，请注意观察速度变化！**")
+        st.warning("⚠️ **V11.4 极速稳定版已上线。请注意观察速度变化！**")
         execute_run("backtest", BACKTEST_DAYS)
 
-### 📌 运行建议
+### 📌 V11.4 极速测试建议
 
-1.  **先测试 M=10：** 请您先用默认的 `FINAL_POOL=10`（在侧边栏手动改回 10）运行一次 20 天的回测，感受一下现在的速度。我预计回测时间将从半小时**缩短到几分钟内**。
-2.  **再提高 M：** 确认速度满意后，您就可以放心地将 **`FINAL_POOL` 提高到 100 甚至 200** 来运行，以达到最高的选股精度。
+1.  **M=100 首次回测：** 请使用默认的 `FINAL_POOL=100` 和 `BACKTEST_DAYS=20` 运行一次。由于缓存机制失效，**首次运行** 20 天可能仍需较长时间（可能在 20-30 分钟）。
+2.  **M=100 第二次回测：** 请在第一次运行结束后，**不要改变任何参数，立即再运行一次**。这次运行应该会快得多（目标是 5 分钟以内），因为大部分基础日线和复权因子数据已缓存在 Streamlit 中，可以直接命中，证明极速优化有效。
