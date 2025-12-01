@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.1 (自动回退版本)
+选股王 · V11.2 (自动回退 + KeyError修复版)
 更新说明：
-1. 【**功能增强 V11.1**】：
+1. 【**Bug 修复 V11.2**】：修复了收盘后因 Tushare 资金流数据（moneyflow）延迟更新导致的 `KeyError: 'net_mf'` 错误。代码现在能够健壮地处理资金流数据缺失或滞后的情况。
+2. 【**功能增强 V11.1**】：
    - 增加**模式选择**：支持“今日选股 (1日回测)”和“多日回测”。
-   - **核心改动**：修改 get_trade_days 函数，使其在数据未更新时，自动选择**上一个有数据的交易日**进行选股/回测，解决了收盘后数据滞后导致回测失败的问题。
+   - **核心改动**：修改 get_trade_days 函数，使其在数据未更新时，自动选择**上一个有数据的交易日**进行选股/回测。
 """
 
 import streamlit as st
@@ -19,9 +20,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.1 最终决战策略 (自动回退版)", layout="wide")
-st.title("选股王 · V11.1 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
-st.markdown("🎯 **V11.1 策略：增加了自动回退功能，确保收盘后数据未更新时，仍能使用最新的可用数据进行选股。**")
+st.set_page_config(page_title="选股王 · V11.2 最终决战策略 (自动回退 + 修复版)", layout="wide")
+st.title("选股王 · V11.2 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
+st.markdown("🎯 **V11.2 策略：已修复收盘后运行可能出现的 `KeyError`，确保选股流程健壮运行。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -74,9 +75,6 @@ def get_trade_days(end_date_str, num_days, mode="backtest"):
 
     # 2. 自动回退逻辑 (仅在选股模式或单日回测时，且数据拉取失败才触发)
     if mode == "select" or num_days == 1:
-        # 检查最新交易日的数据是否可用（通过尝试拉取日线数据来判断）
-        latest_trade_day = trade_days_df['cal_date'].iloc[0]
-        
         # 尝试往前找 MAX_SEARCH_DAYS 个交易日
         for i in range(min(len(trade_days_df), MAX_SEARCH_DAYS)):
             check_date = trade_days_df['cal_date'].iloc[i]
@@ -221,12 +219,13 @@ with st.sidebar:
     
     run_mode = st.radio("选择运行模式", 
                         ("今日选股 (自动匹配最新可用日)", "多日回测 (指定天数)"),
+                        key='run_mode', # 添加key以确保唯一性
                         help="选股模式：自动寻找最新有数据的交易日，仅回测 1 天。回测模式：按您指定的日期和天数回测。")
     
-    backtest_date_end = st.date_input("选择**回测/选股日期**", value=datetime.now().date(), max_value=datetime.now().date())
+    backtest_date_end = st.date_input("选择**回测/选股日期**", value=datetime.now().date(), max_value=datetime.now().date(), key='end_date')
     
     if run_mode == "多日回测 (指定天数)":
-        BACKTEST_DAYS = int(st.number_input("**自动回测天数 (N)**", value=20, step=1, min_value=1, max_value=50, help="程序将自动回测最近 N 个交易日。"))
+        BACKTEST_DAYS = int(st.number_input("**自动回测天数 (N)**", value=20, step=1, min_value=1, max_value=50, key='backtest_days_input', help="程序将自动回测最近 N 个交易日。"))
         MODE = "backtest"
     else:
         # 选股模式，固定为 1 天，但日期会自动回退到有数据的日子
@@ -235,23 +234,23 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=10, step=1, min_value=1)) 
-    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
-    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) 
+    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=10, step=1, min_value=1, key='final_pool')) 
+    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1, key='top_display'))
+    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1, key='top_backtest')) 
     
     st.markdown("---")
     st.header("🛒 灵活过滤条件")
-    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1)
-    MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
-    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=2.0, step=0.5, min_value=0.1) 
-    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0, help="例如：输入 20 代表流通市值必须大于等于 20 亿元。")
-    MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
+    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1, key='min_price')
+    MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0, key='max_price')
+    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=2.0, step=0.5, min_value=0.1, key='min_turnover') 
+    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0, key='min_circ_mv', help="例如：输入 20 代表流通市值必须大于等于 20 亿元。")
+    MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1, key='min_amount_mil')
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
 
 # ---------------------------
 # Token 输入与初始化 
 # ---------------------------
-TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password")
+TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password", key='ts_token')
 if not TS_TOKEN:
     st.warning("请输入 Tushare Token 才能运行脚本。")
     st.stop()
@@ -267,7 +266,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 1. 拉取全市场 Daily 数据
     daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty or 'ts_code' not in daily_all.columns: 
-        # 确保在回退逻辑运行后，如果数据依然缺失，能返回错误
         return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
 
     pool_raw = daily_all.reset_index(drop=True) 
@@ -289,17 +287,26 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             pool_merged = pool_merged.drop(columns=['amount'])
         pool_merged = pool_merged.merge(daily_basic[cols_to_merge], on='ts_code', how='left')
     
-    moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
+    # --- 资金流数据处理 FIX START ---
+    moneyflow_to_merge = pd.DataFrame()
     if not mf_raw.empty:
         possible = ['net_mf','net_mf_amount','net_mf_in']
         for c in possible:
             if c in mf_raw.columns:
-                moneyflow = mf_raw[['ts_code', c]].rename(columns={c:'net_mf'}).fillna(0)
+                moneyflow_to_merge = mf_raw[['ts_code', c]].rename(columns={c:'net_mf'})
                 break            
-    if not moneyflow.empty:
-        pool_merged = pool_merged.merge(moneyflow, on='ts_code', how='left')
+    
+    # 合并资金流数据
+    if not moneyflow_to_merge.empty:
+        pool_merged = pool_merged.merge(moneyflow_to_merge, on='ts_code', how='left')
         
-    pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
+    # 修复 KeyError: 'net_mf'：确保列存在
+    if 'net_mf' not in pool_merged.columns:
+        pool_merged['net_mf'] = np.nan # 初始化为NaN，等待下面的fillna(0)处理
+        
+    pool_merged['net_mf'] = pd.to_numeric(pool_merged['net_mf'], errors='coerce').fillna(0) 
+    # --- 资金流数据处理 FIX END ---
+
     pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
    
   
@@ -548,12 +555,11 @@ st.markdown("---")
 col1, col2 = st.columns(2)
 
 with col1:
-    if st.button("🚀 今日选股 (1日)", help="使用最新的可用交易日数据进行选股。"):
-        st.warning("⚠️ **V11.1 版本已更换为 V9.0 框架 + 强化 MACD 趋势共振策略，并增加了自动回退功能。**")
+    if st.button("🚀 今日选股 (1日)", key='select_button', help="使用最新的可用交易日数据进行选股。"):
+        st.warning("⚠️ **V11.2 版本已修复 `KeyError`，并增加了自动回退功能。**")
         execute_run("select", 1)
 
 with col2:
-    if st.button(f"⏳ 开始 {BACKTEST_DAYS} 日自动回测", help="使用指定日期和天数进行历史回测。"):
-        st.warning("⚠️ **V11.1 版本已更换为 V9.0 框架 + 强化 MACD 趋势共振策略，并增加了自动回退功能。**")
+    if st.button(f"⏳ 开始 {BACKTEST_DAYS} 日自动回测", key='backtest_button', help="使用指定日期和天数进行历史回测。"):
+        st.warning("⚠️ **V11.2 版本已修复 `KeyError`，并增加了自动回退功能。**")
         execute_run("backtest", BACKTEST_DAYS)
-
