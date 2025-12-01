@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.4 (高速优化 + 结构稳定版)
+选股王 · V11.5 (极速优化 + 结构稳定最终版)
 更新说明：
-1. 【**Bug 修复 V11.4**】：修复了 get_future_prices 函数中 Line 142 处的 `SyntaxError: closing parenthesis ']'...` 错误。
-2. 【**性能优化 V11.4**】：
-   - 移除 safe_get 函数中所有 time.sleep(0.5) 强制等待（沿用 V11.3）。
-   - 强化 get_adj_factor 缓存至 7 天，减少重复 API 调用。
-   - **速度瓶颈说明：** 当前速度瓶颈在于多日回测时，历史数据（120天）的重复拉取。请在使用时注意。
+1. 【**Bug 修复 V11.5**】：修复了代码末尾的 `SyntaxError: invalid character '：'` 错误。
+2. 【**Bug 修复 V11.4**】：修复了 get_future_prices 函数中 Line 142 处的 `SyntaxError: closing parenthesis ']'...` 错误。
+3. 【**性能优化 V11.3**】：移除 safe_get 函数中所有 time.sleep(0.5) 强制等待。
+4. 【**Bug 修复 V11.2**】：修复了资金流数据缺失导致的 KeyError: 'net_mf' 错误。
 """
 
 import streamlit as st
@@ -21,9 +20,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.4 最终决战策略 (高速稳定版)", layout="wide")
-st.title("选股王 · V11.4 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
-st.markdown("🚀 **V11.4 修复了语法错误，并保持极速运行设置。请测试 M=100 的回测速度。**")
+st.set_page_config(page_title="选股王 · V11.5 最终决战策略 (高速稳定版)", layout="wide")
+st.title("选股王 · V11.5 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
+st.markdown("🚀 **V11.5 极速稳定版已就绪。请测试 M=100 的回测速度。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -527,15 +526,11 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("🚀 今日选股 (1日)", key='select_button', help="使用最新的可用交易日数据进行选股。"):
-        st.warning("⚠️ **V11.4 极速稳定版已上线。请注意观察速度变化！**")
+        st.warning("⚠️ **V11.5 极速稳定版已上线。请注意观察速度变化！**")
         execute_run("select", 1)
 
 with col2:
     if st.button(f"⏳ 开始 {BACKTEST_DAYS} 日自动回测", key='backtest_button', help="使用指定日期和天数进行历史回测。"):
-        st.warning("⚠️ **V11.4 极速稳定版已上线。请注意观察速度变化！**")
+        st.warning("⚠️ **V11.5 极速稳定版已上线。请注意观察速度变化！**")
         execute_run("backtest", BACKTEST_DAYS)
 
-### 📌 V11.4 极速测试建议
-
-1.  **M=100 首次回测：** 请使用默认的 `FINAL_POOL=100` 和 `BACKTEST_DAYS=20` 运行一次。由于缓存机制失效，**首次运行** 20 天可能仍需较长时间（可能在 20-30 分钟）。
-2.  **M=100 第二次回测：** 请在第一次运行结束后，**不要改变任何参数，立即再运行一次**。这次运行应该会快得多（目标是 5 分钟以内），因为大部分基础日线和复权因子数据已缓存在 Streamlit 中，可以直接命中，证明极速优化有效。
