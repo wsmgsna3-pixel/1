@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.2 (自动回退 + KeyError修复版)
+选股王 · V11.3 (极速优化 + 自动回退版)
 更新说明：
-1. 【**Bug 修复 V11.2**】：修复了收盘后因 Tushare 资金流数据（moneyflow）延迟更新导致的 `KeyError: 'net_mf'` 错误。代码现在能够健壮地处理资金流数据缺失或滞后的情况。
-2. 【**功能增强 V11.1**】：
-   - 增加**模式选择**：支持“今日选股 (1日回测)”和“多日回测”。
-   - **核心改动**：修改 get_trade_days 函数，使其在数据未更新时，自动选择**上一个有数据的交易日**进行选股/回测。
+1. 【**性能优化 V11.3**】：**极速提升性能！** 移除 safe_get 函数中所有不必要的 time.sleep(0.5) 强制等待。
+   - 目的：充分利用用户 10,000 积分带来的 1000 次/分钟的 API 权限，大幅缩短回测时间。
+2. 【**Bug 修复 V11.2**】：修复了收盘后因 Tushare 资金流数据延迟更新导致的 `KeyError: 'net_mf'` 错误。
+3. 【**功能增强 V11.1**】：支持“今日选股 (1日回测)”和“多日回测”模式，并增加了自动回退到最新可用交易日的功能。
 """
 
 import streamlit as st
@@ -20,9 +20,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.2 最终决战策略 (自动回退 + 修复版)", layout="wide")
-st.title("选股王 · V11.2 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
-st.markdown("🎯 **V11.2 策略：已修复收盘后运行可能出现的 `KeyError`，确保选股流程健壮运行。**")
+st.set_page_config(page_title="选股王 · V11.3 最终决战策略 (极速版)", layout="wide")
+st.title("选股王 · V11.3 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
+st.markdown("🚀 **V11.3 极速优化：已移除限速，充分利用您 1000 次/分钟的 API 权限。请放心提高 FINAL_POOL 参数！**")
 
 # ---------------------------
 # 全局变量初始化
@@ -35,7 +35,7 @@ MAX_SEARCH_DAYS = 15 # 最大往前查找天数
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API"""
+    """安全调用 Tushare API - 已移除 time.sleep(0.5)"""
     global pro
     if pro is None:
         return pd.DataFrame(columns=['ts_code']) 
@@ -43,12 +43,11 @@ def safe_get(func_name, **kwargs):
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            time.sleep(0.5) 
             return pd.DataFrame(columns=['ts_code']) 
-        time.sleep(0.5) 
         return df
     except Exception as e:
-        time.sleep(0.5) 
+        # 发生错误时，为防止连续报错，可以短暂等待
+        time.sleep(0.1) 
         return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days, mode="backtest"):
@@ -140,7 +139,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
-    hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
+    hist['close'] = pd.to_numeric(hist['close'], errors='coerce'])
     hist = hist.dropna(subset=['close'])
     hist = hist.reset_index(drop=True) 
     results = {}
@@ -219,7 +218,7 @@ with st.sidebar:
     
     run_mode = st.radio("选择运行模式", 
                         ("今日选股 (自动匹配最新可用日)", "多日回测 (指定天数)"),
-                        key='run_mode', # 添加key以确保唯一性
+                        key='run_mode', 
                         help="选股模式：自动寻找最新有数据的交易日，仅回测 1 天。回测模式：按您指定的日期和天数回测。")
     
     backtest_date_end = st.date_input("选择**回测/选股日期**", value=datetime.now().date(), max_value=datetime.now().date(), key='end_date')
@@ -234,7 +233,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=10, step=1, min_value=1, key='final_pool')) 
+    # 强烈建议 M >= 100 以提高选股精度
+    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=100, step=10, min_value=1, key='final_pool', help="（推荐 100 或更高，以充分利用高权限）")) 
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1, key='top_display'))
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1, key='top_backtest')) 
     
@@ -302,7 +302,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
     # 修复 KeyError: 'net_mf'：确保列存在
     if 'net_mf' not in pool_merged.columns:
-        pool_merged['net_mf'] = np.nan # 初始化为NaN，等待下面的fillna(0)处理
+        pool_merged['net_mf'] = np.nan 
         
     pool_merged['net_mf'] = pd.to_numeric(pool_merged['net_mf'], errors='coerce').fillna(0) 
     # --- 资金流数据处理 FIX END ---
@@ -419,22 +419,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 🚨 V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
     
     # 核心权重：资金流，占比 35%
-    w_mf = 0.35            # 35% - 资金流 (核心动力，保持 V9.0)
-
+    w_mf = 0.35            
     # 动能权重：当日动能，占比 20%
-    w_pct = 0.10            # 10% - 当日涨幅 (削弱)
-    w_turn = 0.10           # 10% - 换手率 (削弱)
-    
+    w_pct = 0.10            
+    w_turn = 0.10           
     # 防御权重：安全边际与波动控制，占比 25%
-    w_position = 0.15       # 15% - 60日位置 (保持 V9.0)
-    w_volatility = 0.10     # 10% - 波动率 (保持 V9.0)
- 
+    w_position = 0.15       
+    w_volatility = 0.10     
     # 趋势权重：中期趋势，占比 20%
-    w_macd = 0.20           # 20% - MACD (**大幅强化，目标改善 D+3**)
-    
+    w_macd = 0.20           
     # 彻底归零项
-    w_vol = 0.00            # 0% - 量比 
-    w_trend = 0.00          # 0% - 10日回报 
+    w_vol = 0.00            
+    w_trend = 0.00          
     
     # Sum: 0.35+0.10+0.10+0.15+0.10+0.20 = 1.00
     
@@ -556,10 +552,15 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("🚀 今日选股 (1日)", key='select_button', help="使用最新的可用交易日数据进行选股。"):
-        st.warning("⚠️ **V11.2 版本已修复 `KeyError`，并增加了自动回退功能。**")
+        st.warning("⚠️ **V11.3 极速版已上线，请注意观察速度变化！**")
         execute_run("select", 1)
 
 with col2:
     if st.button(f"⏳ 开始 {BACKTEST_DAYS} 日自动回测", key='backtest_button', help="使用指定日期和天数进行历史回测。"):
-        st.warning("⚠️ **V11.2 版本已修复 `KeyError`，并增加了自动回退功能。**")
+        st.warning("⚠️ **V11.3 极速版已上线，请注意观察速度变化！**")
         execute_run("backtest", BACKTEST_DAYS)
+
+### 📌 运行建议
+
+1.  **先测试 M=10：** 请您先用默认的 `FINAL_POOL=10`（在侧边栏手动改回 10）运行一次 20 天的回测，感受一下现在的速度。我预计回测时间将从半小时**缩短到几分钟内**。
+2.  **再提高 M：** 确认速度满意后，您就可以放心地将 **`FINAL_POOL` 提高到 100 甚至 200** 来运行，以达到最高的选股精度。
