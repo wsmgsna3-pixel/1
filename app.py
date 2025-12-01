@@ -33,11 +33,11 @@ st.markdown("🎯 **V11.0 策略：在 $\mathbf{V9.0}$ 的基础上，将 $\math
 pro = None
 
 # ---------------------------
-# 辅助函数 (关键优化点 1：移除 0.5 秒强制等待，改为 0.06s)
+# 辅助函数 (关键优化点 1：调整等待时间至 0.2 秒，以求稳定和加速)
 # ---------------------------
 @st.cache_data(ttl=3600*12)
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API，移除 0.5s 强制等待，改为 0.06s 以符合 1000次/分频次"""
+    """安全调用 Tushare API，使用 0.2 秒等待时间来平衡速度和网络稳定性"""
     global pro
     if pro is None:
         return pd.DataFrame(columns=['ts_code'])
@@ -45,12 +45,12 @@ def safe_get(func_name, **kwargs):
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            time.sleep(0.06) # 1000次/分钟 相当于 0.06秒/次
+            time.sleep(0.2) # 调整为 0.2 秒以提高稳定性
             return pd.DataFrame(columns=['ts_code'])
-        time.sleep(0.06) # 1000次/分钟 相当于 0.06秒/次
+        time.sleep(0.2) # 调整为 0.2 秒以提高稳定性
         return df
     except Exception as e:
-        time.sleep(0.06) # 1000次/分钟 相当于 0.06秒/次
+        time.sleep(0.2) # 调整为 0.2 秒以提高稳定性
         return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
@@ -124,11 +124,10 @@ def get_bulk_history_and_adj(ts_codes, selection_date):
     end_hist = selection_date
 
     # 未来数据 (15 天)
-    start_future = (d0 + timedelta(days=1)).strftime("%Ym%d")
-    end_future = (d0 + timedelta(days=15)).strftime("%Ym%d")
+    start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
+    end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
 
-    # 1. 批量获取复权因子 (Tushare 不支持批量，仍需循环调用)
-    # 优化点在于：这些 API 调用集中在了回测日循环的开始，而不是 M*N 次分散调用
+    # 1. 批量获取复权因子 (Tushare adj_factor 接口不支持批量，仍需循环调用)
     adj_map = {
         ts_code: get_adj_factor(ts_code, start_hist, end_future)
         for ts_code in ts_codes
@@ -368,6 +367,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 🚨 关键优化点 2.3：批量获取历史数据和未来收益数据，代替循环内的 API 调用
     # =================================================================================
     final_ts_codes = final_candidates['ts_code'].tolist()
+    # 核心加速点：所有历史数据在这里一次性集中获取，利用缓存和更快的间隔
     preloaded_data_map = get_bulk_history_and_adj(final_ts_codes, last_trade)
  
     # 5. 深度评分 (使用预加载的数据)
@@ -385,7 +385,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'net_mf': getattr(row, 'net_mf', 0)
         }
         
-        # 使用优化后的函数，不再发起 API 调用
+        # 使用优化后的函数，不进行 API 调用
         ind = compute_indicators_optimized(ts_code, preloaded_data)
         rec.update({
             'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
@@ -393,7 +393,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             'volatility': ind.get('volatility', 0), 'position_60d': ind.get('position_60d', np.nan)
         })
         
-        # 使用优化后的函数，不再发起 API 调用
+        # 使用优化后的函数，不进行 API 调用
         future_returns = get_future_prices_optimized(ts_code, last_trade, preloaded_data)
         rec.update({
             'Return_D1 (%)': future_returns.get('Return_D1', np.nan),
