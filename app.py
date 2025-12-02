@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V12.0 终极加速策略：强化资金流 + 爆发力，削弱反向防御
+选股王 · V13.0 终极决战策略：强化资金流 + 爆发力 + 60日趋势确认
 更新说明：
-1. 【**策略精调 V12.0**】：核心变动：
-   - **目标**：解决 V11.0 D+1 负收益和 D+5 趋势逆向问题。
-   - **资金流 (w_mf)** 从 0.35 提升至 **0.45** (大幅强化核心 Alpha)。
-   - **当日涨幅 (w_pct)** 从 0.10 提升至 **0.20** (强化短线爆发力，解决 D+1 弱势)。
-   - **60日位置 (w_position)** 从 0.15 降至 **0.05** (大幅削弱反向防御，避免陷入长期下跌趋势)。
-   - **MACD (w_macd)** 从 0.20 降至 **0.10** (适度降低，让位于资金流和爆发力)。
+1. 【**策略精调 V13.0**】：核心变动：
+   - **目标**：解决 V12.0 D+5 趋势逆向问题，确保选中中期强势股。
+   - **60日位置 (w_position)** 权重提升至 0.15，并**转换为顺向评分**（位置越高，分数越高），作为中期趋势确认的过滤器。
+   - **MACD (w_macd)** 权重归零 (0.00)，将权重转移给更直接有效的 60日位置。
+   - 资金流(0.45) 和 当日爆发力(0.20) 保持 V12.0 成功经验。
    
-   新权重结构：资金流(0.45) + 动能(0.30) + 防御(0.15) + 趋势(0.10) = 1.00
-2. 【**速度优化**】：M 股的历史数据获取采用“零等待”模式 (safe_get_aggressive)，实现速度极致化。
+   新权重结构：资金流(0.45) + 动能(0.30) + 趋势/防御(0.25) = 1.00
+2. 【**速度优化**】：M 股的历史数据获取采用“零等待”模式，默认入选评分数量 M=100。
 """
 
 import streamlit as st
@@ -25,9 +24,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V12.0 终极加速策略", layout="wide")
-st.title("选股王 · V12.0 终极加速策略（强化资金流 + 爆发力）")
-st.markdown("🎯 **V12.0 策略：大幅强化资金流和当日爆发力，大幅削弱 60日位置的反向买入倾向。**")
+st.set_page_config(page_title="选股王 · V13.0 终极决战策略", layout="wide")
+st.title("选股王 · V13.0 终极决战策略（趋势确认，消除 D+5 衰退）")
+st.markdown("🎯 **V13.0 策略：大幅强化资金流和当日爆发力，并将 60日位置转为顺向趋势确认，消除中长期下跌风险。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -279,7 +278,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    # 关键设置 M=100
+    # M=100 默认值，最优速度
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=100, step=1, min_value=1, help="M=100 在保证高准确率的同时，能将回测速度提升约 50%。")) 
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) 
@@ -434,7 +433,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V12.0 策略精调评分
+    # 6. 归一化与 V13.0 策略精调评分
     def normalize(series):
         series_nn = series.dropna()
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -450,38 +449,40 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_position'] = fdf['position_60d'] / 100
     
     # ----------------------------------------------------------------------------------
-    # 🚨 V12.0 终极加速策略：强化资金流 + 爆发力，削弱反向防御
+    # 🚨 V13.0 终极决战策略：强化资金流 + 爆发力 + 60日趋势确认
     
     # 核心权重：资金流，占比 45%
-    w_mf = 0.45             # 45% - 资金流 (大幅强化核心动力)
+    w_mf = 0.45             # 45% - 资金流 (保持核心动力)
 
     # 动能权重：当日动能，占比 30%
-    w_pct = 0.20            # 20% - 当日涨幅 (权重翻倍，捕捉短线爆发)
+    w_pct = 0.20            # 20% - 当日涨幅 (保持爆发力)
     w_turn = 0.10           # 10% - 换手率 (保持)
     
-    # 防御权重：安全边际与波动控制，占比 15%
-    w_position = 0.05       # 5% - 60日位置 (大幅削弱反向买入倾向)
-    w_volatility = 0.10     # 10% - 波动率 (保持)
+    # 趋势确认与防御：占比 25%
+    w_position = 0.15       # 15% - 60日位置 (权重强化并转为顺向，筛选中期强势股)
+    w_volatility = 0.10     # 10% - 波动率 (保持逆向控制)
  
-    # 趋势权重：中期趋势，占比 10%
-    w_macd = 0.10           # 10% - MACD (适度降低，让位于资金流和爆发力)
+    # 中期趋势 (MACD 归零)
+    w_macd = 0.00           # 0% - MACD (归零)
     
     # 彻底归零项 (保持不变)
     w_vol = 0.00            # 0% - 量比 
     w_trend = 0.00          # 0% - 10日回报 
     
-    # Sum: 0.45+0.20+0.10+0.05+0.10+0.10 = 1.00
+    # Sum: 0.45+0.20+0.10+0.15+0.10 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + 
         fdf['s_mf'] * w_mf + 
-        fdf['s_macd'] * w_macd + 
         
-        # 引入防御：60日位置越低越好 (1-s_position)，波动率越低越好 (1-s_volatility)
-        (1 - fdf['s_position']) * w_position + 
+        # 🚨 V13.0 核心修正：60日位置转为顺向 (位置越高，得分越高，确认中期强势)
+        fdf['s_position'] * w_position + 
+        
+        # 波动率保持逆向 (越低越好)
         (1 - fdf['s_volatility']) * w_volatility + 
         
-        # 归零项
+        # MACD 及其他归零项
+        fdf['s_macd'] * w_macd + # w_macd=0
         fdf['s_vol'] * w_vol + 
         fdf['s_trend'] * w_trend     
     )
@@ -498,7 +499,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V12.0 版本已应用：强化资金流 (0.45) + 爆发力 (0.20)，并大幅削弱反向防御 (60日位置 0.05)。**")
+    st.warning("⚠️ **V13.0 版本已应用：强化资金流 (0.45) + 爆发力 (0.20) + 60日顺向趋势确认 (0.15)。**")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -556,7 +557,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V12.0 已应用强化资金流与爆发力策略。**")
+                  help=f"总有效样本数：{total_count}。**V13.0 已应用趋势确认策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
