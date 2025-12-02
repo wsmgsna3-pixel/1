@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V16.0 终极策略：高动能 + 弱防御
+选股王 · V17.0 最终版本：趋势共振版
 更新说明：
-1. 【**策略精调 V16.0**】：核心变动：
-   - **目标**：解决 V15.0 过度防御导致的策略失效。转为激进型策略：相信资金流，允许突破，只进行适度趋势确认。
-   - **波动率 (w_volatility)** 权重从 0.25 大幅降至 **0.05** (极致弱化防御)。
-   - **当日涨幅 (w_pct)** 权重从 0.10 大幅提升至 **0.25** (恢复 D+1 爆发力)。
-   - **MACD (w_macd)** 权重从 0.00 恢复至 **0.15** (用于中期趋势的适度确认)。
-   - **10日回报 (w_trend)** 权重归零 (0.00)。
+1. 【**策略精调 V17.0**】：核心变动：
+   - **目标**：在 V16.0 成功的基础上，消除 D+3 的微弱盘整（-0.03%）。
+   - **当日涨幅 (w_pct)** 权重从 0.25 微降至 **0.20**。
+   - **MACD (w_macd)** 权重从 0.15 微升至 **0.20**。
+   - 目标：用更强的 MACD 趋势确认来平滑 D+1 爆发后的走势，将 D+3 提升至正收益。
    
-   新权重结构：资金流(0.45) + 动能(0.35) + 趋势(0.15) + 弱防御(0.05) = 1.00
+   新权重结构：资金流(0.45) + 动能(0.30) + 趋势(0.20) + 弱防御(0.05) = 1.00
 2. 【**速度优化**】：M 股的历史数据获取采用“零等待”模式，默认入选评分数量 M=100。
 """
 
@@ -25,9 +24,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V16.0 终极策略", layout="wide")
-st.title("选股王 · V16.0 终极策略（高动能 + 弱防御）")
-st.markdown("🎯 **V16.0 策略：大幅降低防御（$\mathbf{0.05}$），提升当日爆发力（$\mathbf{0.25}$），恢复 MACD（$\mathbf{0.15}$）。力求捕获资金流入的真正突破股。**")
+st.set_page_config(page_title="选股王 · V17.0 最终定型版", layout="wide")
+st.title("选股王 · V17.0 最终定型版（趋势共振版）")
+st.markdown("🎯 **V17.0 策略：在 V16.0 成功框架上进行微调，削弱当日爆发力，强化 MACD 趋势共振，旨在消除 D+3 盘整。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -438,7 +437,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V16.0 策略精调评分
+    # 6. 归一化与 V17.0 策略精调评分
     def normalize(series):
         series_nn = series.dropna()
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -454,27 +453,27 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_position'] = fdf['position_60d'] / 100
     
     # ----------------------------------------------------------------------------------
-    # 🚨 V16.0 终极策略：资金流 (0.45) + 高动能 (0.25) + MACD (0.15) + 弱防御 (0.05)
+    # 🚨 V17.0 最终定型策略：资金流 (0.45) + MACD (0.20) + 动能 (0.20) + 弱防御 (0.05)
     
     # 核心权重：资金流，占比 45%
     w_mf = 0.45             # 45% - 资金流 (核心动力)
 
-    # 动能权重：当日动能，占比 35%
-    w_pct = 0.25            # 25% - 当日涨幅 (恢复高爆发力)
+    # 动能权重：当日动能，占比 30%
+    w_pct = 0.20            # 20% - 当日涨幅 (微降，配合 MACD 增强)
     w_turn = 0.10           # 10% - 换手率 (保持)
     
-    # 趋势确认：占比 15%
-    w_macd = 0.15           # 15% - MACD (恢复，用于中期趋势的适度确认)
+    # 趋势确认：占比 20%
+    w_macd = 0.20           # 20% - MACD (增强，用于中期趋势的适度确认，消除 D+3 盘整)
 
     # 弱防御：占比 5%
-    w_volatility = 0.05     # 05% - 波动率 (极致弱防御，允许突破)
+    w_volatility = 0.05     # 05% - 波动率 (极致弱防御，保持 V16.0 的成功)
  
     # 彻底归零项
-    w_trend = 0.00          # 0% - 10日回报 (移除)
-    w_position = 0.00       # 0% - 60日位置 (移除)
+    w_trend = 0.00          # 0% - 10日回报 
+    w_position = 0.00       # 0% - 60日位置 
     w_vol = 0.00            # 0% - 量比 
     
-    # Sum: 0.45+0.25+0.10+0.15+0.05 = 1.00
+    # Sum: 0.45+0.20+0.10+0.20+0.05 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + 
@@ -502,7 +501,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V16.0 版本已应用：资金流 (0.45) + 高动能 (0.25) + MACD (0.15) + 弱防御 (0.05)。**")
+    st.warning("⚠️ **V17.0 版本已应用：资金流 (0.45) + MACD (0.20) + 动能 (0.20) + 弱防御 (0.05)。**")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -560,7 +559,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V16.0 已应用终极突破策略。**")
+                  help=f"总有效样本数：{total_count}。**V17.0 已应用最终定型策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
