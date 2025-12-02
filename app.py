@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V12.3 最终决战策略：全数据预加载高性能修复版 (新增数据量检查)
-核心修复：修复了获取 D0 基准价格时的单日切片逻辑，确保 D+N 收益率能够正确计算。
+选股王 · V12.4 最终决战策略：复权因子健壮下载版
+核心修复：将复权因子（adj_factor）下载方式改为按日期循环，解决批量下载失败导致的数据缺失问题。
 """
 
 import streamlit as st
@@ -24,9 +24,9 @@ GLOBAL_DAILY_RAW = pd.DataFrame()
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V12.3 最终决战策略", layout="wide")
-st.title("选股王 · V12.3 最终决战策略（⚡️终极加速第二次修复）")
-st.markdown("🎯 **V12.3 诊断说明：** 新增下载数据量检查，用于确认 Tushare 数据是否完整。")
+st.set_page_config(page_title="选股王 · V12.4 最终决战策略", layout="wide")
+st.title("选股王 · V12.4 最终决战策略（⚡️复权因子健壮下载修复）")
+st.markdown("🎯 **V12.4 修复说明：** 修复 Tushare 批量下载复权因子失败的问题，确保 D+N 收益率能够正确计算。")
 st.markdown("✅ **优化说明：** 历史数据预加载并确保索引排序正确，回测循环中只进行内存切片操作。")
 
 
@@ -69,6 +69,7 @@ def get_trade_days(end_date_str, num_days):
 def get_all_historical_data(trade_days_list):
     """
     一次性获取所有回测日所需的最大历史范围内的日线数据和复权因子。
+    复权因子下载改为按日期循环，增强健壮性。
     """
     if not trade_days_list: return False
     
@@ -84,60 +85,70 @@ def get_all_historical_data(trade_days_list):
     
     st.info(f"💾 正在批量下载 {start_date} 到 {end_date} 间的**全市场历史数据**...")
     
-    # 1. 批量获取复权因子 (adj_factor)
-    adj_factor_data = safe_get('adj_factor', start_date=start_date, end_date=end_date)
-    if adj_factor_data.empty:
-        # 如果复权因子下载失败，直接报错并停止
-        st.error("❌ 严重错误：无法获取任何复权因子数据。请检查 Tushare Token 和网络。")
-        return False
-        
-    adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
-    adj_factor_data = adj_factor_data.set_index(['ts_code', 'trade_date'])
-    # 修复点 1：对 adj_factor MultiIndex 进行排序
-    adj_factor_data = adj_factor_data.sort_index(level=[0, 1]) 
-    
-    # 2. 批量获取日线行情 (daily)
+    # 1. 获取所有交易日列表
     all_trade_dates_df = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')
     if all_trade_dates_df.empty:
         st.error("无法获取交易日历。")
         return False
     
     all_dates = all_trade_dates_df['cal_date'].tolist()
-    daily_data_list = []
+    if not all_dates:
+        st.error("交易日列表为空。")
+        return False
+
+    # 2. 批量获取复权因子 (adj_factor) - 按日期循环获取 (健壮性修复)
+    adj_factor_data_list = []
     
-    download_progress = st.progress(0, text="下载进度...")
+    adj_download_progress = st.progress(0, text="下载进度 (复权因子)...")
+    
+    for i, date in enumerate(all_dates):
+        # 核心修复点：按日期获取 adj_factor，防止大批量请求超时或失败
+        adj_df = safe_get('adj_factor', trade_date=date) 
+        if not adj_df.empty:
+            adj_factor_data_list.append(adj_df)
+        adj_download_progress.progress((i + 1) / len(all_dates), text=f"下载进度 (复权因子)：正在处理 {date} ({i+1}/{len(all_dates)})")
+    
+    adj_download_progress.empty()
+
+    if not adj_factor_data_list:
+        st.error("❌ 严重错误：无法获取任何复权因子数据。请检查 Tushare Token 和网络。")
+        return False
+        
+    adj_factor_data = pd.concat(adj_factor_data_list, ignore_index=True)
+    adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
+    adj_factor_data = adj_factor_data.set_index(['ts_code', 'trade_date'])
+    # 对 adj_factor MultiIndex 进行排序
+    GLOBAL_ADJ_FACTOR = adj_factor_data.sort_index(level=[0, 1]) 
+    
+    # 3. 批量获取日线行情 (daily) - 按日期循环获取
+    daily_data_list = []
+    download_progress = st.progress(0, text="下载进度 (日线行情)...")
     
     for i, date in enumerate(all_dates):
         daily_df = safe_get('daily', trade_date=date)
         if not daily_df.empty:
             daily_data_list.append(daily_df)
-        download_progress.progress((i + 1) / len(all_dates), text=f"下载进度：正在处理 {date} ({i+1}/{len(all_dates)})")
+        download_progress.progress((i + 1) / len(all_dates), text=f"下载进度 (日线行情)：正在处理 {date} ({i+1}/{len(all_dates)})")
     
     download_progress.empty()
     
     if not daily_data_list:
-        # 如果日线数据下载失败，直接报错并停止
-        st.error("❌ 严重错误：无法获取任何历史日线数据。请检查 Tushare Token 和网络。")
+        st.error("❌ 严重错误：无法获取任何历史日线数据。")
         return False
 
     daily_raw_data = pd.concat(daily_data_list, ignore_index=True)
     daily_raw_data = daily_raw_data.set_index(['ts_code', 'trade_date'])
-    # 修复点 2：对 daily_raw_data MultiIndex 进行排序
-    daily_raw_data = daily_raw_data.sort_index(level=[0, 1])
+    # 对 daily_raw_data MultiIndex 进行排序
+    GLOBAL_DAILY_RAW = daily_raw_data.sort_index(level=[0, 1])
 
-    # 3. 存储到全局变量
-    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW
-    GLOBAL_ADJ_FACTOR = adj_factor_data
-    GLOBAL_DAILY_RAW = daily_raw_data
-    
-    # ⭐️ 诊断信息：确认下载了多少数据
+    # 4. ⭐️ 诊断信息：确认下载了多少数据
     st.info(f"✅ 数据预加载完成。日线数据总条目：{len(GLOBAL_DAILY_RAW)}，复权因子总条目：{len(GLOBAL_ADJ_FACTOR)}")
 
     return True
 
 
 # ----------------------------------------------------------------------
-# ⭐️ 优化的数据获取函数：只从内存中切片
+# ⭐️ 优化的数据获取函数：只从内存中切片 (保持不变)
 # ----------------------------------------------------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     """ 
@@ -186,7 +197,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ----------------------------------------------------------------------
-# ⭐️ 核心修复函数：get_future_prices
+# ⭐️ 核心修复函数：get_future_prices (保持不变)
 # ----------------------------------------------------------------------
 
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
@@ -480,7 +491,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）然后再次点击运行。")
+    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是修复数据下载问题的关键一步。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -550,7 +561,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V12.3 诊断版**")
+                  help=f"总有效样本数：{total_count}。**V12.4 健壮版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
