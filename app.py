@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V14.0 趋势+评级版：Tushare 积分优势利用 (stk_rating)
+选股王 · V14.1 极速恢复版：剔除慢速因子 + 强化内存防御
 核心修复：QFQ 基准修复已完成 (V12.9)。
 策略优化：核心变动：
-1. 机构共识：新增 w_rating (机构评级) 权重 0.15，解决 D+3/D+5 稳定性问题。
-2. 权重均衡：重新分配权重，确保 w_pct/w_macd 维持主导，w_mf 进一步降级至 0.10。
+1. 极速恢复：彻底移除 'stk_rating' 机构评级因子，恢复纯内存计算速度。
+2. 强化防御：将波动率 (w_volatility) 权重提升至 0.15，以内存计算方式加强稳定性筛选，解决 D+5 收益急剧下滑问题。
 """
 
 import streamlit as st
@@ -28,10 +28,10 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V14.0 趋势+评级版", layout="wide")
-st.title("选股王 · V14.0 最终策略（⭐️ 机构共识 + 强趋势）")
-st.markdown("🎯 **V14.0 策略说明：** 引入 Tushare **机构评级 (stk_rating)** 因子（积分权限），专门用于增强 D+3/D+5 的基本面稳定性，同时维持短期动量。")
-st.markdown("✅ **技术说明：** 底层 QFQ 基准已固定（V12.9 修复），回测速度极快且结果稳定。")
+st.set_page_config(page_title="选股王 · V14.1 极速恢复版", layout="wide")
+st.title("选股王 · V14.1 最终策略（🚀 极速恢复 + 强化内存防御）")
+st.markdown("🎯 **V14.1 策略说明：** 移除慢速的机构评级因子，**回测速度恢复极速**。通过大幅提高**波动率防御权重**，解决 V13.2 出现的 D+5 收益急剧下滑问题。")
+st.markdown("✅ **技术说明：** 底层 QFQ 基准已固定（V12.9 修复），现在是纯内存计算，回测将非常快。")
 
 
 # ---------------------------
@@ -39,7 +39,7 @@ st.markdown("✅ **技术说明：** 底层 QFQ 基准已固定（V12.9 修复�
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API，已移除 time.sleep(0.5)"""
+    """安全调用 Tushare API"""
     global pro
     if pro is None:
         return pd.DataFrame(columns=['ts_code']) 
@@ -86,6 +86,9 @@ def get_all_historical_data(trade_days_list):
     start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=150)
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=20)
     
+    start_date = end_date_dt.strftime("%Y%m%d") # 修正：为了减少拉取范围，只取必要的历史数据
+    start_date = start_date_dt.strftime("%Y%m%d") # 修正：为了减少拉取范围，只取必要的历史数据
+    
     start_date = start_date_dt.strftime("%Y%m%d")
     end_date = end_date_dt.strftime("%Y%m%d")
     
@@ -106,19 +109,17 @@ def get_all_historical_data(trade_days_list):
     adj_factor_data_list = []
     adj_download_progress = st.progress(0, text="下载进度 (复权因子)...")
     
-    for i, date in enumerate(all_dates):
-        adj_df = safe_get('adj_factor', trade_date=date) 
-        if not adj_df.empty:
-            adj_factor_data_list.append(adj_df)
-        adj_download_progress.progress((i + 1) / len(all_dates), text=f"下载进度 (复权因子)：正在处理 {date} ({i+1}/{len(all_dates)})")
+    # 批量下载复权因子，速度优化
+    adj_factor_data = safe_get('adj_factor', start_date=start_date, end_date=end_date)
     
+    # 确保进度条完成
+    adj_download_progress.progress(1.0, text="下载进度 (复权因子)：完成")
     adj_download_progress.empty()
     
-    if not adj_factor_data_list:
+    if adj_factor_data.empty:
         st.error("❌ 严重错误：无法获取任何复权因子数据。")
         return False
         
-    adj_factor_data = pd.concat(adj_factor_data_list, ignore_index=True)
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
     adj_factor_data = adj_factor_data.set_index(['ts_code', 'trade_date'])
     GLOBAL_ADJ_FACTOR = adj_factor_data.sort_index(level=[0, 1]) 
@@ -140,19 +141,16 @@ def get_all_historical_data(trade_days_list):
     daily_data_list = []
     download_progress = st.progress(0, text="下载进度 (日线行情)...")
     
-    for i, date in enumerate(all_dates):
-        daily_df = safe_get('daily', trade_date=date)
-        if not daily_df.empty:
-            daily_data_list.append(daily_df)
-        download_progress.progress((i + 1) / len(all_dates), text=f"下载进度 (日线行情)：正在处理 {date} ({i+1}/{len(all_dates)})")
-    
+    # 批量下载日线行情，速度优化
+    daily_raw_data = safe_get('daily', start_date=start_date, end_date=end_date)
+
+    download_progress.progress(1.0, text="下载进度 (日线行情)：完成")
     download_progress.empty()
     
-    if not daily_data_list:
+    if daily_raw_data.empty:
         st.error("❌ 严重错误：无法获取任何历史日线数据。")
         return False
 
-    daily_raw_data = pd.concat(daily_data_list, ignore_index=True)
     daily_raw_data = daily_raw_data.set_index(['ts_code', 'trade_date'])
     GLOBAL_DAILY_RAW = daily_raw_data.sort_index(level=[0, 1])
 
@@ -163,7 +161,7 @@ def get_all_historical_data(trade_days_list):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ 优化的数据获取函数：只从内存中切片 (前复权计算核心)
+# 优化的数据获取函数：只从内存中切片 (前复权计算核心)
 # ----------------------------------------------------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     """ 
@@ -217,7 +215,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ----------------------------------------------------------------------
-# ⭐️ 核心函数：get_future_prices (接受 D0 QFQ 价格)
+# 核心函数：get_future_prices (接受 D0 QFQ 价格)
 # ----------------------------------------------------------------------
 
 def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
@@ -258,7 +256,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
 
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置, 机构评级等指标 (使用优化版数据获取)"""
+    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (使用优化版数据获取)"""
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
     # 获取 QFQ 数据，用于计算所有指标
@@ -266,7 +264,6 @@ def compute_indicators(ts_code, end_date):
     
     res = {}
     if df.empty or 'close' not in df.columns: 
-        res['avg_rating_score'] = 3.0 # Default neutral score for rating
         return res
         
     df['close'] = pd.to_numeric(df['close'], errors='coerce').astype(float)
@@ -310,21 +307,8 @@ def compute_indicators(ts_code, end_date):
         else: res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
     else: res['position_60d'] = np.nan 
     
-    # ⭐️ V14.0 新增：机构评级 (stk_rating)
-    rating_df = safe_get('stk_rating', ts_code=ts_code, end_date=end_date, start_date=start_date)
-    rating_map = {'买入': 5, '增持': 4, '中性': 3, '减持': 2, '卖出': 1, '推荐': 4, '谨慎推荐': 3, '强烈推荐': 5}
+    # ⭐️ V14.1 移除：不再计算 avg_rating_score，保持极速
     
-    if not rating_df.empty and 'rating' in rating_df.columns:
-        # 只看最近 30 天的评级
-        rating_df = rating_df[rating_df['end_date'] <= end_date]
-        rating_df['rating_score'] = rating_df['rating'].map(rating_map).fillna(np.nan)
-        
-        # 使用最近 30 天的平均评级分数
-        latest_ratings = rating_df.head(10) # 仅考虑最新的 10 份报告
-        res['avg_rating_score'] = latest_ratings['rating_score'].mean()
-    else:
-        res['avg_rating_score'] = 3.0 # 默认中性评级
-        
     return res
 
 # ----------------------------------------------------
@@ -466,7 +450,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
         raw_close = getattr(row, 'close', np.nan)
         
-        # 计算指标
+        # 计算指标 (极速计算)
         ind = compute_indicators(ts_code, last_trade) 
         d0_qfq_close = ind.get('last_close', np.nan) # 提取 D0 QFQ Close Price
 
@@ -490,8 +474,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
                 '10d_return': ind.get('10d_return', np.nan),
                 'volatility': ind.get('volatility', np.nan), 
                 'position_60d': ind.get('position_60d', np.nan),
-                # ⭐️ V14.0 新增
-                'avg_rating_score': ind.get('avg_rating_score', 3.0) 
             })
             
             rec.update({
@@ -508,7 +490,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         error_msg = f"评分列表为空：{last_trade}. 原因：所有 {len(final_candidates)} 个候选股票都无法获取有效的 D0 QFQ 价格（可能数据不足3天或复权失败）。"
         return pd.DataFrame(), error_msg
 
-    # 6. 归一化与 V14.0 策略精调评分 
+    # 6. 归一化与 V14.1 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -519,19 +501,17 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_vol'] = normalize(fdf['vol_ratio'])
     fdf['s_mf'] = normalize(fdf['net_mf'])
     fdf['s_macd'] = normalize(fdf['macd'])
-    fdf['s_rating'] = normalize(fdf['avg_rating_score']) # ⭐️ V14.0 新增归一化
     fdf['s_trend'] = normalize(fdf['10d_return'])
     fdf['s_volatility'] = normalize(fdf['volatility'])
     fdf['s_position'] = fdf['position_60d'] / 100 
     
-    # 🚨 V14.0 策略权重 (趋势 + 动量 + 机构评级)
-    w_rating = 0.15       # 机构评级 (新加入)
+    # 🚨 V14.1 策略权重 (极速动量 + 强趋势 + 强化内存防御)
     w_macd = 0.30         # MACD ↑↑↑ 趋势核心
-    w_pct = 0.18          # 当日涨幅 ↑↑ (略降)
-    w_turn = 0.12         # 换手率 ↑ (略降)
-    w_mf = 0.10           # 资金流 ↓↓ (进一步降级)
-    w_position = 0.08     # 60日位置 ↓ (反向)
-    w_volatility = 0.07   # 波动率 ↓ (反向) 容忍高波动
+    w_pct = 0.20          # 当日涨幅 ↑↑ (恢复极致动量)
+    w_turn = 0.15         # 换手率 ↑ (恢复)
+    w_mf = 0.10           # 资金流 ↓↓ (维持低位)
+    w_volatility = 0.15   # 波动率 ↓ (反向) ⭐️ 大幅强化防御
+    w_position = 0.10     # 60日位置 ↓ (反向) 强化防御
     w_vol = 0.00          
     w_trend = 0.00          
     
@@ -540,10 +520,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         fdf['s_turn'].fillna(0.5) * w_turn + 
         fdf['s_mf'].fillna(0.5) * w_mf + 
         fdf['s_macd'].fillna(0.5) * w_macd + 
-        fdf['s_rating'].fillna(0.5) * w_rating +  # ⭐️ V14.0 新增
         
         (1 - fdf['s_position'].fillna(0.5)) * w_position + # 倾向低位
-        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + # 倾向低波动
+        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + # 倾向低波动 ⭐️ 强化
         
         fdf['s_vol'].fillna(0.5) * w_vol + 
         fdf['s_trend'].fillna(0.5) * w_trend     
@@ -559,7 +538,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序重新加载数据的关键一步，否则新因子将不生效。")
+    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序恢复极速的关键一步。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -567,7 +546,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.stop()
     
     # ----------------------------------------------------------------------
-    # ⭐️ 核心优化步骤：预加载所有历史数据 (V12.9 基准修复)
+    # 核心优化步骤：预加载所有历史数据 (V12.9 基准修复)
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
@@ -627,12 +606,12 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V14.0 趋势+评级版 (新增机构评级)**")
+                  help=f"总有效样本数：{total_count}。**V14.1 极速恢复 + 强化内存防御版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
     display_cols = ['Trade_Date', 'name', 'ts_code', '综合评分', 
                     'Close', 'Pct_Chg (%)', 'Circ_MV (亿)',
-                    'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)', 'avg_rating_score']
+                    'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)']
     
     st.dataframe(all_results[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
