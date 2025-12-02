@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V12.2 最终决战策略：全数据预加载高性能修复版
+选股王 · V12.3 最终决战策略：全数据预加载高性能修复版 (新增数据量检查)
 核心修复：修复了获取 D0 基准价格时的单日切片逻辑，确保 D+N 收益率能够正确计算。
 """
 
@@ -24,9 +24,9 @@ GLOBAL_DAILY_RAW = pd.DataFrame()
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V12.2 最终决战策略", layout="wide")
-st.title("选股王 · V12.2 最终决战策略（⚡️终极加速第二次修复）")
-st.markdown("🎯 **V12.2 修复说明：** 修复了 D+N 收益率全部显示 `nan%` 的问题，确保基准价格获取正确。")
+st.set_page_config(page_title="选股王 · V12.3 最终决战策略", layout="wide")
+st.title("选股王 · V12.3 最终决战策略（⚡️终极加速第二次修复）")
+st.markdown("🎯 **V12.3 诊断说明：** 新增下载数据量检查，用于确认 Tushare 数据是否完整。")
 st.markdown("✅ **优化说明：** 历史数据预加载并确保索引排序正确，回测循环中只进行内存切片操作。")
 
 
@@ -69,13 +69,13 @@ def get_trade_days(end_date_str, num_days):
 def get_all_historical_data(trade_days_list):
     """
     一次性获取所有回测日所需的最大历史范围内的日线数据和复权因子。
-    已包含：对 MultiIndex 进行强制排序的修复。
     """
     if not trade_days_list: return False
     
     latest_trade_date = max(trade_days_list)
     earliest_trade_date = min(trade_days_list)
     
+    # 扩大数据获取范围，确保能覆盖回测和未来收益计算
     start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=150)
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=20)
     
@@ -87,8 +87,10 @@ def get_all_historical_data(trade_days_list):
     # 1. 批量获取复权因子 (adj_factor)
     adj_factor_data = safe_get('adj_factor', start_date=start_date, end_date=end_date)
     if adj_factor_data.empty:
-        st.error("无法获取复权因子。")
+        # 如果复权因子下载失败，直接报错并停止
+        st.error("❌ 严重错误：无法获取任何复权因子数据。请检查 Tushare Token 和网络。")
         return False
+        
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
     adj_factor_data = adj_factor_data.set_index(['ts_code', 'trade_date'])
     # 修复点 1：对 adj_factor MultiIndex 进行排序
@@ -114,7 +116,8 @@ def get_all_historical_data(trade_days_list):
     download_progress.empty()
     
     if not daily_data_list:
-        st.error("无法获取历史日线数据。")
+        # 如果日线数据下载失败，直接报错并停止
+        st.error("❌ 严重错误：无法获取任何历史日线数据。请检查 Tushare Token 和网络。")
         return False
 
     daily_raw_data = pd.concat(daily_data_list, ignore_index=True)
@@ -127,6 +130,9 @@ def get_all_historical_data(trade_days_list):
     GLOBAL_ADJ_FACTOR = adj_factor_data
     GLOBAL_DAILY_RAW = daily_raw_data
     
+    # ⭐️ 诊断信息：确认下载了多少数据
+    st.info(f"✅ 数据预加载完成。日线数据总条目：{len(GLOBAL_DAILY_RAW)}，复权因子总条目：{len(GLOBAL_ADJ_FACTOR)}")
+
     return True
 
 
@@ -201,7 +207,7 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     results = {}
     
     # 2. 获取基准价格 (D0 QFQ Close)
-    # ✅ 修复点：只获取 selection_date 当天的数据，保证切片精准
+    # 修复点：只获取 selection_date 当天的数据，保证切片精准
     d0_data = get_qfq_data_v4_optimized_final(ts_code, selection_date, selection_date)
     selection_price_adj = d0_data['close'].iloc[-1] if not d0_data.empty and 'close' in d0_data.columns and len(d0_data) > 0 else np.nan
     
@@ -474,7 +480,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V12.2 修复版：** 第一次运行时（或缓存过期），数据预加载会花费 1-3 分钟。一旦下载完成，后续回测将极快。")
+    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）然后再次点击运行。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -484,7 +490,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     # ----------------------------------------------------------------------
     # ⭐️ 核心优化步骤：预加载所有历史数据 (已加入索引排序修复)
     # ----------------------------------------------------------------------
-    # 提示：如果 Global Cache 已经存在，这里将立即跳过下载，回测速度将极快
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
         st.error("❌ 历史数据预加载失败，回测无法进行。请检查 Tushare Token 和权限。")
@@ -545,7 +550,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V12.2 修复版**")
+                  help=f"总有效样本数：{total_count}。**V12.3 诊断版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
