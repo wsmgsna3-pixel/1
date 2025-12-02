@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V12.1 最终决战策略：全数据预加载高性能修复版
-核心修复：修复了 MultiIndex 排序问题，确保历史指标和未来收益的计算能够正确从内存中读取数据。
+选股王 · V12.2 最终决战策略：全数据预加载高性能修复版
+核心修复：修复了获取 D0 基准价格时的单日切片逻辑，确保 D+N 收益率能够正确计算。
 """
 
 import streamlit as st
@@ -24,9 +24,9 @@ GLOBAL_DAILY_RAW = pd.DataFrame()
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V12.1 最终决战策略", layout="wide")
-st.title("选股王 · V12.1 最终决战策略（⚡️终极加速修复版）")
-st.markdown("🎯 **V12.1 修复说明：** 修复了因 MultiIndex 未排序导致的 **收益率 0% / 评分 None** 问题。回测速度和准确率均已优化。")
+st.set_page_config(page_title="选股王 · V12.2 最终决战策略", layout="wide")
+st.title("选股王 · V12.2 最终决战策略（⚡️终极加速第二次修复）")
+st.markdown("🎯 **V12.2 修复说明：** 修复了 D+N 收益率全部显示 `nan%` 的问题，确保基准价格获取正确。")
 st.markdown("✅ **优化说明：** 历史数据预加载并确保索引排序正确，回测循环中只进行内存切片操作。")
 
 
@@ -69,11 +69,10 @@ def get_trade_days(end_date_str, num_days):
 def get_all_historical_data(trade_days_list):
     """
     一次性获取所有回测日所需的最大历史范围内的日线数据和复权因子。
-    新增：对 MultiIndex 进行强制排序。
+    已包含：对 MultiIndex 进行强制排序的修复。
     """
     if not trade_days_list: return False
     
-    # 确定最大的历史日期范围：最早回测日的前150天到最晚回测日的未来20天
     latest_trade_date = max(trade_days_list)
     earliest_trade_date = min(trade_days_list)
     
@@ -92,7 +91,7 @@ def get_all_historical_data(trade_days_list):
         return False
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
     adj_factor_data = adj_factor_data.set_index(['ts_code', 'trade_date'])
-    # ✅ 修复点 1：对 adj_factor MultiIndex 进行排序
+    # 修复点 1：对 adj_factor MultiIndex 进行排序
     adj_factor_data = adj_factor_data.sort_index(level=[0, 1]) 
     
     # 2. 批量获取日线行情 (daily)
@@ -120,7 +119,7 @@ def get_all_historical_data(trade_days_list):
 
     daily_raw_data = pd.concat(daily_data_list, ignore_index=True)
     daily_raw_data = daily_raw_data.set_index(['ts_code', 'trade_date'])
-    # ✅ 修复点 2：对 daily_raw_data MultiIndex 进行排序
+    # 修复点 2：对 daily_raw_data MultiIndex 进行排序
     daily_raw_data = daily_raw_data.sort_index(level=[0, 1])
 
     # 3. 存储到全局变量
@@ -144,7 +143,6 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
         return pd.DataFrame()
         
     try:
-        # 使用 .loc 配合排序后的 MultiIndex 进行高效切片
         # 切片后，索引变为 trade_date (字符串格式)
         daily_df_full = GLOBAL_DAILY_RAW.loc[ts_code]
         daily_df = daily_df_full.loc[(daily_df_full.index >= start_date) & (daily_df_full.index <= end_date)]
@@ -153,10 +151,8 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
         adj_factor_series = adj_factor_series_full.loc[(adj_factor_series_full.index >= start_date) & (adj_factor_series_full.index <= end_date)]
         
     except KeyError:
-        # 股票代码在当前市场，但历史数据中缺失
         return pd.DataFrame()
-    except Exception as e:
-        # 其他切片错误，如索引级别未找到
+    except Exception:
         return pd.DataFrame()
     
     if daily_df.empty or adj_factor_series.empty: return pd.DataFrame()
@@ -184,14 +180,16 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ----------------------------------------------------------------------
-# 函数调用替换（保持不变）
+# ⭐️ 核心修复函数：get_future_prices
 # ----------------------------------------------------------------------
 
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
-    start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
-    hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date, end_date=end_date)
+    start_date_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
+    end_date_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
+    
+    # 1. 获取未来 N 日数据 (用于计算 D+N 的分子)
+    hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date_future, end_date=end_date_future)
     if hist.empty or 'close' not in hist.columns:
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
@@ -202,10 +200,12 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     hist = hist.reset_index(drop=True) 
     results = {}
     
-    # 获取D-1收盘价作为基准
-    d_minus_1_data = get_qfq_data_v4_optimized_final(ts_code, (d0 - timedelta(days=1)).strftime("%Y%m%d"), selection_date)
-    selection_price_adj = d_minus_1_data['close'].iloc[-1] if not d_minus_1_data.empty and 'close' in d_minus_1_data.columns else np.nan
+    # 2. 获取基准价格 (D0 QFQ Close)
+    # ✅ 修复点：只获取 selection_date 当天的数据，保证切片精准
+    d0_data = get_qfq_data_v4_optimized_final(ts_code, selection_date, selection_date)
+    selection_price_adj = d0_data['close'].iloc[-1] if not d0_data.empty and 'close' in d0_data.columns and len(d0_data) > 0 else np.nan
     
+    # 3. 计算收益
     for n in days_ahead:
         col_name = f'Return_D{n}'
         if len(hist) >= n:
@@ -213,9 +213,12 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
             if pd.notna(selection_price_adj) and selection_price_adj > 1e-9:
                  results[col_name] = (future_price / selection_price_adj - 1) * 100
             else:
-                results[col_name] = np.nan
+                # 基准价格缺失或为零，返回 NaN
+                results[col_name] = np.nan 
         else:
+            # 未来数据不足 N 天，返回 NaN
             results[col_name] = np.nan
+            
     return results
 
 
@@ -471,7 +474,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V12.1 修复版：** 第一次运行时，数据预加载会花费 1-3 分钟。一旦下载完成，数据会被 Streamlit 缓存 24 小时，后续回测将极快。")
+    st.warning("⚠️ **V12.2 修复版：** 第一次运行时（或缓存过期），数据预加载会花费 1-3 分钟。一旦下载完成，后续回测将极快。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -481,6 +484,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     # ----------------------------------------------------------------------
     # ⭐️ 核心优化步骤：预加载所有历史数据 (已加入索引排序修复)
     # ----------------------------------------------------------------------
+    # 提示：如果 Global Cache 已经存在，这里将立即跳过下载，回测速度将极快
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
         st.error("❌ 历史数据预加载失败，回测无法进行。请检查 Tushare Token 和权限。")
@@ -527,6 +531,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         col = f'Return_D{n} (%)' 
         
         filtered_returns = all_results.copy()
+        # 仅对存在收益数据的记录进行计算
         valid_returns = filtered_returns.dropna(subset=[col])
 
         if not valid_returns.empty:
@@ -540,7 +545,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V12.1 修复版**")
+                  help=f"总有效样本数：{total_count}。**V12.2 修复版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
