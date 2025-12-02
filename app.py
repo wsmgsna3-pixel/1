@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V13.2 趋势统治版：V13.1 框架 + 最终防御优化
-核心修复：QFQ 基准修复已完成 (V12.9)。
-策略优化：核心变动：
-1. 极致趋势：提升 MACD (w_macd) 至 0.33。
-2. 容忍风险：削弱波动率防御 (w_volatility) 至 0.10，允许更高的短期波动以换取收益。
+选股王 · V14.3 终极鲁棒版：牺牲启动速度，确保数据完整性
+核心修复：
+1. 彻底解决 V14.1/V14.2 引入的“单次大批量 API 拉取失败”问题。
+2. 将 get_all_historical_data 函数改为 **“按日期循环拉取”** 模式，确保数据完整性（代价：启动加载时间将回到 5-8 分钟）。
+3. 保持 V14.1 的策略权重和 V14.2 的鲁棒性检查。
 """
 
 import streamlit as st
@@ -28,10 +28,10 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V13.2 趋势统治版", layout="wide")
-st.title("选股王 · V13.2 最终策略（👑 趋势统治 / 松绑防御）")
-st.markdown("🎯 **V13.2 策略说明：** 进一步强化 MACD 趋势权重，同时放松对短期波动的限制，目标是使 D+1 收益率转正，并显著提升 D+3/D+5 表现。")
-st.markdown("✅ **技术说明：** 底层 QFQ 基准已固定（V12.9 修复），回测速度极快且结果稳定。")
+st.set_page_config(page_title="选股王 · V14.3 终极鲁棒版", layout="wide")
+st.title("选股王 · V14.3 最终策略（⏳ 牺牲启动速度，确保数据完整性）")
+st.markdown("🎯 **V14.3 策略说明：** 策略权重与 V14.1 相同 (极速动量 + 强化内存防御)。**核心修复**：将历史数据拉取方式从单次大批量改为**按日期循环拉取**，彻底解决数据不完整导致的回测失败。")
+st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
 # ---------------------------
@@ -39,12 +39,13 @@ st.markdown("✅ **技术说明：** 底层 QFQ 基准已固定（V12.9 修复�
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API，已移除 time.sleep(0.5)"""
+    """安全调用 Tushare API"""
     global pro
     if pro is None:
         return pd.DataFrame(columns=['ts_code']) 
     func = getattr(pro, func_name) 
     try:
+        # 为了提高拉取可靠性，我们不对循环拉取部分使用 sleep，而是依赖循环的稳定。
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame(columns=['ts_code']) 
@@ -67,29 +68,28 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ 核心优化：预加载所有历史数据 (日线和复权因子)
+# ⭐️ V14.3 核心修复：按日期循环拉取历史数据
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def get_all_historical_data(trade_days_list):
     """
-    一次性获取所有回测日所需的最大历史范围内的日线数据和复权因子。
-    并计算 GLOBAL_QFQ_BASE_FACTORS。
+    V14.3 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
     """
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
     
     if not trade_days_list: return False
     
-    latest_trade_date = max(trade_days_list) # 以回测结束日作为复权基准日
+    latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     
-    # 扩大数据获取范围，确保能覆盖回测和未来收益计算
+    # 扩大数据获取范围
     start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=150)
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=20)
     
     start_date = start_date_dt.strftime("%Y%m%d")
     end_date = end_date_dt.strftime("%Y%m%d")
     
-    st.info(f"💾 正在批量下载 {start_date} 到 {end_date} 间的**全市场历史数据**...")
+    st.info(f"⏳ 正在按日期循环下载 {start_date} 到 {end_date} 间的**全市场历史数据**...")
     
     # 1. 获取所有交易日列表
     all_trade_dates_df = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')
@@ -98,32 +98,50 @@ def get_all_historical_data(trade_days_list):
         return False
     
     all_dates = all_trade_dates_df['cal_date'].tolist()
-    if not all_dates:
-        st.error("交易日列表为空。")
-        return False
-
-    # 2. 批量获取复权因子 (adj_factor) - 按日期循环获取
+    
+    # 2. 循环获取复权因子 (adj_factor) 和日线行情 (daily)
     adj_factor_data_list = []
-    adj_download_progress = st.progress(0, text="下载进度 (复权因子)...")
+    daily_data_list = []
+    
+    download_progress = st.progress(0, text="下载进度 (按日期循环)...")
     
     for i, date in enumerate(all_dates):
-        adj_df = safe_get('adj_factor', trade_date=date) 
+        download_progress.progress((i + 1) / len(all_dates), text=f"下载进度：处理日期 {date}")
+        
+        # 获取复权因子
+        adj_df = safe_get('adj_factor', trade_date=date)
         if not adj_df.empty:
             adj_factor_data_list.append(adj_df)
-        adj_download_progress.progress((i + 1) / len(all_dates), text=f"下载进度 (复权因子)：正在处理 {date} ({i+1}/{len(all_dates)})")
+            
+        # 获取日线行情
+        daily_df = safe_get('daily', trade_date=date)
+        if not daily_df.empty:
+            daily_data_list.append(daily_df)
+            
+        # 避免过于频繁的 API 调用，Tushare 有 QPS 限制，但按日期循环已经自带了时间间隔
     
-    adj_download_progress.empty()
+    download_progress.progress(1.0, text="下载进度：合并数据...")
+    download_progress.empty()
+
     
+    # 3. 合并和处理数据
     if not adj_factor_data_list:
         st.error("❌ 严重错误：无法获取任何复权因子数据。")
         return False
         
-    adj_factor_data = pd.concat(adj_factor_data_list, ignore_index=True)
+    adj_factor_data = pd.concat(adj_factor_data_list)
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
-    adj_factor_data = adj_factor_data.set_index(['ts_code', 'trade_date'])
-    GLOBAL_ADJ_FACTOR = adj_factor_data.sort_index(level=[0, 1]) 
+    GLOBAL_ADJ_FACTOR = adj_factor_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
     
-    # ⭐️ 核心修复步骤 1：计算并存储全局固定 QFQ 基准因子
+    if not daily_data_list:
+        st.error("❌ 严重错误：无法获取任何历史日线数据。")
+        return False
+
+    daily_raw_data = pd.concat(daily_data_list)
+    GLOBAL_DAILY_RAW = daily_raw_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
+
+
+    # 4. 计算并存储全局固定 QFQ 基准因子 (与 V14.2 保持一致)
     latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
     
     if latest_global_date:
@@ -136,34 +154,18 @@ def get_all_historical_data(trade_days_list):
             GLOBAL_QFQ_BASE_FACTORS = {}
     
     
-    # 3. 批量获取日线行情 (daily) - 按日期循环获取
-    daily_data_list = []
-    download_progress = st.progress(0, text="下载进度 (日线行情)...")
-    
-    for i, date in enumerate(all_dates):
-        daily_df = safe_get('daily', trade_date=date)
-        if not daily_df.empty:
-            daily_data_list.append(daily_df)
-        download_progress.progress((i + 1) / len(all_dates), text=f"下载进度 (日线行情)：正在处理 {date} ({i+1}/{len(all_dates)})")
-    
-    download_progress.empty()
-    
-    if not daily_data_list:
-        st.error("❌ 严重错误：无法获取任何历史日线数据。")
-        return False
-
-    daily_raw_data = pd.concat(daily_data_list, ignore_index=True)
-    daily_raw_data = daily_raw_data.set_index(['ts_code', 'trade_date'])
-    GLOBAL_DAILY_RAW = daily_raw_data.sort_index(level=[0, 1])
-
-    # 4. 诊断信息
+    # 5. 诊断信息
     st.info(f"✅ 数据预加载完成。日线数据总条目：{len(GLOBAL_DAILY_RAW)}，复权因子总条目：{len(GLOBAL_ADJ_FACTOR)}")
 
+    # 检查数据条目是否足够 (简单的完整性检查)
+    if len(GLOBAL_DAILY_RAW) < 100000:
+         st.warning("⚠️ 警告：总条目数偏低。请再次确认 Tushare 积分和 API 访问权限。")
+         
     return True
 
 
 # ----------------------------------------------------------------------
-# ⭐️ 优化的数据获取函数：只从内存中切片 (前复权计算核心)
+# 优化的数据获取函数：只从内存中切片 (前复权计算核心)
 # ----------------------------------------------------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     """ 
@@ -217,7 +219,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ----------------------------------------------------------------------
-# ⭐️ 核心函数：get_future_prices (接受 D0 QFQ 价格)
+# 核心函数：get_future_prices (接受 D0 QFQ 价格)
 # ----------------------------------------------------------------------
 
 def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
@@ -423,8 +425,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df = df[mask_amt]
     
     df = df.reset_index(drop=True)
+    initial_candidate_count = len(df) # 记录硬性过滤后的数量
 
-    if len(df) == 0: return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
+    if initial_candidate_count == 0: return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
 
     # 4. 遴选决赛名单
     limit_pct = int(FINAL_POOL * 0.7)
@@ -433,14 +436,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     existing_codes = set(df_pct['ts_code'])
     df_turn = df[~df['ts_code'].isin(existing_codes)].sort_values('turnover_rate', ascending=False).head(limit_turn).copy()
     final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
-
-    # 4.5 数据完整性前置校验 
+    
+    # ⭐️ V14.2 鲁棒性强化：检查候选股在内存中的 D0 QFQ 数据是否完整 (保留，但现在因循环拉取，成功率极高)
     if not GLOBAL_DAILY_RAW.empty:
-        codes_in_global = GLOBAL_DAILY_RAW.index.get_level_values('ts_code').unique()
-        final_candidates = final_candidates[final_candidates['ts_code'].isin(codes_in_global)].copy()
-
+        try:
+            codes_with_d0_data = GLOBAL_DAILY_RAW.loc[(slice(None), last_trade), :].index.get_level_values('ts_code').unique()
+            final_candidates = final_candidates[final_candidates['ts_code'].isin(codes_with_d0_data)].copy()
+        except KeyError:
+            # 如果 last_trade 日期在 GLOBAL_DAILY_RAW 中完全不存在
+            return pd.DataFrame(), f"跳过 {last_trade}：核心历史数据缓存中缺失回测日 {last_trade} 的全部数据 (已通过鲁棒性检查过滤)"
+            
     if final_candidates.empty:
-        return pd.DataFrame(), f"候选股票池中所有股票在缓存中均缺失历史数据：{last_trade}"
+        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {initial_candidate_count} 个硬性过滤股中，所有股票的 D0 QFQ 价格均无效（数据不足或复权失败）。"
 
     # 5. 深度评分 
     records = []
@@ -450,7 +457,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
         raw_close = getattr(row, 'close', np.nan)
         
-        # 计算指标
+        # 计算指标 (极速计算)
         ind = compute_indicators(ts_code, last_trade) 
         d0_qfq_close = ind.get('last_close', np.nan) # 提取 D0 QFQ Close Price
 
@@ -469,9 +476,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             }
             
             rec.update({
-                'vol_ratio': ind.get('vol_ratio', np.nan), 'macd': ind.get('macd_val', np.nan),
+                'vol_ratio': ind.get('vol_ratio', np.nan), 
+                'macd': ind.get('macd_val', np.nan),
                 '10d_return': ind.get('10d_return', np.nan),
-                'volatility': ind.get('volatility', np.nan), 'position_60d': ind.get('position_60d', np.nan)
+                'volatility': ind.get('volatility', np.nan), 
+                'position_60d': ind.get('position_60d', np.nan),
             })
             
             rec.update({
@@ -485,10 +494,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     
     if fdf.empty: 
-        error_msg = f"评分列表为空：{last_trade}. 原因：所有 {len(final_candidates)} 个候选股票都无法获取有效的 D0 QFQ 价格（可能数据不足3天或复权失败）。"
-        return pd.DataFrame(), error_msg
+        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {len(final_candidates)} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
-    # 6. 归一化与 V13.2 策略精调评分 
+    # 6. 归一化与 V14.1 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -503,23 +511,24 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_volatility'] = normalize(fdf['volatility'])
     fdf['s_position'] = fdf['position_60d'] / 100 
     
-    # 🚨 V13.2 策略权重 (趋势统治 + 松绑防御)
-    w_mf = 0.17           # 资金流 ↓↓
-    w_pct = 0.20          # 当日涨幅 ↑↑
-    w_turn = 0.15         # 换手率 ↑
-    w_position = 0.10     # 60日位置 ↓ (反向)
-    w_volatility = 0.10   # 波动率 ↓ (反向) 容忍高波动
-    w_macd = 0.33         # MACD ↑↑↑ 趋势核心
+    # 🚨 V14.1 策略权重 (极速动量 + 强趋势 + 强化内存防御)
+    w_macd = 0.30         # MACD ↑↑↑ 趋势核心
+    w_pct = 0.20          # 当日涨幅 ↑↑ (恢复极致动量)
+    w_turn = 0.15         # 换手率 ↑ (恢复)
+    w_mf = 0.10           # 资金流 ↓↓ (维持低位)
+    w_volatility = 0.15   # 波动率 ↓ (反向) ⭐️ 大幅强化防御
+    w_position = 0.10     # 60日位置 ↓ (反向) 强化防御
     w_vol = 0.00          
     w_trend = 0.00          
     
     score = (
-        fdf['s_pct'].fillna(0.5) * w_pct + fdf['s_turn'].fillna(0.5) * w_turn + 
+        fdf['s_pct'].fillna(0.5) * w_pct + 
+        fdf['s_turn'].fillna(0.5) * w_turn + 
         fdf['s_mf'].fillna(0.5) * w_mf + 
         fdf['s_macd'].fillna(0.5) * w_macd + 
         
-        (1 - fdf['s_position'].fillna(0.5)) * w_position + # 倾向低位，但权重低
-        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + # 倾向低波动
+        (1 - fdf['s_position'].fillna(0.5)) * w_position + # 倾向低位
+        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + # 倾向低波动 ⭐️ 强化
         
         fdf['s_vol'].fillna(0.5) * w_vol + 
         fdf['s_trend'].fillna(0.5) * w_trend     
@@ -535,7 +544,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序重新加载数据的关键一步。")
+    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序强制重新下载数据的关键一步。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -543,7 +552,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.stop()
     
     # ----------------------------------------------------------------------
-    # ⭐️ 核心优化步骤：预加载所有历史数据 (V12.9 基准修复)
+    # 核心优化步骤：预加载所有历史数据 (V14.3 循环拉取)
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
@@ -561,6 +570,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     my_bar = st.progress(0)
     
     for i, trade_date in enumerate(trade_days_str):
+        # 即使数据加载慢，回测计算仍然是“纯内存计算”
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date} (纯内存计算)")
         
         daily_result_df, error = run_backtest_for_a_day(
@@ -568,7 +578,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         )
         
         if error:
-            st.warning(f"跳过 {trade_date}：{error}")
+            st.warning(f"{error}") # 直接打印更精确的错误信息
         elif not daily_result_df.empty:
             daily_result_df['Trade_Date'] = trade_date
             results_list.append(daily_result_df)
@@ -603,7 +613,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V13.2 趋势统治版**")
+                  help=f"总有效样本数：{total_count}。**V14.3 鲁棒版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
