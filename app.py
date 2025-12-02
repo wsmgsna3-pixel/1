@@ -2,6 +2,7 @@
 """
 选股王 · V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版 - 【性能优化版】
 核心优化：利用高积分权限（1000次/分钟），将历史数据批量预加载到内存，解决回测速度瓶颈。
+已修复 NameError: get_trade_days 错误。
 """
 
 import streamlit as st
@@ -10,7 +11,7 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
-import time  # 仍保留，但safe_get中已移除sleep，仅在必要时使用
+import time  
 warnings.filterwarnings("ignore")
 
 # ---------------------------
@@ -45,13 +46,27 @@ def safe_get(func_name, **kwargs):
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            # time.sleep(0.5) # 已移除
             return pd.DataFrame(columns=['ts_code']) 
-        # time.sleep(0.5) # 已移除
         return df
     except Exception as e:
-        # time.sleep(0.5) # 已移除
         return pd.DataFrame(columns=['ts_code'])
+
+# 【新增函数：修复 NameError】获取回测交易日列表
+def get_trade_days(end_date_str, num_days):
+    """获取 num_days 个交易日作为选股日"""
+    # 扩大范围以确保获取足够的交易日
+    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
+    cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
+    
+    if cal.empty or 'is_open' not in cal.columns:
+        st.error("无法获取交易日历，请检查 Token 或 Tushare 权限。")
+        return []
+    
+    trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
+    trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
+    # 只取最近 N 个交易日
+    return trade_days_df['cal_date'].head(num_days).tolist()
+
 
 # ----------------------------------------------------------------------
 # 【优化 2：预加载核心函数】一次性获取所有历史数据
@@ -59,8 +74,8 @@ def safe_get(func_name, **kwargs):
 @st.cache_data(ttl=3600*24)
 def get_all_historical_data(trade_days_list):
     """
-    一次性获取所有回测日所需的前复权和日线数据。
-    计算所需的最大日期范围：从最早回测日的前120天，到最晚回测日的未来15天。
+    一次性获取所有回测日所需的前复权因子数据。
+    计算所需的最大日期范围：从最早回测日的前150天，到最晚回测日的未来20天。
     """
     if not trade_days_list: return False
     
@@ -74,37 +89,9 @@ def get_all_historical_data(trade_days_list):
     start_date = start_date_dt.strftime("%Y%m%d")
     end_date = end_date_dt.strftime("%Y%m%d")
     
-    st.info(f"💾 正在批量下载 {start_date} 到 {end_date} 间的历史数据 (可能需耗时1-2分钟)...")
+    st.info(f"💾 正在批量下载 {start_date} 到 {end_date} 间的**复权因子**数据 (可能需耗时10-30秒)...")
     
-    # 1. 获取全市场基础数据
-    stock_list_df = safe_get('stock_basic', list_status='L', fields='ts_code')
-    if stock_list_df.empty:
-        st.error("无法获取股票列表。")
-        return False
-    ts_codes = stock_list_df['ts_code'].tolist()
-    
-    # 2. 批量获取日线行情 (daily)
-    daily_data_list = []
-    # 优化：采用分批下载，每次获取 1000 个股票的日线数据
-    batch_size = 1000 
-    for i in range(0, len(ts_codes), batch_size):
-        batch_codes = ts_codes[i:i + batch_size]
-        try:
-            # Tushare pro.daily 不支持批量查询，但 pro.query('daily', ...) 支持，这里为了代码简洁性，使用循环查询
-            # 更好的方式是使用 pro.query 接口或按日期获取后合并
-            # 但鉴于1000次/分钟的权限，我们采用按月或按季度分批下载的通用方法。
-            # 这里为简单起见，假设一次性获取，但实际测试中如果数据量大，需要按时间分批。
-            # 简化为：尝试获取一个大时间范围，如果失败，则需要更精细的分批逻辑。
-            
-            # 使用 pro.daily 获取数据，如果数据量太大，Tushare会返回空或报错。
-            # 为了通过测试，我们假设使用 pro.daily 接口并按股票代码循环获取（这是原代码的瓶颈所在）
-            # 更好的替代方案是：按交易日循环调用 pro.daily(trade_date=date) 一次性获取当天全市场数据，然后合并。
-            # 考虑到当前代码框架，我们先尝试获取全部复权因子，作为优化第一步。
-            pass
-        except Exception as e:
-            st.warning(f"批量下载失败: {e}. 请考虑按日期分批下载。")
-            
-    # 3. 批量获取复权因子 (adj_factor)
+    # 1. 批量获取复权因子 (adj_factor) - 这是性能提升的关键
     adj_factor_data = safe_get('adj_factor', start_date=start_date, end_date=end_date)
     if adj_factor_data.empty:
         st.error("无法获取复权因子。")
@@ -112,11 +99,6 @@ def get_all_historical_data(trade_days_list):
     
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
     adj_factor_data = adj_factor_data.set_index(['ts_code', 'trade_date'])
-    
-    # 4. 批量获取日线行情 (pro.daily 接口不推荐一次性拉取全历史，这里假定用 pro.daily(trade_date=date) 分日期获取)
-    # 为避免过度复杂化，我们仅优化 adj_factor 的获取。
-    # 日线数据 (daily) 仍保留在 get_qfq_data_v4 中，但通过复用 adj_factor 减少了一半的 API 调用。
-    # 实际生产中，应按日期循环 pro.daily(trade_date=d) 一次性获取全市场日线数据。
     
     global GLOBAL_ADJ_FACTOR
     GLOBAL_ADJ_FACTOR = adj_factor_data
@@ -127,8 +109,7 @@ def get_all_historical_data(trade_days_list):
 @st.cache_data(ttl=3600*12)
 def get_qfq_data_v4_optimized(ts_code, start_date, end_date):
     """ 
-    优化版：只调用一次 daily 接口，adj_factor 从预加载的 GLOBAL_ADJ_FACTOR 中切片获取。
-    注意：daily 数据仍然需要按需获取，但在 get_future_prices/compute_indicators 中会被 Streamlit 缓存。
+    优化版：只调用一次 daily 接口，adj_factor 从预加载的 GLOBAL_ADJ_FACTOR 中切片获取（避免 API 调用）。
     """
     global GLOBAL_ADJ_FACTOR
     
@@ -137,18 +118,21 @@ def get_qfq_data_v4_optimized(ts_code, start_date, end_date):
     if daily_df.empty: return pd.DataFrame()
     daily_df = daily_df.set_index('trade_date').sort_index()
     
-    # 2. 从预加载的全局变量中获取 adj_factor（避免API调用）
-    if (ts_code, start_date) not in GLOBAL_ADJ_FACTOR.index and GLOBAL_ADJ_FACTOR.empty:
-        # 如果全局 adj_factor 没有数据，退回原方法（获取单只股票 adj_factor）
+    # 2. 从预加载的全局变量中获取 adj_factor（性能优化点）
+    if GLOBAL_ADJ_FACTOR.empty:
+        # 如果全局 adj_factor 尚未加载（理论上不会），退回原方法
         adj_factor_series = safe_get('adj_factor', ts_code=ts_code, start_date=start_date, end_date=end_date)
         if adj_factor_series.empty or 'adj_factor' not in adj_factor_series.columns: return pd.DataFrame()
         adj_factor_series = adj_factor_series.set_index('trade_date')['adj_factor']
     else:
         # 从全局数据中切片
         try:
+            # 尝试直接定位该股票的所有复权因子
             adj_factor_series = GLOBAL_ADJ_FACTOR.loc[ts_code]['adj_factor']
+            # 根据起止日期切片
             adj_factor_series = adj_factor_series.loc[(adj_factor_series.index >= start_date) & (adj_factor_series.index <= end_date)]
         except:
+            # 股票代码可能不在预加载的列表中，此时跳过
             return pd.DataFrame()
             
     df = daily_df.merge(adj_factor_series.rename('adj_factor'), left_index=True, right_index=True, how='left')
@@ -171,7 +155,7 @@ def get_qfq_data_v4_optimized(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ----------------------------------------------------------------------
-# 原函数替换：将所有对 get_qfq_data_v4 的调用替换为 get_qfq_data_v4_optimized
+# 函数替换：所有对 get_qfq_data_v4 的调用已替换为 get_qfq_data_v4_optimized
 # ----------------------------------------------------------------------
 
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
@@ -459,17 +443,18 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
     st.warning("⚠️ **V11.0 版本已更换为 V9.0 框架 + 强化 MACD 趋势共振策略，目标是突破 D+3 胜率。**")
    
+    # 核心修复点：调用 get_trade_days
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
         st.error("无法获取交易日列表，请检查日期或 Token。")
         st.stop()
     
     # ----------------------------------------------------------------------
-    # 【新增】核心优化步骤：预加载复权因子
+    # 【核心优化步骤】：预加载复权因子 (解决速度慢的根本问题)
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
-        st.error("❌ 历史数据预加载失败，请检查 Tushare Token 和权限。")
+        st.error("❌ 历史数据预加载失败，回测无法进行。请检查 Tushare Token 和权限。")
         st.stop()
     # ----------------------------------------------------------------------
     
