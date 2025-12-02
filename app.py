@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V12.6 最终决战策略：纯 QFQ 基准版 (最高准确性要求)
-核心修复：移除 V12.5 的 D0 价格回退机制，严格只使用内存中计算出的 D0 前复权价格作为回测基准，确保回测的纯粹性和准确性。
+选股王 · V12.7 纯 QFQ 最终版：指标复用修复
+核心修复：将 D0 前复权价格（QFQ Price）的获取与指标计算绑定，并复用该价格作为收益率基准，消除 D0 价格的“影子缺失”问题。
 """
 
 import streamlit as st
@@ -24,9 +24,9 @@ GLOBAL_DAILY_RAW = pd.DataFrame()
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V12.6 最终决战策略", layout="wide")
-st.title("选股王 · V12.6 最终决战策略（✨ 纯 QFQ 基准版）")
-st.markdown("🎯 **V12.6 修复说明：** 严格只使用内存中计算出的 **D0 前复权价格**作为回测基准，避免任何原始价格引入的潜在误差。")
+st.set_page_config(page_title="选股王 · V12.7 纯 QFQ 最终版", layout="wide")
+st.title("选股王 · V12.7 最终决战策略（✅ D0 QFQ 价格复用修复）")
+st.markdown("🎯 **V12.7 修复说明：** 确保收益率计算的分母（D0 QFQ 价格）与指标计算使用的价格高度一致，消除因冗余获取导致的 NaN 问题。")
 st.markdown("✅ **优化说明：** 历史数据预加载并确保索引排序正确，回测循环中只进行内存切片操作。")
 
 
@@ -69,7 +69,6 @@ def get_trade_days(end_date_str, num_days):
 def get_all_historical_data(trade_days_list):
     """
     一次性获取所有回测日所需的最大历史范围内的日线数据和复权因子。
-    复权因子下载改为按日期循环，增强健壮性。
     """
     if not trade_days_list: return False
     
@@ -96,13 +95,12 @@ def get_all_historical_data(trade_days_list):
         st.error("交易日列表为空。")
         return False
 
-    # 2. 批量获取复权因子 (adj_factor) - 按日期循环获取 (健壮性修复)
+    # 2. 批量获取复权因子 (adj_factor) - 按日期循环获取
     adj_factor_data_list = []
     
     adj_download_progress = st.progress(0, text="下载进度 (复权因子)...")
     
     for i, date in enumerate(all_dates):
-        # 核心修复点：按日期获取 adj_factor，防止大批量请求超时或失败
         adj_df = safe_get('adj_factor', trade_date=date) 
         if not adj_df.empty:
             adj_factor_data_list.append(adj_df)
@@ -184,10 +182,8 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     df = df.sort_index()
     latest_adj_factor = df['adj_factor'].iloc[-1]
     
-    # 确保 latest_adj_factor 非零，避免除以零
+    # 确保 latest_adj_factor 非零
     if latest_adj_factor < 1e-9:
-        # 如果最新复权因子为零，则直接返回原始价格，但在回测中通常会导致 nan 或后续问题。
-        # 这里为保持计算流程完整，但实际应依赖健壮的下载确保其非零。
         for col in ['open', 'high', 'low', 'close', 'pre_close']:
             if col in df.columns:
                 df[col + '_qfq'] = df[col]
@@ -204,13 +200,17 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ----------------------------------------------------------------------
-# ⭐️ 核心函数：get_future_prices (严格使用 QFQ 作为基准)
+# ⭐️ 核心函数：get_future_prices (接受 D0 QFQ 价格)
 # ----------------------------------------------------------------------
 
-def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
+def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
+    # 核心变动：接受 d0_qfq_close 作为已验证的基准价格
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_date_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_date_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
+    
+    # D0 基准价格：使用传入的已验证 QFQ 价格
+    selection_price_adj = d0_qfq_close 
     
     # 1. 获取未来 N 日数据 (用于计算 D+N 的分子) - 必须是 QFQ
     hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date_future, end_date=end_date_future)
@@ -218,19 +218,13 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
+        
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
-    
     hist = hist.dropna(subset=['close'])
     hist = hist.reset_index(drop=True) 
     results = {}
     
-    # 2. 严格获取基准价格 (D0 QFQ Close)
-    # D0 价格必须通过 QFQ 计算获得
-    d0_data = get_qfq_data_v4_optimized_final(ts_code, selection_date, selection_date)
-    # 如果 d0_data 为空或没有 close 列， selection_price_adj 严格为 nan
-    selection_price_adj = d0_data['close'].iloc[-1] if not d0_data.empty and 'close' in d0_data.columns and len(d0_data) > 0 else np.nan
-    
-    # 3. 计算收益
+    # 2. 计算收益
     for n in days_ahead:
         col_name = f'Return_D{n}'
         
@@ -254,7 +248,7 @@ def compute_indicators(ts_code, end_date):
     """计算 MACD, 10日回报, 波动率, 60日位置等指标 (使用优化版数据获取)"""
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
-    # 用于计算指标的数据，也必须是 QFQ 数据
+    # 获取 QFQ 数据，用于计算所有指标
     df = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date, end_date=end_date)
     
     res = {}
@@ -265,10 +259,11 @@ def compute_indicators(ts_code, end_date):
     df['vol'] = pd.to_numeric(df['vol'], errors='coerce').fillna(0)
     df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     close = df['close']
-    res['last_close'] = close.iloc[-1]
+    
+    # ⭐️ 核心：存储 D0 QFQ 收盘价，用于复用
+    res['last_close'] = close.iloc[-1] if len(close) > 0 else np.nan
     
     # MACD, 量比, 10日回报, 波动率, 60日位置计算（保持不变）
-    # MACD 计算 
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -277,17 +272,14 @@ def compute_indicators(ts_code, end_date):
         res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     else: res['macd_val'] = np.nan
         
-    # 量比计算 
     vols = df['vol'].tolist()
     if len(vols) >= 6 and vols[-6:-1] and np.mean(vols[-6:-1]) > 1e-9:
         res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
     else: res['vol_ratio'] = np.nan
         
-    # 10日回报、波动率计算 
     res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 and close.iloc[-10]!=0 else 0
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
-    # 60日位置计算 
     if len(df) >= 60:
         hist_60 = df.tail(60)
         min_low = hist_60['low'].min()
@@ -334,7 +326,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ---------------------------
-# 核心回测逻辑函数 (run_backtest_for_a_day - 恢复调用 get_future_prices)
+# 核心回测逻辑函数 (run_backtest_for_a_day - 更新调用 get_future_prices)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS):
     """为单个交易日运行选股和回测逻辑"""
@@ -426,34 +418,39 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     for row in final_candidates.itertuples():
         ts_code = row.ts_code
         
-        # ⚠️ 注意：此处 Close 依然是原始收盘价，仅用于展示和筛选，不影响收益率计算
+        # ⚠️ 注意：此处的 Close 是原始收盘价，仅用于展示和初筛
         raw_close = getattr(row, 'close', np.nan)
         
+        # ⭐️ 核心：计算指标。如果计算成功，ind['last_close'] 就是 D0 QFQ Close Price
+        ind = compute_indicators(ts_code, last_trade) 
+        d0_qfq_close = ind.get('last_close', np.nan) # 提取 D0 QFQ Close Price
+
         rec = {
             'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
-            'Close': raw_close, 
+            'Close': raw_close, # 仍显示原始价格
             'Circ_MV (亿)': getattr(row, 'circ_mv_billion', np.nan),
             'Pct_Chg (%)': getattr(row, 'pct_chg', 0), 
             'turnover': getattr(row, 'turnover_rate', 0),
             'net_mf': getattr(row, 'net_mf', 0)
         }
         
-        ind = compute_indicators(ts_code, last_trade) 
         rec.update({
             'vol_ratio': ind.get('vol_ratio', np.nan), 'macd': ind.get('macd_val', np.nan),
             '10d_return': ind.get('10d_return', np.nan),
             'volatility': ind.get('volatility', np.nan), 'position_60d': ind.get('position_60d', np.nan)
         })
         
-        # 移除 raw_close 参数，严格依赖 QFQ 计算基准价
-        future_returns = get_future_prices(ts_code, last_trade) 
+        # ⭐️ 核心：将已验证的 D0 QFQ 价格传入
+        future_returns = get_future_prices(ts_code, last_trade, d0_qfq_close) 
         rec.update({
             'Return_D1 (%)': future_returns.get('Return_D1', np.nan),
             'Return_D3 (%)': future_returns.get('Return_D3', np.nan),
             'Return_D5 (%)': future_returns.get('Return_D5', np.nan),
         })
 
-        records.append(rec)
+        # 仅当 D0 QFQ Close Price 有效时，才添加记录。
+        if pd.notna(d0_qfq_close):
+            records.append(rec)
     
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
@@ -483,7 +480,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     w_vol = 0.00            
     w_trend = 0.00          
     
-    # 确保所有评分列都是数字类型，且 nan 不参与计算
     score = (
         fdf['s_pct'].fillna(0.5) * w_pct + fdf['s_turn'].fillna(0.5) * w_turn + 
         fdf['s_mf'].fillna(0.5) * w_mf + 
@@ -576,7 +572,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V12.6 纯 QFQ 基准版**")
+                  help=f"总有效样本数：{total_count}。**V12.7 纯 QFQ 最终版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
