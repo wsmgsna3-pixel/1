@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V18.0 最终定型版：恢复防御，稳定趋势共振
+选股王 · V19.0 最终定型版：强化爆发力与前瞻性
 更新说明：
-1. 【**策略精调 V18.0**】：
-   - **目标**：在 V17.0 基础上，彻底修复排序逻辑，并恢复 60日位置防御，以稳定 D+5 收益。
-   - **60日位置 (w_position)** 从 0.00 恢复至 **0.10**，作为高位风险的保护。
-   - 资金流和当日涨幅权重微降，以腾出空间给防御项。
+1. 【**策略精调 V19.0**】：
+   - **目标**：解决 V18.0 D+5 崩塌问题，削减滞后指标权重，增强短线爆发力。
+   - **资金流 (w_mf)** 从 0.40 降至 **0.30**。
+   - **MACD (w_macd)** 从 0.20 降至 **0.15**。
+   - **当日涨幅 (w_pct)** 从 0.15 升至 **0.25**。
+   - **换手率 (w_turn)** 从 0.10 升至 **0.15**。
+   - **稳定防御 (0.15)** 保持不变。
    
-   新权重结构：资金流(0.40) + 动能(0.25) + 趋势(0.20) + 稳定防御(0.15) = 1.00
-
-2. 【**排序修复 V17.1**】：最终排序从升序 (ascending=True) **改回降序 (ascending=False)**，匹配正向的评分逻辑。
+   新权重结构：瞬时爆发(0.40) + 趋势与资金流(0.45) + 稳定防御(0.15) = 1.00
 """
 
 import streamlit as st
@@ -24,10 +25,10 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V18.0 最终定型版（恢复防御）", layout="wide")
-st.title("选股王 · V18.0 最终定型版（恢复防御）")
-st.markdown("🎯 **V18.0 策略：修复 V17.0 排序逻辑错误，并重新引入 60日位置防御，以稳定中期收益。**")
-st.markdown("🛡️ **当前版本已恢复排序逻辑，并使用 0.10 的 60日位置权重。**")
+st.set_page_config(page_title="选股王 · V19.0 最终定型版（强化爆发）", layout="wide")
+st.title("选股王 · V19.0 最终定型版（强化爆发）")
+st.markdown("🎯 **V19.0 策略：削减 MACD 和资金流滞后性，增强当日涨幅和换手率，以捕获更早期的爆发信号。**")
+st.markdown("📈 **新权重结构：瞬时爆发(0.40) + 趋势与资金流(0.45) + 稳定防御(0.15)。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -438,7 +439,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V18.0 策略精调评分
+    # 6. 归一化与 V19.0 策略精调评分
     def normalize(series):
         series_nn = series.dropna()
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -454,27 +455,27 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_position'] = fdf['position_60d'] / 100
     
     # ----------------------------------------------------------------------------------
-    # 🚨 V18.0 最终定型策略：恢复防御和修复排序
+    # 🚨 V19.0 最终定型策略：强化爆发与前瞻性
     
-    # 核心权重：资金流，占比 40% (微降)
-    w_mf = 0.40             # 40% - 资金流 (核心动力)
+    # 核心权重：资金流 (削减)
+    w_mf = 0.30             # 30% - 资金流 
 
-    # 动能权重：当日动能，占比 25% (微降)
-    w_pct = 0.15            # 15% - 当日涨幅
-    w_turn = 0.10           # 10% - 换手率
+    # 动能权重：当日动能 (增强)
+    w_pct = 0.25            # 25% - 当日涨幅 (增强爆发力)
+    w_turn = 0.15           # 15% - 换手率 (增强爆发力)
     
-    # 趋势确认：占比 20%
-    w_macd = 0.20           # 20% - MACD (增强)
+    # 趋势确认：(削减)
+    w_macd = 0.15           # 15% - MACD (削减滞后性)
 
-    # 稳定防御：占比 15% (恢复)
-    w_volatility = 0.05     # 05% - 波动率 (极致弱防御)
-    w_position = 0.10       # 10% - 60日位置 (恢复强势防御)
+    # 稳定防御：(保持)
+    w_volatility = 0.05     # 05% - 波动率 
+    w_position = 0.10       # 10% - 60日位置 
  
     # 彻底归零项
     w_trend = 0.00          # 0% - 10日回报 
     w_vol = 0.00            # 0% - 量比 
     
-    # Sum: 0.40+0.15+0.10+0.20+0.05+0.10 = 1.00
+    # Sum: 0.30+0.25+0.15+0.15+0.05+0.10 = 1.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + 
@@ -493,7 +494,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     )
     fdf['综合评分'] = score * 100
     # ----------------------------------------------------------------------------------
-    # 🚨 V18.0 排序修复：从升序 (True) 更改回降序 (False)，选择分数最高的 Top K
+    # 排序：选择分数最高的 Top K
     # ----------------------------------------------------------------------------------
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
     fdf.index += 1
@@ -506,7 +507,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V18.0 版本已应用：资金流 (0.40) + MACD (0.20) + 动能 (0.25) + 稳定防御 (0.15)。**")
+    st.warning("⚠️ **V19.0 版本已应用：瞬时爆发(0.40) + 趋势与资金流(0.45) + 稳定防御(0.15)。**")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -564,7 +565,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V18.0 已应用最终定型策略。**")
+                  help=f"总有效样本数：{total_count}。**V19.0 已应用最终定型策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
