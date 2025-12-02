@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V13.2 趋势统治版：V13.1 框架 + 最终防御优化
+选股王 · V14.0 趋势+评级版：Tushare 积分优势利用 (stk_rating)
 核心修复：QFQ 基准修复已完成 (V12.9)。
 策略优化：核心变动：
-1. 极致趋势：提升 MACD (w_macd) 至 0.33。
-2. 容忍风险：削弱波动率防御 (w_volatility) 至 0.10，允许更高的短期波动以换取收益。
+1. 机构共识：新增 w_rating (机构评级) 权重 0.15，解决 D+3/D+5 稳定性问题。
+2. 权重均衡：重新分配权重，确保 w_pct/w_macd 维持主导，w_mf 进一步降级至 0.10。
 """
 
 import streamlit as st
@@ -28,9 +28,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V13.2 趋势统治版", layout="wide")
-st.title("选股王 · V13.2 最终策略（👑 趋势统治 / 松绑防御）")
-st.markdown("🎯 **V13.2 策略说明：** 进一步强化 MACD 趋势权重，同时放松对短期波动的限制，目标是使 D+1 收益率转正，并显著提升 D+3/D+5 表现。")
+st.set_page_config(page_title="选股王 · V14.0 趋势+评级版", layout="wide")
+st.title("选股王 · V14.0 最终策略（⭐️ 机构共识 + 强趋势）")
+st.markdown("🎯 **V14.0 策略说明：** 引入 Tushare **机构评级 (stk_rating)** 因子（积分权限），专门用于增强 D+3/D+5 的基本面稳定性，同时维持短期动量。")
 st.markdown("✅ **技术说明：** 底层 QFQ 基准已固定（V12.9 修复），回测速度极快且结果稳定。")
 
 
@@ -258,7 +258,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
 
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (使用优化版数据获取)"""
+    """计算 MACD, 10日回报, 波动率, 60日位置, 机构评级等指标 (使用优化版数据获取)"""
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
     # 获取 QFQ 数据，用于计算所有指标
@@ -266,6 +266,7 @@ def compute_indicators(ts_code, end_date):
     
     res = {}
     if df.empty or 'close' not in df.columns: 
+        res['avg_rating_score'] = 3.0 # Default neutral score for rating
         return res
         
     df['close'] = pd.to_numeric(df['close'], errors='coerce').astype(float)
@@ -309,6 +310,21 @@ def compute_indicators(ts_code, end_date):
         else: res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
     else: res['position_60d'] = np.nan 
     
+    # ⭐️ V14.0 新增：机构评级 (stk_rating)
+    rating_df = safe_get('stk_rating', ts_code=ts_code, end_date=end_date, start_date=start_date)
+    rating_map = {'买入': 5, '增持': 4, '中性': 3, '减持': 2, '卖出': 1, '推荐': 4, '谨慎推荐': 3, '强烈推荐': 5}
+    
+    if not rating_df.empty and 'rating' in rating_df.columns:
+        # 只看最近 30 天的评级
+        rating_df = rating_df[rating_df['end_date'] <= end_date]
+        rating_df['rating_score'] = rating_df['rating'].map(rating_map).fillna(np.nan)
+        
+        # 使用最近 30 天的平均评级分数
+        latest_ratings = rating_df.head(10) # 仅考虑最新的 10 份报告
+        res['avg_rating_score'] = latest_ratings['rating_score'].mean()
+    else:
+        res['avg_rating_score'] = 3.0 # 默认中性评级
+        
     return res
 
 # ----------------------------------------------------
@@ -469,9 +485,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             }
             
             rec.update({
-                'vol_ratio': ind.get('vol_ratio', np.nan), 'macd': ind.get('macd_val', np.nan),
+                'vol_ratio': ind.get('vol_ratio', np.nan), 
+                'macd': ind.get('macd_val', np.nan),
                 '10d_return': ind.get('10d_return', np.nan),
-                'volatility': ind.get('volatility', np.nan), 'position_60d': ind.get('position_60d', np.nan)
+                'volatility': ind.get('volatility', np.nan), 
+                'position_60d': ind.get('position_60d', np.nan),
+                # ⭐️ V14.0 新增
+                'avg_rating_score': ind.get('avg_rating_score', 3.0) 
             })
             
             rec.update({
@@ -488,7 +508,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         error_msg = f"评分列表为空：{last_trade}. 原因：所有 {len(final_candidates)} 个候选股票都无法获取有效的 D0 QFQ 价格（可能数据不足3天或复权失败）。"
         return pd.DataFrame(), error_msg
 
-    # 6. 归一化与 V13.2 策略精调评分 
+    # 6. 归一化与 V14.0 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -499,26 +519,30 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_vol'] = normalize(fdf['vol_ratio'])
     fdf['s_mf'] = normalize(fdf['net_mf'])
     fdf['s_macd'] = normalize(fdf['macd'])
+    fdf['s_rating'] = normalize(fdf['avg_rating_score']) # ⭐️ V14.0 新增归一化
     fdf['s_trend'] = normalize(fdf['10d_return'])
     fdf['s_volatility'] = normalize(fdf['volatility'])
     fdf['s_position'] = fdf['position_60d'] / 100 
     
-    # 🚨 V13.2 策略权重 (趋势统治 + 松绑防御)
-    w_mf = 0.17           # 资金流 ↓↓
-    w_pct = 0.20          # 当日涨幅 ↑↑
-    w_turn = 0.15         # 换手率 ↑
-    w_position = 0.10     # 60日位置 ↓ (反向)
-    w_volatility = 0.10   # 波动率 ↓ (反向) 容忍高波动
-    w_macd = 0.33         # MACD ↑↑↑ 趋势核心
+    # 🚨 V14.0 策略权重 (趋势 + 动量 + 机构评级)
+    w_rating = 0.15       # 机构评级 (新加入)
+    w_macd = 0.30         # MACD ↑↑↑ 趋势核心
+    w_pct = 0.18          # 当日涨幅 ↑↑ (略降)
+    w_turn = 0.12         # 换手率 ↑ (略降)
+    w_mf = 0.10           # 资金流 ↓↓ (进一步降级)
+    w_position = 0.08     # 60日位置 ↓ (反向)
+    w_volatility = 0.07   # 波动率 ↓ (反向) 容忍高波动
     w_vol = 0.00          
     w_trend = 0.00          
     
     score = (
-        fdf['s_pct'].fillna(0.5) * w_pct + fdf['s_turn'].fillna(0.5) * w_turn + 
+        fdf['s_pct'].fillna(0.5) * w_pct + 
+        fdf['s_turn'].fillna(0.5) * w_turn + 
         fdf['s_mf'].fillna(0.5) * w_mf + 
         fdf['s_macd'].fillna(0.5) * w_macd + 
+        fdf['s_rating'].fillna(0.5) * w_rating +  # ⭐️ V14.0 新增
         
-        (1 - fdf['s_position'].fillna(0.5)) * w_position + # 倾向低位，但权重低
+        (1 - fdf['s_position'].fillna(0.5)) * w_position + # 倾向低位
         (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + # 倾向低波动
         
         fdf['s_vol'].fillna(0.5) * w_vol + 
@@ -535,7 +559,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序重新加载数据的关键一步。")
+    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序重新加载数据的关键一步，否则新因子将不生效。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -603,12 +627,12 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V13.2 趋势统治版**")
+                  help=f"总有效样本数：{total_count}。**V14.0 趋势+评级版 (新增机构评级)**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
     display_cols = ['Trade_Date', 'name', 'ts_code', '综合评分', 
                     'Close', 'Pct_Chg (%)', 'Circ_MV (亿)',
-                    'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)']
+                    'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)', 'avg_rating_score']
     
     st.dataframe(all_results[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
