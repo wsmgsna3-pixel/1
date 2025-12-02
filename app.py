@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V20.0 最终反转版：应对永久性排序反转
+选股王 · V21.0 最终稳定版：拥抱稳定与防御
 更新说明：
-1. 【**策略精调 V20.0**】：
-   - **目标**：接受执行环境对排序的永久性反转。在 V19.0 权重结构下，彻底反转评分公式。
-   - **原理**：将所有“正面”指标（资金流、涨幅、MACD）进行 (1 - s_i) 转换，使其分数越低越好。将所有“负面”指标（波动率、60日位置）进行直接 s_i 转换，使其分数越高越差。
-   - **最终效果**：最好的股票得分最低，系统反向选择后即可成功。
+1. 【**策略精调 V21.0**】：
+   - **目标**：解决 D+5 崩塌问题。降低当日爆发力（w_pct, w_turn），增强稳定资金流（w_mf）和高位防御（w_position）。
+   - **评分公式**：保持 V20.0 的“反转评分”公式不变，以适应环境的永久性排序反转。
    
-   权重保持 V19.0 结构：瞬时爆发(0.40) + 趋势与资金流(0.45) + 稳定防御(0.15) = 1.00
+   新权重结构：稳定资金流 + 趋势确认 + 强防御 (0.70) 对抗 短线爆发 (0.30)
 """
 
 import streamlit as st
@@ -22,10 +21,10 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V20.0 最终反转版（策略适配）", layout="wide")
-st.title("选股王 · V20.0 最终反转版（策略适配）")
-st.markdown("🎯 **V20.0 策略：在 V19.0 的最优权重下，彻底反转评分公式，以适应执行环境永久性的排序反转。**")
-st.markdown("✅ **最低分 = 最佳股票。** 请确保使用**新日期**和 **N=3** 进行快速验证。")
+st.set_page_config(page_title="选股王 · V21.0 最终稳定版（高防御）", layout="wide")
+st.title("选股王 · V21.0 最终稳定版（高防御）")
+st.markdown("🎯 **V21.0 策略：降低短线爆发权重，大幅增强资金流和高位防御，以解决 D+5 崩塌问题。**")
+st.markdown("✅ **评分公式仍为反转模式。** 请确保使用**新日期**和 **N=3** 进行快速验证。")
 
 # ---------------------------
 # 全局变量初始化
@@ -436,7 +435,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
 
-    # 6. 归一化与 V20.0 策略精调评分
+    # 6. 归一化与 V21.0 策略精调评分
     def normalize(series):
         series_nn = series.dropna()
         if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -452,19 +451,19 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_position'] = fdf['position_60d'] / 100
     
     # ----------------------------------------------------------------------------------
-    # 🚨 V20.0 最终反转策略：为适应环境的永久性反转而设计
+    # 🚨 V21.0 最终稳定策略：在 V20.0 反转公式下，降低爆发力，增强防御。
     
-    # 权重保持 V19.0 结构
-    w_mf = 0.30             # 30% - 资金流 
-    w_pct = 0.25            # 25% - 当日涨幅 
-    w_turn = 0.15           # 15% - 换手率 
-    w_macd = 0.15           # 15% - MACD 
-    w_volatility = 0.05     # 05% - 波动率 
-    w_position = 0.10       # 10% - 60日位置 
+    # V21.0 最终稳定权重
+    w_mf = 0.40             # 40% - 资金流 (提升)
+    w_pct = 0.15            # 15% - 当日涨幅 (降低)
+    w_turn = 0.10           # 10% - 换手率 (降低)
+    w_macd = 0.15           # 15% - MACD (保持)
+    w_volatility = 0.05     # 05% - 波动率 (保持)
+    w_position = 0.15       # 15% - 60日位置 (提升)
     w_trend = 0.00          # 0% - 10日回报 
     w_vol = 0.00            # 0% - 量比 
     
-    # Sum: 0.30+0.25+0.15+0.15+0.05+0.10 = 1.00
+    # Sum: 0.40+0.15+0.10+0.15+0.05+0.15 = 1.00
     
     score = (
         # 瞬时爆发和趋势指标 (正向因素，现反转为 LOW SCORE)
@@ -496,7 +495,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V20.0 版本已应用：最终反转策略。目标：最低分 = 最佳股票。**")
+    st.warning("⚠️ **V21.0 版本已应用：最终稳定策略。目标：降低爆发，增强防御。**")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -554,7 +553,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V20.0 已应用最终反转策略。**")
+                  help=f"总有效样本数：{total_count}。**V21.0 已应用最终稳定策略。**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
