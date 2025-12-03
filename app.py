@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V14.11 极致反转抢跑版：当日暴跌 + 资金抄底 + 中期趋势防御
+选股王 · V14.12 绝对防御版：极致低波动率 + 资金避险
 核心修复：
-1. 【**策略精调 V14.11**】：彻底放弃动量，转向极致反转策略。
-   - Pct_Chg (w_pct) 权重升至 0.40，但**在评分时取负** (筛选当日跌幅最大者)。
-   - Money Flow (w_mf) 权重 0.30 (抄底验证，有资金流入的下跌更有可能反弹)。
-   - 60日位置 (w_position) 权重 0.30 (中期趋势防御，筛选仍处高位的"错杀"股)。
-   - 波动率、10日回报、换手率等指标权重清零。
+1. 【**策略精调 V14.12**】：彻底放弃攻击和反攻，转为绝对防御策略，目标是最小化亏损。
+   - 当日涨幅 (Pct_Chg) 权重清零，完全不依赖价格变化。
+   - **波动率 (w_volatility)** 权重升至 **0.50** (绝对防御核心，波动越低越好)。
+   - **资金流 (w_mf)** 权重升至 **0.50** (避险核心，大资金驻扎)。
+   - 其他指标权重全部清零。
 """
 
 import streamlit as st
@@ -30,9 +30,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V14.11 极致反转抢跑版", layout="wide")
-st.title("选股王 · V14.11 最终策略（❄️ 极致反转 / 资金抄底）")
-st.markdown("🎯 **V14.11 策略说明：** **当日暴跌，中期趋势高位，有资金抄底。** 核心权重：**当日涨幅 -0.40** (当日跌幅越大越好) + **资金流 0.30** (抄底验证) + **60日位置 0.30** (中期趋势防御)。")
+st.set_page_config(page_title="选股王 · V14.12 绝对防御版", layout="wide")
+st.title("选股王 · V14.12 最终策略（🛡️ 绝对防御 / 资金避险）")
+st.markdown("🎯 **V14.12 策略说明：** **彻底放弃攻击。** 核心权重：**波动率 -0.50** (波动越低越好) + **资金流 0.50** (避险港)。**目标：在弱市中最小化亏损。**")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -69,12 +69,12 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ V14.11 核心：按日期循环拉取历史数据 (鲁棒性保证)
+# ⭐️ V14.12 核心：按日期循环拉取历史数据 (鲁棒性保证)
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def get_all_historical_data(trade_days_list):
     """
-    V14.11 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
+    V14.12 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
     """
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
     
@@ -299,7 +299,7 @@ def compute_indicators(ts_code, end_date):
     else: res['vol_ratio'] = np.nan
         
     res['10d_return'] = (close.iloc[-1]/close.iloc[-10] - 1) * 100 if len(close)>=10 and close.iloc[-10]!=0 else 0
-    res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
+    res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0 # ⭐️ V14.12 核心防御指标
     
     if len(df) >= 60:
         hist_60 = df.tail(60)
@@ -323,7 +323,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("核心参数")
-    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=10, step=1, min_value=1)) 
+    FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=100, step=1, min_value=1)) # 放大入围池
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) 
     
@@ -420,7 +420,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 过滤流通市值
     mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
     df = df[mask_circ_mv] 
-    # 过滤换手率 (V14.11 仍保留换手率，但不作为评分项，仅作为硬性过滤)
+    # 过滤换手率 (V14.12 仍保留换手率，但不作为评分项，仅作为硬性过滤)
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER 
     df = df[mask_turn]
     # 过滤成交额
@@ -433,18 +433,15 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if initial_candidate_count == 0: return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
 
     # 4. 遴选决赛名单
-    # **V14.11 特殊处理：使用当日跌幅（取负的 Pct_Chg）和资金流作为入围标准**
-    # 入围标准：当日跌幅最大（反转潜力）和资金流入最大（抄底验证）
-    df['neg_pct_chg'] = -df['pct_chg']
+    # **V14.12 特殊处理：使用资金流和换手率作为入围标准**
+    limit_mf = int(FINAL_POOL * 0.7)
+    df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf).copy()
     
-    limit_pct_neg = int(FINAL_POOL * 0.7)
-    df_pct_neg = df.sort_values('neg_pct_chg', ascending=False).head(limit_pct_neg).copy()
+    limit_turn = FINAL_POOL - len(df_mf)
+    existing_codes = set(df_mf['ts_code'])
+    df_turn = df[~df['ts_code'].isin(existing_codes)].sort_values('turnover_rate', ascending=False).head(limit_turn).copy()
     
-    limit_mf = FINAL_POOL - len(df_pct_neg)
-    existing_codes = set(df_pct_neg['ts_code'])
-    df_mf = df[~df['ts_code'].isin(existing_codes)].sort_values('net_mf', ascending=False).head(limit_mf).copy()
-    
-    final_candidates = pd.concat([df_pct_neg, df_mf]).reset_index(drop=True)
+    final_candidates = pd.concat([df_mf, df_turn]).reset_index(drop=True)
     
     # 鲁棒性强化：检查候选股在内存中的 D0 QFQ 数据是否完整
     if not GLOBAL_DAILY_RAW.empty:
@@ -488,7 +485,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
                 'macd': ind.get('macd_val', np.nan),
                 '10d_return': ind.get('10d_return', np.nan), 
                 'volatility': ind.get('volatility', np.nan), 
-                'position_60d': ind.get('position_60d', np.nan), # ⭐️ V14.11 核心中期趋势指标
+                'position_60d': ind.get('position_60d', np.nan), 
             })
             
             rec.update({
@@ -504,44 +501,40 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if fdf.empty: 
         return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {len(final_candidates)} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
-    # 6. 归一化与 V14.11 策略精调评分 
+    # 6. 归一化与 V14.12 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
         return (series - series_nn.min()) / (series_nn.max() - series_nn.min() + 1e-9)
 
-    # 反转策略核心：Pct_Chg 负值归一化 (跌得越多，归一化得分越高)
-    fdf['s_neg_pct'] = normalize(-fdf['Pct_Chg (%)']) 
-    fdf['s_mf'] = normalize(fdf['net_mf'])
-    fdf['s_position'] = fdf['position_60d'] / 100 # 60日位置，归一化到 0-1
+    fdf['s_mf'] = normalize(fdf['net_mf']) # 资金流 (正向)
+    fdf['s_volatility'] = normalize(fdf['volatility']) # 波动率 (反向)
     
-    # 移除未使用的得分项
+    # 其他评分项全部清除
     fdf['s_pct'] = 0.5
     fdf['s_turn'] = 0.5
     fdf['s_vol'] = 0.5
     fdf['s_macd'] = 0.5
     fdf['s_trend'] = 0.5
-    fdf['s_volatility'] = 0.5
+    fdf['s_position'] = 0.5
     
     
-    # 🚨 V14.11 策略权重 (极致反转抢跑)
-    w_pct_neg = 0.40      # 当日跌幅 (使用 s_neg_pct)
-    w_mf = 0.30           # 资金流 (抄底验证)
-    w_position = 0.30     # 60日位置 (中期趋势防御)
+    # 🚨 V14.12 策略权重 (绝对防御抢跑)
+    w_mf = 0.50             # 资金流 (避险核心)
+    w_volatility = 0.50     # 波动率 (绝对防御核心)
     
     # 其他权重清零
     w_pct = 0.00
     w_turn = 0.00
     w_macd = 0.00
     w_trend = 0.00
-    w_volatility = 0.00 
+    w_position = 0.00 
     w_vol = 0.00
     
     
     score = (
-        fdf['s_neg_pct'].fillna(0.5) * w_pct_neg + # 跌幅越大，得分越高
         fdf['s_mf'].fillna(0.5) * w_mf +           # 资金流入越多，得分越高
-        fdf['s_position'].fillna(0.5) * w_position # 60日位置越高，得分越高 (仍是中期牛股)
+        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility # 波动率越低，得分越高 (反向)
     )
     fdf['综合评分'] = score * 100
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
@@ -562,7 +555,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.stop()
     
     # ----------------------------------------------------------------------
-    # 核心优化步骤：预加载所有历史数据 (V14.11 循环拉取 - 稳定可靠)
+    # 核心优化步骤：预加载所有历史数据 (V14.12 循环拉取 - 稳定可靠)
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
@@ -623,7 +616,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V14.11 极致反转抢跑版**")
+                  help=f"总有效样本数：{total_count}。**V14.12 绝对防御版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
