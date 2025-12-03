@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V21.0 MACD趋势 + 低波动蓄势 + 异常放量版 (终极稳定版)
+选股王 · V22.0 MACD趋势 + 资金流最大化版 (回归 V20.0 并强化)
 核心修复：
-1. 【**策略升级 V21.0**】：解决 V20.0 D+1 微亏和 D+5 持续回撤问题。
+1. 【**策略升级 V22.0**】：回归 V20.0 成功组合，并移除低波动蓄势因子，防止信号冲突。
 2. 【**硬性过滤保留**】：收盘价必须高于 20 日均线 (MA20)。
-3. 【**评分大改**】：MACD (0.20) 结合日涨幅绝对值反向因子 (0.15)，筛选出强趋势中、当天低波动放量的股票。
-4. 【**评分结构**】：量比(0.40) + 资金流(0.25) + MACD(正向)(0.20) + 日涨幅绝对值(反向)(0.15)。
+3. 【**评分大改**】：将资金流 (Net_MF) 权重提高到 0.40，与量比齐平，最大化资金驱动力。
+4. 【**评分结构**】：量比(0.40) + 资金流(0.40) + MACD(0.20)。
 """
 
 import streamlit as st
@@ -29,9 +29,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V21.0 MACD趋势/低波动蓄势版", layout="wide")
-st.title("选股王 · V21.0 最终策略（🚀 MACD 趋势 + 低波动蓄势）")
-st.markdown("🎯 **V21.0 策略说明：** **【硬性条件】收盘价 > MA20。** 核心权重：**量比 0.40** (核心触发) + **资金流 0.25** + **MACD 0.20** (中期动能) + **日涨幅绝对值 -0.15** (惩罚大幅波动/低波动蓄势)。")
+st.set_page_config(page_title="选股王 · V22.0 MACD趋势/资金流最大化版", layout="wide")
+st.title("选股王 · V22.0 最终策略（🚀 MACD 趋势 + 资金流最大化）")
+st.markdown("🎯 **V22.0 策略说明：** **【硬性条件】收盘价 > MA20。** 核心权重：**量比 0.40** (核心触发) + **资金流 0.40** (最大化机构关注度) + **MACD 0.20** (中期动能)。")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -283,7 +283,7 @@ def compute_indicators(ts_code, end_date):
     
     res['last_close'] = close.iloc[-1] if len(close) > 0 else np.nan
     
-    # V17.0/V21.0 保留：MA20
+    # V22.0 保留：MA20
     if len(close) >= 20:
         res['ma20'] = close.tail(20).mean() # 20日均价
     else: res['ma20'] = np.nan
@@ -303,9 +303,9 @@ def compute_indicators(ts_code, end_date):
         res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
     else: res['vol_ratio'] = np.nan
        
-    # 10日回报 (V21.0 中不再用于评分，但保留记录)
+    # 10日回报 (V22.0 中不再用于评分，但保留记录)
     res['10d_return'] = (close.iloc[-1]/close.iloc[-10] - 1) * 100 if len(close)>=10 and close.iloc[-10]!=0 else 0
-    # 波动率 (V21.0 中不再用于评分，但保留记录)
+    # 波动率 (V22.0 中不再用于评分，但保留记录)
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
     if len(df) >= 60:
@@ -321,7 +321,7 @@ def compute_indicators(ts_code, end_date):
     return res
 
 # ----------------------------------------------------
-# 侧边栏参数 (V21.0 过滤条件调整)
+# 侧边栏参数 (V22.0 过滤条件调整)
 # ----------------------------------------------------
 with st.sidebar:
     st.header("模式与日期选择")
@@ -441,10 +441,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 过滤流通市值 (用户要求 >= 20.0 亿元)
     mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
     df = df[mask_circ_mv] 
-    # 过滤换手率 (V21.0 策略要求 >= 3.0%)
+    # 过滤换手率 (V22.0 策略要求 >= 3.0%)
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER 
     df = df[mask_turn]
-    # 过滤成交额 (V21.0 策略要求 >= 1.0 亿元)
+    # 过滤成交额 (V22.0 策略要求 >= 1.0 亿元)
     mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
     
@@ -453,7 +453,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 
     if initial_candidate_count == 0: return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单 (V21.0 策略：使用资金流和换手率作为入围标准)
+    # 4. 遴选决赛名单 (V22.0 策略：使用资金流和换手率作为入围标准)
     limit_mf = int(FINAL_POOL * 0.7)
     # 资金流筛选 70% 的候选股
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf).copy()
@@ -490,7 +490,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         d0_ma20 = ind.get('ma20', np.nan) 
         
         # ----------------------------------------------------
-        # ⚠️ V21.0 核心趋势过滤：收盘价必须高于 MA20
+        # ⚠️ V22.0 核心趋势过滤：收盘价必须高于 MA20
         # ----------------------------------------------------
         if pd.isna(d0_ma20) or d0_ma20 == 0 or d0_qfq_close < d0_ma20:
             continue # 跳过不符合 MA20 上升趋势的股票
@@ -504,7 +504,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
                 'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
                 'Close': raw_close, 
                 'Circ_MV (亿)': getattr(row, 'circ_mv_billion', np.nan),
-                'Pct_Chg (%)': getattr(row, 'pct_chg', 0), # V21.0 核心反向因子
+                'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
                 'turnover': getattr(row, 'turnover_rate', 0),
                 'net_mf': getattr(row, 'net_mf', 0)
             }
@@ -531,18 +531,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if fdf.empty: 
         return pd.DataFrame(), f"跳过 {last_trade}：MA20 过滤后评分列表为空。"
 
-    # 6. 归一化与 V21.0 策略精调评分 (MACD趋势 + 低波动蓄势) 
+    # 6. 归一化与 V22.0 策略精调评分 (MACD趋势 + 资金流最大化) 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
         return (series - series_nn.min()) / (series_nn.max() - series_nn.min() + 1e-9)
 
-    # V21.0 核心因子归一化
+    # V22.0 核心因子归一化
     fdf['s_mf'] = normalize(fdf['net_mf'])
     fdf['s_vol_ratio'] = normalize(fdf['vol_ratio']) 
     fdf['s_macd'] = normalize(fdf['macd']) 
-    # V21.0 引入：惩罚所有大幅度波动（无论涨跌），促进选出静默放量的股票
-    fdf['s_pct_abs'] = normalize(fdf['Pct_Chg (%)'].abs()) 
     
     # 移除未使用的得分项，赋值为中性值
     fdf['s_position'] = 0.5 
@@ -551,24 +549,22 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_turn'] = 0.5
     fdf['s_vol'] = 0.5
     fdf['s_trend'] = 0.5
+    fdf['s_pct_abs'] = 0.5
     
     
-    # 🚨 V21.0 策略权重 (MACD趋势 + 低波动蓄势)
-    w_vol_ratio = 0.40      # 量比 (正向) -> 权重最高 (核心触发)
-    w_mf = 0.25             # 资金流 (正向)
+    # 🚨 V22.0 策略权重 (纯趋势 + 资金流最大化)
+    w_vol_ratio = 0.40      # 量比 (正向) -> 核心触发
+    w_mf = 0.40             # 资金流 (正向) -> 权重最大化
     w_macd = 0.20           # MACD (正向) -- 中期趋势确认
-    w_pct_chg = 0.15        # 日涨幅绝对值 (反向) -- 惩罚大幅波动的股票
     
     
     score = (
-        # 权重最高：量比越大，得分越高 (短期放量异动信号，占 40%)
+        # 权重最高：量比越大，得分越高 (占 40%)
         fdf['s_vol_ratio'].fillna(0.5) * w_vol_ratio +          
-        # 资金流入越多，得分越高 (占 25%)
+        # 权重最高：资金流入越多，得分越高 (占 40%)
         fdf['s_mf'].fillna(0.5) * w_mf +           
         # MACD越大，得分越高 (正向，占 20%)
-        fdf['s_macd'].fillna(0.5) * w_macd +
-        # 日涨幅绝对值越小，得分越高 (反向，占 15%)
-        (1 - fdf['s_pct_abs'].fillna(0.5)) * w_pct_chg
+        fdf['s_macd'].fillna(0.5) * w_macd
     )
     
     fdf['综合评分'] = score * 100
@@ -652,7 +648,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V21.0 MACD趋势/低波动蓄势版**")
+                  help=f"总有效样本数：{total_count}。**V22.0 MACD趋势/资金流最大化版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
