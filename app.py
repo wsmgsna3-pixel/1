@@ -277,6 +277,7 @@ def compute_indicators(ts_code, end_date):
          df['pct_chg'] = 0.0
          
     close = df['close']
+    high = df['high']  # 修复：添加high变量
     
     res['last_close'] = close.iloc[-1] if len(close) > 0 else np.nan
     
@@ -319,10 +320,10 @@ def compute_indicators(ts_code, end_date):
         res['trend_score'] = (trend_score / 3) * 100
     else: res['trend_score'] = 0
     
-    # V17.0 新增：突破新高
-    if len(high) >= 20:
-        highest_20d = high.tail(20).max()
-        current_high = high.iloc[-1]
+    # V17.0 新增：突破新高 - 修复：使用df['high']而不是high
+    if len(df['high']) >= 20:
+        highest_20d = df['high'].tail(20).max()
+        current_high = df['high'].iloc[-1]
         res['breakout_20d'] = 100 if current_high >= highest_20d * 0.99 else 0  # 99%就算突破
     
     if len(df) >= 60:
