@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V14.8 资金流统治版：绝对强化资金流，搭配温和动量
+选股王 · V14.9 持续动能版：资金流 + 10日回报强化持续性
 核心修复：
-1. 【**策略哲学颠覆 V14.8**】：放弃所有技术指标，转向**资金流统治**。
-   - Money Flow (w_mf) 提升至 **0.50** (绝对核心驱动力)。
-   - Pct_Chg (w_pct) 重新引入，权重 **0.25** (寻找温和启动的股票)。
-   - (1 - 波动率) (w_volatility) 降至 **0.25** (防御手段)。
-   - MACD/Turnover/Position 权重清零。
+1. 【**策略精调 V14.9**】：基于 V14.8 的成功，强化持续性。
+   - Money Flow (w_mf) 略降至 **0.40** (第一核心)。
+   - **10日回报 (w_trend)** 引入，权重 **0.35** (替代 Pct_Chg，筛选具有持续上涨能力的股票)。
+   - (1 - 波动率) (w_volatility) 维持 **0.25** (防御手段)。
+   - Pct_Chg 权重清零。
 """
 
 import streamlit as st
@@ -30,9 +30,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V14.8 资金流统治版", layout="wide")
-st.title("选股王 · V14.8 最终策略（💰 资金流统治 / 温和动量）")
-st.markdown("🎯 **V14.8 策略说明：** **抛弃所有技术指标。** 核心权重：**资金流 0.50** (绝对统治力，只看钱流入) + **当日涨幅 0.25** (寻找温和启动) + **波动率 0.25** (防御过滤)。")
+st.set_page_config(page_title="选股王 · V14.9 持续动能版", layout="wide")
+st.title("选股王 · V14.9 最终策略（🚀 持续动能 / 资金流核心）")
+st.markdown("🎯 **V14.9 策略说明：** **基于 V14.8 的成功，强化持续性。** 核心权重：**资金流 0.40** + **10日回报 0.35** (中期动能) + **波动率 0.25** (防御过滤)。")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -70,12 +70,12 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ V14.8 核心：按日期循环拉取历史数据 (鲁棒性保证)
+# ⭐️ V14.9 核心：按日期循环拉取历史数据 (鲁棒性保证)
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def get_all_historical_data(trade_days_list):
     """
-    V14.8 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
+    V14.9 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
     """
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
     
@@ -299,7 +299,8 @@ def compute_indicators(ts_code, end_date):
         res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
     else: res['vol_ratio'] = np.nan
         
-    res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 and close.iloc[-10]!=0 else 0
+    # V14.9 核心：10日回报
+    res['10d_return'] = (close.iloc[-1]/close.iloc[-10] - 1) * 100 if len(close)>=10 and close.iloc[-10]!=0 else 0
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
     if len(df) >= 60:
@@ -421,7 +422,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 过滤流通市值
     mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
     df = df[mask_circ_mv] 
-    # 过滤换手率 (V14.8 保留换手率，但不作为评分项，仅作为硬性过滤)
+    # 过滤换手率 (V14.9 仍保留换手率，但不作为评分项，仅作为硬性过滤)
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER 
     df = df[mask_turn]
     # 过滤成交额
@@ -451,7 +452,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             return pd.DataFrame(), f"跳过 {last_trade}：核心历史数据缓存中缺失回测日 {last_trade} 的全部数据 (已通过鲁棒性检查过滤)"
             
     if final_candidates.empty:
-        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {initial_candidate_count} 个硬性过滤股中，所有股票的 D0 QFQ 价格均无效。"
+        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {initial_candidate_count} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
     # 5. 深度评分 
     records = []
@@ -482,7 +483,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             rec.update({
                 'vol_ratio': ind.get('vol_ratio', np.nan), 
                 'macd': ind.get('macd_val', np.nan),
-                '10d_return': ind.get('10d_return', np.nan),
+                '10d_return': ind.get('10d_return', np.nan), # ⭐️ V14.9 核心动能指标
                 'volatility': ind.get('volatility', np.nan), 
                 'position_60d': ind.get('position_60d', np.nan),
             })
@@ -500,7 +501,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if fdf.empty: 
         return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {len(final_candidates)} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
-    # 6. 归一化与 V14.8 策略精调评分 
+    # 6. 归一化与 V14.9 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -511,33 +512,34 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_vol'] = normalize(fdf['vol_ratio'])
     fdf['s_mf'] = normalize(fdf['net_mf'])
     fdf['s_macd'] = normalize(fdf['macd'])
-    fdf['s_trend'] = normalize(fdf['10d_return'])
+    fdf['s_trend'] = normalize(fdf['10d_return']) # ⭐️ V14.9 核心动能评分
     fdf['s_volatility'] = normalize(fdf['volatility'])
     fdf['s_position'] = fdf['position_60d'] / 100 
     
-    # 🚨 V14.8 策略权重 (资金流统治 + 温和动量)
-    w_mf = 0.50           # 资金流 ↑↑↑↑↑ ⭐️ 绝对统治力
-    w_pct = 0.25          # 当日涨幅 ↑↑ 
+    # 🚨 V14.9 策略权重 (资金流 + 持续动能 + 防御)
+    w_mf = 0.40           # 资金流 ↑↑↑↑ (第一核心)
+    w_trend = 0.35        # 10日回报 ↑↑↑ (持续动能核心)
     w_volatility = 0.25   # 波动率 ↓ (反向) 防御
+    w_pct = 0.00          # 当日涨幅 (清零)
     w_turn = 0.00         # 换手率 (清零)
     w_macd = 0.00         # 趋势核心 (清零)
     w_position = 0.00     # 60日位置 ↓ (清零)
     w_vol = 0.00          
-    w_trend = 0.00          
+    
     
     # 波动率需要反向加权 (1 - score) 
     score = (
         fdf['s_mf'].fillna(0.5) * w_mf + 
-        fdf['s_pct'].fillna(0.5) * w_pct +
+        fdf['s_trend'].fillna(0.5) * w_trend + # 持续动能
         
         # 核心防御因子
         (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + 
         
+        fdf['s_pct'].fillna(0.5) * w_pct +
         fdf['s_turn'].fillna(0.5) * w_turn + 
         fdf['s_macd'].fillna(0.5) * w_macd + 
         (1 - fdf['s_position'].fillna(0.5)) * w_position + 
-        fdf['s_vol'].fillna(0.5) * w_vol + 
-        fdf['s_trend'].fillna(0.5) * w_trend     
+        fdf['s_vol'].fillna(0.5) * w_vol     
     )
     fdf['综合评分'] = score * 100
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
@@ -558,7 +560,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.stop()
     
     # ----------------------------------------------------------------------
-    # 核心优化步骤：预加载所有历史数据 (V14.8 循环拉取 - 稳定可靠)
+    # 核心优化步骤：预加载所有历史数据 (V14.9 循环拉取 - 稳定可靠)
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
@@ -619,7 +621,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V14.8 资金流统治版**")
+                  help=f"总有效样本数：{total_count}。**V14.9 持续动能版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
