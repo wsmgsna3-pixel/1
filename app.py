@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V14.8.1 温和动量抢跑版：资金流主导 + 动能/防御平衡 (鲁棒性修复)
-核心修复：
-1. 【**Bug Fix V14.8.1**】：修复 run_backtest_for_a_day 函数中因 daily_basic 接口在特定日期缺失 'turnover_rate' 字段导致的 KeyError。
-   - 在处理 'turnover_rate' 之前加入 if 检查，以增强代码的鲁棒性。
+选股王 · V15.0 动量趋势增强版：中期动量 + 趋势突破 (鲁棒性修复+策略优化)
+核心优化：
+1. 【**策略优化 V15.0**】：从资金流主导转向动量趋势主导，采用20日动量+均线趋势+突破信号组合
+   - 新权重：动量(0.40) + 趋势(0.25) + 量价(0.15) + 突破(0.10) + 防御(0.10) = 1.00
+   - 新增20日动量、均线排列、量比、突破新高等多个有效因子
    
-V14.8 权重结构：资金流(0.50) + 动能(0.25) + 趋势(0.15) + 防御(0.10) = 1.00
+2. 【**过滤条件优化**】：放宽选股范围，提高策略灵活性
+   - 最低股价从10元降至5元
+   - 最低流通市值从20亿降至10亿
+   - 最低换手率从2%降至1%
+   - 最低成交额从0.6亿降至0.3亿
 """
 
 import streamlit as st
@@ -29,9 +34,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V14.8.1 温和动量抢跑版 (Bug Fix)", layout="wide")
-st.title("选股王 · V14.8.1 最终策略（🚀 温和动量 / 资金主导 - 鲁棒性增强）")
-st.markdown("🎯 **V14.8 策略说明：** **资金流主导，温和追逐动能。** 核心权重：**资金流 0.50** + **当日涨幅 0.25** + **60日位置 0.15** + **波动率 -0.10**。")
+st.set_page_config(page_title="选股王 · V15.0 动量趋势增强版", layout="wide")
+st.title("选股王 · V15.0 动量趋势增强版（🚀 中期动量 / 趋势突破 - 策略优化）")
+st.markdown("🎯 **V15.0 策略说明：** **动量趋势主导，注重中期动能。** 核心权重：**20日动量 0.40** + **趋势排列 0.25** + **量价配合 0.15** + **突破新高 0.10** + **防御因子 0.10**。")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -68,12 +73,12 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ V14.8.1 核心：按日期循环拉取历史数据 (鲁棒性保证)
+# ⭐️ V15.0 核心：按日期循环拉取历史数据 (鲁棒性保证)
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def get_all_historical_data(trade_days_list):
     """
-    V14.8.1 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
+    V15.0 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
     """
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
     
@@ -257,9 +262,11 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     return results
 
 
-@st.cache_data(ttl=3600*12) 
-def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (使用优化版数据获取)"""
+# ----------------------------------------------------------------------
+# ⭐️ V15.0 新增：增强版指标计算函数
+# ----------------------------------------------------------------------
+def compute_indicators_v2(ts_code, end_date):
+    """增强版指标计算 - 新增动量、趋势、量价、突破等因子"""
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
     # 获取 QFQ 数据，用于计算所有指标
@@ -270,8 +277,8 @@ def compute_indicators(ts_code, end_date):
         return res
         
     df['close'] = pd.to_numeric(df['close'], errors='coerce').astype(float)
-    df['low'] = pd.to_numeric(df['low'], errors='coerce').astype(float)
     df['high'] = pd.to_numeric(df['high'], errors='coerce').astype(float)
+    df['low'] = pd.to_numeric(df['low'], errors='coerce').astype(float)
     df['vol'] = pd.to_numeric(df['vol'], errors='coerce').fillna(0)
     
     if len(df) >= 2:
@@ -280,40 +287,100 @@ def compute_indicators(ts_code, end_date):
          df['pct_chg'] = 0.0
          
     close = df['close']
+    high = df['high']
+    low = df['low']
+    vol = df['vol']
     
     res['last_close'] = close.iloc[-1] if len(close) > 0 else np.nan
     
-    # MACD, 量比, 10日回报, 波动率, 60日位置计算（保持不变）
-    if len(close) >= 26:
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        diff = ema12 - ema26
-        dea = diff.ewm(span=9, adjust=False).mean()
-        res['macd_val'] = ((diff - dea) * 2).iloc[-1]
-    else: res['macd_val'] = np.nan
-        
-    vols = df['vol'].tolist()
-    if len(vols) >= 6 and vols[-6:-1] and np.mean(vols[-6:-1]) > 1e-9:
-        res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
-    else: res['vol_ratio'] = np.nan
-        
-    res['10d_return'] = (close.iloc[-1]/close.iloc[-10] - 1) * 100 if len(close)>=10 and close.iloc[-10]!=0 else 0
-    res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
+    # 1. 动量因子 (20日涨幅)
+    if len(close) >= 20:
+        res['momentum_20d'] = (close.iloc[-1] / close.iloc[-20] - 1) * 100
+    else:
+        res['momentum_20d'] = 0
     
+    # 2. 趋势因子 (均线排列)
+    if len(close) >= 20:
+        ma5 = close.rolling(5).mean()
+        ma10 = close.rolling(10).mean()
+        ma20 = close.rolling(20).mean()
+        
+        # 均线多头排列得分
+        trend_score = 0
+        if ma5.iloc[-1] > ma10.iloc[-1]: trend_score += 1
+        if ma10.iloc[-1] > ma20.iloc[-1]: trend_score += 1
+        if close.iloc[-1] > ma5.iloc[-1]: trend_score += 1
+        res['trend_score'] = trend_score / 3 * 100  # 归一化到0-100
+    else:
+        res['trend_score'] = 0
+    
+    # 3. 量价关系
+    if len(vol) >= 10:
+        # 量比：当日成交量/5日均量
+        avg_vol_5d = vol.rolling(5).mean().iloc[-1]
+        if avg_vol_5d > 0:
+            res['volume_ratio'] = vol.iloc[-1] / avg_vol_5d
+        else:
+            res['volume_ratio'] = 1
+        
+        # 换手率稳定性
+        vol_std = vol.tail(10).std()
+        vol_mean = vol.tail(10).mean()
+        if vol_mean > 0:
+            res['volume_stability'] = (1 - vol_std / vol_mean) * 100
+    else:
+        res['volume_ratio'] = 1
+        res['volume_stability'] = 50
+    
+    # 4. 突破因子 (创20日新高)
+    if len(high) >= 20:
+        highest_20d = high.tail(20).max()
+        current_high = high.iloc[-1]
+        res['breakout_score'] = 100 if current_high >= highest_20d else 0
+    else:
+        res['breakout_score'] = 0
+    
+    # 5. 防御因子 (60日位置 + 波动率)
     if len(df) >= 60:
         hist_60 = df.tail(60)
         min_low = hist_60['low'].min()
         max_high = hist_60['high'].max()
         current_close = hist_60['close'].iloc[-1]
         
-        if max_high == min_low: res['position_60d'] = 50.0 
-        else: res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
-    else: res['position_60d'] = np.nan 
+        if max_high > min_low:
+            res['position_60d'] = (current_close - min_low) / (max_high - min_low) * 100
+        else:
+            res['position_60d'] = 50
+    
+    # 计算波动率 (20日)
+    if len(df) >= 20:
+        returns = close.pct_change().dropna()
+        res['volatility_20d'] = returns.tail(20).std() * np.sqrt(252) * 100  # 年化波动率
+    
+    # 保留原有指标用于兼容
+    if len(close) >= 26:
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        diff = ema12 - ema26
+        dea = diff.ewm(span=9, adjust=False).mean()
+        res['macd_val'] = ((diff - dea) * 2).iloc[-1]
+    else: 
+        res['macd_val'] = np.nan
+        
+    vols = df['vol'].tolist()
+    if len(vols) >= 6 and vols[-6:-1] and np.mean(vols[-6:-1]) > 1e-9:
+        res['vol_ratio'] = vols[-1] / np.mean(vols[-6:-1])
+    else: 
+        res['vol_ratio'] = np.nan
+        
+    res['10d_return'] = (close.iloc[-1]/close.iloc[-10] - 1) * 100 if len(close)>=10 and close.iloc[-10]!=0 else 0
+    res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
     return res
 
+
 # ----------------------------------------------------
-# 侧边栏参数 (保持不变)
+# 侧边栏参数 (V15.0 优化：更宽松的过滤条件)
 # ----------------------------------------------------
 with st.sidebar:
     st.header("模式与日期选择")
@@ -327,12 +394,12 @@ with st.sidebar:
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) 
     
     st.markdown("---")
-    st.header("🛒 灵活过滤条件")
-    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1)
-    MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
-    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=2.0, step=0.5, min_value=0.1) 
-    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0, help="例如：输入 20 代表流通市值必须大于等于 20 亿元。")
-    MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.6, step=0.1, min_value=0.1)
+    st.header("🛒 V15.0 灵活过滤条件 (更宽松)")
+    MIN_PRICE = st.number_input("最低股价 (元)", value=5.0, step=0.5, min_value=0.1, help="从10元降至5元，扩大选股范围")
+    MAX_PRICE = st.number_input("最高股价 (元)", value=500.0, step=5.0, min_value=1.0, help="从300元升至500元，包含更多高价优质股")
+    MIN_TURNOVER = st.number_input("最低换手率 (%)", value=1.0, step=0.5, min_value=0.1, help="从2%降至1%，减少过滤掉低换手潜力股")
+    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=10.0, step=1.0, min_value=1.0, help="从20亿降至10亿，扩大中小盘股选择")
+    MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=0.3, step=0.1, min_value=0.1, help="从0.6亿降至0.3亿，提高策略灵活性")
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
 
 # ---------------------------
@@ -346,15 +413,16 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ---------------------------
-# 核心回测逻辑函数 (run_backtest_for_a_day)
+# ⭐️ V15.0 核心回测逻辑函数 (增强版)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS):
-    """为单个交易日运行选股和回测逻辑"""
+    """为单个交易日运行选股和回测逻辑 - V15.0 增强版"""
     global GLOBAL_DAILY_RAW
     
     # 1. 拉取全市场 Daily 数据 (今日快照)
     daily_all = safe_get('daily', trade_date=last_trade) 
-    if daily_all.empty or 'ts_code' not in daily_all.columns: return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
+    if daily_all.empty or 'ts_code' not in daily_all.columns: 
+        return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
 
     pool_raw = daily_all.reset_index(drop=True) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
@@ -363,7 +431,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
     pool_merged = pool_raw.copy()
 
-    # 数据合并 (保持不变)
+    # 数据合并
     if not stock_basic.empty and 'name' in stock_basic.columns:
         pool_merged = pool_merged.merge(stock_basic[['ts_code','name','list_date']], on='ts_code', how='left')
     else:
@@ -388,15 +456,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
     
-    # ----------------------------------------------------
-    # ⭐️ V14.8.1 修复：在处理 'turnover_rate' 之前进行检查
-    # ----------------------------------------------------
+    # 检查 'turnover_rate' 字段
     if 'turnover_rate' not in pool_merged.columns:
-        # 如果 daily_basic 拉取失败或缺失该字段，则用 0 填充，确保程序继续运行
         pool_merged['turnover_rate'] = 0.0 
-        # 可以选择 st.warning(f"⚠️ {last_trade} 警告：daily_basic 数据缺失 'turnover_rate' 字段，已用 0 填充。")
     
-    # 确保 'turnover_rate' 列存在并填充NaN
     pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
     
    
@@ -414,44 +477,70 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mask_bj = df['ts_code'].str.startswith('92') 
     df = df[~mask_bj]
     
-    # V14.5 修复：通用新股过滤
+    # 新股过滤
     TODAY = datetime.strptime(last_trade, "%Y%m%d")
-    MIN_LIST_DAYS = 120 # 上市至少 120 天 (~6 个月交易日)
+    MIN_LIST_DAYS = 120
     df['list_date_dt'] = pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')
     df['days_listed'] = (TODAY - df['list_date_dt']).dt.days
     
-    # 将过滤应用于所有股票
     mask_new_all = df['days_listed'] < MIN_LIST_DAYS
     df = df[~mask_new_all] 
     
     # 过滤价格
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
+    
     # 过滤流通市值
     mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
     df = df[mask_circ_mv] 
-    # 过滤换手率 (仍保留换手率，但不作为评分项，仅作为硬性过滤)
+    
+    # 过滤换手率
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER 
     df = df[mask_turn]
+    
     # 过滤成交额
     mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
     
     df = df.reset_index(drop=True)
-    initial_candidate_count = len(df) # 记录硬性过滤后的数量
+    initial_candidate_count = len(df)
 
-    if initial_candidate_count == 0: return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
+    if initial_candidate_count == 0: 
+        return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单
-    # **V14.8 筛选：使用当日涨幅和资金流作为入围标准**
-    limit_pct = int(FINAL_POOL * 0.7)
-    df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
+    # 4. V15.0 新增：计算动量趋势指标进行预筛选
+    momentum_scores = []
+    trend_scores = []
     
-    limit_mf = FINAL_POOL - len(df_pct)
-    existing_codes = set(df_pct['ts_code'])
-    df_mf = df[~df['ts_code'].isin(existing_codes)].sort_values('net_mf', ascending=False).head(limit_mf).copy()
+    for row in df.itertuples():
+        ts_code = row.ts_code
+        ind = compute_indicators_v2(ts_code, last_trade)
+        momentum_scores.append(ind.get('momentum_20d', 0))
+        trend_scores.append(ind.get('trend_score', 0))
     
-    final_candidates = pd.concat([df_pct, df_mf]).reset_index(drop=True)
+    df['momentum_20d'] = momentum_scores
+    df['trend_score'] = trend_scores
+    
+    # V15.0 动量趋势预筛选：要求20日动量>0且趋势得分>33
+    if len(df) > 0:
+        momentum_mask = df['momentum_20d'] > 0
+        trend_mask = df['trend_score'] > 33  # 至少满足一个趋势条件
+        df = df[momentum_mask & trend_mask].copy()
+    
+    if len(df) == 0:
+        return pd.DataFrame(), f"动量趋势筛选后无股票：{last_trade}"
+
+    # 5. 遴选决赛名单
+    # V15.0 筛选：使用20日动量和趋势得分作为入围标准
+    limit_momentum = int(FINAL_POOL * 0.6)  # 60% 按动量选
+    limit_trend = FINAL_POOL - limit_momentum  # 40% 按趋势选
+    
+    df_momentum = df.sort_values('momentum_20d', ascending=False).head(limit_momentum).copy()
+    
+    existing_codes = set(df_momentum['ts_code'])
+    df_trend = df[~df['ts_code'].isin(existing_codes)].sort_values('trend_score', ascending=False).head(limit_trend).copy()
+    
+    final_candidates = pd.concat([df_momentum, df_trend]).reset_index(drop=True)
     
     # 鲁棒性强化：检查候选股在内存中的 D0 QFQ 数据是否完整
     if not GLOBAL_DAILY_RAW.empty:
@@ -464,7 +553,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if final_candidates.empty:
         return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {len(final_candidates)} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
-    # 5. 深度评分 
+    # 6. V15.0 深度评分 (使用新因子和新权重)
     records = []
     
     for row in final_candidates.itertuples():
@@ -472,8 +561,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         
         raw_close = getattr(row, 'close', np.nan)
         
-        # 计算指标 (极速计算)
-        ind = compute_indicators(ts_code, last_trade) 
+        # 计算增强版指标
+        ind = compute_indicators_v2(ts_code, last_trade) 
         d0_qfq_close = ind.get('last_close', np.nan) # 提取 D0 QFQ Close Price
 
         # 仅当 D0 QFQ Close Price 有效且非零时，才进行收益率计算和记录
@@ -482,21 +571,27 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             future_returns = get_future_prices(ts_code, last_trade, d0_qfq_close) 
             
             rec = {
-                'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
+                'ts_code': ts_code, 
+                'name': getattr(row, 'name', ts_code),
                 'Close': raw_close, 
                 'Circ_MV (亿)': getattr(row, 'circ_mv_billion', np.nan),
                 'Pct_Chg (%)': getattr(row, 'pct_chg', 0), 
                 'turnover': getattr(row, 'turnover_rate', 0),
-                'net_mf': getattr(row, 'net_mf', 0)
-            }
-            
-            rec.update({
+                'net_mf': getattr(row, 'net_mf', 0),
+                # V15.0 新增因子
+                'momentum_20d': ind.get('momentum_20d', 0),
+                'trend_score': ind.get('trend_score', 0),
+                'volume_ratio': ind.get('volume_ratio', 1),
+                'volume_stability': ind.get('volume_stability', 50),
+                'breakout_score': ind.get('breakout_score', 0),
+                'position_60d': ind.get('position_60d', 50),
+                'volatility_20d': ind.get('volatility_20d', 30),
+                # 保留原有因子
                 'vol_ratio': ind.get('vol_ratio', np.nan), 
                 'macd': ind.get('macd_val', np.nan),
                 '10d_return': ind.get('10d_return', np.nan), 
                 'volatility': ind.get('volatility', np.nan), 
-                'position_60d': ind.get('position_60d', np.nan), 
-            })
+            }
             
             rec.update({
                 'Return_D1 (%)': future_returns.get('Return_D1', np.nan),
@@ -511,38 +606,62 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if fdf.empty: 
         return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {len(final_candidates)} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
-    # 6. 归一化与 V14.8 策略精调评分 
+    # 7. V15.0 归一化与策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
-        if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
+        if series_nn.empty or series_nn.max() == series_nn.min(): 
+            return pd.Series([0.5] * len(series), index=series.index)
         return (series - series_nn.min()) / (series_nn.max() - series_nn.min() + 1e-9)
 
     # 归一化所有使用的因子
-    fdf['s_pct'] = normalize(fdf['Pct_Chg (%)'])
-    fdf['s_mf'] = normalize(fdf['net_mf'])
-    fdf['s_position'] = fdf['position_60d'] / 100 # 60日位置，归一化到 0-1
-    fdf['s_volatility'] = normalize(fdf['volatility']) # 波动率 (反向)
+    fdf['s_momentum'] = normalize(fdf['momentum_20d'])          # 动量越大越好
+    fdf['s_trend'] = normalize(fdf['trend_score'])              # 趋势越强越好
     
-    # 移除未使用的得分项，赋值为中性值
-    fdf['s_turn'] = 0.5
-    fdf['s_vol'] = 0.5
-    fdf['s_macd'] = 0.5
-    fdf['s_trend'] = 0.5
-    
-    
-    # 🚨 V14.8 策略权重 (温和动量抢跑)
-    w_mf = 0.50             # 资金流 (正向)
-    w_pct = 0.25            # 当日涨幅 (正向)
-    w_position = 0.15       # 60日位置 (正向)
-    w_volatility = 0.10     # 波动率 (反向)
-    
-    
-    score = (
-        fdf['s_mf'].fillna(0.5) * w_mf +           # 资金流入越多，得分越高
-        fdf['s_pct'].fillna(0.5) * w_pct +          # 涨幅越大，得分越高
-        fdf['s_position'].fillna(0.5) * w_position + # 60日位置越高，得分越高
-        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility # 波动率越低，得分越高 (反向)
+    # 量比得分：1.5-3.0为最佳区间
+    fdf['s_volume'] = np.where(
+        (fdf['volume_ratio'] >= 1.5) & (fdf['volume_ratio'] <= 3.0),
+        1.0,
+        np.where(
+            fdf['volume_ratio'] < 1.5, 
+            fdf['volume_ratio'] / 1.5, 
+            3.0 / fdf['volume_ratio']
+        )
     )
+    
+    fdf['s_breakout'] = fdf['breakout_score'] / 100           # 突破得分 (0或1)
+    
+    # 位置得分：40-70分最好，过高或过低都减分
+    position_score = np.where(
+        (fdf['position_60d'] >= 40) & (fdf['position_60d'] <= 70),
+        1.0,
+        np.where(
+            fdf['position_60d'] < 40, 
+            fdf['position_60d'] / 40, 
+            (100 - fdf['position_60d']) / 30
+        )
+    )
+    fdf['s_position'] = position_score
+    
+    # 波动率得分：越低越好
+    fdf['s_volatility'] = 1 - normalize(fdf['volatility_20d'])
+    
+    # 🚨 V15.0 策略权重 (动量趋势增强)
+    w_momentum = 0.40      # 动量因子 (正向)
+    w_trend = 0.25         # 趋势因子 (正向)
+    w_volume = 0.15        # 量价关系 (正向)
+    w_breakout = 0.10      # 突破因子 (正向)
+    w_defensive = 0.10     # 防御因子 (位置+波动率)
+    
+    # 计算综合评分
+    score = (
+        fdf['s_momentum'].fillna(0.5) * w_momentum +
+        fdf['s_trend'].fillna(0.5) * w_trend +
+        fdf['s_volume'].fillna(0.5) * w_volume +
+        fdf['s_breakout'].fillna(0) * w_breakout +
+        fdf['s_position'].fillna(0.5) * 0.05 +  # 位置因子占防御权重的一半
+        fdf['s_volatility'].fillna(0.5) * 0.05   # 波动率因子占防御权重的一半
+    )
+    
     fdf['综合评分'] = score * 100
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
     fdf.index += 1
@@ -552,7 +671,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 # 主运行块 
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测 (V15.0 动量趋势增强版)"):
     
     st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序强制重新下载数据的关键一步。")
    
@@ -562,7 +681,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.stop()
     
     # ----------------------------------------------------------------------
-    # 核心优化步骤：预加载所有历史数据 (V14.8.1 循环拉取 - 稳定可靠)
+    # 核心优化步骤：预加载所有历史数据
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
@@ -571,7 +690,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     st.success("✅ 历史数据预加载完成！QFQ 基准已固定。现在开始极速回测...")
     # ----------------------------------------------------------------------
     
-    st.header(f"📈 正在进行 {BACKTEST_DAYS} 个交易日的回测...")
+    st.header(f"📈 正在进行 {BACKTEST_DAYS} 个交易日的回测 (V15.0 动量趋势增强版)...")
     
     results_list = []
     total_days = len(trade_days_str)
@@ -580,7 +699,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     my_bar = st.progress(0)
     
     for i, trade_date in enumerate(trade_days_str):
-        # 即使数据加载慢，回测计算仍然是“纯内存计算”
         progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date} (纯内存计算)")
         
         daily_result_df, error = run_backtest_for_a_day(
@@ -588,7 +706,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         )
         
         if error:
-            st.warning(f"{error}") # 直接打印更精确的错误信息
+            st.warning(f"{error}")
         elif not daily_result_df.empty:
             daily_result_df['Trade_Date'] = trade_date
             results_list.append(daily_result_df)
@@ -606,6 +724,24 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
     st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {len(all_results['Trade_Date'].unique())} 个有效交易日)")
     
+    # 显示所有返回因子的统计信息
+    st.subheader("📈 选股因子统计")
+    factor_cols = ['momentum_20d', 'trend_score', 'volume_ratio', 'breakout_score', 'position_60d', 'volatility_20d']
+    factor_stats = {}
+    
+    for col in factor_cols:
+        if col in all_results.columns:
+            factor_stats[col] = {
+                '均值': all_results[col].mean(),
+                '中位数': all_results[col].median(),
+                '标准差': all_results[col].std()
+            }
+    
+    if factor_stats:
+        factor_df = pd.DataFrame(factor_stats).T
+        st.dataframe(factor_df.round(2), use_container_width=True)
+    
+    # 显示收益统计
     for n in [1, 3, 5]:
         col = f'Return_D{n} (%)' 
         
@@ -616,19 +752,47 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             avg_return = valid_returns[col].mean()
             hit_rate = (valid_returns[col] > 0).sum() / len(valid_returns) * 100 if len(valid_returns) > 0 else 0.0
             total_count = len(valid_returns)
+            median_return = valid_returns[col].median()
+            std_return = valid_returns[col].std()
         else:
             avg_return = np.nan
             hit_rate = 0.0
             total_count = 0
+            median_return = np.nan
+            std_return = np.nan
             
-        st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
-                  f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V14.8.1 温和动量抢跑版**")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric(f"D+{n} 平均收益", f"{avg_return:.2f}%")
+        with col2:
+            st.metric(f"D+{n} 胜率", f"{hit_rate:.1f}%")
+        with col3:
+            st.metric(f"D+{n} 中位数收益", f"{median_return:.2f}%")
+        with col4:
+            st.metric(f"D+{n} 样本数", f"{total_count}")
+        
+        # 显示收益分布
+        if not valid_returns.empty and len(valid_returns) > 5:
+            st.caption(f"D+{n} 收益分布：最低 {valid_returns[col].min():.2f}%，最高 {valid_returns[col].max():.2f}%，标准差 {std_return:.2f}%")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
+    # 显示详细的回测结果
     display_cols = ['Trade_Date', 'name', 'ts_code', '综合评分', 
                     'Close', 'Pct_Chg (%)', 'Circ_MV (亿)',
+                    'momentum_20d', 'trend_score', 'volume_ratio',
                     'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)']
     
-    st.dataframe(all_results[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
+    # 只显示存在的列
+    available_cols = [col for col in display_cols if col in all_results.columns]
+    
+    st.dataframe(all_results[available_cols].sort_values('Trade_Date', ascending=False), 
+                 use_container_width=True,
+                 column_config={
+                     'momentum_20d': st.column_config.NumberColumn(format="%.1f"),
+                     'trend_score': st.column_config.NumberColumn(format="%.1f"),
+                     'volume_ratio': st.column_config.NumberColumn(format="%.2f"),
+                     'Return_D1 (%)': st.column_config.NumberColumn(format="%.2f"),
+                     'Return_D3 (%)': st.column_config.NumberColumn(format="%.2f"),
+                     'Return_D5 (%)': st.column_config.NumberColumn(format="%.2f"),
+                 })
