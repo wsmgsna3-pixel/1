@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V16.1 低位蓄势 / 异动抢跑版：反向动量 + 量比爆发 (反追高修复)
+选股王 · V17.0 MA20 趋势过滤 + 异常放量版 (反追高终极修复)
 核心修复：
-1. 【**策略升级 V16.1**】：彻底移除当日涨幅权重，转而使用低波动、量比和低位筛选，解决买在山顶问题。
-2. 【**过滤调整**】：最低换手率调高至 3.0%，最低成交额调高至 1.0 亿元。
-3. 【**评分标准**】：低波动率(反向) 0.40 + 量比(正向) 0.30 + 资金流(正向) 0.20 + 60日位置(反向) 0.10。
+1. 【**策略升级 V17.0**】：解决 V16.1 缺乏趋势过滤的问题。
+2. 【**新增硬性过滤**】：**收盘价必须高于 20 日均线 (MA20)**，确保只在短线牛股中寻找机会。
+3. 【**评分调整**】：量比权重提高至 0.40，波动率权重降低至 0.30。
+4. 【**过滤条件**】：最低流通市值 20 亿元，最低股价 10 元，最低换手率 3.0%，最低成交额 1.0 亿元。
 """
 
 import streamlit as st
@@ -28,9 +29,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V16.1 低位蓄势 / 异动抢跑版", layout="wide")
-st.title("选股王 · V16.1 最终策略（🚀 低位蓄势 / 异动抢跑 - 反追高版）")
-st.markdown("🎯 **V16.1 策略说明：** **低位蓄势，短期放量抢跑。** 核心权重：**短期波动率 -0.40** (反向) + **量比 0.30** + **资金流 0.20** + **60日位置 -0.10** (反向)。")
+st.set_page_config(page_title="选股王 · V17.0 MA20 趋势过滤版", layout="wide")
+st.title("选股王 · V17.0 最终策略（🚀 MA20 趋势过滤 + 异常放量）")
+st.markdown("🎯 **V17.0 策略说明：** **【硬性条件】收盘价 > MA20。** 核心权重：**量比 0.40** (正向) + **短期波动率 -0.30** (反向) + **资金流 0.20** (正向) + **60日位置 -0.10** (反向)。")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -82,7 +83,7 @@ def get_all_historical_data(trade_days_list):
     earliest_trade_date = min(trade_days_list)
     
     # 扩大数据获取范围
-    start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=150)
+    start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=120) # 120天满足 MA20/60d位置计算
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=20)
     
     start_date = start_date_dt.strftime("%Y%m%d")
@@ -258,7 +259,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
 
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (使用优化版数据获取)"""
+    """计算 MACD, 10日回报, 波动率, 60日位置, MA20等指标 (使用优化版数据获取)"""
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     
     # 获取 QFQ 数据，用于计算所有指标
@@ -282,7 +283,12 @@ def compute_indicators(ts_code, end_date):
     
     res['last_close'] = close.iloc[-1] if len(close) > 0 else np.nan
     
-    # MACD, 量比, 10日回报, 波动率, 60日位置计算（保持不变）
+    # V17.0 新增：MA20
+    if len(close) >= 20:
+        res['ma20'] = close.tail(20).mean() # 20日均价
+    else: res['ma20'] = np.nan
+    
+    # MACD, 量比, 10日回报, 波动率, 60日位置计算
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -314,7 +320,7 @@ def compute_indicators(ts_code, end_date):
     return res
 
 # ----------------------------------------------------
-# 侧边栏参数 (V16.1 过滤条件调整)
+# 侧边栏参数 (V17.0 过滤条件调整)
 # ----------------------------------------------------
 with st.sidebar:
     st.header("模式与日期选择")
@@ -434,10 +440,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     # 过滤流通市值 (用户要求 >= 20.0 亿元)
     mask_circ_mv = df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS
     df = df[mask_circ_mv] 
-    # 过滤换手率 (V16.1 策略要求 >= 3.0%)
+    # 过滤换手率 (V17.0 策略要求 >= 3.0%)
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER 
     df = df[mask_turn]
-    # 过滤成交额 (V16.1 策略要求 >= 1.0 亿元)
+    # 过滤成交额 (V17.0 策略要求 >= 1.0 亿元)
     mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
     
@@ -446,7 +452,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 
     if initial_candidate_count == 0: return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
 
-    # 4. 遴选决赛名单 (V16.1 策略：使用资金流和换手率作为入围标准)
+    # 4. 遴选决赛名单 (V17.0 策略：使用资金流和换手率作为入围标准)
     limit_mf = int(FINAL_POOL * 0.7)
     # 资金流筛选 70% 的候选股
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf).copy()
@@ -480,6 +486,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         # 计算指标 (极速计算)
         ind = compute_indicators(ts_code, last_trade) 
         d0_qfq_close = ind.get('last_close', np.nan) # 提取 D0 QFQ Close Price
+        d0_ma20 = ind.get('ma20', np.nan) # V17.0 新增 MA20
+        
+        # ----------------------------------------------------
+        # ⚠️ V17.0 核心趋势过滤：收盘价必须高于 MA20
+        # ----------------------------------------------------
+        if pd.isna(d0_ma20) or d0_ma20 == 0 or d0_qfq_close < d0_ma20:
+            continue # 跳过不符合 MA20 上升趋势的股票
 
         # 仅当 D0 QFQ Close Price 有效且非零时，才进行收益率计算和记录
         if pd.notna(d0_qfq_close) and d0_qfq_close > 1e-9:
@@ -496,7 +509,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             }
             
             rec.update({
-                'vol_ratio': ind.get('vol_ratio', np.nan), # V16.1 评分新指标
+                'vol_ratio': ind.get('vol_ratio', np.nan), # V17.0 评分新指标
+                'ma20': d0_ma20, # 记录 MA20 方便查看
                 'macd': ind.get('macd_val', np.nan),
                 '10d_return': ind.get('10d_return', np.nan), 
                 'volatility': ind.get('volatility', np.nan), 
@@ -514,9 +528,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     
     if fdf.empty: 
-        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：D0 QFQ 价格无效或被过滤。"
+        return pd.DataFrame(), f"跳过 {last_trade}：MA20 过滤后评分列表为空。"
 
-    # 6. 归一化与 V16.1 策略精调评分 (反向动量/低位爆发) 
+    # 6. 归一化与 V17.0 策略精调评分 (MA20趋势过滤 + 异常放量) 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -524,11 +538,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 
     # 归一化所有使用的因子
     fdf['s_mf'] = normalize(fdf['net_mf'])
-    fdf['s_vol_ratio'] = normalize(fdf['vol_ratio']) # V16.1 核心：量比
-    fdf['s_position'] = fdf['position_60d'] / 100 # 60日位置，归一化到 0-1
-    fdf['s_volatility'] = normalize(fdf['volatility']) # 波动率
+    fdf['s_vol_ratio'] = normalize(fdf['vol_ratio']) 
+    fdf['s_position'] = fdf['position_60d'] / 100 
+    fdf['s_volatility'] = normalize(fdf['volatility']) 
     
-    # 移除未使用的得分项，赋值为中性值 (V16.1 策略不再使用当日涨幅/MACD等)
+    # 移除未使用的得分项，赋值为中性值
     fdf['s_pct'] = 0.5
     fdf['s_turn'] = 0.5
     fdf['s_vol'] = 0.5
@@ -537,18 +551,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_10d_return'] = 0.5
     
     
-    # 🚨 V16.1 策略权重 (低位蓄势 + 异动抢跑)
-    w_volatility = 0.40     # 波动率 (反向) -> 权重最高
-    w_vol_ratio = 0.30      # 量比 (正向)
+    # 🚨 V17.0 策略权重 (MA20趋势过滤 + 异常放量)
+    w_vol_ratio = 0.40      # 量比 (正向) -> 权重最高
+    w_volatility = 0.30     # 波动率 (反向)
     w_mf = 0.20             # 资金流 (正向)
     w_position = 0.10       # 60日位置 (反向)
     
     
     score = (
-        # 权重最高：波动率越低，得分越高 (反向，占 40%)
-        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + 
-        # 量比越大，得分越高 (短期放量异动信号，占 30%)
+        # 权重最高：量比越大，得分越高 (短期放量异动信号，占 40%)
         fdf['s_vol_ratio'].fillna(0.5) * w_vol_ratio +          
+        # 波动率越低，得分越高 (反向，占 30%)
+        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + 
         # 资金流入越多，得分越高 (大资金潜伏，占 20%)
         fdf['s_mf'].fillna(0.5) * w_mf +           
         # 60日位置越低，得分越高 (低位筛选，反向，占 10%)
@@ -636,7 +650,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V16.1 低位蓄势 / 异动抢跑版**")
+                  help=f"总有效样本数：{total_count}。**V17.0 MA20 趋势过滤版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
