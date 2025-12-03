@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V14.6 趋势主导版：去当日涨幅，强化 MACD 和换手率
+选股王 · V14.7 极致防御 + 底部突破版：波动率统治，寻找低位反转
 核心修复：
-1. 【**新股防御 V14.5**】：保持新股过滤的鲁棒性。
-2. 【**策略精调 V14.6**】：核心调整：**动量降级，趋势主导**，解决“追高失败”问题。
-   - MACD (w_macd) 提升至 **0.45** (强化中期趋势统治力)。
-   - Turnover (w_turn) 提升至 **0.30** (专注于活跃股票)。
-   - Pct_Chg (w_pct) 降至 **0.05** (大幅削弱当日涨幅影响，防止追高)。
-   - 波动率防御 (w_volatility) 维持 0.10。
+1. 【**策略哲学颠覆 V14.7**】：彻底放弃 MACD 和 Pct_Chg 的高权重，转向**防御**和**低位突破**。
+   - (1 - 波动率) (w_volatility) 提升至 **0.40** (绝对防御核心)。
+   - Turnover (w_turn) 维持 **0.30** (保证活跃度)。
+   - (1 - 60日位置) (w_position) 重新引入，权重 **0.20** (寻找低位反转机会)。
+   - MACD/Pct_Chg 权重清零。
 """
 
 import streamlit as st
@@ -31,9 +30,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V14.6 趋势主导版", layout="wide")
-st.title("选股王 · V14.6 最终策略（👑 趋势主导 / 削弱动量）")
-st.markdown("🎯 **V14.6 策略说明：** **修复追高问题**，将当日涨幅权重降至 0.05，大幅强化 **MACD (0.45)** 和 **换手率 (0.30)**，专注于中期趋势良好且交易极度活跃的股票。")
+st.set_page_config(page_title="选股王 · V14.7 极致防御 + 底部突破版", layout="wide")
+st.title("选股王 · V14.7 最终策略（🛡️ 极致防御 / 底部突破）")
+st.markdown("🎯 **V14.7 策略说明：** **彻底放弃动量和趋势，转向防御性选股。** 核心权重：**波动率 0.40** (低波动优先) + **换手率 0.30** (保证活跃) + **60日低位 0.20** (寻找低位反转)。")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -71,12 +70,12 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ V14.6 核心：按日期循环拉取历史数据 (鲁棒性保证)
+# ⭐️ V14.7 核心：按日期循环拉取历史数据 (鲁棒性保证)
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def get_all_historical_data(trade_days_list):
     """
-    V14.3 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
+    V14.7 鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性。
     """
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
     
@@ -501,7 +500,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if fdf.empty: 
         return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {len(final_candidates)} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
-    # 6. 归一化与 V14.6 策略精调评分 
+    # 6. 归一化与 V14.7 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -516,25 +515,27 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_volatility'] = normalize(fdf['volatility'])
     fdf['s_position'] = fdf['position_60d'] / 100 
     
-    # 🚨 V14.6 策略权重 (趋势主导 / 削弱动量)
-    w_macd = 0.45         # MACD ↑↑↑↑ 趋势核心 (绝对主导)
-    w_turn = 0.30         # 换手率 ↑↑↑ (极度活跃)
-    w_volatility = 0.10   # 波动率 ↓ (反向) 轻量级防御
+    # 🚨 V14.7 策略权重 (极致防御 + 底部突破)
+    w_volatility = 0.40   # 波动率 ↓ (反向) ⭐️ 绝对防御核心
+    w_turn = 0.30         # 换手率 ↑↑↑ (保证活跃度)
+    w_position = 0.20     # 60日位置 ↓ (反向) ⭐️ 寻找低位反转
     w_mf = 0.10           # 资金流 ↓↓ 
-    w_pct = 0.05          # 当日涨幅 ↑ (大幅削弱，防止追高)
-    w_position = 0.00     # 60日位置 ↓ (保持移除)
+    w_macd = 0.00         # 趋势核心 (清零)
+    w_pct = 0.00          # 当日涨幅 ↑ (清零)
     w_vol = 0.00          
     w_trend = 0.00          
     
+    # 波动率和位置需要反向加权 (1 - score) 
     score = (
-        fdf['s_pct'].fillna(0.5) * w_pct + 
         fdf['s_turn'].fillna(0.5) * w_turn + 
         fdf['s_mf'].fillna(0.5) * w_mf + 
-        fdf['s_macd'].fillna(0.5) * w_macd + 
         
-        # 轻量级波动防御
+        # 核心防御和低位反转因子
         (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + 
+        (1 - fdf['s_position'].fillna(0.5)) * w_position + 
         
+        fdf['s_macd'].fillna(0.5) * w_macd + 
+        fdf['s_pct'].fillna(0.5) * w_pct +
         fdf['s_vol'].fillna(0.5) * w_vol + 
         fdf['s_trend'].fillna(0.5) * w_trend     
     )
@@ -557,7 +558,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.stop()
     
     # ----------------------------------------------------------------------
-    # 核心优化步骤：预加载所有历史数据 (V14.6 循环拉取 - 稳定可靠)
+    # 核心优化步骤：预加载所有历史数据 (V14.7 循环拉取 - 稳定可靠)
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
@@ -618,7 +619,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V14.6 趋势主导版**")
+                  help=f"总有效样本数：{total_count}。**V14.7 极致防御版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
