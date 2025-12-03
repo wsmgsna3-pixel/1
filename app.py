@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V14.5 终极稳健版：新股防御 + MACD主导策略
+选股王 · V14.6 趋势主导版：去当日涨幅，强化 MACD 和换手率
 核心修复：
-1. 【**新股漏洞修复 V14.5**】：将 120 天上市日限制应用于所有股票，防止主板次新股被错误选中。
-2. 【**策略精调 V14.5**】：平衡 V14.4 的过度动量，采用 **MACD主导 + 轻量波动防御** 策略，过滤掉极端高波动股。
-   - MACD (w_macd) 维持 0.40。
-   - 波动率防御 (w_volatility) 提升至 0.10。
-   - 日动量 (w_pct) 降至 0.20。
+1. 【**新股防御 V14.5**】：保持新股过滤的鲁棒性。
+2. 【**策略精调 V14.6**】：核心调整：**动量降级，趋势主导**，解决“追高失败”问题。
+   - MACD (w_macd) 提升至 **0.45** (强化中期趋势统治力)。
+   - Turnover (w_turn) 提升至 **0.30** (专注于活跃股票)。
+   - Pct_Chg (w_pct) 降至 **0.05** (大幅削弱当日涨幅影响，防止追高)。
+   - 波动率防御 (w_volatility) 维持 0.10。
 """
 
 import streamlit as st
@@ -30,9 +31,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V14.5 终极稳健版", layout="wide")
-st.title("选股王 · V14.5 最终策略（🛡️ 新股防御 + MACD主导）")
-st.markdown("🎯 **V14.5 策略说明：** **已修复主板新股漏洞。** 策略权重采用 MACD 主导 + 轻量波动防御，旨在选择中期趋势清晰、短期波动不过度的稳健动量股。")
+st.set_page_config(page_title="选股王 · V14.6 趋势主导版", layout="wide")
+st.title("选股王 · V14.6 最终策略（👑 趋势主导 / 削弱动量）")
+st.markdown("🎯 **V14.6 策略说明：** **修复追高问题**，将当日涨幅权重降至 0.05，大幅强化 **MACD (0.45)** 和 **换手率 (0.30)**，专注于中期趋势良好且交易极度活跃的股票。")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -70,7 +71,7 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ V14.3/V14.4/V14.5 核心修复：按日期循环拉取历史数据 (鲁棒性保证)
+# ⭐️ V14.6 核心：按日期循环拉取历史数据 (鲁棒性保证)
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def get_all_historical_data(trade_days_list):
@@ -120,7 +121,7 @@ def get_all_historical_data(trade_days_list):
         if not daily_df.empty:
             daily_data_list.append(daily_df)
             
-        # 避免过于频繁的 API 调用，Tushare 有 QPS 限制，但按日期循环已经自带了时间间隔
+        # 避免过于频繁的 API 调用，Tushare 有 QPS 限制
     
     download_progress.progress(1.0, text="下载进度：合并数据...")
     download_progress.empty()
@@ -143,7 +144,7 @@ def get_all_historical_data(trade_days_list):
     GLOBAL_DAILY_RAW = daily_raw_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
 
 
-    # 4. 计算并存储全局固定 QFQ 基准因子 (与 V14.2 保持一致)
+    # 4. 计算并存储全局固定 QFQ 基准因子
     latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
     
     if latest_global_date:
@@ -159,7 +160,7 @@ def get_all_historical_data(trade_days_list):
     # 5. 诊断信息
     st.info(f"✅ 数据预加载完成。日线数据总条目：{len(GLOBAL_DAILY_RAW)}，复权因子总条目：{len(GLOBAL_ADJ_FACTOR)}")
 
-    # 检查数据条目是否足够 (简单的完整性检查)
+    # 检查数据条目是否足够 
     if len(GLOBAL_DAILY_RAW) < 100000:
          st.warning("⚠️ 警告：总条目数偏低。请再次确认 Tushare 积分和 API 访问权限。")
          
@@ -171,7 +172,7 @@ def get_all_historical_data(trade_days_list):
 # ----------------------------------------------------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     """ 
-    V12.9 修复版：日线数据和复权因子均从预加载的全局变量中切片获取，
+    日线数据和复权因子均从预加载的全局变量中切片获取，
     复权基准使用 GLOBAL_QFQ_BASE_FACTORS 中存储的统一因子。
     """
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
@@ -179,7 +180,6 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     if GLOBAL_DAILY_RAW.empty or GLOBAL_ADJ_FACTOR.empty or not GLOBAL_QFQ_BASE_FACTORS:
         return pd.DataFrame()
         
-    # ⭐️ 核心修复步骤 2：获取全局固定复权基准
     latest_adj_factor = GLOBAL_QFQ_BASE_FACTORS.get(ts_code, np.nan)
     if pd.isna(latest_adj_factor) or latest_adj_factor < 1e-9:
         return pd.DataFrame() 
@@ -207,7 +207,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     # 复权计算逻辑
     df = df.sort_index()
     
-    # ⭐️ 核心修复步骤 3：使用全局固定基准进行向量化复权计算
+    # 使用全局固定基准进行向量化复权计算
     for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns:
             # QFQ Price = Raw Price * (Adj Factor / Global Base Factor)
@@ -406,13 +406,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mask_bj = df['ts_code'].str.startswith('92') 
     df = df[~mask_bj]
     
-    # ⭐️ V14.5 核心修复：通用新股过滤
+    # V14.5 修复：通用新股过滤
     TODAY = datetime.strptime(last_trade, "%Y%m%d")
     MIN_LIST_DAYS = 120 # 上市至少 120 天 (~6 个月交易日)
     df['list_date_dt'] = pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')
     df['days_listed'] = (TODAY - df['list_date_dt']).dt.days
     
-    # 修复：将过滤应用于所有股票
+    # 将过滤应用于所有股票
     mask_new_all = df['days_listed'] < MIN_LIST_DAYS
     df = df[~mask_new_all] 
     
@@ -435,6 +435,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if initial_candidate_count == 0: return pd.DataFrame(), f"硬性过滤后无股票：{last_trade}"
 
     # 4. 遴选决赛名单
+    # 保持 V14.5 的入围逻辑 (当日涨幅 + 换手率)
     limit_pct = int(FINAL_POOL * 0.7)
     df_pct = df.sort_values('pct_chg', ascending=False).head(limit_pct).copy()
     limit_turn = FINAL_POOL - len(df_pct)
@@ -442,17 +443,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df_turn = df[~df['ts_code'].isin(existing_codes)].sort_values('turnover_rate', ascending=False).head(limit_turn).copy()
     final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
     
-    # ⭐️ V14.2 鲁棒性强化：检查候选股在内存中的 D0 QFQ 数据是否完整 (保留，确保无数据股票被过滤)
+    # 鲁棒性强化：检查候选股在内存中的 D0 QFQ 数据是否完整
     if not GLOBAL_DAILY_RAW.empty:
         try:
             codes_with_d0_data = GLOBAL_DAILY_RAW.loc[(slice(None), last_trade), :].index.get_level_values('ts_code').unique()
             final_candidates = final_candidates[final_candidates['ts_code'].isin(codes_with_d0_data)].copy()
         except KeyError:
-            # 如果 last_trade 日期在 GLOBAL_DAILY_RAW 中完全不存在
             return pd.DataFrame(), f"跳过 {last_trade}：核心历史数据缓存中缺失回测日 {last_trade} 的全部数据 (已通过鲁棒性检查过滤)"
             
     if final_candidates.empty:
-        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {initial_candidate_count} 个硬性过滤股中，所有股票的 D0 QFQ 价格均无效（数据不足或复权失败）。"
+        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {initial_candidate_count} 个硬性过滤股中，所有股票的 D0 QFQ 价格均无效。"
 
     # 5. 深度评分 
     records = []
@@ -501,7 +501,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if fdf.empty: 
         return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空. 原因：在 {len(final_candidates)} 个已检查的候选股中，所有股票的 D0 QFQ 价格均无效。"
 
-    # 6. 归一化与 V14.5 策略精调评分 
+    # 6. 归一化与 V14.6 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -516,13 +516,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_volatility'] = normalize(fdf['volatility'])
     fdf['s_position'] = fdf['position_60d'] / 100 
     
-    # 🚨 V14.5 策略权重 (MACD主导 + 轻量波动防御)
-    w_macd = 0.40         # MACD ↑↑↑ 趋势核心 (维持最大权重)
-    w_pct = 0.20          # 当日涨幅 ↑↑ (略微降低)
-    w_turn = 0.20         # 换手率 ↑ (维持高活跃度)
-    w_mf = 0.10           # 资金流 ↓↓ (维持低位)
-    w_volatility = 0.10   # 波动率 ↓ (反向) ⭐️ 提升至 0.10，轻量级防御
-    w_position = 0.00     # 60日位置 ↓ (反向) ⭐️ 保持移除
+    # 🚨 V14.6 策略权重 (趋势主导 / 削弱动量)
+    w_macd = 0.45         # MACD ↑↑↑↑ 趋势核心 (绝对主导)
+    w_turn = 0.30         # 换手率 ↑↑↑ (极度活跃)
+    w_volatility = 0.10   # 波动率 ↓ (反向) 轻量级防御
+    w_mf = 0.10           # 资金流 ↓↓ 
+    w_pct = 0.05          # 当日涨幅 ↑ (大幅削弱，防止追高)
+    w_position = 0.00     # 60日位置 ↓ (保持移除)
     w_vol = 0.00          
     w_trend = 0.00          
     
@@ -557,7 +557,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         st.stop()
     
     # ----------------------------------------------------------------------
-    # 核心优化步骤：预加载所有历史数据 (V14.3/V14.4/V14.5 循环拉取 - 稳定可靠)
+    # 核心优化步骤：预加载所有历史数据 (V14.6 循环拉取 - 稳定可靠)
     # ----------------------------------------------------------------------
     preload_success = get_all_historical_data(trade_days_str)
     if not preload_success:
@@ -618,7 +618,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V14.5 稳健版**")
+                  help=f"总有效样本数：{total_count}。**V14.6 趋势主导版**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
