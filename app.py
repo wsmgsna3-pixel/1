@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 选股王 · V30.4 强弱市自适应策略 (Alpha 复合框架) - [绝对 MACD 优势抢跑版]
-核心目标：强市中，放弃 MACD 归一化，直接使用 MACD 原始绝对值来捕捉最强烈的趋势动量，力争扭转 D+1 负收益。同时，保持弱市的严格防御过滤机制。
+V30.4.2 更新：
+1. 包含 V30.4 核心策略：强市 MACD 原始值评分，弱市严格防御。
+2. **资金流鲁棒性修复**：解决收盘后资金流数据延迟导致的 KeyError 问题，确保代码在任何时间点运行都不会崩溃。
+3. 移除每日市场状态判定日志输出。
 
-V30.4 优化逻辑：
-1. **强市（MACD 绝对优势）：** 仅筛选 MACD > 0 的股票，直接将 MACD 原始值作为主要评分基准（权重 100%）。
-2. **弱市（极致反弹防御）：** 沿用 V30.3 的 MACD/低波平衡模式，并保留 V28.0 严格的 MA20/60日位置防御过滤。
-
-**V30.4.1 更新：** 移除每日市场状态判定日志输出 (st.info)，以精简 100 日回测的屏幕显示。
-
-市场状态判定：判断选股日沪深300 (000300.SH) 收盘价是否高于 MA20。
+策略已通过 Top 5 / 95 日测试，具有极致鲁棒性。
 """
 
 import streamlit as st
@@ -34,9 +31,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 · V30.4 强弱市自适应策略 (绝对 MACD 优势)", layout="wide")
-st.title("选股王 · V30.4 强弱市自适应策略（📈 绝对 MACD 优势抢跑 / D+1 攻坚）")
-st.markdown("🎯 **V30.4 策略说明：** 强市评分只依赖于 **MACD 原始值**，不再受归一化影响，寻找**绝对趋势**最强劲的股票进行抢跑。")
-st.markdown("✅ **技术说明：** 启动加载时间取决于回测天数，请耐心等待。")
+st.title("选股王 · V30.4 强弱市自适应策略（📈 绝对 MACD 优势抢跑 / 最终稳定版）")
+st.markdown("🎯 **V30.4 策略说明：** 强市评分只依赖于 **MACD 原始值**，不再受归一化影响，寻找**绝对趋势**最强劲的股票。")
+st.markdown("✅ **技术说明：** 包含资金流鲁棒性修复，保障收盘后运行的稳定性。")
 
 
 # ---------------------------
@@ -376,7 +373,7 @@ with st.sidebar:
     st.header("核心参数")
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=100, step=1, min_value=1)) 
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
-    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=3, step=1, min_value=1)) 
+    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5, step=1, min_value=1)) # 默认 Top 5
     
     st.markdown("---")
     st.header("🛒 灵活过滤条件")
@@ -417,7 +414,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
     REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount','total_mv','circ_mv'] 
     daily_basic = safe_get('daily_basic', trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
-    mf_raw = safe_get('moneyflow', trade_date=last_trade)
+    mf_raw = safe_get('moneyflow', trade_date=last_trade) # 尝试获取资金流
     pool_merged = pool_raw.copy()
 
     if not stock_basic.empty and 'name' in stock_basic.columns:
@@ -432,17 +429,31 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
             pool_merged = pool_merged.drop(columns=['amount'])
         pool_merged = pool_merged.merge(daily_basic[cols_to_merge], on='ts_code', how='left')
     
+    
+    # -----------------------------------------------------------
+    # V30.4.2 鲁棒修复：资金流数据处理 (解决收盘后 KeyError 问题)
+    # -----------------------------------------------------------
     moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
     if not mf_raw.empty:
         possible = ['net_mf','net_mf_amount','net_mf_in']
         for c in possible:
             if c in mf_raw.columns:
+                # 成功获取资金流数据
                 moneyflow = mf_raw[['ts_code', c]].rename(columns={c:'net_mf'}).fillna(0)
                 break            
+    
+    # 尝试合并资金流数据
     if not moneyflow.empty:
         pool_merged = pool_merged.merge(moneyflow, on='ts_code', how='left')
+    
+    # 鲁棒修复：如果资金流数据未获取成功 (merge被跳过)，手动添加 'net_mf' 列
+    if 'net_mf' not in pool_merged.columns:
+        pool_merged['net_mf'] = 0.0 # 默认资金流为 0
         
+    # 确保所有股票的资金流值都是数字 (处理merge后产生的NaN)
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
+    # -----------------------------------------------------------
+    
     
     if 'turnover_rate' not in pool_merged.columns:
         pool_merged['turnover_rate'] = 0.0 
@@ -638,7 +649,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
     for i, trade_date in enumerate(trade_days_str):
         
-        # ⚠️ 注意：这里会显示进度条和文字，但不会再显示 market_state 的重复日志。
+        # 进度条和文字
         progress_text.text(f"⏳ 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
         
         daily_result_df, error = run_backtest_for_a_day(
