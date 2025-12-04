@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 选股王 · V30.4 强弱市自适应策略 (Alpha 复合框架) - [绝对 MACD 优势抢跑版]
-V30.4.3 更新：
+V30.4.4 更新：
 1. 包含 V30.4 核心策略：强市 MACD 原始值评分，弱市严格防御。
-2. **资金流鲁棒性修复 (V30.4.2)**：解决收盘后资金流数据延迟导致的 KeyError 问题。
-3. **每日指标鲁棒性修复 (V30.4.3)**：解决 circ_mv, turnover_rate 等 daily_basic 字段因 API 不稳或数据缺失导致的 KeyError 问题。
-
-策略已通过 Top 5 / 95 日测试，具有极致鲁棒性。
+2. **资金流鲁棒性修复 (V30.4.2)**：解决资金流数据延迟导致的 KeyError。
+3. **每日指标鲁棒性修复 (V30.4.3)**：解决 circ_mv, turnover_rate 等缺失导致的 KeyError。
+4. **🚀 增量缓存修复 (V30.4.4 核心)**：彻底解决长回测中断后缓存中毒和必须重新下载全部数据的问题。
 """
 
 import streamlit as st
@@ -31,9 +30,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 · V30.4 强弱市自适应策略 (绝对 MACD 优势)", layout="wide")
-st.title("选股王 · V30.4 强弱市自适应策略（📈 绝对 MACD 优势抢跑 / 最终稳定版）")
+st.title("选股王 · V30.4 强弱市自适应策略（📈 绝对 MACD 优势抢跑 / 增量缓存稳定版）")
 st.markdown("🎯 **V30.4 策略说明：** 强市评分只依赖于 **MACD 原始值**，不再受归一化影响，寻找**绝对趋势**最强劲的股票。")
-st.markdown("✅ **技术说明：** 包含资金流和每日指标的**双重鲁棒性修复 (V30.4.3)**，保障任何时间点运行的稳定性。")
+st.markdown("✅ **技术说明：** 包含资金流、每日指标的**双重鲁棒性修复**，以及针对长时间回测中断的 **增量缓存机制 (V30.4.4)**。")
 
 
 # ---------------------------
@@ -75,12 +74,29 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# ⭐️ 核心加速函数：按日期循环拉取历史数据 
+# ⭐️ V30.4.4 新增：按日缓存数据函数 (解决长回测中断问题)
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
+def fetch_and_cache_daily_data(date):
+    """安全拉取并缓存单个交易日的数据"""
+    adj_df = safe_get('adj_factor', trade_date=date)
+    daily_df = safe_get('daily', trade_date=date)
+    
+    # 返回一个包含该日期数据的字典，便于后续合并
+    return {
+        'adj': adj_df,
+        'daily': daily_df,
+    }
+
+
+# ----------------------------------------------------------------------
+# 核心加速函数：按日期循环拉取历史数据 
+# ----------------------------------------------------------------------
+# ⚠️ 注意：此处不再使用 @st.cache_data，转而依赖内部的 fetch_and_cache_daily_data
 def get_all_historical_data(trade_days_list):
     """
-    鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性，并将数据存储到全局变量中。
+    通过循环调用 fetch_and_cache_daily_data 构建全局数据，
+    利用 Streamlit 的 fine-grained 缓存机制避免重复下载。
     """
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
     
@@ -96,8 +112,6 @@ def get_all_historical_data(trade_days_list):
     start_date = start_date_dt.strftime("%Y%m%d")
     end_date = end_date_dt.strftime("%Y%m%d")
     
-    st.info(f"⏳ 正在按日期循环下载 {start_date} 到 {end_date} 间的**全市场历史数据** (批量下载, 较慢)...")
-    
     # 1. 获取所有交易日列表
     all_trade_dates_df = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')
     if all_trade_dates_df.empty:
@@ -105,7 +119,8 @@ def get_all_historical_data(trade_days_list):
         return False
     
     all_dates = all_trade_dates_df['cal_date'].tolist()
-    
+    st.info(f"⏳ 正在按日期循环下载 {start_date} 到 {end_date} 间的**全市场历史数据** (增量缓存)...")
+
     # 2. 循环获取复权因子 (adj_factor) 和日线行情 (daily)
     adj_factor_data_list = []
     daily_data_list = []
@@ -113,17 +128,23 @@ def get_all_historical_data(trade_days_list):
     download_progress = st.progress(0, text="下载进度 (按日期循环)...")
     
     for i, date in enumerate(all_dates):
-        download_progress.progress((i + 1) / len(all_dates), text=f"下载进度：处理日期 {date}")
-        
-        # 获取复权因子
-        adj_df = safe_get('adj_factor', trade_date=date)
-        if not adj_df.empty:
-            adj_factor_data_list.append(adj_df)
+        # 核心：调用缓存函数，如果已缓存则瞬间返回
+        try:
+            cached_data = fetch_and_cache_daily_data(date)
             
-        # 获取日线行情
-        daily_df = safe_get('daily', trade_date=date)
-        if not daily_df.empty:
-            daily_data_list.append(daily_df)
+            if not cached_data['adj'].empty:
+                adj_factor_data_list.append(cached_data['adj'])
+                
+            if not cached_data['daily'].empty:
+                daily_data_list.append(cached_data['daily'])
+                
+            download_progress.progress((i + 1) / len(all_dates), text=f"下载进度：处理日期 {date}")
+        
+        except Exception as e:
+            # 如果某个日期下载失败，记录错误并尝试继续/中断
+            st.error(f"❌ 警告：日期 {date} 的数据拉取失败，可能是 Tushare 超时。错误：{e}")
+            # 由于我们依赖于 per-date 缓存，这里即使失败也可以让循环继续，下次运行时会重试失败的日期
+            continue 
             
     
     download_progress.progress(1.0, text="下载进度：合并数据...")
@@ -634,7 +655,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **请务必先清除 Streamlit 缓存！**（右上角三点菜单 -> Settings -> Clear Cache）这是让程序强制重新下载数据的关键一步。")
+    # 🚨 V30.4.4 指引：现在只需要清除旧的整体缓存
+    st.info("💡 **重要提示 (V30.4.4)：** 首次运行时速度较慢，请等待。若中途失败，无需清除缓存，只需重新点击按钮，程序将从失败点**快速恢复**。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
