@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.2 强弱市自适应策略 (Alpha 复合框架) - [极致短线抢跑版]
-核心目标：根据市场状态切换，并极度优先**D+1（次日）**和**D+3（短期）**收益。
+选股王 · V30.3 强弱市自适应策略 (Alpha 复合框架) - [高质量趋势抢跑版]
+核心目标：根据市场状态切换，**放弃**当日资金流的过度依赖，转而聚焦于 **MACD（趋势共振）**和**低波动率（稳健惯性）**，以提高 D+1 和 D+3 的稳定收益。
 
-V30.2 优化逻辑：
-1. **强市（动量抢跑）：** 资金流权重提升至 60%，以捕捉次日爆发力最强的股票。
-2. **弱市（反弹防御）：** MACD 权重提升至 50%，在严格防御过滤下，只选择反弹信号最强的超跌股，以实现 D+1/D+3 反弹收益。
+V30.3 优化逻辑：
+1. **强市（高质量趋势）：** MACD (50%) + 波动率反向 (30%)，确保选出的是趋势已启动且上涨稳健的股票。
+2. **弱市（极致反弹防御）：** MACD (45%) + 波动率反向 (45%)，在严格防御下寻找安全边际高且反弹意愿强的超跌股。
 
 市场状态判定：判断选股日沪深300 (000300.SH) 收盘价是否高于 MA20。
 """
@@ -20,7 +20,7 @@ import time
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 全局变量初始化 (来自 jingong.txt V14.8.1 加速结构)
+# 全局变量初始化
 # ---------------------------
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
@@ -31,9 +31,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.2 强弱市自适应策略 (极致短线抢跑)", layout="wide")
-st.title("选股王 · V30.2 强弱市自适应策略（🚀 极致短线抢跑 / D+1 优先）")
-st.markdown("🎯 **V30.2 策略说明：** 策略根据市场状态切换，并将权重极度倾向于 **资金流 (D+1 惯性)** 和 **MACD (趋势爆发力)**。")
+st.set_page_config(page_title="选股王 · V30.3 强弱市自适应策略 (高质量趋势抢跑)", layout="wide")
+st.title("选股王 · V30.3 强弱市自适应策略（📈 高质量趋势抢跑 / D+1/D+3 稳定收益）")
+st.markdown("🎯 **V30.3 策略说明：** 策略放弃极致短线追高，转而利用 **MACD** 和 **低波动率** 捕捉更具持续性和惯性的短期上涨机会。")
 st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟)，但数据可靠，回测计算速度极快。")
 
 
@@ -539,7 +539,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         return pd.DataFrame(), f"跳过 {last_trade}：弱市防御过滤后无有效股票。"
 
 
-    # 5. 归一化与动态策略评分 (V30.2 极致短线抢跑优化)
+    # 5. 归一化与动态策略评分 (V30.3 高质量趋势抢跑优化)
     def normalize(series):
         series_nn = series.dropna() 
         if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
@@ -549,32 +549,32 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_macd'] = normalize(fdf['macd']) 
     fdf['s_volatility'] = normalize(fdf['volatility']) 
     
-    # --- V30.2 动态策略评分 ---
+    # --- V30.3 动态策略评分 ---
     if market_state == 'Strong':
-        # 策略 1: 极致动量抢跑模式 (D+1 优先)
-        fdf['策略'] = '极致动量抢跑 V30.2'
-        w_mf = 0.60   # 资金流 (大幅提升至 60%，决定D+1的爆发力)
-        w_macd = 0.30  # MACD 趋势 (保证趋势启动的质量)
-        w_volatility = 0.10 # 波动率反向 (次要防御)
+        # 策略 1: 高质量趋势抢跑模式 (MACD主导，追求D+1和D+3的持续惯性)
+        fdf['策略'] = '高质量趋势 V30.3'
+        w_macd = 0.50   # MACD 趋势 (大幅提升至 50%，寻找持续的趋势惯性)
+        w_volatility = 0.30  # 波动率反向 (30%，确保趋势上涨过程稳健)
+        w_mf = 0.20 # 资金流 (降权，作为辅助催化剂)
         
         score = (
-            fdf['s_mf'].fillna(0.5) * w_mf + 
-            fdf['s_macd'].fillna(0.5) * w_macd +
-            fdf['s_volatility'].rsub(1).fillna(0.5) * w_volatility # 低波动率意味着资金效率更高
+            fdf['s_macd'].fillna(0.5) * w_macd + 
+            fdf['s_volatility'].rsub(1).fillna(0.5) * w_volatility + 
+            fdf['s_mf'].fillna(0.5) * w_mf 
         )
     else: # Weak Market
-        # 策略 2: 极致反弹防御模式 (寻找D+1/D+3反弹信号最强的超跌股)
-        fdf['策略'] = '极致反弹防御 V30.2'
-        w_volatility = 0.30  # 波动率反向 (中等防御，保障安全边际)
-        w_macd = 0.50  # MACD (大幅提升至 50%，寻找反弹意愿最强烈的股票)
-        w_mf = 0.20
+        # 策略 2: 极致反弹防御模式 (MACD与低波平衡，确保反弹力度和安全度)
+        fdf['策略'] = '极致反弹防御 V30.3'
+        w_volatility = 0.45  # 波动率反向 (45%，提高安全边际)
+        w_macd = 0.45  # MACD (45%，核心反弹信号)
+        w_mf = 0.10  # 资金流 (降权，作为微弱辅助)
         
         score = (
-            # 波动率越低，得分越高 (反向，占 30%) - 降低风险
+            # 波动率越低，得分越高 (反向，占 45%) - 提高防御安全边际
             fdf['s_volatility'].rsub(1).fillna(0.5) * w_volatility + 
-            # MACD越大，得分越高 (正向，占 50%) - 核心反弹信号
+            # MACD越大，得分越高 (正向，占 45%) - 核心反弹信号
             fdf['s_macd'].fillna(0.5) * w_macd +
-            # 资金流入越多，得分越高 (正向，占 20%) - 辅助催化剂
+            # 资金流入越多，得分越高 (正向，占 10%) - 辅助催化剂
             fdf['s_mf'].fillna(0.5) * w_mf 
         )
         
@@ -651,7 +651,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**V30.2 极致短线抢跑策略**")
+                  help=f"总有效样本数：{total_count}。**V30.3 高质量趋势抢跑策略**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
