@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
-更新说明：
-1. 【**策略精调 V11.0**】：核心变动：
-   - 目标：以 V9.0 为基础，精准修复 D+3 周期低胜率问题。
-   - **MACD (w_macd)** 从 0.10 大幅提升至 **0.20** (强化中期趋势共振，筛选能持续走高 3-5 天的股票)。
-   - **当日涨幅 (w_pct)** 和 **换手率 (w_turn)** 从 0.15 降至 **0.10** (为 MACD 腾出权重)。
-   - **资金流 (w_mf)**、**60日位置 (w_position)** 和 **波动率 (w_volatility)** 权重维持 V9.0 水平，保持核心动力和防御性。
+选股王 · V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版 (极速回测版)
+核心修复：
+1. 【**极速回测加速**】：引入 V14.8.1 的“全局历史数据预加载”和“内存切片QFQ计算”机制。
+   - 显著加速回测循环（将网络I/O转换为内存I/O）。
+2. 【**Bug Fix**】：移除 Tushare API 调用中的 time.sleep(0.5) 延迟。
    
-   新权重结构：资金流(0.35) + 趋势(0.20) + 防御(0.25) + 动能(0.20) = 1.00
+V11.0 策略权重结构：资金流(0.35) + 趋势(0.20) + 防御(0.25) + 动能(0.20) = 1.00
 """
 
 import streamlit as st
@@ -21,23 +19,28 @@ import time
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 页面设置
-# ---------------------------
-st.set_page_config(page_title="选股王 · V11.0 最终决战策略", layout="wide")
-st.title("选股王 · V11.0 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版）")
-st.markdown("🎯 **V11.0 策略：在 $\mathbf{V9.0}$ 的基础上，将 $\mathbf{MACD}$ 权重提升到 $\mathbf{0.20}$，目标是巩固 $\mathbf{D+1}$ 胜率，并突破 $\mathbf{D+3}$ 胜率到 $\mathbf{50\%}$。**")
-
-# ---------------------------
-# 全局变量初始化
+# 全局变量初始化 (来自 jingong.txt V14.8.1 加速结构)
 # ---------------------------
 pro = None 
+GLOBAL_ADJ_FACTOR = pd.DataFrame() 
+GLOBAL_DAILY_RAW = pd.DataFrame() 
+GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 
 # ---------------------------
-# 辅助函数 (保持 V10.0 代码结构，省略重复部分)
+# 页面设置
+# ---------------------------
+st.set_page_config(page_title="选股王 · V11.0 最终决战策略 (🚀 极速回测版)", layout="wide")
+st.title("选股王 · V11.0 最终决战策略（V9.0 框架 + 强化 MACD 趋势共振版 / 🚀 极速回测）")
+st.markdown("🎯 **V11.0 策略：** 核心权重：**资金流 0.35** + **MACD 0.20** + **60日位置 0.15** + **波动率 0.10** + **当日涨幅 0.10** + **换手率 0.10**。")
+st.markdown("✅ **技术说明：** 启动加载时间较长 (5-8 分钟，用于批量下载)，但数据可靠，**回测计算速度极快**。")
+
+
+# ---------------------------
+# 辅助函数 (API调用和数据获取)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
-    """安全调用 Tushare API"""
+    """安全调用 Tushare API (已移除 time.sleep 延迟)"""
     global pro
     if pro is None:
         return pd.DataFrame(columns=['ts_code']) 
@@ -45,50 +48,166 @@ def safe_get(func_name, **kwargs):
     try:
         df = func(**kwargs)
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-            time.sleep(0.5) 
             return pd.DataFrame(columns=['ts_code']) 
-        time.sleep(0.5) 
         return df
     except Exception as e:
-        time.sleep(0.5) 
         return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
     """获取 num_days 个交易日作为选股日"""
     start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
     cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
+    
     if cal.empty or 'is_open' not in cal.columns:
         st.error("无法获取交易日历，请检查 Token 或 Tushare 权限。")
         return []
+    
     trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
     trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
     return trade_days_df['cal_date'].head(num_days).tolist()
 
-@st.cache_data(ttl=3600*24)
-def get_adj_factor(ts_code, start_date, end_date):
-    df = safe_get('adj_factor', ts_code=ts_code, start_date=start_date, end_date=end_date)
-    if df.empty or 'adj_factor' not in df.columns: return pd.DataFrame()
-    df['adj_factor'] = pd.to_numeric(df['adj_factor'], errors='coerce').fillna(0)
-    df = df.set_index('trade_date').sort_index() 
-    return df['adj_factor']
 
-@st.cache_data(ttl=3600*12)
-def get_qfq_data_v4(ts_code, start_date, end_date):
-    daily_df = safe_get('daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
-    if daily_df.empty: return pd.DataFrame()
-    daily_df = daily_df.set_index('trade_date').sort_index()
-    adj_factor_series = get_adj_factor(ts_code, start_date, end_date)
-    if adj_factor_series.empty: return pd.DataFrame()
+# ----------------------------------------------------------------------
+# ⭐️ 核心加速函数：按日期循环拉取历史数据 (来自 jingong.txt V14.8.1)
+# ----------------------------------------------------------------------
+@st.cache_data(ttl=3600*24)
+def get_all_historical_data(trade_days_list):
+    """
+    鲁棒修复：改用按日期循环拉取日线和复权因子，确保数据完整性，并将数据存储到全局变量中。
+    """
+    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
+    
+    if not trade_days_list: return False
+    
+    latest_trade_date = max(trade_days_list) 
+    earliest_trade_date = min(trade_days_list)
+    
+    # 扩大数据获取范围 (150天历史 + 20天未来)
+    start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=150)
+    end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=20)
+    
+    start_date = start_date_dt.strftime("%Y%m%d")
+    end_date = end_date_dt.strftime("%Y%m%d")
+    
+    st.info(f"⏳ 正在按日期循环下载 {start_date} 到 {end_date} 间的**全市场历史数据** (批量下载, 较慢)...")
+    
+    # 1. 获取所有交易日列表
+    all_trade_dates_df = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')
+    if all_trade_dates_df.empty:
+        st.error("无法获取交易日历。")
+        return False
+    
+    all_dates = all_trade_dates_df['cal_date'].tolist()
+    
+    # 2. 循环获取复权因子 (adj_factor) 和日线行情 (daily)
+    adj_factor_data_list = []
+    daily_data_list = []
+    
+    download_progress = st.progress(0, text="下载进度 (按日期循环)...")
+    
+    for i, date in enumerate(all_dates):
+        download_progress.progress((i + 1) / len(all_dates), text=f"下载进度：处理日期 {date}")
+        
+        # 获取复权因子
+        adj_df = safe_get('adj_factor', trade_date=date)
+        if not adj_df.empty:
+            adj_factor_data_list.append(adj_df)
+            
+        # 获取日线行情
+        daily_df = safe_get('daily', trade_date=date)
+        if not daily_df.empty:
+            daily_data_list.append(daily_df)
+            
+    
+    download_progress.progress(1.0, text="下载进度：合并数据...")
+    download_progress.empty()
+
+    
+    # 3. 合并和处理数据
+    if not adj_factor_data_list:
+        st.error("❌ 严重错误：无法获取任何复权因子数据。")
+        return False
+        
+    adj_factor_data = pd.concat(adj_factor_data_list)
+    adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
+    GLOBAL_ADJ_FACTOR = adj_factor_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
+    
+    if not daily_data_list:
+        st.error("❌ 严重错误：无法获取任何历史日线数据。")
+        return False
+
+    daily_raw_data = pd.concat(daily_data_list)
+    GLOBAL_DAILY_RAW = daily_raw_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
+
+
+    # 4. 计算并存储全局固定 QFQ 基准因子
+    latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
+    
+    if latest_global_date:
+        try:
+            latest_adj_df = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_global_date), 'adj_factor']
+            GLOBAL_QFQ_BASE_FACTORS = latest_adj_df.droplevel(1).to_dict()
+            st.info(f"✅ 全局 QFQ 基准因子已设置。基准日期: {latest_global_date}，股票数量: {len(GLOBAL_QFQ_BASE_FACTORS)}")
+        except Exception as e:
+            st.error(f"无法设置全局 QFQ 基准因子: {e}")
+    
+    # 如果失败，确保它是空的，以便后续函数可以检查
+    if not GLOBAL_QFQ_BASE_FACTORS:
+        GLOBAL_QFQ_BASE_FACTORS = {} 
+    
+    
+    # 5. 诊断信息
+    st.info(f"✅ 数据预加载完成。日线数据总条目：{len(GLOBAL_DAILY_RAW)}，复权因子总条目：{len(GLOBAL_ADJ_FACTOR)}")
+         
+    return True
+
+
+# ----------------------------------------------------------------------
+# 优化的数据获取函数：只从内存中切片 (前复权计算核心，取代 get_qfq_data_v4)
+# ----------------------------------------------------------------------
+def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
+    """ 
+    日线数据和复权因子均从预加载的全局变量中切片获取，
+    复权基准使用 GLOBAL_QFQ_BASE_FACTORS 中存储的统一因子。
+    """
+    global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
+  
+    if GLOBAL_DAILY_RAW.empty or GLOBAL_ADJ_FACTOR.empty or not GLOBAL_QFQ_BASE_FACTORS:
+        return pd.DataFrame()
+        
+    latest_adj_factor = GLOBAL_QFQ_BASE_FACTORS.get(ts_code, np.nan)
+    if pd.isna(latest_adj_factor) or latest_adj_factor < 1e-9:
+        return pd.DataFrame() 
+
+    try:
+        # 切片数据
+        daily_df_full = GLOBAL_DAILY_RAW.loc[ts_code]
+        daily_df = daily_df_full.loc[(daily_df_full.index >= start_date) & (daily_df_full.index <= end_date)]
+      
+        adj_factor_series_full = GLOBAL_ADJ_FACTOR.loc[ts_code]['adj_factor']
+        adj_factor_series = adj_factor_series_full.loc[(adj_factor_series_full.index >= start_date) & (adj_factor_series_full.index <= end_date)]
+        
+    except KeyError:
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    
+    if daily_df.empty or adj_factor_series.empty: return pd.DataFrame()
+            
+    # 合并原始价格和复权因子
     df = daily_df.merge(adj_factor_series.rename('adj_factor'), left_index=True, right_index=True, how='left')
     df = df.dropna(subset=['adj_factor'])
     if df.empty: return pd.DataFrame()
-    latest_adj_factor = df['adj_factor'].iloc[-1]
+    
+    # 复权计算逻辑
+    df = df.sort_index()
+    
+    # 使用全局固定基准进行向量化复权计算
     for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns:
-            if latest_adj_factor > 1e-9:
-                df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
-            else:
-                df[col + '_qfq'] = df[col] 
+            # QFQ Price = Raw Price * (Adj Factor / Global Base Factor)
+            df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
+    
     df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
     df['trade_date'] = pd.to_datetime(df['trade_date_str'], format='%Y%m%d')
     df = df.sort_values('trade_date').set_index('trade_date_str')
@@ -96,47 +215,72 @@ def get_qfq_data_v4(ts_code, start_date, end_date):
         df[col] = df[col + '_qfq']
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
-def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
+# ----------------------------------------------------------------------
+# 核心函数：get_future_prices (使用优化版数据获取)
+# ----------------------------------------------------------------------
+def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
+    
     d0 = datetime.strptime(selection_date, "%Y%m%d")
-    start_date = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
-    hist = get_qfq_data_v4(ts_code, start_date=start_date, end_date=end_date)
+    start_date_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
+    end_date_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
+    
+    selection_price_adj = d0_qfq_close 
+    
+    # 1. 获取未来 N 日数据 (使用极速内存切片函数)
+    # 注意：这里调用的是 V14.8.1 的 fast function，替代了 V11.0 原来的慢速 get_qfq_data_v4
+    hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date_future, end_date=end_date_future)
+    
     if hist.empty or 'close' not in hist.columns:
         results = {}
         for n in days_ahead: results[f'Return_D{n}'] = np.nan
         return results
+        
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
     hist = hist.dropna(subset=['close'])
     hist = hist.reset_index(drop=True) 
     results = {}
-    selection_price_adj = get_qfq_data_v4(ts_code, (d0 - timedelta(days=1)).strftime("%Y%m%d"), selection_date)['close'].iloc[-1] if not get_qfq_data_v4(ts_code, (d0 - timedelta(days=1)).strftime("%Y%m%d"), selection_date).empty else np.nan
+    
+    # 2. 计算收益
     for n in days_ahead:
         col_name = f'Return_D{n}'
-        if len(hist) >= n:
-            future_price = hist.iloc[n-1]['close']
-            if pd.notna(selection_price_adj) and selection_price_adj > 1e-9:
+        
+        if pd.notna(selection_price_adj) and selection_price_adj > 1e-9:
+            if len(hist) >= n:
+                future_price = hist.iloc[n-1]['close']
                 results[col_name] = (future_price / selection_price_adj - 1) * 100
             else:
                 results[col_name] = np.nan
         else:
-            results[col_name] = np.nan
+            results[col_name] = np.nan 
+            
     return results
 
 
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
-    """计算 MACD, 10日回报, 波动率, 60日位置等指标"""
+    """计算 MACD, 10日回报, 波动率, 60日位置等指标 (使用优化版数据获取)"""
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
-    df = get_qfq_data_v4(ts_code, start_date=start_date, end_date=end_date)
+    
+    # 获取 QFQ 数据，用于计算所有指标 (使用极速内存切片函数)
+    df = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date, end_date=end_date)
+    
     res = {}
-    if df.empty or len(df) < 3 or 'close' not in df.columns: return res
+    if df.empty or len(df) < 3 or 'close' not in df.columns: 
+        return res
+        
     df['close'] = pd.to_numeric(df['close'], errors='coerce').astype(float)
     df['low'] = pd.to_numeric(df['low'], errors='coerce').astype(float)
     df['high'] = pd.to_numeric(df['high'], errors='coerce').astype(float)
     df['vol'] = pd.to_numeric(df['vol'], errors='coerce').fillna(0)
-    df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
+    
+    if len(df) >= 2:
+         df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
+    else:
+         df['pct_chg'] = 0.0
+         
     close = df['close']
-    res['last_close'] = close.iloc[-1]
+    
+    res['last_close'] = close.iloc[-1] # D0 QFQ Close Price
     
     # MACD 计算 
     if len(close) >= 26:
@@ -154,7 +298,7 @@ def compute_indicators(ts_code, end_date):
     else: res['vol_ratio'] = np.nan
         
     # 10日回报、波动率计算
-    res['10d_return'] = close.iloc[-1]/close.iloc[-10] - 1 if len(close)>=10 and close.iloc[-10]!=0 else 0
+    res['10d_return'] = (close.iloc[-1]/close.iloc[-10] - 1) * 100 if len(close)>=10 and close.iloc[-10]!=0 else 0
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
     # 60日位置计算
@@ -169,11 +313,9 @@ def compute_indicators(ts_code, end_date):
     else: res['position_60d'] = np.nan 
     
     return res
-# ----------------------------------------------------
-
 
 # ----------------------------------------------------
-# 侧边栏参数 (定义 BACKTEST_DAYS 等变量)
+# 侧边栏参数 (保持不变)
 # ----------------------------------------------------
 with st.sidebar:
     st.header("模式与日期选择")
@@ -196,7 +338,7 @@ with st.sidebar:
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
 
 # ---------------------------
-# Token 输入与初始化 
+# Token 输入与初始化 (保持不变)
 # ---------------------------
 TS_TOKEN = st.text_input("Tushare Token（输入后按回车）", type="password")
 if not TS_TOKEN:
@@ -210,8 +352,9 @@ pro = ts.pro_api()
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS):
     """为单个交易日运行选股和回测逻辑"""
+    global GLOBAL_DAILY_RAW
     
-    # 1. 拉取全市场 Daily 数据 (省略合并和过滤的重复代码)
+    # 1. 拉取全市场 Daily 数据 (今日快照)
     daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty or 'ts_code' not in daily_all.columns: return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
 
@@ -222,6 +365,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
     pool_merged = pool_raw.copy()
 
+    # 数据合并 (保持不变)
     if not stock_basic.empty and 'name' in stock_basic.columns:
         pool_merged = pool_merged.merge(stock_basic[['ts_code','name','list_date']], on='ts_code', how='left')
     else:
@@ -245,8 +389,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         pool_merged = pool_merged.merge(moneyflow, on='ts_code', how='left')
         
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
-    pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
     
+    # 鲁棒性修复：确保 turnover_rate 存在
+    if 'turnover_rate' not in pool_merged.columns:
+        pool_merged['turnover_rate'] = 0.0 
+    pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
+   
     # 3. 执行硬性条件过滤
     df = pool_merged.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
@@ -255,7 +403,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
     df['name'] = df['name'].astype(str)
     
-    # 过滤 ST 股/退市股/北交所/次新股
+    # 过滤 ST 股/退市股/北交所/次新股 (V11.0 次新股过滤逻辑)
     mask_st = df['name'].str.contains('ST|退', case=False, na=False)
     df = df[~mask_st]
     mask_bj = df['ts_code'].str.startswith('92') 
@@ -292,44 +440,69 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     existing_codes = set(df_pct['ts_code'])
     df_turn = df[~df['ts_code'].isin(existing_codes)].sort_values('turnover_rate', ascending=False).head(limit_turn).copy()
     final_candidates = pd.concat([df_pct, df_turn]).reset_index(drop=True)
+    
+    # 鲁棒性强化：检查候选股在内存中的 D0 QFQ 数据是否完整 (从 V14.8.1 引入)
+    if not GLOBAL_DAILY_RAW.empty:
+        try:
+            codes_with_d0_data = GLOBAL_DAILY_RAW.loc[(slice(None), last_trade), :].index.get_level_values('ts_code').unique()
+            final_candidates = final_candidates[final_candidates['ts_code'].isin(codes_with_d0_data)].copy()
+        except KeyError:
+             return pd.DataFrame(), f"跳过 {last_trade}：核心历史数据缓存中缺失回测日 {last_trade} 的全部数据"
+            
+    if final_candidates.empty:
+        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空."
 
     # 5. 深度评分 
     records = []
     for row in final_candidates.itertuples():
         ts_code = row.ts_code
         
-        rec = {
-            'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
-            'Close': getattr(row, 'close', np.nan),
-            'Circ_MV (亿)': getattr(row, 'circ_mv_billion', np.nan),
-            'Pct_Chg (%)': getattr(row, 'pct_chg', 0), 
-            'turnover': getattr(row, 'turnover_rate', 0),
-            'net_mf': getattr(row, 'net_mf', 0)
-        }
+        raw_close = getattr(row, 'close', np.nan)
         
-        ind = compute_indicators(ts_code, last_trade)
-        rec.update({
-            'vol_ratio': ind.get('vol_ratio', 0), 'macd': ind.get('macd_val', 0),
-            '10d_return': ind.get('10d_return', 0),
-            'volatility': ind.get('volatility', 0), 'position_60d': ind.get('position_60d', np.nan)
-        })
-        
-        future_returns = get_future_prices(ts_code, last_trade) # 直接获取收益率
-        rec.update({
-            'Return_D1 (%)': future_returns.get('Return_D1', np.nan),
-            'Return_D3 (%)': future_returns.get('Return_D3', np.nan),
-            'Return_D5 (%)': future_returns.get('Return_D5', np.nan),
-        })
+        # 计算指标 (现在是极速内存计算)
+        ind = compute_indicators(ts_code, last_trade) 
+        d0_qfq_close = ind.get('last_close', np.nan) # 提取 D0 QFQ Close Price (用于 future price 计算基准)
 
-        records.append(rec)
+        # 仅当 D0 QFQ Close Price 有效且非零时，才进行收益率计算和记录 (从 V14.8.1 引入的鲁棒性检查)
+        if pd.notna(d0_qfq_close) and d0_qfq_close > 1e-9:
+        
+            # 注意：get_future_prices 现在需要 d0_qfq_close 作为输入
+            future_returns = get_future_prices(ts_code, last_trade, d0_qfq_close)
+            
+            rec = {
+                'ts_code': ts_code, 'name': getattr(row, 'name', ts_code),
+                'Close': raw_close, 
+                'Circ_MV (亿)': getattr(row, 'circ_mv_billion', np.nan),
+                'Pct_Chg (%)': getattr(row, 'pct_chg', 0), 
+                'turnover': getattr(row, 'turnover_rate', 0),
+                'net_mf': getattr(row, 'net_mf', 0)
+            }
+            
+            rec.update({
+                'vol_ratio': ind.get('vol_ratio', np.nan), 
+                'macd': ind.get('macd_val', np.nan),
+                '10d_return': ind.get('10d_return', np.nan),
+                'volatility': ind.get('volatility', np.nan), 
+                'position_60d': ind.get('position_60d', np.nan), 
+            })
+            
+            rec.update({
+                'Return_D1 (%)': future_returns.get('Return_D1', np.nan),
+                'Return_D3 (%)': future_returns.get('Return_D3', np.nan),
+                'Return_D5 (%)': future_returns.get('Return_D5', np.nan),
+            })
+
+            records.append(rec)
     
     fdf = pd.DataFrame(records)
-    if fdf.empty: return pd.DataFrame(), f"评分列表为空：{last_trade}"
+    
+    if fdf.empty: 
+        return pd.DataFrame(), f"跳过 {last_trade}：评分列表为空 (所有股票的 D0 QFQ 价格均无效)。"
 
     # 6. 归一化与 V11.0 策略精调评分 
     def normalize(series):
         series_nn = series.dropna() 
-        if series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
+        if series_nn.empty or series_nn.max() == series_nn.min(): return pd.Series([0.5] * len(series), index=series.index)
         return (series - series_nn.min()) / (series_nn.max() - series_nn.min() + 1e-9)
 
     fdf['s_pct'] = normalize(fdf['Pct_Chg (%)'])
@@ -342,40 +515,31 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_position'] = fdf['position_60d'] / 100 
     
     # ----------------------------------------------------------------------------------
-    # 🚨 V11.0 最终决战策略：V9.0 框架 + 强化 MACD 趋势共振版
+    # 🚨 V11.0 最终决战策略：权重保持不变
+    # 核心权重：资金流(0.35)，趋势MACD(0.20)，防御(0.25)，动能(0.20)
     
-    # 核心权重：资金流，占比 35%
-    w_mf = 0.35             # 35% - 资金流 (核心动力，保持 V9.0)
-
-    # 动能权重：当日动能，占比 20%
-    w_pct = 0.10            # 10% - 当日涨幅 (削弱)
-    w_turn = 0.10           # 10% - 换手率 (削弱)
-    
-    # 防御权重：安全边际与波动控制，占比 25%
-    w_position = 0.15       # 15% - 60日位置 (保持 V9.0)
-    w_volatility = 0.10     # 10% - 波动率 (保持 V9.0)
-    
-    # 趋势权重：中期趋势，占比 20%
-    w_macd = 0.20           # 20% - MACD (**大幅强化，目标改善 D+3**)
-    
-    # 彻底归零项
+    w_mf = 0.35            # 35% - 资金流 (正向)
+    w_pct = 0.10            # 10% - 当日涨幅 (正向)
+    w_turn = 0.10           # 10% - 换手率 (正向)
+    w_position = 0.15       # 15% - 60日位置 (反向：越低越好)
+    w_volatility = 0.10     # 10% - 波动率 (反向：越低越好)
+    w_macd = 0.20           # 20% - MACD (正向)
     w_vol = 0.00            # 0% - 量比 
     w_trend = 0.00          # 0% - 10日回报 
     
-    # Sum: 0.35+0.10+0.10+0.15+0.10+0.20 = 1.00
-    
     score = (
-        fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + 
-        fdf['s_mf'] * w_mf + 
-        fdf['s_macd'] * w_macd + 
+        fdf['s_pct'].fillna(0.5) * w_pct + 
+        fdf['s_turn'].fillna(0.5) * w_turn + 
+        fdf['s_mf'].fillna(0.5) * w_mf + 
+        fdf['s_macd'].fillna(0.5) * w_macd + 
         
         # 引入防御：60日位置越低越好 (1-s_position)，波动率越低越好 (1-s_volatility)
-        (1 - fdf['s_position']) * w_position + 
-        (1 - fdf['s_volatility']) * w_volatility + 
+        (1 - fdf['s_position'].fillna(0.5)) * w_position + 
+        (1 - fdf['s_volatility'].fillna(0.5)) * w_volatility + 
         
         # 归零项
-        fdf['s_vol'] * w_vol + 
-        fdf['s_trend'] * w_trend     
+        fdf['s_vol'].fillna(0.5) * w_vol + 
+        fdf['s_trend'].fillna(0.5) * w_trend     
     )
     fdf['综合评分'] = score * 100
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
@@ -386,16 +550,27 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     return fdf.head(TOP_BACKTEST).copy(), None
 
 # ---------------------------
-# 主运行块 (保持不变)
+# 主运行块 (已插入数据预加载)
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    st.warning("⚠️ **V11.0 版本已更换为 V9.0 框架 + 强化 MACD 趋势共振策略，目标是突破 D+3 胜率。**")
-    
+    st.warning("⚠️ **V11.0 极速回测版已应用。**请注意：程序会在开始时下载大量历史数据，请耐心等待。")
+   
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
         st.error("无法获取交易日列表，请检查日期或 Token。")
         st.stop()
+        
+    # ----------------------------------------------------------------------
+    # 核心优化步骤：预加载所有历史数据 (来自 V14.8.1 稳定可靠)
+    # ----------------------------------------------------------------------
+    preload_success = get_all_historical_data(trade_days_str)
+    if not preload_success:
+        st.error("❌ 历史数据预加载失败，回测无法进行。请检查 Tushare Token 和权限。")
+        st.stop()
+    st.success("✅ 历史数据预加载完成！QFQ 基准已固定。现在开始极速回测...")
+    # ----------------------------------------------------------------------
+
     
     st.header(f"📈 正在进行 {BACKTEST_DAYS} 个交易日的回测...")
     
@@ -406,8 +581,8 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     my_bar = st.progress(0)
     
     for i, trade_date in enumerate(trade_days_str):
-        progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
-        
+        progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date} (纯内存计算)")
+   
         daily_result_df, error = run_backtest_for_a_day(
             trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS
         )
@@ -429,7 +604,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         
     all_results = pd.concat(results_list)
     
-    st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {total_days} 个交易日)")
+    st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {len(all_results['Trade_Date'].unique())} 个有效交易日)")
     
     for n in [1, 3, 5]:
         col = f'Return_D{n} (%)' 
