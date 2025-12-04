@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 选股王 · V30.4 强弱市自适应策略 (Alpha 复合框架) - [绝对 MACD 优势抢跑版]
-V30.4.2 更新：
+V30.4.3 更新：
 1. 包含 V30.4 核心策略：强市 MACD 原始值评分，弱市严格防御。
-2. **资金流鲁棒性修复**：解决收盘后资金流数据延迟导致的 KeyError 问题，确保代码在任何时间点运行都不会崩溃。
-3. 移除每日市场状态判定日志输出。
+2. **资金流鲁棒性修复 (V30.4.2)**：解决收盘后资金流数据延迟导致的 KeyError 问题。
+3. **每日指标鲁棒性修复 (V30.4.3)**：解决 circ_mv, turnover_rate 等 daily_basic 字段因 API 不稳或数据缺失导致的 KeyError 问题。
 
 策略已通过 Top 5 / 95 日测试，具有极致鲁棒性。
 """
@@ -33,7 +33,7 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 st.set_page_config(page_title="选股王 · V30.4 强弱市自适应策略 (绝对 MACD 优势)", layout="wide")
 st.title("选股王 · V30.4 强弱市自适应策略（📈 绝对 MACD 优势抢跑 / 最终稳定版）")
 st.markdown("🎯 **V30.4 策略说明：** 强市评分只依赖于 **MACD 原始值**，不再受归一化影响，寻找**绝对趋势**最强劲的股票。")
-st.markdown("✅ **技术说明：** 包含资金流鲁棒性修复，保障收盘后运行的稳定性。")
+st.markdown("✅ **技术说明：** 包含资金流和每日指标的**双重鲁棒性修复 (V30.4.3)**，保障任何时间点运行的稳定性。")
 
 
 # ---------------------------
@@ -431,7 +431,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     
     
     # -----------------------------------------------------------
-    # V30.4.2 鲁棒修复：资金流数据处理 (解决收盘后 KeyError 问题)
+    # ⭐️ V30.4.3 鲁棒修复：确保每日基础数据字段存在 (解决 circ_mv, turnover_rate 等缺失)
+    # -----------------------------------------------------------
+    required_daily_basic_cols = ['turnover_rate','amount','total_mv','circ_mv']
+    for col in required_daily_basic_cols:
+        if col not in pool_merged.columns:
+            # 如果接口返回空数据或缺失字段，则手动添加并填充 0
+            pool_merged[col] = 0.0
+            
+    # -----------------------------------------------------------
+    
+    # -----------------------------------------------------------
+    # V30.4.2 鲁棒修复：资金流数据处理 (解决 net_mf 缺失)
     # -----------------------------------------------------------
     moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
     if not mf_raw.empty:
@@ -454,13 +465,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
     # -----------------------------------------------------------
     
-    
-    if 'turnover_rate' not in pool_merged.columns:
-        pool_merged['turnover_rate'] = 0.0 
-    pool_merged['turnover_rate'] = pool_merged['turnover_rate'].fillna(0) 
    
     df = pool_merged.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
+    # 确保使用的列都存在且是数字
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
@@ -530,7 +538,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         # --------------------------------------------------------------------
         if market_state == 'Weak':
             if pd.isna(d0_ma20) or d0_ma20 == 0 or d0_qfq_close < d0_ma20:
-                continue # 个股必须处于中期上升趋势
+                continue # 个股必须处于中期上升趋势 (MA20之上)
             if pd.isna(d0_position_60d) or d0_position_60d > 20.0:
                 continue # 个股必须处于 60 日超卖区间 (V28.0 极度防御核心)
         # --------------------------------------------------------------------
@@ -673,7 +681,13 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         
     all_results = pd.concat(results_list)
     
-    st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {len(all_results['Trade_Date'].unique())} 个有效交易日)")
+    # 兼容处理：如果 Trade_Date 是对象类型，尝试转换为字符串
+    if all_results['Trade_Date'].dtype != 'object':
+        all_results['Trade_Date'] = all_results['Trade_Date'].astype(str)
+        
+    valid_days_count = len(all_results['Trade_Date'].unique())
+    
+    st.header(f"📊 最终平均回测结果 (Top {TOP_BACKTEST}，共 {valid_days_count} 个有效交易日)")
     
     for n in [1, 3, 5]:
         col = f'Return_D{n} (%)' 
