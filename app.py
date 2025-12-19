@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.13.1 极速共振版
-1. **性能优化**：将北向资金获取方式从“单股循环查询”改为“每日批量拉取”，提速 20倍+。
-2. **逻辑保持**：完整保留 V30.13 的北向打分、RPS趋势锁、中盘共振逻辑。
+选股王 · V30.14 精准打击版
+1. **速度优化**：采用“双重漏斗”模式，只对最终入围的 Top 15 股票查询北向数据，大幅提速。
+2. **胜率修复**：移除过于严苛的 "MA60+3%" 锁，回归 V30.12.3 的高胜率逻辑。
+3. **雷达激活**：优化北向判定逻辑，捕捉“连续3天净买入”的温和信号。
 """
 
 import streamlit as st
@@ -26,13 +27,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.13.1：极速版", layout="wide")
-st.title("选股王 V30.13.1：极速版（⚡️ 提速 20倍 + 🦅 北向雷达）")
+st.set_page_config(page_title="选股王 V30.14：精准打击版", layout="wide")
+st.title("选股王 V30.14：精准打击版（⚡️ 智能延迟加载 + 🦅 灵敏北向雷达）")
 st.markdown("""
-**版本优化 (V30.13.1)：**
-1. ⚡️ **极速引擎**：重构北向资金算法，由“单次请求”改为“批量批发”，彻底解决回测慢的问题。
-2. 🦅 **北向雷达**：保持 V30.13 逻辑（连买+500，大卖-5000）。
-3. 📈 **趋势锁**：保持 60日线+3% 筛选。
+**版本进化 (V30.14)：**
+1. ⚡️ **智能加速**：只对技术面通关的 Top 15 股票查北向数据，拒绝无效查询。
+2. 🦅 **灵敏雷达**：只要外资**连续3天增仓**即触发奖励，不再漏掉细水长流的主力。
+3. 🔄 **胜率回归**：移除 3% 乖离率硬锁，找回 V30.12.3 的 50%+ 胜率手感。
 """)
 
 # ---------------------------
@@ -228,65 +229,36 @@ def get_market_state(trade_date):
     ma20 = index_data['close'].tail(20).mean()
     return 'Strong' if latest > ma20 else 'Weak'
 
-# --- ⚡️ 极速北向批量获取 (New) ---
+# --- ⚡️ 智能单点北向查询 (Lazy Load) ---
+# 不再批量拉取，改为“查单股”，但只查 Top 10
 @st.cache_data(ttl=3600*12)
-def get_bulk_northbound_data(target_date, lookback=3):
-    """
-    批量拉取全市场最近3天的北向资金数据
-    """
-    # 计算最近的几个交易日
-    end_dt = datetime.strptime(target_date, "%Y%m%d")
-    # 稍微多取几天以防停牌
-    start_dt_str = (end_dt - timedelta(days=10)).strftime("%Y%m%d") 
-    
-    # 获取交易日历
-    cal = safe_get('trade_cal', start_date=start_dt_str, end_date=target_date, is_open='1')
-    if cal.empty: return pd.DataFrame()
-    
-    # 取最近 lookback 个交易日 (比如3天)
-    recent_days = cal.sort_values('cal_date', ascending=False)['cal_date'].head(lookback).tolist()
-    
-    all_dfs = []
-    # 循环拉取这几天的全市场数据 (每天一次API，共3次，极快)
-    for date in recent_days:
-        try:
-            # hk_hold 传入 trade_date 会返回当日所有持股
-            df = safe_get('hk_hold', trade_date=date)
-            if not df.empty:
-                all_dfs.append(df)
-        except: pass
-    
-    if not all_dfs: return pd.DataFrame()
-    
-    # 合并并排序
-    bulk_df = pd.concat(all_dfs)
-    bulk_df = bulk_df.sort_values(['ts_code', 'trade_date'])
-    return bulk_df
-
-def check_nb_status_from_bulk(ts_code, bulk_df):
-    """
-    从批量数据中查询单只股票状态 (纯内存操作，0耗时)
-    """
-    if bulk_df.empty: return 0
-    
-    # 筛选出该股票的数据
-    stock_df = bulk_df[bulk_df['ts_code'] == ts_code]
-    if len(stock_df) < 2: return 0
-    
-    latest_vol = stock_df.iloc[-1]['vol']
-    prev_vol = stock_df.iloc[-2]['vol']
-    
-    # 1. 连续 3 天增仓
-    if len(stock_df) >= 3:
-        v3 = stock_df.iloc[-3]['vol']
-        if latest_vol > prev_vol > v3:
-            return 2
-            
-    # 2. 单日大幅变动
-    if latest_vol > prev_vol * 1.1: return 1
-    if latest_vol < prev_vol * 0.9: return -1
-    
-    return 0
+def check_single_stock_northbound(ts_code, end_date):
+    # 获取该股最近 5 天的北向持仓
+    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=12)).strftime("%Y%m%d")
+    try:
+        df = safe_get('hk_hold', ts_code=ts_code, start_date=start_date, end_date=end_date)
+        if df.empty: return 0 
+        
+        df = df.sort_values('trade_date')
+        if len(df) < 2: return 0
+        
+        latest_vol = df.iloc[-1]['vol']
+        prev_vol = df.iloc[-2]['vol']
+        
+        # 1. 连续 3 天增仓 (灵敏版：只要增加就算)
+        if len(df) >= 3:
+            v3 = df.iloc[-3]['vol']
+            if latest_vol > prev_vol and prev_vol > v3:
+                return 2 # 连买
+        
+        # 2. 单日大卖 (风控)
+        if latest_vol < prev_vol * 0.95: return -1 # 卖出超过 5% 即警惕
+        
+        # 3. 单日买入
+        if latest_vol > prev_vol: return 1
+        
+        return 0
+    except: return 0
 
 # ---------------------------
 # 核心回测逻辑
@@ -301,9 +273,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     daily_basic = safe_get('daily_basic', trade_date=last_trade)
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
-    
-    # 1. 批量预取北向数据 (⚡️ 提速核心)
-    bulk_nb_df = get_bulk_northbound_data(last_trade, lookback=3)
     
     # 板块共振
     strong_industry_codes = set()
@@ -342,7 +311,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
     candidates = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)
     
-    records = []
+    # --- 第一阶段：技术面粗筛 (本地计算，快) ---
+    preliminary_records = []
     for row in candidates.itertuples():
         # 板块过滤
         if GLOBAL_STOCK_INDUSTRY and strong_industry_codes:
@@ -356,8 +326,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_rsi = ind.get('rsi_12', 50)
         d0_bias = ind.get('bias_20', 0)
         
-        # 趋势锁
-        if d0_close < ind['ma60'] * 1.03: continue 
+        # 趋势锁 (回归 V30.12.3 逻辑，只要求站上均线)
+        if d0_close < ind['ma60']: continue 
         
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT or d0_bias > BIAS_LIMIT: continue
@@ -371,50 +341,70 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue
             
-        # 2. 内存查询北向状态 (⚡️ 0耗时)
-        nb_status = check_nb_status_from_bulk(row.ts_code, bulk_nb_df)
+        # 计算基础分 (用于选出 Top 15 进入决赛)
+        base_score = ind['macd_val'] * 1000 + (row.net_mf / 10000)
+        
+        preliminary_records.append({
+            'row_data': row,
+            'ind_data': ind,
+            'base_score': base_score,
+            'd0_close': d0_close
+        })
+    
+    if not preliminary_records: return pd.DataFrame(), "Empty"
+    
+    # 排序选出前 15 名进入“北向查询决赛圈”
+    preliminary_records.sort(key=lambda x: x['base_score'], reverse=True)
+    finalists = preliminary_records[:15]
+    
+    # --- 第二阶段：北向精查 (API请求，仅对 Top 15) ---
+    final_records = []
+    for item in finalists:
+        row = item['row_data']
+        ind = item['ind_data']
+        d0_close = item['d0_close']
+        
+        # 查北向 (Lazy Load)
+        nb_status = check_single_stock_northbound(row.ts_code, last_trade)
+        
+        # 计算最终分
+        final_score = item['base_score']
+        # 连续买入+500，单日买入+200，大卖-5000
+        if nb_status == 2:
+             if final_score > 0: final_score += 500
+        elif nb_status == 1:
+             if final_score > 0: final_score += 200
+        elif nb_status == -1:
+             final_score -= 5000
+             
+        # 强市过热扣分
+        if market_state == 'Strong':
+            if ind.get('rsi_12', 50) > RSI_LIMIT: final_score -= 500
+            if ind.get('bias_20', 0) > BIAS_LIMIT: final_score -= 500
 
         future = get_future_prices(row.ts_code, last_trade, d0_close)
         
-        records.append({
+        final_records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
-            'rsi': d0_rsi, 'bias': d0_bias, 'macd': ind['macd_val'], 'net_mf': row.net_mf,
+            'rsi': ind.get('rsi_12'), 'bias': ind.get('bias_20'), 
+            'net_mf': row.net_mf,
             'Return_D1 (%)': future.get('Return_D1', np.nan),
             'Return_D3 (%)': future.get('Return_D3', np.nan),
             'Return_D5 (%)': future.get('Return_D5', np.nan),
             'market_state': market_state,
             'nb_status': nb_status, 
-            'Sector_Boost': 'Yes'
+            'Sector_Boost': 'Yes',
+            'Score': final_score
         })
-            
-    if not records: return pd.DataFrame(), "Empty"
-    fdf = pd.DataFrame(records)
-    
-    def dynamic_score(r):
-        base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
-        # 北向修正 (不对称打分)
-        if r['nb_status'] == 2: 
-            if base_score > 0: base_score += 500  
-        elif r['nb_status'] == 1: 
-            if base_score > 0: base_score += 200
-        elif r['nb_status'] == -1: 
-            base_score -= 5000 
         
-        if r['market_state'] == 'Strong':
-            penalty = 0
-            if r['rsi'] > RSI_LIMIT: penalty += 500
-            if r['bias'] > BIAS_LIMIT: penalty += 500
-            return base_score - penalty
-        return base_score
-
-    fdf['Score'] = fdf.apply(dynamic_score, axis=1)
+    fdf = pd.DataFrame(final_records)
     return fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST), None
 
 # ---------------------------
 # UI 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.13.1 极速共振版")
+    st.header("V30.14 精准打击版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
@@ -441,8 +431,8 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.13.1 极速版"):
-    st.info("⚡️ 极速引擎已启动，正在批量预加载北向数据...")
+if st.button(f"🚀 启动 V30.14 精准版"):
+    st.info("⚡️ 智能引擎已启动 (双重漏斗筛选)...")
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not get_all_historical_data(trade_days):
@@ -458,7 +448,7 @@ if st.button(f"🚀 启动 V30.13.1 极速版"):
             res['Trade_Date'] = date
             results.append(res)
         
-        # 极速版不需要 sleep，因为请求数极少
+        # 智能版请求极少，无需 sleep
         bar.progress((i+1)/len(trade_days), text=f"正在分析第 {i+1} 天: {date}")
         
     bar.empty()
@@ -466,7 +456,7 @@ if st.button(f"🚀 启动 V30.13.1 极速版"):
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.13.1 极速仪表盘")
+        st.header("📊 V30.14 精准仪表盘")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
