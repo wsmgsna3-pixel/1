@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.10 纯粹趋势版 (统一赛道 + 市值门槛)
-V30.10 核心重构：
-1. [入围重构] 取消“涨幅榜赛道”，全市场只选“资金流最强”且“涨幅适中”的前 100 名。
-   - 逻辑：确保所有入围者都是“有主力真金白银买入”的，且大家在同一起跑线竞争。
-2. [市值门槛] 默认只选流通市值 50亿 - 2000亿 的股票，剔除小盘妖股和巨无霸。
-3. [评分逻辑] 维持 V30.7 的 MACD * 10000，优选趋势最强的龙头。
+选股王 · V30.11 稳健主升版 (剔除涨停 + 3%确认)
+V30.11 核心优化：
+1. [选股微调] "涨幅赛道"只选当日涨幅 5.0% - 9.5% 的股票。
+   - 目的：剔除已涨停的缩量股，专做换手充分的大阳线。
+2. [实战适配] 默认买入阈值调整为 3.0%，模拟“确认强势再上车”。
+3. [核心保留] 沿用 V30.7 的 MACD*10000 评分和资金流逻辑。
 """
 
 import streamlit as st
@@ -28,9 +28,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.10 纯粹趋势版", layout="wide")
-st.title("选股王 · V30.10 纯粹趋势版（🦄 资金流+中阳线统一赛道）")
-st.markdown("🎯 **V30.10 策略：** 只有 **市值达标** 且 **主力大买** 的 **中阳线** 股票才能入围，最后按 MACD 决胜负。")
+st.set_page_config(page_title="选股王 · V30.11 稳健主升版", layout="wide")
+st.title("选股王 · V30.11 稳健主升版（✂️ 剔除涨停 / 🎯 3%确认）")
+st.markdown("🎯 **策略逻辑：** 锁定 **5%-9.5%** 的大阳线 + **资金流龙头**，次日 **+3%** 确认后买入。")
 
 
 # ---------------------------
@@ -163,6 +163,7 @@ def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], 
     if hist.empty: return results
         
     d1_data = hist.iloc[0]
+    # 买入价 = Open * (1 + 阈值)
     buy_price_threshold = d1_data['open'] * (1 + buy_threshold_pct / 100.0)
     
     if d1_data['high'] < buy_price_threshold: return results 
@@ -170,6 +171,7 @@ def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], 
     for n in days_ahead:
         idx = n - 1
         if len(hist) > idx:
+            # 收益率 = (卖出价 - 买入确认价) / 买入确认价
             results[f'Return_D{n}'] = (hist.iloc[idx]['close'] / buy_price_threshold - 1) * 100
             
     return results
@@ -213,19 +215,16 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 纯粹选股门槛 (V30.10)")
-    st.info("💡 **只选符合以下所有条件的股票**")
-    
+    st.header("2. 选股微调 (V30.11)")
+    # 新增：涨幅赛道的上下限
+    st.info("💡 **涨幅赛道** 只选涨幅在此区间的股票 (避开涨停)：")
     col1, col2 = st.columns(2)
-    with col1: MIN_PCT_CHG = st.number_input("最小涨幅 (%)", value=3.0)
-    with col2: MAX_PCT_CHG = st.number_input("最大涨幅 (%)", value=8.0)
-    
-    col3, col4 = st.columns(2)
-    with col3: MIN_MV_BILLION = st.number_input("最小市值(亿)", value=50.0)
-    with col4: MAX_MV_BILLION = st.number_input("最大市值(亿)", value=2000.0)
+    with col1: PCT_MIN = st.number_input("最小涨幅%", value=5.0)
+    with col2: PCT_MAX = st.number_input("最大涨幅%", value=9.5)
     
     st.header("3. 实战参数")
-    BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
+    # 默认值改为 3.0
+    BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=3.0, step=0.1, help="模拟 D1 涨幅 3% 时买入")
     
     st.markdown("---")
     st.header("4. 基础过滤")
@@ -234,6 +233,7 @@ with st.sidebar:
     MIN_PRICE = st.number_input("最低股价", value=10.0, step=0.5) 
     MAX_PRICE = st.number_input("最高股价", value=300.0, step=5.0)
     MIN_TURNOVER = st.number_input("最低换手 (%)", value=3.0) 
+    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿)", value=20.0)
     MIN_AMOUNT = st.number_input("最低成交额 (亿)", value=1.0) * 100000000 
 
 # ---------------------------
@@ -272,7 +272,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     for c in ['turnover_rate','circ_mv','net_mf']: 
         if c not in pool.columns: pool[c] = 0.0
 
-    # 3. 严格过滤 (V30.10 核心：统一赛道 + 市值门槛)
+    # 3. 硬性过滤
     df = pool.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
@@ -286,19 +286,26 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 
     df = df[
         (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE) & 
-        (df['circ_mv_billion'] >= MIN_MV_BILLION) & (df['circ_mv_billion'] <= MAX_MV_BILLION) & # 市值门槛
+        (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) &
         (df['turnover_rate'] >= MIN_TURNOVER) &
         (df['amount'] * 1000 >= MIN_AMOUNT)
     ]
-
-    # [涨幅区间]：必须是中阳线
-    df = df[(df['pct_chg'] >= MIN_PCT_CHG) & (df['pct_chg'] <= MAX_PCT_CHG)]
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
 
-    # 4. 统一入围 (V30.10)
-    # 不再分赛道，直接选池子里的“吸金王”
-    candidates = df.sort_values('net_mf', ascending=False).head(FINAL_POOL).reset_index(drop=True)
+    # 4. 初选 (双赛道回归：资金流 vs 涨幅微调)
+    limit_mf = int(FINAL_POOL * 0.5)
+    
+    # 赛道 A: 资金流前 50 (大票) - 不限涨幅，只要有主力买就行
+    df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
+    
+    # 赛道 B: 涨幅榜前 50 (小票) - [V30.11 修改] 只选 5% - 9.5%
+    mask_good_shape = (df['pct_chg'] >= PCT_MIN) & (df['pct_chg'] <= PCT_MAX)
+    df_good_shape = df[mask_good_shape]
+    
+    df_pct = df_good_shape[~df_good_shape['ts_code'].isin(df_mf['ts_code'])].sort_values('pct_chg', ascending=False).head(FINAL_POOL - len(df_mf))
+    
+    candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
     
     if not GLOBAL_DAILY_RAW.empty:
         try:
@@ -317,7 +324,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
             'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
-            'Circ_MV': row.circ_mv_billion,
             'macd': ind['macd_val'], 'volatility': ind['volatility'],
             'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3')
         })
@@ -325,14 +331,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "无正向MACD股票"
 
-    # 6. 评分 (回归 MACD * 10000)
+    # 6. 评分 (回归 V30.7 原始评分：MACD * 10000)
+    # 逻辑：即使是小票，因为我们过滤了涨停板，保留了中阳线，
+    # 此时高 MACD 的票更大概率是“刚突破”或“主升浪”
     s_vol = fdf['volatility']
     if s_vol.max() != s_vol.min():
         s_vol = (s_vol - s_vol.min()) / (s_vol.max() - s_vol.min())
     else: s_vol = 0.5
     
     fdf['综合评分'] = fdf['macd'] * 10000 + (1 - s_vol) * 0.3
-    fdf['策略'] = '纯粹趋势(资金流+MACD)'
+    fdf['策略'] = '稳健主升(5-9.5% + 资金流)'
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
@@ -340,13 +348,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日纯粹回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日稳健回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V30.10 纯粹版回测...")
+    st.success("✅ 数据就绪！开始 V30.11 回测...")
     
     results = []
     bar = st.progress(0)
@@ -366,7 +374,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日纯粹回测"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.10 回测报告 (纯粹趋势 + 市值门槛)")
+    st.header(f"📊 V30.11 回测报告 (剔除涨停 + {BUY_THRESHOLD_PCT}%确认)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(2)
