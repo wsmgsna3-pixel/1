@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.7 强市专注版 (右侧实战 + 弱市空仓)
-V30.7 更新内容：
-1. [策略提纯] 彻底移除弱市交易逻辑。若指数跌破 MA20，全天强制空仓。
-2. [实战模拟] 保持 V30.6 的右侧买入确认机制 (D1 涨幅 > 阈值才买入)。
-3. [效率提升] 弱市日直接跳过计算，回测速度显著提升。
+选股王 · V30.7 强市专注版 (KeyError 修复版)
+V30.7 修复内容：
+1. [Bug修复] 修正资金流合并逻辑，防止因字段缺失导致的 KeyError。
+2. [策略提纯] 彻底移除弱市交易逻辑。若指数跌破 MA20，全天强制空仓。
+3. [实战模拟] 保持右侧买入确认机制 (D1 涨幅 > 阈值才买入)。
 """
 
 import streamlit as st
@@ -271,10 +271,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     d_basic = safe_get('daily_basic', trade_date=last_trade, fields='ts_code,turnover_rate,circ_mv,total_mv')
     pool = pool.merge(d_basic, on='ts_code', how='left') if not d_basic.empty else pool
     
-    # 资金流
+    # 资金流 [修复部分]
     mf = safe_get('moneyflow', trade_date=last_trade)
-    if not mf.empty:
-        mf = mf[['ts_code', 'net_mf']].fillna(0) if 'net_mf' in mf.columns else pd.DataFrame()
+    if not mf.empty and 'net_mf' in mf.columns: # 确保字段存在
+        mf = mf[['ts_code', 'net_mf']].fillna(0)
         pool = pool.merge(mf, on='ts_code', how='left')
     
     for c in ['turnover_rate','circ_mv','net_mf']: 
