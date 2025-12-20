@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.8 终极公正版 (评分修正 + 实战配置)
-V30.8 核心修正：
-1. [评分修复] 修正 MACD 评分公式。使用 (MACD/Price) 归一化，消除高价股的天然优势。
-2. [配置调整] 默认最低股价调整为 10.0 元。
-3. [策略继承] 保持 V30.7 的“弱市空仓”与“右侧确认”机制。
+选股王 · V30.10 纯粹趋势版 (统一赛道 + 市值门槛)
+V30.10 核心重构：
+1. [入围重构] 取消“涨幅榜赛道”，全市场只选“资金流最强”且“涨幅适中”的前 100 名。
+   - 逻辑：确保所有入围者都是“有主力真金白银买入”的，且大家在同一起跑线竞争。
+2. [市值门槛] 默认只选流通市值 50亿 - 2000亿 的股票，剔除小盘妖股和巨无霸。
+3. [评分逻辑] 维持 V30.7 的 MACD * 10000，优选趋势最强的龙头。
 """
 
 import streamlit as st
@@ -27,9 +28,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.8 终极公正版", layout="wide")
-st.title("选股王 · V30.8 终极公正版（⚖️ 归一化评分 / 🛡️ 弱市避险）")
-st.markdown("🎯 **V30.8 修正说明：** 已修复 MACD 评分对高价股的偏倚，现在 10 元股与 100 元股拥有同等入选机会。")
+st.set_page_config(page_title="选股王 · V30.10 纯粹趋势版", layout="wide")
+st.title("选股王 · V30.10 纯粹趋势版（🦄 资金流+中阳线统一赛道）")
+st.markdown("🎯 **V30.10 策略：** 只有 **市值达标** 且 **主力大买** 的 **中阳线** 股票才能入围，最后按 MACD 决胜负。")
 
 
 # ---------------------------
@@ -58,7 +59,7 @@ def get_trade_days(end_date_str, num_days):
 
 
 # ----------------------------------------------------------------------
-# 数据拉取与缓存
+# 数据拉取
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def fetch_and_cache_daily_data(date):
@@ -118,7 +119,7 @@ def get_all_historical_data(trade_days_list):
     return True
 
 # ----------------------------------------------------------------------
-# 数据切片
+# 数据处理
 # ----------------------------------------------------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
@@ -148,7 +149,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df.sort_values('trade_date').set_index('trade_date_str')[['open', 'high', 'low', 'close', 'vol']]
 
 # ----------------------------------------------------------------------
-# 右侧收益模拟
+# 右侧收益
 # ----------------------------------------------------------------------
 def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], buy_threshold_pct=1.5):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -174,7 +175,7 @@ def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], 
     return results
 
 # ----------------------------------------------------------------------
-# 指标计算
+# 指标
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
@@ -212,19 +213,27 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.8)")
-    BUY_THRESHOLD_PCT = st.number_input("**买入确认阈值 (%)**", value=1.5, step=0.1, help="D1 涨幅超过此值才买入")
+    st.header("2. 纯粹选股门槛 (V30.10)")
+    st.info("💡 **只选符合以下所有条件的股票**")
+    
+    col1, col2 = st.columns(2)
+    with col1: MIN_PCT_CHG = st.number_input("最小涨幅 (%)", value=3.0)
+    with col2: MAX_PCT_CHG = st.number_input("最大涨幅 (%)", value=8.0)
+    
+    col3, col4 = st.columns(2)
+    with col3: MIN_MV_BILLION = st.number_input("最小市值(亿)", value=50.0)
+    with col4: MAX_MV_BILLION = st.number_input("最大市值(亿)", value=2000.0)
+    
+    st.header("3. 实战参数")
+    BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
-    st.header("3. 过滤条件")
+    st.header("4. 基础过滤")
     FINAL_POOL = int(st.number_input("入围数量", value=100)) 
-    TOP_BACKTEST = int(st.number_input("每日持仓 Top K", value=5))
-    
-    # [V30.8 修改] 默认值改为 10.0
+    TOP_BACKTEST = int(st.number_input("Top K", value=5))
     MIN_PRICE = st.number_input("最低股价", value=10.0, step=0.5) 
     MAX_PRICE = st.number_input("最高股价", value=300.0, step=5.0)
     MIN_TURNOVER = st.number_input("最低换手 (%)", value=3.0) 
-    MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿)", value=20.0)
     MIN_AMOUNT = st.number_input("最低成交额 (亿)", value=1.0) * 100000000 
 
 # ---------------------------
@@ -255,7 +264,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     d_basic = safe_get('daily_basic', trade_date=last_trade, fields='ts_code,turnover_rate,circ_mv,total_mv')
     pool = pool.merge(d_basic, on='ts_code', how='left') if not d_basic.empty else pool
     
-    # 修复 KeyError 隐患
     mf = safe_get('moneyflow', trade_date=last_trade)
     if not mf.empty and 'net_mf' in mf.columns:
         mf = mf[['ts_code', 'net_mf']].fillna(0)
@@ -264,7 +272,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     for c in ['turnover_rate','circ_mv','net_mf']: 
         if c not in pool.columns: pool[c] = 0.0
 
-    # 3. 过滤
+    # 3. 严格过滤 (V30.10 核心：统一赛道 + 市值门槛)
     df = pool.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
@@ -278,18 +286,19 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 
     df = df[
         (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE) & 
-        (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) &
+        (df['circ_mv_billion'] >= MIN_MV_BILLION) & (df['circ_mv_billion'] <= MAX_MV_BILLION) & # 市值门槛
         (df['turnover_rate'] >= MIN_TURNOVER) &
         (df['amount'] * 1000 >= MIN_AMOUNT)
     ]
+
+    # [涨幅区间]：必须是中阳线
+    df = df[(df['pct_chg'] >= MIN_PCT_CHG) & (df['pct_chg'] <= MAX_PCT_CHG)]
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
 
-    # 4. 初选
-    limit_mf = int(FINAL_POOL * 0.5)
-    df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
-    df_pct = df[~df['ts_code'].isin(df_mf['ts_code'])].sort_values('pct_chg', ascending=False).head(FINAL_POOL - len(df_mf))
-    candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
+    # 4. 统一入围 (V30.10)
+    # 不再分赛道，直接选池子里的“吸金王”
+    candidates = df.sort_values('net_mf', ascending=False).head(FINAL_POOL).reset_index(drop=True)
     
     if not GLOBAL_DAILY_RAW.empty:
         try:
@@ -308,6 +317,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
             'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
+            'Circ_MV': row.circ_mv_billion,
             'macd': ind['macd_val'], 'volatility': ind['volatility'],
             'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3')
         })
@@ -315,18 +325,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "无正向MACD股票"
 
-    # 6. [V30.8] 评分修正 (MACD / Price)
-    # 波动率归一化
+    # 6. 评分 (回归 MACD * 10000)
     s_vol = fdf['volatility']
     if s_vol.max() != s_vol.min():
         s_vol = (s_vol - s_vol.min()) / (s_vol.max() - s_vol.min())
     else: s_vol = 0.5
     
-    # 核心修正：(MACD / Close) * 10000 -> 衡量上涨动能的相对强度
-    fdf['macd_norm'] = (fdf['macd'] / fdf['Close']) * 10000
-    
-    fdf['综合评分'] = fdf['macd_norm'] + (1 - s_vol) * 0.3
-    fdf['策略'] = '绝对MACD优势(修正)'
+    fdf['综合评分'] = fdf['macd'] * 10000 + (1 - s_vol) * 0.3
+    fdf['策略'] = '纯粹趋势(资金流+MACD)'
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
@@ -334,13 +340,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日纯净回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日纯粹回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V30.8 修正版回测...")
+    st.success("✅ 数据就绪！开始 V30.10 纯粹版回测...")
     
     results = []
     bar = st.progress(0)
@@ -360,7 +366,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日纯净回测"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.8 回测报告 (归一化MACD + 右侧{BUY_THRESHOLD_PCT}%)")
+    st.header(f"📊 V30.10 回测报告 (纯粹趋势 + 市值门槛)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(2)
