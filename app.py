@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.7 冠军复刻版 (强市专注 + 右侧确认)
-V30.7 核心逻辑：
-1. [极致进攻] 锁定全市场“资金流最强”和“涨幅最大”的 100 只股票。
-2. [趋势评分] 使用 MACD * 10000 评分，优选高价趋势龙头 (实测收益最高)。
-3. [弱市空仓] 指数跌破 MA20 自动空仓，保住利润。
-4. [右侧买入] D1 涨幅 > 1.5% 才出手，拒绝阴跌接盘。
+选股王 · V30.13 维护版 (修复启动崩溃 + 内存优化)
+V30.13 更新内容：
+1. [系统修复] 适配 Streamlit 新版语法，修复 use_container_width 警告。
+2. [内存优化] 引入 gc (垃圾回收) 机制，防止回测天数过多导致页面卡死。
+3. [策略保持] 依然是 V30.7 的冠军逻辑 (资金流+涨幅榜 / MACD*10000 / 右侧1.5%)。
 """
 
 import streamlit as st
@@ -14,6 +13,8 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
+import gc # 引入垃圾回收模块
+
 warnings.filterwarnings("ignore")
 
 # ---------------------------
@@ -28,9 +29,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.7 冠军版", layout="wide")
-st.title("选股王 · V30.7 冠军版（👑 资金流/涨幅双赛道 + 🛡️ 弱市空仓）")
-st.markdown("🎯 **当前策略：** 收益率最高的版本。只做**强市**，只选**最强龙头**，**右侧 +1.5%** 买入。")
+st.set_page_config(page_title="选股王 · V30.13 维护版", layout="wide")
+st.title("选股王 · V30.13 维护版（🔧 启动修复 + 内存优化）")
+st.markdown("🎯 **策略核心：** 资金流前50 + 涨幅榜前50，MACD*10000 评分，右侧 +1.5% 买入。")
 
 
 # ---------------------------
@@ -70,6 +71,9 @@ def fetch_and_cache_daily_data(date):
 def get_all_historical_data(trade_days_list):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
     if not trade_days_list: return False
+    
+    # 强制进行垃圾回收，释放旧内存
+    gc.collect()
     
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
@@ -210,11 +214,12 @@ def get_market_state(trade_date):
 with st.sidebar:
     st.header("1. 回测设置")
     backtest_date_end = st.date_input("回测结束日期", value=datetime.now().date(), max_value=datetime.now().date())
+    
+    # 建议先设置小一点，看能否启动
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.7)")
-    # 默认回归 1.5%
+    st.header("2. 实战参数 (V30.13)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
@@ -255,7 +260,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     d_basic = safe_get('daily_basic', trade_date=last_trade, fields='ts_code,turnover_rate,circ_mv,total_mv')
     pool = pool.merge(d_basic, on='ts_code', how='left') if not d_basic.empty else pool
     
-    # [V30.7 修复版] 资金流数据处理
+    # 资金流数据处理
     mf = safe_get('moneyflow', trade_date=last_trade)
     if not mf.empty and 'net_mf' in mf.columns:
         mf = mf[['ts_code', 'net_mf']].fillna(0)
@@ -291,7 +296,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     # 赛道 A: 资金流前 50
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
     
-    # 赛道 B: 涨幅榜前 50 (拥抱涨停板)
+    # 赛道 B: 涨幅榜前 50
     df_pct = df[~df['ts_code'].isin(df_mf['ts_code'])].sort_values('pct_chg', ascending=False).head(FINAL_POOL - len(df_mf))
     
     candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
@@ -320,7 +325,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "无正向MACD股票"
 
-    # 6. 评分 (MACD * 10000 暴力美学)
+    # 6. 评分 (MACD * 10000)
     s_vol = fdf['volatility']
     if s_vol.max() != s_vol.min():
         s_vol = (s_vol - s_vol.min()) / (s_vol.max() - s_vol.min())
@@ -333,35 +338,50 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     return fdf.reset_index(drop=True), None
 
 # ---------------------------
-# 主程序
+# 主程序 (防崩溃修复版)
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日维护版回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
+    # 获取历史数据
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V30.7 冠军版回测...")
+    
+    st.success("✅ 数据就绪！开始 V30.13 维护版回测...")
     
     results = []
     bar = st.progress(0)
+    error_count = 0
     
     for i, date in enumerate(trade_days):
-        df, msg = run_backtest_for_a_day(date, TOP_BACKTEST, FINAL_POOL, BUY_THRESHOLD_PCT)
-        if not df.empty:
-            df['Trade_Date'] = date
-            results.append(df)
+        try:
+            df, msg = run_backtest_for_a_day(date, TOP_BACKTEST, FINAL_POOL, BUY_THRESHOLD_PCT)
+            if not df.empty:
+                df['Trade_Date'] = date
+                results.append(df)
+            elif msg:
+                pass 
+                
+        except Exception as e:
+            st.warning(f"⚠️ {date} 数据计算异常，已自动跳过。原因: {str(e)}")
+            error_count += 1
+            
         bar.progress((i + 1) / len(trade_days))
+        
     bar.empty()
     
+    if error_count > 0:
+        st.warning(f"💡 提示：有 {error_count} 个交易日因异常被跳过。")
+    
     if not results:
-        st.error("区间内无有效强市交易日。")
+        st.error("区间内无有效强市交易日，或所有数据均下载失败。")
         st.stop()
         
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.7 回测报告 (暴力MACD + 1.5%确认)")
+    st.header(f"📊 V30.13 回测报告 (适配新版环境)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(2)
@@ -377,4 +397,5 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
             st.metric(f"D+{n} 收益 / 胜率", f"{avg_ret:.2f}% / {hit_rate:.1f}%", help=f"成交：{count} 笔")
 
     st.header("📋 每日成交明细")
-    st.dataframe(all_res.sort_values('Trade_Date', ascending=False), use_container_width=True)
+    # [修复点] 使用 width 代替 use_container_width
+    st.dataframe(all_res.sort_values('Trade_Date', ascending=False), width=1200)
