@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.13 数据挖掘超进化版 (黄金区间 + 智能评分)
-V30.13 核心进化：
-1. [MACD门槛] 提升至 > 0.2，剔除低效的弱势股。
-2. [智能评分] 引入数据挖掘发现的“黄金规律”：
-   - 价格甜蜜区(30-100元) 给予 10% 加分。
-   - 高波动率(庄股特征) 给予 10% 扣分。
-3. [防崩溃] 继承 V30.7 的所有容错机制。
+选股王 · V30.14 修正进化版 (拥抱波动 + 价格优选)
+修正逻辑：
+1. [撤销惩罚] 数据证明“高波动”往往伴随“高收益”，撤销对波动率的扣分。
+2. [保留奖励] 数据证明 30-100元 区间收益显著(1.37% vs 0.20%)，保留价格加分。
+3. [回归本质] 核心依然是 MACD * 10000，只做微调，不改暴力本色。
 """
 
 import streamlit as st
@@ -29,9 +27,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.13 超进化版", layout="wide")
-st.title("选股王 · V30.13 超进化版（💎 黄金区间优化 + 🧠 智能评分）")
-st.markdown("🎯 **策略逻辑：** 基于 300 天回测数据挖掘，**优选 30-100元 股票**，**惩罚高波动**，锁定真正的主升浪龙头。")
+st.set_page_config(page_title="选股王 · V30.14 修正进化版", layout="wide")
+st.title("选股王 · V30.14 修正进化版（🔥 拥抱波动 + 💎 价格优选）")
+st.markdown("🎯 **修正策略：** 撤销对高波动的惩罚（找回妖股），保留对 30-100元 黄金区间的奖励（通过率更高）。")
 
 
 # ---------------------------
@@ -214,7 +212,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.13)")
+    st.header("2. 实战参数 (V30.14)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
@@ -236,7 +234,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑 (V30.13 超进化)
+# 核心逻辑 (V30.14 修正版)
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     # 1. 弱市熔断
@@ -255,7 +253,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     if not basic.empty:
         pool = pool.merge(basic, on='ts_code', how='left')
     
-    # [V30.7遗留] 修复 name 缺失防止报错
+    # 修复 name
     if 'name' not in pool.columns:
         pool['name'] = 'Unknown'
 
@@ -293,12 +291,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
 
-    # 4. 初选 (双赛道)
+    # 4. 初选
     limit_mf = int(FINAL_POOL * 0.5)
-    
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
     df_pct = df[~df['ts_code'].isin(df_mf['ts_code'])].sort_values('pct_chg', ascending=False).head(FINAL_POOL - len(df_mf))
-    
     candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
     
     if not GLOBAL_DAILY_RAW.empty:
@@ -311,8 +307,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     records = []
     for row in candidates.itertuples():
         ind = compute_indicators(row.ts_code, last_trade) 
-        # [V30.13 优化] MACD 门槛从 0 提升到 0.2，剔除还没睡醒的弱股
-        if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0.2: continue
+        # [V30.14 回归] 依然使用 >0，不做过分筛选
+        if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
         
         future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold)
         
@@ -326,22 +322,23 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "无强趋势MACD股票"
 
-    # 6. [V30.13 智能评分] 黄金公式
-    # 归一化波动率
+    # 6. [V30.14 修正评分] 
     s_vol = fdf['volatility']
     if s_vol.max() != s_vol.min():
         s_vol = (s_vol - s_vol.min()) / (s_vol.max() - s_vol.min())
     else: s_vol = 0.5
     
-    # (A) 价格因子：30-100元是妖股温床，给予 1.1倍 (10%) 加成
+    # (A) 价格奖励：保留 30-100元 的 1.1倍加分
     price_bonus = fdf['Close'].apply(lambda x: 1.1 if 30 <= x <= 100 else 1.0)
     
-    # (B) 波动惩罚：高波动率(s_vol接近1) 给予 0.9倍 (10%扣分)，低波动率保持 1.0
-    vol_penalty = 1 - (s_vol * 0.1)
+    # (B) 撤销波动惩罚 (vol_penalty = 1.0)，只保留微弱的波动率因子(0.3)作为底色，不扣分
+    # 原始公式：macd * 10000 + (1-vol)*0.3
+    # V30.14 公式：(macd * 10000 + (1-vol)*0.3) * price_bonus
     
-    # (C) 综合评分 = MACD * 10000 * 价格加成 * 波动惩罚
-    fdf['综合评分'] = fdf['macd'] * 10000 * price_bonus * vol_penalty
-    fdf['策略'] = '智能进化版(区间优选)'
+    base_score = fdf['macd'] * 10000 + (1 - s_vol) * 0.3
+    fdf['综合评分'] = base_score * price_bonus
+    
+    fdf['策略'] = '修正进化(波动回归)'
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
@@ -349,13 +346,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.13 超进化回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.14 修正回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！V30.13 智能回测启动...")
+    st.success("✅ 数据就绪！V30.14 修正回测启动...")
     
     results = []
     bar = st.progress(0)
@@ -388,7 +385,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.13 超进化回测"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.13 回测报告 (MACD>0.2 + 黄金区间优选)")
+    st.header(f"📊 V30.14 回测报告 (价格优选 + 拥抱波动)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(2)
