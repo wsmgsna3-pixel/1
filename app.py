@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V31.6 连续性增强版 (针对负收益优化)
-主要优化点（基于V31.5负收益分析）：
-1. 移除动量>0和RSI<70硬过滤（太严导致选票少且不准）
-2. 新增连续上涨过滤：要求前2日至少有上涨（防脉冲后回调）
-3. 评分中大幅奖励高动量（0.3权重）和高量比（0.3）
-4. MACD 0.3，波动率0.1
-5. 买入阈值降到0.8%（增加成交，降低成本）
-6. 最低股价20元，涨幅≤12%
-预计效果：选到更多“连续放量上涨”票，收益转正，D+3/D+5改善
+选股王 · V32.0 纯量价连续版 (全新思路：放弃MACD，纯连续放量上涨)
+主要变化（针对负收益彻底改思路）：
+1. 完全移除MACD（之前暴力MACD容易假突破）
+2. 核心：要求前3日累计涨幅>10% + 至少2日上涨 + 当日涨幅>5% + 量比>1.5
+3. 评分：5日动量 0.4 + 量比 0.3 + 当日涨幅 0.2 + 高价奖励 0.1
+4. 资金流只作为备选池补充
+5. 买入阈值0.8%，最低股价20元
+6. 预计捕捉2025年“连续强势热点”股，D+3/D+5大幅改善
 """
 
 import streamlit as st
@@ -31,9 +30,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V31.6 连续性增强版", layout="wide")
-st.title("选股王 · V31.6 连续性增强版（🛡️ 连续上涨 + 👑 正收益优化）")
-st.markdown("🎯 **当前策略：** 资金流/涨幅双赛道 + 连续上涨过滤 + 高动量/量比奖励 + 弱市空仓（可关闭） + 右侧 0.8% 确认。")
+st.set_page_config(page_title="选股王 · V32.0 纯量价连续版", layout="wide")
+st.title("选股王 · V32.0 纯量价连续版（🛡️ 连续放量上涨 + 👑 正收益新思路）")
+st.markdown("🎯 **当前策略：** 当日涨幅>5% + 前3日累计>10% + 至少2日上涨 + 量比1.5+ + 高价/动量奖励 + 右侧 0.8% 确认。")
 
 
 # ---------------------------
@@ -178,23 +177,17 @@ def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], 
     return results
 
 # ----------------------------------------------------------------------
-# 指标（新增连续上涨天数、动量）
+# 新指标：5日动量 + 连续上涨天数
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*12) 
-def compute_indicators(ts_code, end_date):
-    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
+def compute_quantity_price_indicators(ts_code, end_date):
+    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
     df = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date, end_date=end_date)
     res = {}
-    if df.empty or len(df) < 26: return res
+    if df.empty or len(df) < 10: return res
          
-    df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     close = df['close']
     res['last_close'] = close.iloc[-1] 
-    
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    res['macd_val'] = ((ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()).iloc[-1] * 2
-    res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
     # 5日动量
     if len(df) >= 6:
@@ -202,18 +195,18 @@ def compute_indicators(ts_code, end_date):
     else:
         res['momentum_5d'] = 0
     
-    # 连续上涨天数（从后往前数连续正pct_chg）
-    if len(df) >= 3:
-        recent_chg = df['pct_chg'].tail(3).values
-        consecutive_up = 0
-        for chg in reversed(recent_chg[:-1]):  # 不含当日
-            if chg > 0:
-                consecutive_up += 1
-            else:
-                break
-        res['consecutive_up'] = consecutive_up
+    # 前3日累计涨幅（不含当日）
+    if len(df) >= 4:
+        res['pre3_cum_return'] = (close.iloc[-2] / close.iloc[-5] - 1) * 100
     else:
-        res['consecutive_up'] = 0
+        res['pre3_cum_return'] = 0
+    
+    # 前3日上涨天数（不含当日）
+    if len(df) >= 4:
+        pre_chg = close.pct_change().iloc[-4:-1] * 100
+        res['pre_up_days'] = (pre_chg > 0).sum()
+    else:
+        res['pre_up_days'] = 0
     
     return res
 
@@ -236,7 +229,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=200, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V31.6)")
+    st.header("2. 实战参数 (V32.0)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=0.8, step=0.1)
     ENABLE_WEAK_FILTER = st.checkbox("启用弱市熔断（指数<MA50空仓）", value=False)
     
@@ -246,7 +239,7 @@ with st.sidebar:
     TOP_BACKTEST = int(st.number_input("Top K", value=5))
     MIN_PRICE = st.number_input("最低股价", value=20.0, step=5.0) 
     MAX_PRICE = st.number_input("最高股价", value=300.0, step=5.0)
-    MIN_TURNOVER = st.number_input("最低换手 (%)", value=3.0) 
+    MIN_TURNOVER = st.number_input("最低换手 (%)", value=5.0, help="提高到5%捕捉活跃股") 
     MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿)", value=20.0)
     MIN_AMOUNT = st.number_input("最低成交额 (亿)", value=1.0) * 100000000 
 
@@ -259,7 +252,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑
+# 核心逻辑（纯量价连续）
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     if ENABLE_WEAK_FILTER:
@@ -287,16 +280,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     if not mf.empty and 'net_mf' in mf.columns:
         mf = mf[['ts_code', 'net_mf']].fillna(0)
         pool = pool.merge(mf, on='ts_code', how='left')
-    
-    cyq = safe_get('cyq_perf', trade_date=last_trade)
-    if not cyq.empty and 'win_rate' in cyq.columns:
-        cyq = cyq[['ts_code', 'win_rate']]
-        cyq['win_rate'] = pd.to_numeric(cyq['win_rate'], errors='coerce').fillna(50)
-        pool = pool.merge(cyq, on='ts_code', how='left')
 
-    for c in ['turnover_rate','circ_mv','net_mf','volume_ratio','win_rate']: 
+    for c in ['turnover_rate','circ_mv','net_mf','volume_ratio']: 
         if c not in pool.columns: 
-            pool[c] = 1.0 if c == 'volume_ratio' else (50.0 if c == 'win_rate' else 0.0)
+            pool[c] = 1.0 if c == 'volume_ratio' else 0.0
 
     df = pool.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
@@ -311,23 +298,24 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         df['days_listed'] = (datetime.strptime(last_trade, "%Y%m%d") - pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')).dt.days
         df = df[df['days_listed'] >= 120]
 
+    # 基础过滤 + 当日涨幅>5%
     df = df[
         (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE) & 
         (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) &
         (df['turnover_rate'] >= MIN_TURNOVER) &
         (df['amount'] * 1000 >= MIN_AMOUNT) &
-        (df['pct_chg'] <= 12)
+        (df['pct_chg'] > 5) & (df['pct_chg'] <= 15) &  # 当日强势但防极端的
+        (df['volume_ratio'] >= 1.5)
     ]
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
 
+    # 初选池：涨幅前 + 资金流补
     limit_mf = int(FINAL_POOL * 0.3)
-    
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
     df_pct = df[~df['ts_code'].isin(df_mf['ts_code'])].sort_values('pct_chg', ascending=False).head(FINAL_POOL - len(df_mf))
-    
     candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
-    
+
     if not GLOBAL_DAILY_RAW.empty:
         try:
             available = GLOBAL_DAILY_RAW.loc[(slice(None), last_trade), :].index.get_level_values('ts_code').unique()
@@ -336,33 +324,30 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 
     records = []
     for row in candidates.itertuples():
-        ind = compute_indicators(row.ts_code, last_trade) 
-        if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
+        ind = compute_quantity_price_indicators(row.ts_code, last_trade) 
         
-        # 新过滤：前2日至少1日上涨（连续性）
-        if ind.get('consecutive_up', 0) < 1: continue
+        # 严格连续性过滤
+        if ind.get('pre3_cum_return', 0) <= 10 or ind.get('pre_up_days', 0) < 2: continue
         
-        win_rate = getattr(row, 'win_rate', 50)
         volume_ratio = getattr(row, 'volume_ratio', 1.0)
         momentum_5d = ind.get('momentum_5d', 0)
+        close_price = row.close
         
         future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold, days_ahead=[1,3,5])
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
-            'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
+            'Close': close_price, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
             'Volume_Ratio': volume_ratio,
-            'Win_Rate': win_rate,
             'Momentum_5d': momentum_5d,
-            'macd': ind['macd_val'], 'volatility': ind['volatility'],
             'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3'), 'Return_D5 (%)': future.get('Return_D5')
         })
     
     fdf = pd.DataFrame(records)
-    if fdf.empty: return pd.DataFrame(), "无连续上涨股票"
+    if fdf.empty: return pd.DataFrame(), "无连续强势股票"
 
-    # 评分：奖励高动量和高量比
-    for col in ['macd', 'volatility', 'Win_Rate', 'Volume_Ratio', 'Momentum_5d']:
+    # 纯量价评分
+    for col in ['Momentum_5d', 'Volume_Ratio', 'Pct_Chg (%)', 'Close']:
         min_val = fdf[col].min()
         max_val = fdf[col].max()
         if max_val > min_val:
@@ -370,12 +355,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         else:
             fdf[f'{col}_norm'] = 0.5
     
-    fdf['综合评分'] = (fdf['macd_norm'] * 0.3 + 
-                       fdf['volatility_norm'] * 0.1 +  
-                       fdf['Win_Rate_norm'] * 0.1 +
-                       fdf['Volume_Ratio_norm'] * 0.3 +
-                       fdf['Momentum_5d_norm'] * 0.3) * 100000
-    fdf['策略'] = '连续性多因子（正收益版）'
+    fdf['综合评分'] = (fdf['Momentum_5d_norm'] * 0.4 + 
+                       fdf['Volume_Ratio_norm'] * 0.3 +  
+                       fdf['Pct_Chg (%)_norm'] * 0.2 +
+                       fdf['Close_norm'] * 0.1) * 100000
+    fdf['策略'] = '纯量价连续上涨'
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
@@ -389,7 +373,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V31.6 连续性增强版回测...")
+    st.success("✅ 数据就绪！开始 V32.0 纯量价连续版回测...")
     
     results = []
     bar = st.progress(0)
@@ -414,13 +398,13 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
         st.warning(f"💡 提示：回测过程中有 {error_count} 个交易日因数据缺失被跳过，不影响整体结果。")
     
     if not results:
-        st.error("所有交易日均无符合条件股票。请放宽连续上涨要求试试。")
+        st.error("所有交易日均无符合条件股票。请放宽连续性要求试试。")
         st.stop()
         
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V31.6 回测报告 (连续性多因子 + {BUY_THRESHOLD_PCT}%确认)")
+    st.header(f"📊 V32.0 回测报告 (纯量价连续 + {BUY_THRESHOLD_PCT}%确认)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(3)
