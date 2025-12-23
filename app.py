@@ -7,7 +7,6 @@
 3. 最低股价降回20元（平衡信号数量与质量）
 4. 涨幅上限≤10%保持，量比评分权重0.25
 5. 波动率权重0.15，MACD 0.35，高价奖励0.15，胜率0.1，动量0.25
-6. 参考搜索：融入RSI过滤（RSI<70避免超买），KD类似但用动量简化
 预计效果：更偏趋势股，D+3/D+5收益转正，提升1-2%
 """
 
@@ -341,14 +340,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         
         win_rate = getattr(row, 'win_rate', 50)
         volume_ratio = getattr(row, 'volume_ratio', 1.0)
-        close_price = row.close
         momentum_5d = ind.get('momentum_5d', 0)
         
         future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold, days_ahead=[1,3,5])
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
-            'Close': close_price, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
+            'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
             'Volume_Ratio': volume_ratio,
             'Win_Rate': win_rate,
             'Momentum_5d': momentum_5d,
@@ -435,4 +433,3 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
 
     st.header("📋 每日成交明细")
     st.dataframe(all_res.sort_values('Trade_Date', ascending=False), use_container_width=True)
-``` '趋势
