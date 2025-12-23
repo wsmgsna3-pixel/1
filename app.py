@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V31.0 优化版 (利用10000积分权限 + 提升D+3胜率/收益)
-主要优化点（针对2025年数据回测表现）：
-1. 降低右侧买入确认阈值默认到0.8%（界面可调），增加成交机会，降低买入成本
-2. 过滤单日涨幅>15%的极端票（减少一日游大亏）
-3. 要求量比>=1.5（放量确认）
-4. 利用10000积分权限，加入cyq_perf（每日筹码胜率）过滤+加分，只选历史胜率>=60%的票，并在评分中奖励高胜率
-5. 评分体系优化：降低MACD权重，波动率正向奖励（强势股特征），加入筹码胜率因子
-6. 资金流占比降到30%，更偏向趋势+量能持续的票
-预计效果：D+3中位数收益转正、大亏比例下降、平均收益提升到2.5-4%、胜率60%+
+选股王 · V31.1 修复版 (解决弱市熔断导致无信号问题)
+主要修复与优化：
+1. 新增侧边栏开关：是否启用弱市熔断（默认关闭），方便回测历史区间所有日子
+2. 弱市判断逻辑优化：从MA20改为MA50（更宽松，避免过度空仓），并只在开关开启时生效
+3. 保持原有V31.0所有优化（筹码胜率、量比、过滤15%涨停、0.8%确认、多因子评分等）
+4. 增加D+5收益统计（很多趋势股后期加速）
 """
 
 import streamlit as st
@@ -31,9 +28,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V31.0 优化版", layout="wide")
-st.title("选股王 · V31.0 优化版（🛡️ 10000积分专属 + 👑 高胜率策略）")
-st.markdown("🎯 **当前策略：** 资金流/涨幅双赛道 + 量比1.5+ + 筹码胜率60+ + 弱市空仓 + 右侧 0.8% 确认。已利用10000积分权限加入cyq_perf胜率过滤。")
+st.set_page_config(page_title="选股王 · V31.1 修复版", layout="wide")
+st.title("选股王 · V31.1 修复版（🛡️ 弱市熔断可开关 + 👑 高胜率策略）")
+st.markdown("🎯 **当前策略：** 资金流/涨幅双赛道 + 量比1.5+ + 筹码胜率60+ + 弱市空仓（可关闭） + 右侧 0.8% 确认。")
 
 
 # ---------------------------
@@ -152,7 +149,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df.sort_values('trade_date').set_index('trade_date_str')[['open', 'high', 'low', 'close', 'vol']]
 
 # ----------------------------------------------------------------------
-# 右侧收益
+# 右侧收益（增加D5）
 # ----------------------------------------------------------------------
 def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], buy_threshold_pct=0.8):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -200,11 +197,13 @@ def compute_indicators(ts_code, end_date):
 
 @st.cache_data(ttl=3600*12)
 def get_market_state(trade_date):
-    start_date = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=40)).strftime("%Y%m%d")
+    # 优化：用MA50，更宽松
+    start_date = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=100)).strftime("%Y%m%d")
     index_data = safe_get('daily', ts_code='000300.SH', start_date=start_date, end_date=trade_date, is_index=True)
-    if index_data.empty or len(index_data) < 20: return 'Weak'
+    if index_data.empty or len(index_data) < 50: return 'Weak'
     index_data = index_data.sort_values('trade_date')
-    return 'Strong' if index_data.iloc[-1]['close'] > index_data['close'].tail(20).mean() else 'Weak'
+    ma50 = index_data['close'].tail(50).mean()
+    return 'Strong' if index_data.iloc[-1]['close'] > ma50 else 'Weak'
       
         
 # ----------------------------------------------------
@@ -216,8 +215,9 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=200, step=1, help="建议200+天获得更稳定统计"))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V31.0)")
+    st.header("2. 实战参数 (V31.1)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=0.8, step=0.1, help="默认0.8%更适合2025年市场")
+    ENABLE_WEAK_FILTER = st.checkbox("启用弱市熔断（指数<MA50空仓）", value=False, help="关闭可回测所有日子，开启更安全")
     
     st.markdown("---")
     st.header("3. 基础过滤")
@@ -238,13 +238,14 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑 (10000积分优化版)
+# 核心逻辑
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
-    # 1. 弱市熔断
-    market_state = get_market_state(last_trade)
-    if market_state == 'Weak':
-        return pd.DataFrame(), f"弱市避险：指数 < MA20，全天空仓。"
+    # 1. 弱市熔断（可开关 + MA50更宽松）
+    if ENABLE_WEAK_FILTER:
+        market_state = get_market_state(last_trade)
+        if market_state == 'Weak':
+            return pd.DataFrame(), f"弱市避险：指数 < MA50，全天空仓。"
 
     # 2. 拉取数据
     daily_all = safe_get('daily', trade_date=last_trade) 
@@ -252,7 +253,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 
     pool = daily_all.reset_index(drop=True)
     
-    # [修复点] 更稳健地获取 stock_basic
     basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
     if not basic.empty:
         pool = pool.merge(basic, on='ts_code', how='left')
@@ -260,18 +260,15 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     if 'name' not in pool.columns:
         pool['name'] = 'Unknown'
 
-    # daily_basic 增加 volume_ratio（量比）
     d_basic = safe_get('daily_basic', trade_date=last_trade, fields='ts_code,turnover_rate,circ_mv,total_mv,volume_ratio')
     if not d_basic.empty:
         pool = pool.merge(d_basic, on='ts_code', how='left')
     
-    # 资金流
     mf = safe_get('moneyflow', trade_date=last_trade)
     if not mf.empty and 'net_mf' in mf.columns:
         mf = mf[['ts_code', 'net_mf']].fillna(0)
         pool = pool.merge(mf, on='ts_code', how='left')
     
-    # 利用10000积分权限：加入cyq_perf（筹码胜率）
     cyq = safe_get('cyq_perf', trade_date=last_trade)
     if not cyq.empty and 'win_rate' in cyq.columns:
         cyq = cyq[['ts_code', 'win_rate']]
@@ -287,7 +284,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
     df['pct_chg'] = pd.to_numeric(df['pct_chg'], errors='coerce').fillna(0)
 
-    # 过滤 ST + 新股 + 价格/市值/换手/成交额
     df = df[~df['name'].str.contains('ST|退', case=False, na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     
@@ -300,13 +296,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) &
         (df['turnover_rate'] >= MIN_TURNOVER) &
         (df['amount'] * 1000 >= MIN_AMOUNT) &
-        (df['pct_chg'] <= 15) &  # 新增：过滤单日涨幅>15%的一日游
-        (df['volume_ratio'] >= 1.5)  # 新增：要求放量
+        (df['pct_chg'] <= 15) &
+        (df['volume_ratio'] >= 1.5)
     ]
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
 
-    # 4. 初选 (双赛道，资金流占比降到30%)
+    # 4. 初选
     limit_mf = int(FINAL_POOL * 0.3)
     
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
@@ -326,11 +322,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         ind = compute_indicators(row.ts_code, last_trade) 
         if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
         
-        # 利用筹码胜率过滤（10000积分权限）
         win_rate = getattr(row, 'win_rate', 50)
-        if win_rate < 60: continue  # 只选历史胜率60%以上的票
+        if win_rate < 60: continue
         
-        future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold)
+        future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold, days_ahead=[1,3,5])
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
@@ -338,14 +333,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
             'Volume_Ratio': getattr(row, 'volume_ratio', 1.0),
             'Win_Rate': win_rate,
             'macd': ind['macd_val'], 'volatility': ind['volatility'],
-            'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3')
+            'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3'), 'Return_D5 (%)': future.get('Return_D5')
         })
     
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "无符合条件股票"
 
-    # 6. 新评分体系（多因子，降低MACD权重，奖励波动率和筹码胜率）
-    # 归一化
+    # 6. 评分
     for col in ['macd', 'volatility', 'Win_Rate']:
         min_val = fdf[col].min()
         max_val = fdf[col].max()
@@ -355,7 +349,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
             fdf[f'{col}_norm'] = 0.5
     
     fdf['综合评分'] = (fdf['macd_norm'] * 0.4 + 
-                       fdf['volatility_norm'] * 0.3 +  # 正向奖励高波动
+                       fdf['volatility_norm'] * 0.3 +  
                        fdf['Win_Rate_norm'] * 0.3) * 100000
     fdf['策略'] = '多因子MACD+筹码胜率'
     
@@ -363,7 +357,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     return fdf.reset_index(drop=True), None
 
 # ---------------------------
-# 主程序 (防崩溃循环)
+# 主程序
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
     
@@ -371,7 +365,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V31.0 10000积分优化版回测...")
+    st.success("✅ 数据就绪！开始 V31.1 修复版回测...")
     
     results = []
     bar = st.progress(0)
@@ -383,8 +377,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
             if not df.empty:
                 df['Trade_Date'] = date
                 results.append(df)
-            elif msg:
-                pass 
                 
         except Exception as e:
             st.warning(f"⚠️ {date} 数据计算异常，已自动跳过。原因: {str(e)}")
@@ -398,17 +390,17 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
         st.warning(f"💡 提示：回测过程中有 {error_count} 个交易日因数据缺失被跳过，不影响整体结果。")
     
     if not results:
-        st.error("区间内无有效强市交易日，或所有数据均下载失败。")
+        st.error("所有交易日均无符合条件股票（可能过滤太严或数据问题）。建议关闭弱市熔断重试。")
         st.stop()
         
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V31.0 回测报告 (多因子 + 筹码胜率 + {BUY_THRESHOLD_PCT}%确认)")
+    st.header(f"📊 V31.1 回测报告 (多因子 + 筹码胜率 + {BUY_THRESHOLD_PCT}%确认)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
-    cols = st.columns(2)
-    for idx, n in enumerate([1, 3]):
+    cols = st.columns(3)
+    for idx, n in enumerate([1, 3, 5]):
         col = f'Return_D{n} (%)' 
         valid = all_res.dropna(subset=[col])
         if not valid.empty:
