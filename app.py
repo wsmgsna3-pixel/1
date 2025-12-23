@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V31.3 增强版 (针对D+3/D+5衰减优化)
-主要优化点（基于V31.2回测数据）：
-1. 严格过滤单日涨幅>12%（从CSV看14%+票后续衰减严重，防准一日游）
-2. 加回量比>=1.2硬过滤（确保放量，缺失时默认通过但评分低）
-3. 评分权重调整：MACD 0.35 + 波动率 0.25（更奖励强势高波动） + 胜率 0.2 + 量比 0.2
-4. 买入阈值默认回到1.0%（0.8%虽提升D+1，但导致后期易衰减，买更确认突破）
-5. 保持弱市熔断默认关闭 + cyq缺失兼容
-预计效果：D+3收益回升到1.5-2.5%，D+5转正或微负，减少尾部大亏
+选股王 · V31.4 高价优先版 (针对低价股衰减优化)
+主要优化点（基于V31.3数据分析）：
+1. 最低股价默认提高到30元（数据证明>50元股D+3/D+5显著正收益，低价股拖累整体）
+2. 涨幅上限严格到≤10%（8-12%组衰减严重）
+3. 移除量比硬过滤，靠评分奖励高量比
+4. 波动率权重大幅降低到0.1（高波动组表现差）
+5. 新增价格归一化奖励（高价股加分）
+6. 量比权重提高到0.3（奖励放量持续）
+预计效果：信号更偏高价趋势股，D+3/D+5明显转正，整体收益提升
 """
 
 import streamlit as st
@@ -30,9 +31,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V31.3 增强版", layout="wide")
-st.title("选股王 · V31.3 增强版（🛡️ 防一日游 + 👑 D+3/D+5优化）")
-st.markdown("🎯 **当前策略：** 资金流/涨幅双赛道 + 涨幅≤12% + 量比1.2+ + 胜率/量比评分奖励 + 弱市空仓（可关闭） + 右侧 1.0% 确认。")
+st.set_page_config(page_title="选股王 · V31.4 高价优先版", layout="wide")
+st.title("选股王 · V31.4 高价优先版（🛡️ 高价趋势 + 👑 D+3/D+5优化）")
+st.markdown("🎯 **当前策略：** 资金流/涨幅双赛道 + 股价≥30 + 涨幅≤10% + 高价/量比评分奖励 + 弱市空仓（可关闭） + 右侧 1.0% 确认。")
 
 
 # ---------------------------
@@ -216,15 +217,15 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=200, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V31.3)")
-    BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.0, step=0.1, help="1.0%更利于中长期持有")
+    st.header("2. 实战参数 (V31.4)")
+    BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.0, step=0.1)
     ENABLE_WEAK_FILTER = st.checkbox("启用弱市熔断（指数<MA50空仓）", value=False)
     
     st.markdown("---")
     st.header("3. 基础过滤")
     FINAL_POOL = int(st.number_input("入围数量", value=100)) 
     TOP_BACKTEST = int(st.number_input("Top K", value=5))
-    MIN_PRICE = st.number_input("最低股价", value=10.0, step=0.5) 
+    MIN_PRICE = st.number_input("最低股价", value=30.0, step=5.0, help="提高到30+优先高价趋势股") 
     MAX_PRICE = st.number_input("最高股价", value=300.0, step=5.0)
     MIN_TURNOVER = st.number_input("最低换手 (%)", value=3.0) 
     MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿)", value=20.0)
@@ -296,8 +297,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) &
         (df['turnover_rate'] >= MIN_TURNOVER) &
         (df['amount'] * 1000 >= MIN_AMOUNT) &
-        (df['pct_chg'] <= 12) &  # 更严格防一日游
-        (df['volume_ratio'] >= 1.2)  # 加回轻度放量过滤
+        (df['pct_chg'] <= 10)  # 更严格防脉冲
     ]
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
@@ -322,12 +322,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         
         win_rate = getattr(row, 'win_rate', 50)
         volume_ratio = getattr(row, 'volume_ratio', 1.0)
+        close_price = row.close
         
         future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold, days_ahead=[1,3,5])
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
-            'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
+            'Close': close_price, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
             'Volume_Ratio': volume_ratio,
             'Win_Rate': win_rate,
             'macd': ind['macd_val'], 'volatility': ind['volatility'],
@@ -337,8 +338,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "无正MACD股票"
 
-    # 增强评分：更奖励波动率
-    for col in ['macd', 'volatility', 'Win_Rate', 'Volume_Ratio']:
+    # 新评分：新增价格奖励 + 波动率降权 + 量比升权
+    for col in ['macd', 'volatility', 'Win_Rate', 'Volume_Ratio', 'Close']:
         min_val = fdf[col].min()
         max_val = fdf[col].max()
         if max_val > min_val:
@@ -346,11 +347,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         else:
             fdf[f'{col}_norm'] = 0.5
     
-    fdf['综合评分'] = (fdf['macd_norm'] * 0.35 + 
-                       fdf['volatility_norm'] * 0.25 +  
+    fdf['综合评分'] = (fdf['macd_norm'] * 0.4 + 
+                       fdf['volatility_norm'] * 0.1 +  # 降权
                        fdf['Win_Rate_norm'] * 0.2 +
-                       fdf['Volume_Ratio_norm'] * 0.2) * 100000
-    fdf['策略'] = '多因子增强（防衰减）'
+                       fdf['Volume_Ratio_norm'] * 0.3 +  # 升权
+                       fdf['Close_norm'] * 0.2) * 100000  # 新增高价奖励
+    fdf['策略'] = '高价多因子（防低价拖累）'
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
@@ -364,7 +366,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V31.3 增强版回测...")
+    st.success("✅ 数据就绪！开始 V31.4 高价优先版回测...")
     
     results = []
     bar = st.progress(0)
@@ -389,13 +391,13 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
         st.warning(f"💡 提示：回测过程中有 {error_count} 个交易日因数据缺失被跳过，不影响整体结果。")
     
     if not results:
-        st.error("所有交易日均无符合条件股票。请适当放宽过滤（如关闭量比或提高涨幅上限）。")
+        st.error("所有交易日均无符合条件股票。请适当降低最低股价或放宽涨幅上限。")
         st.stop()
         
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V31.3 回测报告 (多因子增强 + {BUY_THRESHOLD_PCT}%确认)")
+    st.header(f"📊 V31.4 回测报告 (高价多因子 + {BUY_THRESHOLD_PCT}%确认)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(3)
