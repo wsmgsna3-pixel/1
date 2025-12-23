@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-回踩强势股 · 稳定极速回测版
-特点：
-- 一次拉取全市场数据
-- 无交易也不报错
-- 适合新手长期反复回测
+强势股评分 + 回测 · 稳定工程版
 """
 
 import streamlit as st
@@ -15,15 +11,15 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings("ignore")
 
-# =====================================================
+# =========================
 # 页面
-# =====================================================
+# =========================
 st.set_page_config(layout="wide")
-st.title("🛡 回踩强势股 · 稳定极速回测版")
+st.title("📊 强势股评分 + 回测 · 稳定工程版")
 
-# =====================================================
+# =========================
 # Token
-# =====================================================
+# =========================
 TS_TOKEN = st.text_input("Tushare Token", type="password")
 if not TS_TOKEN:
     st.stop()
@@ -31,23 +27,21 @@ if not TS_TOKEN:
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-# =====================================================
+# =========================
 # 参数
-# =====================================================
+# =========================
 with st.sidebar:
-    st.header("回测参数")
     END_DATE = st.date_input("回测结束日", datetime.now().date())
-    BACKTEST_DAYS = st.number_input("回测天数", 20, 300, 100, 10)
+    BACKTEST_DAYS = st.number_input("回测天数", 50, 500, 200, 50)
 
-    st.markdown("---")
-    st.header("交易规则")
     STOP_LOSS = -3.0
     TAKE_PROFIT = 6.0
     HOLD_DAYS = 3
+    SCORE_THRESHOLD = 5
 
-# =====================================================
-# 工具函数
-# =====================================================
+# =========================
+# 工具
+# =========================
 @st.cache_data(ttl=3600)
 def get_trade_days(end, n):
     start = (end - timedelta(days=n * 3)).strftime("%Y%m%d")
@@ -55,93 +49,83 @@ def get_trade_days(end, n):
     return cal[cal["is_open"] == 1].sort_values("cal_date", ascending=False)["cal_date"].head(n).tolist()
 
 @st.cache_data(ttl=3600)
-def load_daily(start, end):
-    df = pro.daily(start_date=start, end_date=end)
+def load_data(start, end):
+    daily = pro.daily(start_date=start, end_date=end)
+    basic = pro.daily_basic(start_date=start, end_date=end,
+                            fields="ts_code,trade_date,turnover_rate,circ_mv")
+    df = daily.merge(basic, on=["ts_code","trade_date"], how="left")
     for c in ["open","high","low","close","vol"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.sort_values(["ts_code","trade_date"])
 
-@st.cache_data(ttl=3600)
-def load_basic(start, end):
-    return pro.daily_basic(
-        start_date=start,
-        end_date=end,
-        fields="ts_code,trade_date,turnover_rate,circ_mv"
-    )
-
-# =====================================================
-# 主回测
-# =====================================================
-if st.button("🚀 开始稳定极速回测"):
+# =========================
+# 主逻辑
+# =========================
+if st.button("🚀 开始回测"):
 
     trade_days = get_trade_days(END_DATE, BACKTEST_DAYS)
-
-    if not trade_days:
-        st.error("无法获取交易日")
-        st.stop()
-
     start_date = (datetime.strptime(trade_days[-1], "%Y%m%d") - timedelta(days=30)).strftime("%Y%m%d")
     end_date = trade_days[0]
 
-    st.info("📥 正在加载全市场历史数据（仅一次）")
-    daily = load_daily(start_date, end_date)
-    basic = load_basic(start_date, end_date)
-
-    data = daily.merge(basic, on=["ts_code","trade_date"], how="left")
-
-    results = []
+    data = load_data(start_date, end_date)
     grouped = data.groupby("ts_code")
 
-    bar = st.progress(0)
-    total = len(grouped)
+    results = []
+    candidates_count = 0
 
-    for i, (ts_code, df) in enumerate(grouped):
+    for ts_code, df in grouped:
         df = df.reset_index(drop=True)
-
         if len(df) < 15:
-            bar.progress(i / total)
             continue
 
-        for idx in range(10, len(df) - HOLD_DAYS):
-            today = df.iloc[idx]
-            trade_date = today["trade_date"]
-
-            if trade_date not in trade_days:
+        for i in range(10, len(df) - HOLD_DAYS):
+            today = df.iloc[i]
+            if today["trade_date"] not in trade_days:
                 continue
 
-            # ===== 静态过滤 =====
+            # 基础过滤
             if not (8 <= today["close"] <= 80):
                 continue
-            if today["turnover_rate"] < 2:
+            if today["turnover_rate"] < 1.5:
                 continue
-            if not (30 <= today["circ_mv"] / 10000 <= 500):
-                continue
-
-            # ===== 强势 =====
-            ret_5 = today["close"] / df.iloc[idx-5]["close"] - 1
-            if not 0.06 <= ret_5 <= 0.25:
+            if not (30 <= today["circ_mv"]/10000 <= 500):
                 continue
 
-            # ===== 回踩 =====
-            pct = (today["close"] / df.iloc[idx-1]["close"] - 1) * 100
-            ma5 = df["close"].iloc[idx-5:idx].mean()
-            vol_ma5 = df["vol"].iloc[idx-5:idx].mean()
+            # ===== 评分 =====
+            score = 0
+            ret_5 = today["close"] / df.iloc[i-5]["close"] - 1
+            if ret_5 > 0.04:
+                score += 2
+            if ret_5 > 0.08:
+                score += 2
+            if ret_5 > 0.12:
+                score += 3
 
-            if not (-3 <= pct <= -0.5):
-                continue
-            if today["vol"] > vol_ma5:
-                continue
-            if today["low"] < ma5:
+            pct = (today["close"] / df.iloc[i-1]["close"] - 1) * 100
+            if -4 <= pct <= -1:
+                score += 2
+
+            ma5 = df["close"].iloc[i-5:i].mean()
+            if today["low"] >= ma5:
+                score += 2
+
+            vol_ma5 = df["vol"].iloc[i-5:i].mean()
+            if today["vol"] <= vol_ma5:
+                score += 2
+
+            if score < SCORE_THRESHOLD:
                 continue
 
-            # ===== 模拟交易 =====
-            buy = df.iloc[idx+1]["open"]
+            candidates_count += 1
+
+            # ===== 回测 =====
+            buy = df.iloc[i+1]["open"]
             sl = buy * (1 + STOP_LOSS / 100)
             tp = buy * (1 + TAKE_PROFIT / 100)
 
             exit_ret = None
-            for j in range(1, HOLD_DAYS + 1):
-                row = df.iloc[idx + j]
+            for j in range(1, HOLD_DAYS+1):
+                row = df.iloc[i+j]
                 if row["low"] <= sl:
                     exit_ret = STOP_LOSS
                     break
@@ -150,31 +134,20 @@ if st.button("🚀 开始稳定极速回测"):
                     break
 
             if exit_ret is None:
-                close_p = df.iloc[idx + HOLD_DAYS]["close"]
-                exit_ret = (close_p / buy - 1) * 100
+                exit_ret = (df.iloc[i+HOLD_DAYS]["close"] / buy - 1) * 100
 
-            results.append({
-                "交易日": trade_date,
-                "股票": ts_code,
-                "收益%": round(exit_ret, 2)
-            })
-
-        bar.progress(i / total)
-
-    bar.empty()
+            results.append(exit_ret)
 
     # =========================
-    # 结果展示（关键稳健点）
+    # 结果
     # =========================
+    st.metric("候选信号数量", candidates_count)
+
     if not results:
-        st.warning("⚠️ 回测区间内未产生任何交易（策略条件较严格，这是正常现象）")
+        st.warning("⚠️ 没有产生任何成交，请降低评分阈值或拉长回测区间")
         st.stop()
 
-    res = pd.DataFrame(results)
-
-    st.header("📊 回测结果")
-    st.metric("平均收益%", round(res["收益%"].mean(), 2))
-    st.metric("胜率%", round((res["收益%"] > 0).mean() * 100, 1))
+    res = pd.Series(results)
+    st.metric("平均收益%", round(res.mean(), 2))
+    st.metric("胜率%", round((res > 0).mean() * 100, 1))
     st.metric("交易次数", len(res))
-
-    st.dataframe(res.sort_values("交易日", ascending=False), use_container_width=True)
