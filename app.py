@@ -6,41 +6,40 @@ import numpy as np
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="主力成本支撑V5", layout="wide")
-st.title("⚓ Tushare V5.0 主力成本支撑系统")
+st.set_page_config(page_title="主力成本V6 (严谨版)", layout="wide")
+st.title("⚓ Tushare V6.0 主力成本支撑 (T+1严谨回测)")
 st.markdown("""
-### 策略核心：拒绝高位接盘，只做底部支撑
-1. **安全垫**：买入价接近市场平均成本 (`cost_50pct`)。
-2. **避高位**：剔除获利盘过高 (>60%) 的股票，防止主力出货。
-3. **抓反弹**：在主力护盘线附近低吸。
+### V6 升级说明：
+1. **真实模拟**：T日选股，**T+1日开盘价买入**（更符合实战）。
+2. **硬盘缓存**：下载过的数据不再重复下载，大幅提升速度。
+3. **更长周期**：建议测试 2024 全年。
 """)
 
 # ==========================================
-# 参数设置
+# 侧边栏设置
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 抄底参数")
+    st.header("⚙️ 参数设置")
     my_token = st.text_input("Tushare Token", type="password")
     
-    start_date = st.text_input("开始日期", value="20241008")
-    end_date = st.text_input("结束日期", value="20241130")
+    # 默认时间拉长，测试长期稳定性
+    start_date = st.text_input("开始日期", value="20240101")
+    end_date = st.text_input("结束日期", value="20241220")
     initial_cash = st.slider("初始资金 (万)", 10, 500, 100) * 10000
     
     st.divider()
-    # 止盈止损可以稍微放大，因为是底部买入
-    stop_loss = st.slider("止损阈值", -10.0, -3.0, -8.0) / 100.0
+    stop_loss = st.slider("止损阈值", -15.0, -3.0, -8.0) / 100.0
     take_profit = st.slider("止盈阈值", 5.0, 50.0, 15.0) / 100.0
+    max_hold_days = st.slider("最长持股天数", 5, 30, 10)
 
-# 按钮区
-st.divider()
-run_btn = st.button("🚀 启动 V5 抄底回测", type="primary", use_container_width=True)
+run_btn = st.button("🚀 启动 V6 回测", type="primary", use_container_width=True)
 
 # ==========================================
 # 核心逻辑
 # ==========================================
 if run_btn:
     if not my_token:
-        st.error("请先在左侧输入 Token")
+        st.error("请输入 Token")
         st.stop()
         
     ts.set_token(my_token)
@@ -60,10 +59,12 @@ if run_btn:
         STOP_LOSS = stop_loss
         TAKE_PROFIT = take_profit
         FEE_RATE = 0.0003
+        MAX_HOLD_DAYS = max_hold_days
 
     cfg = Config()
 
-    @st.cache_data(ttl=3600)
+    # --- 1. 缓存交易日历 (硬盘缓存) ---
+    @st.cache_data(ttl=86400, persist=True)
     def get_trading_days(start, end):
         try:
             df = pro.trade_cal(exchange='', start_date=start, end_date=end, is_open='1')
@@ -71,68 +72,49 @@ if run_btn:
         except:
             return []
 
-    # --- 数据获取 ---
-    def fetch_data_support(date):
+    # --- 2. 获取数据 (核心耗时步骤，开启 persist=True) ---
+    # 注意：如果这步报错，可能是磁盘写入权限问题，通常 Streamlit Cloud 没问题
+    @st.cache_data(ttl=86400, persist=True, show_spinner=False)
+    def fetch_data_cached(date):
         try:
-            # 1. 基础行情
+            # A. 基础行情
             df_daily = pro.daily(trade_date=date)
             if df_daily.empty: return pd.DataFrame()
 
+            # B. 每日指标
             df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
             
-            # 2. 筹码数据 (获取 cost_50pct 成本均线)
-            df_cyq = pd.DataFrame()
-            try:
-                df_cyq = pro.cyq_perf(trade_date=date)
-            except:
-                pass
-
+            # C. 筹码数据
+            df_cyq = pro.cyq_perf(trade_date=date)
             if df_cyq.empty or 'cost_50pct' not in df_cyq.columns:
-                return pd.DataFrame() # 没筹码数据就不做
+                return pd.DataFrame()
 
-            # 3. 合并
+            # 合并
             df_merge = pd.merge(df_daily, df_basic, on='ts_code', how='inner')
-            # 关键：获取成本数据
             df_final = pd.merge(df_merge, df_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
             
             return df_final
         except:
             return pd.DataFrame()
 
-    # --- 选股逻辑 (V5 核心) ---
-    def select_stocks_support(df):
+    # --- 3. 选股逻辑 (不变) ---
+    def select_stocks(df):
         if df.empty: return []
-        
-        # 计算 乖离率：(当前价 - 平均成本) / 平均成本
-        # 结果越接近 0，说明价格越接近成本线
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
         
         condition = (
-            # 1. 价格要在成本线附近 (支撑位)
-            (df['bias'] > 0) &                # 股价刚站上成本线
-            (df['bias'] < 0.1) &              # 距离成本线不超过 10% (安全区间)
-            
-            # 2. 拒绝高位票
-            (df['winner_rate'] < 70) &        # 获利盘不要太多，防止砸盘
-            
-            # 3. 基本面过滤
-            (df['circ_mv'] > 300000) &        # 剔除小票
-            (df['pe_ttm'] > 0) & (df['pe_ttm'] < 60) & # 有业绩支撑
-            
-            # 4. 活跃度
-            (df['turnover_rate'] > 2.0)
+            (df['bias'] > 0) & (df['bias'] < 0.1) &  # 支撑位
+            (df['winner_rate'] < 70) &               # 拒绝高位
+            (df['circ_mv'] > 300000) &               # 只要中大盘
+            (df['turnover_rate'] > 1.0)              # 有流动性
         )
-        
-        selected = df[condition].copy()
-        
-        # 优先选 bias 最小的 (离成本线最近的，最安全)
-        selected = selected.sort_values(by='bias', ascending=True).head(3)
+        selected = df[condition].sort_values('bias', ascending=True).head(3)
         return selected['ts_code'].tolist()
 
-    # --- 回测执行 ---
+    # --- 4. 回测引擎 (T+1 模式) ---
     dates = get_trading_days(cfg.START_DATE, cfg.END_DATE)
     if not dates:
-        st.error("日期范围无效")
+        st.error("日期无效")
         st.stop()
 
     cash = cfg.INITIAL_CASH
@@ -140,76 +122,148 @@ if run_btn:
     history = []
     trade_log = []
     
+    # 待买入队列 {code: signal_date}
+    buy_queue = {} 
+
     progress_bar = st.progress(0)
     
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
-        status_box.caption(f"回测进度: {date}")
+        status_box.markdown(f"🗓️ **{date}** | 资产: {int(cash + sum([p['vol']*p['last_price'] for p in positions.values()])) if positions else int(cash)}")
         
-        df_today = fetch_data_support(date)
+        df_today = fetch_data_cached(date)
         
-        price_map = {}
+        price_map_close = {}
+        price_map_open = {}
+        price_map_high = {}
+        price_map_low = {}
+        
         if not df_today.empty:
-            price_map = df_today.set_index('ts_code')['close'].to_dict()
+            df_today = df_today.set_index('ts_code')
+            price_map_close = df_today['close'].to_dict()
+            price_map_open = df_today['open'].to_dict()
+            price_map_high = df_today['high'].to_dict()
+            price_map_low = df_today['low'].to_dict()
 
-        # 1. 卖出
-        codes_to_del = []
+        # --- A. 处理昨日的买入信号 (T+1 开盘买入) ---
+        # 遍历待买入队列
+        for code in list(buy_queue.keys()):
+            if len(positions) >= cfg.MAX_POSITIONS: 
+                buy_queue.pop(code) # 没钱了，信号作废
+                continue
+                
+            if code in price_map_open:
+                # 按开盘价买入
+                buy_price = price_map_open[code]
+                
+                # 资金分配
+                slot_cash = cash / (cfg.MAX_POSITIONS - len(positions))
+                vol = int(slot_cash / buy_price / 100) * 100
+                
+                if vol > 0 and cash >= vol * buy_price:
+                    cost = vol * buy_price * (1 + cfg.FEE_RATE)
+                    cash -= cost
+                    positions[code] = {
+                        'cost': buy_price, 
+                        'vol': vol, 
+                        'date': date, 
+                        'last_price': buy_price
+                    }
+                    trade_log.append({
+                        'date': date, 'code': code, 'action': 'BUY', 
+                        'price': buy_price, 'reason': 'T+1开盘'
+                    })
+                # 买完(或买不起)移出队列
+                buy_queue.pop(code)
+            else:
+                # 停牌，保留信号到明天
+                pass
+
+        # --- B. 持仓监控 (卖出逻辑) ---
+        codes_to_sell = []
         for code, pos in positions.items():
-            if code in price_map:
-                curr_p = price_map[code]
+            if code in price_map_close:
+                # 更新最新价用于计算市值
+                pos['last_price'] = price_map_close[code]
+                
                 cost = pos['cost']
-                ret = (curr_p - cost) / cost
+                high_p = price_map_high.get(code, pos['last_price'])
+                low_p = price_map_low.get(code, pos['last_price'])
+                close_p = pos['last_price']
                 
                 reason = ""
-                if ret <= cfg.STOP_LOSS: reason = "止损"
-                elif ret >= cfg.TAKE_PROFIT: reason = "止盈"
-                elif (pd.to_datetime(date) - pd.to_datetime(pos['date'])).days >= 10: reason = "超时换股"
+                sell_price = close_p
+                
+                # 1. 止损 (检查最低价)
+                if (low_p - cost) / cost <= cfg.STOP_LOSS:
+                    reason = "止损"
+                    sell_price = cost * (1 + cfg.STOP_LOSS) # 模拟触价成交
+                    
+                # 2. 止盈 (检查最高价)
+                elif (high_p - cost) / cost >= cfg.TAKE_PROFIT:
+                    reason = "止盈"
+                    sell_price = cost * (1 + cfg.TAKE_PROFIT)
+                
+                # 3. 超时 (检查收盘价)
+                elif (pd.to_datetime(date) - pd.to_datetime(pos['date'])).days >= cfg.MAX_HOLD_DAYS:
+                    reason = "超时"
+                    sell_price = close_p
                 
                 if reason:
-                    revenue = pos['vol'] * curr_p * (1 - cfg.FEE_RATE - 0.001)
-                    cash += revenue
+                    revenue = pos['vol'] * sell_price * (1 - cfg.FEE_RATE - 0.001)
                     profit = revenue - (pos['vol'] * cost)
-                    trade_log.append({'date': date, 'code': code, 'action': 'SELL', 'price': curr_p, 'reason': reason, 'profit': profit})
-                    codes_to_del.append(code)
-        for c in codes_to_del: del positions[c]
+                    cash += revenue
+                    trade_log.append({
+                        'date': date, 'code': code, 'action': 'SELL', 
+                        'price': round(sell_price, 2), 
+                        'profit': round(profit, 2), 
+                        'reason': reason
+                    })
+                    codes_to_sell.append(code)
+        
+        for c in codes_to_sell: del positions[c]
 
-        # 2. 买入
-        if not df_today.empty and len(positions) < cfg.MAX_POSITIONS:
-            targets = select_stocks_support(df_today)
+        # --- C. 每日选股 (产生信号放进队列) ---
+        if not df_today.empty and len(positions) + len(buy_queue) < cfg.MAX_POSITIONS:
+            targets = select_stocks(df_today.reset_index())
             for code in targets:
-                if code not in positions and code in price_map:
-                    if len(positions) < cfg.MAX_POSITIONS:
-                        price = price_map[code]
-                        slot_cash = cash / (cfg.MAX_POSITIONS - len(positions))
-                        vol = int(slot_cash / price / 100) * 100
-                        
-                        if vol > 0 and cash >= vol * price:
-                            cash -= vol * price * (1 + cfg.FEE_RATE)
-                            positions[code] = {'cost': price, 'vol': vol, 'date': date}
-                            trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': price, 'reason': '成本支撑'})
+                if code not in positions and code not in buy_queue:
+                    # 放入待买入队列，明天开盘买
+                    buy_queue[code] = date
 
-        # 3. 结算
-        total = cash
-        for code in positions:
-            p = price_map.get(code, positions[code]['cost'])
-            total += positions[code]['vol'] * p
-        history.append({'date': pd.to_datetime(date), 'asset': total})
+        # --- D. 结算资产 ---
+        total_asset = cash
+        for code, pos in positions.items():
+            total_asset += pos['vol'] * pos.get('last_price', pos['cost'])
+        
+        history.append({'date': pd.to_datetime(date), 'asset': total_asset})
 
-    # --- 结果 ---
+    # ==========================================
+    # 结果展示
+    # ==========================================
     status_box.empty()
     st.balloons()
     
     if history:
         df_res = pd.DataFrame(history).set_index('date')
-        final_val = df_res['asset'].iloc[-1]
-        ret = (final_val - cfg.INITIAL_CASH) / cfg.INITIAL_CASH * 100
+        ret = (df_res['asset'].iloc[-1] - cfg.INITIAL_CASH) / cfg.INITIAL_CASH * 100
+        max_dd = ((df_res['asset'].cummax() - df_res['asset']) / df_res['asset'].cummax()).max() * 100
         
-        st.subheader("📊 V5 回测报告")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("最终收益", f"{ret:.2f}%", delta_color="normal")
-        c2.metric("最大回撤", f"{((df_res['asset'].cummax() - df_res['asset'])/df_res['asset'].cummax()).max():.2%}")
+        st.subheader("📊 V6 严谨回测报告")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("区间收益", f"{ret:.2f}%", delta=f"{int(df_res['asset'].iloc[-1]-cfg.INITIAL_CASH)}")
+        c2.metric("最大回撤", f"{max_dd:.2f}%")
         c3.metric("交易次数", len(trade_log))
+        c4.metric("胜率", f"{len([t for t in trade_log if t['action']=='SELL' and t['profit']>0]) / len([t for t in trade_log if t['action']=='SELL']) * 100:.1f}%" if trade_log else "0.0%")
         
         st.line_chart(df_res['asset'])
-        if trade_log:
-            st.dataframe(pd.DataFrame(trade_log))
+        
+        with st.expander("查看详细交易流水", expanded=True):
+            if trade_log:
+                df_tx = pd.DataFrame(trade_log)
+                # 格式化一下显示
+                st.dataframe(df_tx.style.format({'price': '{:.2f}', 'profit': '{:.2f}'}))
+            else:
+                st.info("区间内无交易")
+    else:
+        st.error("数据获取失败，请重试")
