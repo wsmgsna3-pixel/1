@@ -4,3 +4,7 @@ numpy
 tushare
 joblib
 plotly
+tushare
+pandas
+numpy
+matplotlib
