@@ -6,39 +6,38 @@ import numpy as np
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V9 严谨修正版", layout="wide")
-st.title("🛡️ V9.0 终极修正版 (修复时间轴BUG)")
+st.set_page_config(page_title="V11 激进游击", layout="wide")
+st.title("⚡ V11.0 激进游击战 (高频高周转)")
 st.markdown("""
-### 修复说明：
-1. **🕒 强制时间正序**：修复了“先买后卖”的时间穿越 BUG。
-2. **🎒 持仓看板**：清晰展示当前账户持仓，不再“失踪”。
-3. **🧹 缓存清理**：点下方按钮可强制刷新数据。
+### 🚀 提速策略：
+1.  **降低门槛**：大盘风控降为 **5日线**，选股区间放宽至 **30%**。
+2.  **极速轮动**：持股上限仅 **5天**，不涨就换股，拒绝死拿。
+3.  **微利快跑**：赚 **5%** 就开启止盈监控，积少成多。
 """)
 
 # ==========================================
 # 侧边栏
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 参数设置")
+    st.header("⚙️ 激进参数")
     my_token = st.text_input("Tushare Token", type="password")
     
     start_date = st.text_input("开始日期", value="20250101")
     end_date = st.text_input("结束日期", value="20251224")
-    initial_cash = st.slider("初始资金 (万)", 10, 500, 100) * 10000
+    initial_cash = st.slider("初始资金 (万)", 10, 500, 20) * 10000
     
     st.divider()
-    max_pos = st.slider("持仓上限", 3, 5, 3) 
-    stop_loss = st.slider("硬止损", -15.0, -5.0, -8.0) / 100.0
+    # 既然资金少，就集中火力
+    max_pos = st.slider("持仓只数", 1, 3, 2) 
     
-    st.subheader("移动止盈")
-    start_trailing = st.slider("启动阈值", 5, 20, 8) / 100.0
-    drawdown_limit = st.slider("允许回撤", 1, 10, 3) / 100.0
+    # 止盈止损都要快
+    stop_loss = st.slider("硬止损", -10.0, -3.0, -5.0) / 100.0
     
-    if st.button("🧹 清除所有缓存 (报错时点我)"):
-        st.cache_data.clear()
-        st.success("缓存已清除，请重新点击开始回测")
+    st.subheader("超短止盈")
+    start_trailing = st.slider("启动阈值", 3, 10, 5) / 100.0 # 5%就准备跑
+    drawdown_limit = st.slider("允许回撤", 1, 5, 2) / 100.0
 
-run_btn = st.button("🚀 启动 V9.0 (逻辑已修复)", type="primary", use_container_width=True)
+run_btn = st.button("🔥 启动 V11 激进版", type="primary", use_container_width=True)
 
 # ==========================================
 # 核心逻辑
@@ -64,21 +63,22 @@ if run_btn:
         MAX_POSITIONS = max_pos
         STOP_LOSS = stop_loss
         FEE_RATE = 0.0003
-        MAX_HOLD_DAYS = 20 
+        # 核心修改：5天不涨就走
+        MAX_HOLD_DAYS = 5 
         TRAIL_START = start_trailing
         TRAIL_DROP = drawdown_limit
 
     cfg = Config()
 
-    # --- 1. 获取大盘 (强制排序核心修复) ---
+    # --- 1. 获取大盘 (改为 MA5 风控) ---
     @st.cache_data(ttl=86400, persist=True)
     def get_market_sentiment(start, end):
         try:
             df = pro.index_daily(ts_code='000001.SH', start_date=start, end_date=end)
-            # 🔧 修复核心：强制按日期正序排列
-            df = df.sort_values('trade_date', ascending=True) 
-            df['ma20'] = df['close'].rolling(20).mean()
-            df['is_safe'] = df['close'] > df['ma20']
+            df = df.sort_values('trade_date', ascending=True)
+            # 改为 MA5，反应更快，交易机会更多
+            df['ma_line'] = df['close'].rolling(5).mean() 
+            df['is_safe'] = df['close'] > df['ma_line']
             return df.set_index('trade_date')['is_safe'].to_dict()
         except:
             return {}
@@ -106,17 +106,24 @@ if run_btn:
         except:
             return pd.DataFrame()
 
-    def select_stocks_v9(df):
+    def select_stocks_v11(df):
         if df.empty: return []
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
-        condition = ((df['bias'] > -0.02) & (df['bias'] < 0.1) & (df['winner_rate'] < 60) & (df['circ_mv'] > 300000) & (df['turnover_rate'] > 1.5))
-        return df[condition].sort_values('bias', ascending=True).head(3)['ts_code'].tolist()
+        
+        # 核心修改：大幅放宽选股条件
+        condition = (
+            (df['bias'] > -0.05) & (df['bias'] < 0.30) & # 放宽到 30%，捕捉强势股
+            (df['winner_rate'] < 80) & # 获利盘限制也放宽
+            (df['circ_mv'] > 300000) &  
+            (df['turnover_rate'] > 2.5) # 必须活跃
+        )
+        
+        # 按换手率排序，优先买活跃的
+        return df[condition].sort_values('turnover_rate', ascending=False).head(5)['ts_code'].tolist()
 
     # --- 4. 回测循环 ---
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
-    # 🔧 修复核心：日期强制排序，防止时光倒流
-    dates = sorted(cal_df['cal_date'].tolist()) 
-    
+    dates = sorted(cal_df['cal_date'].tolist())
     market_safe_map = get_market_sentiment(cfg.START_DATE, cfg.END_DATE)
 
     cash = cfg.INITIAL_CASH
@@ -129,9 +136,10 @@ if run_btn:
     
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
+        
+        # 风控检查
         is_market_safe = market_safe_map.get(date, False)
-        status_box.text(f"Processing: {date} | Safe: {is_market_safe} | Pos: {len(positions)}")
-
+        
         df_price = fetch_price_data(date)
         df_strat = fetch_strategy_data(date)
         
@@ -147,7 +155,11 @@ if run_btn:
             price_map_high = df_price['high'].to_dict()
             price_map_low = df_price['low'].to_dict()
 
-        # --- A. Buy Execution ---
+        status_box.text(f"Day: {date} | Market Safe: {is_market_safe} | Pos: {len(positions)}")
+
+        # --- A. Buy ---
+        # 激进版：即使大盘不好，只要不是暴跌(MA5能反应)，也允许少量尝试
+        # 这里保留熔断，但因为用的是 MA5，熔断概率小很多
         if not is_market_safe:
             buy_queue = [] 
         
@@ -161,10 +173,10 @@ if run_btn:
                     cost = vol * buy_price * (1 + cfg.FEE_RATE)
                     cash -= cost
                     positions[code] = {'cost': buy_price, 'vol': vol, 'date': date, 'high_since_buy': buy_price}
-                    trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '主力成本(T+1)'})
+                    trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '游击(T+1)'})
         buy_queue = []
 
-        # --- B. Sell Logic ---
+        # --- B. Sell ---
         codes_to_sell = []
         for code, pos in positions.items():
             if code in price_map_close:
@@ -186,10 +198,9 @@ if run_btn:
                     reason = "止损"
                     sell_price = cost * (1 + cfg.STOP_LOSS)
                 elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
-                    reason = f"移动止盈({drawdown*100:.1f}%)"
-                    sell_price = curr_price
+                    reason = f"快进快出({drawdown*100:.1f}%)"
                 elif (pd.to_datetime(date) - pd.to_datetime(pos['date'])).days >= cfg.MAX_HOLD_DAYS:
-                    reason = "超时"
+                    reason = "超时换股"
                 
                 if reason:
                     revenue = pos['vol'] * sell_price * (1 - cfg.FEE_RATE)
@@ -197,54 +208,51 @@ if run_btn:
                     cash += revenue
                     trade_log.append({'date': date, 'code': code, 'action': 'SELL', 'price': round(sell_price, 2), 'profit': round(profit, 2), 'reason': reason})
                     codes_to_sell.append(code)
-        
         for c in codes_to_sell: del positions[c]
 
-        # --- C. Selection ---
+        # --- C. Select ---
+        # 只要有空位就拼命选
         if is_market_safe and not df_strat.empty and len(positions) < cfg.MAX_POSITIONS:
-            targets = select_stocks_v9(df_strat.reset_index())
+            targets = select_stocks_v11(df_strat.reset_index())
             for code in targets:
                 if code not in positions: buy_queue.append(code)
 
-        # --- D. Settlement ---
+        # --- D. Settle ---
         total = cash
         for code, pos in positions.items():
             total += pos['vol'] * price_map_close.get(code, pos['high_since_buy'])
         history.append({'date': pd.to_datetime(date), 'asset': total})
 
-    # --- 结果展示 ---
+    # --- 结果 ---
     status_box.empty()
     st.balloons()
     
     if history:
         df_res = pd.DataFrame(history).set_index('date')
         ret = (df_res['asset'].iloc[-1] - cfg.INITIAL_CASH) / cfg.INITIAL_CASH * 100
-        max_dd = ((df_res['asset'].cummax() - df_res['asset']) / df_res['asset'].cummax()).max() * 100
         
-        st.subheader("🛡️ V9.0 终极修正报告")
-        c1, c2, c3 = st.columns(3)
+        wins = len([t for t in trade_log if t['action']=='SELL' and t['profit']>0])
+        total_sells = len([t for t in trade_log if t['action']=='SELL'])
+        win_rate = (wins / total_sells * 100) if total_sells > 0 else 0
+        
+        st.subheader("🔥 V11 激进版报告")
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("区间收益", f"{ret:.2f}%")
         c2.metric("交易次数", len(trade_log))
-        c3.metric("当前持仓数", len(positions))
+        c3.metric("胜率", f"{win_rate:.1f}%")
+        c4.metric("周转率", f"{len(trade_log)/len(dates)*100:.0f}%", help="资金活跃度")
         
         st.line_chart(df_res['asset'])
         
-        # --- ➕ 增强版：当前持仓看板 ---
         st.divider()
-        st.subheader("🎒 当前持仓详情 (再也不会失踪了)")
+        st.subheader("🎒 当前持仓")
         if positions:
             pos_data = []
             for code, info in positions.items():
-                pos_data.append({
-                    "代码": code,
-                    "买入日期": info['date'],
-                    "成本价": f"{info['cost']:.2f}",
-                    "最高价(以来)": f"{info['high_since_buy']:.2f}",
-                    "持仓天数": (pd.to_datetime(dates[-1]) - pd.to_datetime(info['date'])).days
-                })
-            st.table(pd.DataFrame(pos_data))
+                pos_data.append({"代码": code, "日期": info['date'], "成本": f"{info['cost']:.2f}", "浮盈": f"{(price_map_close.get(code,0)-info['cost'])/info['cost']*100:.1f}%"})
+            st.dataframe(pd.DataFrame(pos_data))
         else:
-            st.info("✅ 当前空仓 (资金安全)")
+            st.info("空仓")
 
-        with st.expander("📝 完整交易流水 (已按时间正序排列)"):
+        with st.expander("交易明细"):
             st.dataframe(pd.DataFrame(trade_log))
