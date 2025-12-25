@@ -6,14 +6,15 @@ import numpy as np
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V14.3 终极封存版", layout="wide")
-st.title("🏆 V14.3 黄金狙击 (实盘冠军版)")
+st.set_page_config(page_title="V15.1 实盘指挥部", layout="wide")
+st.title("📱 V15.1 黄金狙击 (微信排序 + 冠军排名)")
 st.markdown("""
-### 👑 冠军配置 (The Champion Set)：
-* **核心战绩**：收益 **69.45%** | 胜率 **59.0%**
-* **资金管理**：持仓 **3只** | 持股 **10天**
-* **风控铁律**：T+1 盘中 **-5.01%** 触价即跑
-* **大盘防线**：MA20 生命线
+### 👁️ 实盘看盘指南：
+1.  **排序方式**：**最新日期在最上面** (像微信消息一样)。
+2.  **排名指标**：请重点看 **【排名】** 列。
+    * 🥇 **第 1 名**：当天的“金股”，Bias 最低，必须优先买。
+    * 🥈 **第 2/3 名**：备选，有钱再买。
+3.  **选股技巧**：如果只想看明天的票，把**结束日期设为明天**，**开始日期往前推 60 天**。
 """)
 
 # ==========================================
@@ -23,19 +24,18 @@ with st.sidebar:
     st.header("⚙️ 实盘参数")
     my_token = st.text_input("Tushare Token", type="password")
     
-    start_date = st.text_input("开始日期", value="20250101")
-    end_date = st.text_input("结束日期", value="20251224")
+    # 建议默认跨度设大一点，防止MA20数据不足
+    start_date = st.text_input("开始日期 (建议前推60天)", value="20251101")
+    end_date = st.text_input("结束日期 (设为明天)", value="20251225")
     initial_cash = st.slider("初始资金 (万)", 10, 500, 20) * 10000
     
     st.divider()
-    # === 参数已固化为最佳回测值 ===
     max_pos = 3
     st.success(f"持仓上限: {max_pos} 只 (黄金配置)")
     
     max_hold_days = 10
-    st.success(f"持股周期: {max_hold_days} 天 (耐心配置)")
+    st.success(f"持股周期: {max_hold_days} 天 (耐心持有)")
     
-    # 硬止损 -5.01%
     STOP_LOSS_FIXED = -0.0501
     st.error(f"硬止损: {STOP_LOSS_FIXED*100}% (盘中条件单)")
     
@@ -43,7 +43,7 @@ with st.sidebar:
     start_trailing = st.slider("启动阈值 (%)", 5, 20, 8) / 100.0
     drawdown_limit = st.slider("允许回撤 (%)", 1, 10, 3) / 100.0
 
-run_btn = st.button("🚀 启动实盘验证", type="primary", use_container_width=True)
+run_btn = st.button("🚀 启动选股/回测", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -75,7 +75,9 @@ if run_btn:
     @st.cache_data(ttl=86400, persist=True)
     def get_market_sentiment(start, end):
         try:
-            df = pro.index_daily(ts_code='000001.SH', start_date=start, end_date=end)
+            # 多取一点数据以计算MA20
+            real_start = (pd.to_datetime(start) - pd.Timedelta(days=60)).strftime('%Y%m%d')
+            df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
             df = df.sort_values('trade_date', ascending=True)
             df['ma_safe'] = df['close'].rolling(20).mean()
             df['is_safe'] = df['close'] > df['ma_safe']
@@ -106,8 +108,8 @@ if run_btn:
         except:
             return pd.DataFrame()
 
-    # --- 选股逻辑 (Bias排名) ---
-    def select_stocks_final(df):
+    # --- 选股逻辑 (增加排名计算) ---
+    def select_stocks_ranked(df):
         if df.empty: return []
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
         condition = (
@@ -116,7 +118,13 @@ if run_btn:
             (df['circ_mv'] > 300000) &  
             (df['turnover_rate'] > 1.5)
         )
-        return df[condition].sort_values('bias', ascending=True).head(5)
+        selected = df[condition].sort_values('bias', ascending=True).head(5)
+        
+        # === 核心：给选出来的股票打上排名标签 ===
+        # reset_index后，第一行就是第0个，rank = index + 1
+        selected = selected.reset_index(drop=True)
+        selected['day_rank'] = selected.index + 1 
+        return selected
 
     # --- 4. 回测循环 ---
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
@@ -127,7 +135,7 @@ if run_btn:
     positions = {} 
     history = []
     trade_log = []
-    buy_queue = [] 
+    buy_queue = [] # 存储结构：[{'code': code, 'rank': 1, 'bias': -0.02}]
 
     progress_bar = st.progress(0)
     
@@ -156,8 +164,7 @@ if run_btn:
         current_date_obj = pd.to_datetime(date)
 
         for code, pos in positions.items():
-            if current_date_obj <= pd.to_datetime(pos['date']): 
-                continue 
+            if current_date_obj <= pd.to_datetime(pos['date']): continue 
 
             if code in price_map_close:
                 curr_price = price_map_close[code]
@@ -174,14 +181,11 @@ if run_btn:
                 reason = ""
                 sell_price = curr_price
                 
-                # === T+1 盘中止损 ===
                 if (low_today - cost) / cost <= cfg.STOP_LOSS: 
                     reason = "止损(T+1盘中)"
                     sell_price = cost * (1 + cfg.STOP_LOSS)
-                    
                 elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
                     reason = f"移动止盈({drawdown*100:.1f}%)"
-                # === 10天耐心持有 ===
                 elif (current_date_obj - pd.to_datetime(pos['date'])).days >= cfg.MAX_HOLD_DAYS:
                     reason = f"超时换股({cfg.MAX_HOLD_DAYS}天)"
                 
@@ -189,15 +193,25 @@ if run_btn:
                     revenue = pos['vol'] * sell_price * (1 - cfg.FEE_RATE)
                     profit = revenue - (pos['vol'] * cost)
                     cash += revenue
-                    trade_log.append({'date': date, 'code': code, 'action': 'SELL', 'price': round(sell_price, 2), 'profit': round(profit, 2), 'reason': reason})
+                    # 卖出记录不需要排名，填空
+                    trade_log.append({
+                        '日期': date, '代码': code, '方向': '卖出', 
+                        '价格': round(sell_price, 2), '盈亏': round(profit, 2), 
+                        '理由': reason, '排名': '-', 'Bias': '-'
+                    })
                     codes_to_sell.append(code)
         
         for c in codes_to_sell: del positions[c]
 
         # 2. Buy Logic
-        if not is_market_safe: buy_queue = [] 
+        if not is_market_safe: 
+            buy_queue = [] 
         
-        for code in buy_queue:
+        for item in buy_queue:
+            code = item['code']
+            rank = item['rank']
+            bias_val = item['bias']
+            
             if len(positions) >= cfg.MAX_POSITIONS: break
             if code in price_map_open:
                 buy_price = price_map_open[code]
@@ -207,15 +221,27 @@ if run_btn:
                     cost = vol * buy_price * (1 + cfg.FEE_RATE)
                     cash -= cost
                     positions[code] = {'cost': buy_price, 'vol': vol, 'date': date, 'high_since_buy': buy_price}
-                    trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '低吸(T+1)'})
+                    # 记录买入时的排名和Bias
+                    trade_log.append({
+                        '日期': date, '代码': code, '方向': '买入', 
+                        '价格': buy_price, '盈亏': 0, 
+                        '理由': '低吸(T+1)', 
+                        '排名': f"第 {rank} 名", 
+                        'Bias': f"{bias_val*100:.2f}%"
+                    })
         buy_queue = []
 
-        # 3. Select
+        # 3. Select (带排名的选股)
         if is_market_safe and not df_strat.empty and len(positions) < cfg.MAX_POSITIONS:
-            target_df = select_stocks_final(df_strat.reset_index())
+            target_df = select_stocks_ranked(df_strat.reset_index())
             for i, row in target_df.iterrows():
                 if row['ts_code'] not in positions: 
-                    buy_queue.append(row['ts_code'])
+                    # 将排名信息存入队列
+                    buy_queue.append({
+                        'code': row['ts_code'], 
+                        'rank': row['day_rank'],
+                        'bias': row['bias']
+                    })
 
         # 4. Settle
         total = cash
@@ -223,7 +249,7 @@ if run_btn:
             total += pos['vol'] * price_map_close.get(code, pos['high_since_buy'])
         history.append({'date': pd.to_datetime(date), 'asset': total})
 
-    # --- 结果 ---
+    # --- 结果展示 (微信式排序) ---
     status_box.empty()
     st.balloons()
     
@@ -231,17 +257,33 @@ if run_btn:
         df_res = pd.DataFrame(history).set_index('date')
         ret = (df_res['asset'].iloc[-1] - cfg.INITIAL_CASH) / cfg.INITIAL_CASH * 100
         
-        wins = len([t for t in trade_log if t['action']=='SELL' and t['profit']>0])
-        total_sells = len([t for t in trade_log if t['action']=='SELL'])
-        win_rate = (wins / total_sells * 100) if total_sells > 0 else 0
-        
-        st.subheader("🏆 实盘策略最终报告")
-        c1, c2, c3, c4 = st.columns(4)
+        st.subheader("📱 实盘操作面板")
+        c1, c2, c3 = st.columns(3)
         c1.metric("区间收益", f"{ret:.2f}%")
-        c2.metric("交易次数", len(trade_log))
-        c3.metric("真实胜率", f"{win_rate:.1f}%")
-        c4.metric("策略状态", "✅ Ready for Action")
+        c2.metric("最新仓位", f"{len(positions)} / {cfg.MAX_POSITIONS}")
+        c3.metric("大盘状态", "安全" if is_market_safe else "危险(空仓)")
         
         st.line_chart(df_res['asset'])
-        with st.expander("交易明细"):
-            st.dataframe(pd.DataFrame(trade_log))
+        
+        st.divider()
+        st.markdown("### 📋 交易明细 (最新在最上)")
+        
+        if trade_log:
+            df_log = pd.DataFrame(trade_log)
+            # === 核心修改：按日期倒序排列，同一天按排名正序 ===
+            # 这样今天的数据在最上面，且第1名排在第2名上面
+            df_log = df_log.sort_values(by=['日期', '排名'], ascending=[False, True])
+            
+            # 高亮显示“买入”和“第 1 名”
+            def highlight_rows(row):
+                if row['方向'] == '买入':
+                    if '第 1 名' in str(row['排名']):
+                        return ['background-color: #d4edda; color: green'] * len(row) # 冠军买入亮绿色
+                    return ['background-color: #f0f8ff'] * len(row) # 普通买入浅蓝色
+                elif row['理由'] and '止损' in str(row['理由']):
+                     return ['background-color: #f8d7da; color: red'] * len(row) # 止损浅红色
+                return [''] * len(row)
+
+            st.dataframe(df_log.style.apply(highlight_rows, axis=1), height=600)
+        else:
+            st.info("近期无交易，建议检查日期设置或休息观望。")
