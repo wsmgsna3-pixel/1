@@ -6,13 +6,13 @@ import numpy as np
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V14.0 复刻版", layout="wide")
-st.title("🏆 V14.0 黄金狙击 (69% 奇迹复刻版)")
+st.set_page_config(page_title="V14.2 终极修正", layout="wide")
+st.title("🏆 V14.2 黄金狙击 (盘中止损修复版)")
 st.markdown("""
-### 🌟 还原设置：
-1.  **硬止损**：**直接写死为 -5.01%** (不再用滑块，消除手抖误差)。
-2.  **代码逻辑**：完全退回至 V14.0 (去除 V14.1 的价格/市值额外过滤)。
-3.  **目标**：找回丢失的 17% 收益。
+### 🕵️‍♂️ 真相大白：
+* **核心修复**：从 **“收盘价止损”** 改回 **“盘中最低价止损”**。
+* **效果**：一旦触及 -5.01% 红线，盘中立即执行，绝不拖泥带水，释放资金抓新机会。
+* **预期**：找回那丢失的 17% 收益，重回巅峰。
 """)
 
 # ==========================================
@@ -31,15 +31,14 @@ with st.sidebar:
     max_pos = 3
     st.info(f"持仓上限: {max_pos} (已锁定)")
     
-    # 关键：这里直接定义变量，不给滑动的机会
-    STOP_LOSS_FIXED = -0.0501 
-    st.info(f"硬止损: {STOP_LOSS_FIXED*100}% (已锁定 5.01%)")
+    STOP_LOSS_FIXED = -0.0501
+    st.info(f"硬止损: {STOP_LOSS_FIXED*100}% (已锁定)")
     
-    st.subheader("移动止盈 (保持原样)")
+    st.subheader("移动止盈")
     start_trailing = st.slider("启动阈值 (%)", 5, 20, 8) / 100.0
     drawdown_limit = st.slider("允许回撤 (%)", 1, 10, 3) / 100.0
 
-run_btn = st.button("🚀 启动复刻回测", type="primary", use_container_width=True)
+run_btn = st.button("🚀 启动 V14.2 (见证奇迹)", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -59,7 +58,7 @@ if run_btn:
         END_DATE = end_date
         INITIAL_CASH = initial_cash
         MAX_POSITIONS = max_pos
-        STOP_LOSS = STOP_LOSS_FIXED # 使用写死的 5.01%
+        STOP_LOSS = STOP_LOSS_FIXED
         FEE_RATE = 0.0003
         MAX_HOLD_DAYS = 10 
         TRAIL_START = start_trailing
@@ -106,8 +105,6 @@ if run_btn:
     def select_stocks_v14_pure(df):
         if df.empty: return []
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
-        
-        # 严格复刻 V14.0 的条件，没有任何多余的过滤
         condition = (
             (df['bias'] > -0.03) & (df['bias'] < 0.15) & 
             (df['winner_rate'] < 70) &
@@ -140,12 +137,14 @@ if run_btn:
         price_map_open = {}
         price_map_close = {}
         price_map_high = {}
+        price_map_low = {}
         
         if not df_price.empty:
             df_price = df_price.set_index('ts_code')
             price_map_open = df_price['open'].to_dict()
             price_map_close = df_price['close'].to_dict()
             price_map_high = df_price['high'].to_dict()
+            price_map_low = df_price['low'].to_dict()
         
         # 1. Sell Logic
         codes_to_sell = []
@@ -157,6 +156,7 @@ if run_btn:
             if code in price_map_close:
                 curr_price = price_map_close[code]
                 high_today = price_map_high.get(code, curr_price)
+                low_today = price_map_low.get(code, curr_price)
                 
                 if high_today > pos['high_since_buy']: pos['high_since_buy'] = high_today
                 
@@ -168,8 +168,8 @@ if run_btn:
                 reason = ""
                 sell_price = curr_price
                 
-                # === 核心：使用 cfg.STOP_LOSS (即 -5.01%) ===
-                if (curr_price - cost) / cost <= cfg.STOP_LOSS: 
+                # === 核心修复点：使用 low_today (盘中最低价) ===
+                if (low_today - cost) / cost <= cfg.STOP_LOSS: 
                     reason = "止损"
                     sell_price = cost * (1 + cfg.STOP_LOSS)
                 elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
@@ -227,12 +227,12 @@ if run_btn:
         total_sells = len([t for t in trade_log if t['action']=='SELL'])
         win_rate = (wins / total_sells * 100) if total_sells > 0 else 0
         
-        st.subheader("🏆 V14.0 复刻版报告")
+        st.subheader("🏆 V14.2 终极报告")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("区间收益", f"{ret:.2f}%")
         c2.metric("交易次数", len(trade_log))
         c3.metric("真实胜率", f"{win_rate:.1f}%")
-        c4.metric("参数状态", "已锁死 5.01%")
+        c4.metric("止损模式", "盘中触线即卖")
         
         st.line_chart(df_res['asset'])
         with st.expander("交易明细"):
