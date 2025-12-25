@@ -6,20 +6,20 @@ import numpy as np
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V12 趋势共振", layout="wide")
-st.title("📈 V12.0 趋势共振版 (胜率优先)")
+st.set_page_config(page_title="V13 完美平衡", layout="wide")
+st.title("⚖️ V13.0 完美平衡版 (V9内核 + 资金提速)")
 st.markdown("""
-### 🎯 胜率拯救计划：
-1.  **只做右侧**：放弃抄底，只买 **站稳主力成本线** 的强势股。
-2.  **双重共振**：大盘 > 20日线 + 个股 > 20日线 (均线多头)。
-3.  **拒绝阴跌**：只买 **阳线** (收盘价 > 开盘价)，确保动量向上。
+### 🌟 策略逻辑：回归 V9 低吸
+1.  **坚持低吸**：沿用 V9 的主力成本支撑逻辑（胜率保证）。
+2.  **资金提速**：持仓扩充至 **5只**，持股缩短至 **8天**（解决交易少的问题）。
+3.  **适度宽容**：买入区间微调至 15%，增加可买标的。
 """)
 
 # ==========================================
 # 侧边栏
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 参数设置")
+    st.header("⚙️ 平衡参数")
     my_token = st.text_input("Tushare Token", type="password")
     
     start_date = st.text_input("开始日期", value="20250101")
@@ -27,15 +27,16 @@ with st.sidebar:
     initial_cash = st.slider("初始资金 (万)", 10, 500, 20) * 10000
     
     st.divider()
-    # 既然追求胜率，仓位可以稍微集中一点
-    max_pos = st.slider("持仓只数", 2, 5, 3) 
-    stop_loss = st.slider("硬止损", -10.0, -3.0, -6.0) / 100.0
+    # 核心改变：增加持仓数，提升资金利用率
+    max_pos = st.slider("持仓上限", 3, 8, 5) 
     
-    st.subheader("稳健止盈")
+    stop_loss = st.slider("硬止损", -10.0, -3.0, -8.0) / 100.0
+    
+    st.subheader("移动止盈")
     start_trailing = st.slider("启动阈值", 5, 20, 8) / 100.0
     drawdown_limit = st.slider("允许回撤", 1, 10, 3) / 100.0
 
-run_btn = st.button("🚀 启动 V12 高胜率版", type="primary", use_container_width=True)
+run_btn = st.button("🚀 启动 V13 平衡版", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -57,20 +58,22 @@ if run_btn:
         MAX_POSITIONS = max_pos
         STOP_LOSS = stop_loss
         FEE_RATE = 0.0003
-        MAX_HOLD_DAYS = 10 # 趋势票拿稳一点，给10天
+        # V13 提速：8天不涨就换股
+        MAX_HOLD_DAYS = 8 
         TRAIL_START = start_trailing
         TRAIL_DROP = drawdown_limit
 
     cfg = Config()
 
-    # --- 1. 获取大盘 (必须站稳 MA20) ---
+    # --- 1. 获取大盘 (回归 MA20 稳健风控) ---
     @st.cache_data(ttl=86400, persist=True)
     def get_market_sentiment(start, end):
         try:
             df = pro.index_daily(ts_code='000001.SH', start_date=start, end_date=end)
             df = df.sort_values('trade_date', ascending=True)
             df['ma20'] = df['close'].rolling(20).mean()
-            # 只有站上 20日线才操作，过滤掉熊市和暴跌
+            # 既然是低吸，大盘要求可以稍微低一点，或者保持 MA20
+            # 为了安全，保持 MA20，但允许在均线附近操作
             df['is_safe'] = df['close'] > df['ma20']
             return df.set_index('trade_date')['is_safe'].to_dict()
         except:
@@ -88,40 +91,32 @@ if run_btn:
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
     def fetch_strategy_data(date):
         try:
-            # 获取基础指标
             df_daily = pro.daily(trade_date=date)
             if df_daily.empty: return pd.DataFrame()
-            
-            # 我们需要简单的均线数据来判断趋势
-            # 但Tushare daily接口不直接给MA，我们用一种巧妙的方法：
-            # 1. 主力成本线 (cost_50pct) 本身就是一种超级均线
-            # 2. 我们要求 Price > Cost 且 Close > Open
-            
             df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
             df_cyq = pro.cyq_perf(trade_date=date)
-            
             if df_cyq.empty or 'cost_50pct' not in df_cyq.columns: return pd.DataFrame()
-            
             df_merge = pd.merge(df_daily, df_basic, on='ts_code', how='inner')
             df_final = pd.merge(df_merge, df_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
             return df_final
         except:
             return pd.DataFrame()
 
-    def select_stocks_v12(df):
+    def select_stocks_v13(df):
         if df.empty: return []
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
         
-        # === V12 核心胜率滤网 ===
+        # V13 平衡标准：低吸 (Bias < 0.15)
+        # 相比 V9 (0.1) 稍微放宽，增加机会
+        # 相比 V12 (Bias > 0) 坚持买跌，保证安全
         condition = (
-            (df['bias'] > 0.01) & (df['bias'] < 0.15) &  # 关键：必须在成本线上方(1%~15%)，说明已经突破压力位
-            (df['close'] > df['open']) &                 # 关键：当天必须是阳线 (红盘)
-            (df['winner_rate'] < 80) &                   # 获利盘适中，防止高位出货
-            (df['circ_mv'] > 300000) &                   # 剔除小票
-            (df['turnover_rate'] > 2.0)                  # 必须有量
+            (df['bias'] > -0.03) & (df['bias'] < 0.15) & 
+            (df['winner_rate'] < 70) &
+            (df['circ_mv'] > 300000) &  
+            (df['turnover_rate'] > 1.5)
         )
-        # 优先买资金关注度高的（换手率排序）
-        return df[condition].sort_values('turnover_rate', ascending=False).head(5)['ts_code'].tolist()
+        # 优先买 乖离率低 的 (越跌越买)
+        return df[condition].sort_values('bias', ascending=True).head(5)['ts_code'].tolist()
 
     # --- 4. 回测循环 ---
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
@@ -138,7 +133,7 @@ if run_btn:
     
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
-        is_market_safe = market_safe_map.get(date, False) # MA20 风控
+        is_market_safe = market_safe_map.get(date, False) 
         status_box.text(f"Day: {date} | Market Safe: {is_market_safe} | Pos: {len(positions)}")
 
         df_price = fetch_price_data(date)
@@ -161,7 +156,7 @@ if run_btn:
         current_date_obj = pd.to_datetime(date)
 
         for code, pos in positions.items():
-            if current_date_obj <= pd.to_datetime(pos['date']): continue # 冻结T+1
+            if current_date_obj <= pd.to_datetime(pos['date']): continue 
 
             if code in price_map_close:
                 curr_price = price_map_close[code]
@@ -182,9 +177,9 @@ if run_btn:
                     reason = "止损"
                     sell_price = cost * (1 + cfg.STOP_LOSS)
                 elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
-                    reason = f"趋势止盈({drawdown*100:.1f}%)"
+                    reason = f"移动止盈({drawdown*100:.1f}%)"
                 elif (current_date_obj - pd.to_datetime(pos['date'])).days >= cfg.MAX_HOLD_DAYS:
-                    reason = "趋势走坏(超时)"
+                    reason = "超时换股"
                 
                 if reason:
                     revenue = pos['vol'] * sell_price * (1 - cfg.FEE_RATE)
@@ -208,12 +203,12 @@ if run_btn:
                     cost = vol * buy_price * (1 + cfg.FEE_RATE)
                     cash -= cost
                     positions[code] = {'cost': buy_price, 'vol': vol, 'date': date, 'high_since_buy': buy_price}
-                    trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '趋势确认(T+1)'})
+                    trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '主力成本(T+1)'})
         buy_queue = []
 
         # 3. Select
         if is_market_safe and not df_strat.empty and len(positions) < cfg.MAX_POSITIONS:
-            targets = select_stocks_v12(df_strat.reset_index())
+            targets = select_stocks_v13(df_strat.reset_index())
             for code in targets:
                 if code not in positions: buy_queue.append(code)
 
@@ -235,12 +230,12 @@ if run_btn:
         total_sells = len([t for t in trade_log if t['action']=='SELL'])
         win_rate = (wins / total_sells * 100) if total_sells > 0 else 0
         
-        st.subheader("📈 V12.0 趋势共振版报告")
+        st.subheader("⚖️ V13.0 平衡版报告")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("区间收益", f"{ret:.2f}%")
         c2.metric("交易次数", len(trade_log))
         c3.metric("真实胜率", f"{win_rate:.1f}%")
-        c4.metric("持仓情况", len(positions))
+        c4.metric("当前持仓", len(positions))
         
         st.line_chart(df_res['asset'])
         with st.expander("交易明细"):
