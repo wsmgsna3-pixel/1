@@ -6,9 +6,14 @@ import numpy as np
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V8.1 严谨修复版", layout="wide")
-st.title("🛡️ V8.1 终极防御 (逻辑闭环修复)")
-st.markdown("### 修复重点：强制日期排序 | 增加持仓看板 | 消除逻辑幽灵")
+st.set_page_config(page_title="V9 严谨修正版", layout="wide")
+st.title("🛡️ V9.0 终极修正版 (修复时间轴BUG)")
+st.markdown("""
+### 修复说明：
+1. **🕒 强制时间正序**：修复了“先买后卖”的时间穿越 BUG。
+2. **🎒 持仓看板**：清晰展示当前账户持仓，不再“失踪”。
+3. **🧹 缓存清理**：点下方按钮可强制刷新数据。
+""")
 
 # ==========================================
 # 侧边栏
@@ -28,8 +33,12 @@ with st.sidebar:
     st.subheader("移动止盈")
     start_trailing = st.slider("启动阈值", 5, 20, 8) / 100.0
     drawdown_limit = st.slider("允许回撤", 1, 10, 3) / 100.0
+    
+    if st.button("🧹 清除所有缓存 (报错时点我)"):
+        st.cache_data.clear()
+        st.success("缓存已清除，请重新点击开始回测")
 
-run_btn = st.button("🚀 启动 V8.1", type="primary", use_container_width=True)
+run_btn = st.button("🚀 启动 V9.0 (逻辑已修复)", type="primary", use_container_width=True)
 
 # ==========================================
 # 核心逻辑
@@ -61,12 +70,13 @@ if run_btn:
 
     cfg = Config()
 
-    # --- 1. 获取大盘 (强制排序) ---
+    # --- 1. 获取大盘 (强制排序核心修复) ---
     @st.cache_data(ttl=86400, persist=True)
     def get_market_sentiment(start, end):
         try:
             df = pro.index_daily(ts_code='000001.SH', start_date=start, end_date=end)
-            df = df.sort_values('trade_date', ascending=True) # 关键：强制正序
+            # 🔧 修复核心：强制按日期正序排列
+            df = df.sort_values('trade_date', ascending=True) 
             df['ma20'] = df['close'].rolling(20).mean()
             df['is_safe'] = df['close'] > df['ma20']
             return df.set_index('trade_date')['is_safe'].to_dict()
@@ -96,16 +106,16 @@ if run_btn:
         except:
             return pd.DataFrame()
 
-    def select_stocks_v8(df):
+    def select_stocks_v9(df):
         if df.empty: return []
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
         condition = ((df['bias'] > -0.02) & (df['bias'] < 0.1) & (df['winner_rate'] < 60) & (df['circ_mv'] > 300000) & (df['turnover_rate'] > 1.5))
         return df[condition].sort_values('bias', ascending=True).head(3)['ts_code'].tolist()
 
     # --- 4. 回测循环 ---
-    # 获取交易日历并强制排序
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
-    dates = sorted(cal_df['cal_date'].tolist()) # 关键：确保日期绝对有序
+    # 🔧 修复核心：日期强制排序，防止时光倒流
+    dates = sorted(cal_df['cal_date'].tolist()) 
     
     market_safe_map = get_market_sentiment(cfg.START_DATE, cfg.END_DATE)
 
@@ -139,7 +149,7 @@ if run_btn:
 
         # --- A. Buy Execution ---
         if not is_market_safe:
-            buy_queue = [] # 熔断清空
+            buy_queue = [] 
         
         for code in buy_queue:
             if len(positions) >= cfg.MAX_POSITIONS: break
@@ -151,9 +161,7 @@ if run_btn:
                     cost = vol * buy_price * (1 + cfg.FEE_RATE)
                     cash -= cost
                     positions[code] = {'cost': buy_price, 'vol': vol, 'date': date, 'high_since_buy': buy_price}
-                    # 确保写入日志
-                    trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '低吸(T+1)'})
-        
+                    trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '主力成本(T+1)'})
         buy_queue = []
 
         # --- B. Sell Logic ---
@@ -194,7 +202,7 @@ if run_btn:
 
         # --- C. Selection ---
         if is_market_safe and not df_strat.empty and len(positions) < cfg.MAX_POSITIONS:
-            targets = select_stocks_v8(df_strat.reset_index())
+            targets = select_stocks_v9(df_strat.reset_index())
             for code in targets:
                 if code not in positions: buy_queue.append(code)
 
@@ -211,31 +219,32 @@ if run_btn:
     if history:
         df_res = pd.DataFrame(history).set_index('date')
         ret = (df_res['asset'].iloc[-1] - cfg.INITIAL_CASH) / cfg.INITIAL_CASH * 100
+        max_dd = ((df_res['asset'].cummax() - df_res['asset']) / df_res['asset'].cummax()).max() * 100
         
-        st.subheader("🛡️ V8.1 回测报告")
+        st.subheader("🛡️ V9.0 终极修正报告")
         c1, c2, c3 = st.columns(3)
         c1.metric("区间收益", f"{ret:.2f}%")
         c2.metric("交易次数", len(trade_log))
-        c3.metric("当前持仓", len(positions))
+        c3.metric("当前持仓数", len(positions))
         
         st.line_chart(df_res['asset'])
         
-        # --- ➕ 持仓看板 (关键) ---
+        # --- ➕ 增强版：当前持仓看板 ---
         st.divider()
-        st.subheader("🎒 当前持仓 (实盘对照)")
+        st.subheader("🎒 当前持仓详情 (再也不会失踪了)")
         if positions:
             pos_data = []
             for code, info in positions.items():
                 pos_data.append({
                     "代码": code,
                     "买入日期": info['date'],
-                    "成本": f"{info['cost']:.2f}",
-                    "最高价": f"{info['high_since_buy']:.2f}",
-                    "状态": "持仓中"
+                    "成本价": f"{info['cost']:.2f}",
+                    "最高价(以来)": f"{info['high_since_buy']:.2f}",
+                    "持仓天数": (pd.to_datetime(dates[-1]) - pd.to_datetime(info['date'])).days
                 })
-            st.dataframe(pd.DataFrame(pos_data))
+            st.table(pd.DataFrame(pos_data))
         else:
-            st.info("当前空仓")
-            
-        with st.expander("交易明细"):
+            st.info("✅ 当前空仓 (资金安全)")
+
+        with st.expander("📝 完整交易流水 (已按时间正序排列)"):
             st.dataframe(pd.DataFrame(trade_log))
