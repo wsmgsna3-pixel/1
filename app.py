@@ -2,25 +2,24 @@ import streamlit as st
 import tushare as ts
 import pandas as pd
 import numpy as np
-from datetime import timedelta
 
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V14 黄金狙击", layout="wide")
-st.title("🏆 V14.0 黄金狙击版 (高胜率+快周转)")
+st.set_page_config(page_title="V14.1 自由定制", layout="wide")
+st.title("🔧 V14.1 黄金狙击 (全参数解锁版)")
 st.markdown("""
-### 🌟 终极策略内核：
-1.  **精准低吸**：主力成本线 + 15% 宽松区间，不错过强势回调。
-2.  **拒绝死拿**：持股上限缩减至 **10天**。主力不拉，我们这就走。
-3.  **严谨风控**：T+1 冻结机制 + MA20 大盘熔断。
+### 🔓 新增控制权：
+1.  **时间控制**：持股天数由您定。
+2.  **选股偏好**：可过滤 **小市值** 或 **高价股**。
+3.  **核心逻辑**：依然保持 V14 的高胜率低吸内核。
 """)
 
 # ==========================================
-# 侧边栏
+# 侧边栏 (参数全家桶)
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 黄金参数")
+    st.header("⚙️ 核心参数")
     my_token = st.text_input("Tushare Token", type="password")
     
     start_date = st.text_input("开始日期", value="20250101")
@@ -28,14 +27,24 @@ with st.sidebar:
     initial_cash = st.slider("初始资金 (万)", 10, 500, 20) * 10000
     
     st.divider()
-    max_pos = st.slider("持仓上限", 2, 5, 3) 
-    stop_loss = st.slider("硬止损", -10.0, -3.0, -8.0) / 100.0
+    st.subheader("🕹️ 交易节奏")
+    max_pos = st.slider("持仓上限 (只)", 2, 5, 3, help="建议保持3只")
+    # === 新增：持股天数调整 ===
+    max_hold_days = st.slider("最长持股 (天)", 5, 30, 10, help="超过这个时间不涨就换股")
     
-    st.subheader("移动止盈")
-    start_trailing = st.slider("启动阈值", 5, 20, 8) / 100.0
-    drawdown_limit = st.slider("允许回撤", 1, 10, 3) / 100.0
+    st.divider()
+    st.subheader("🎯 选股偏好")
+    # === 新增：市值和价格过滤 ===
+    min_circ_mv = st.slider("最小流通市值 (亿)", 10, 200, 30) * 10000 # 转换为万元
+    max_price = st.slider("最高股价限制 (元)", 20, 300, 200, help="不买超过这个价格的股票")
+    
+    st.divider()
+    st.subheader("🛡️ 风控参数")
+    stop_loss = st.slider("硬止损 (%)", -10.0, -3.0, -5.0) / 100.0
+    start_trailing = st.slider("止盈启动 (%)", 5, 20, 8) / 100.0
+    drawdown_limit = st.slider("允许回撤 (%)", 1, 10, 3) / 100.0
 
-run_btn = st.button("🚀 启动 V14 终极版", type="primary", use_container_width=True)
+run_btn = st.button("🚀 启动定制回测", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -57,14 +66,16 @@ if run_btn:
         MAX_POSITIONS = max_pos
         STOP_LOSS = stop_loss
         FEE_RATE = 0.0003
-        # V14 核心调整：10天不涨就换股
-        MAX_HOLD_DAYS = 10 
+        # 参数对接
+        MAX_HOLD_DAYS = max_hold_days
+        MIN_CIRC_MV = min_circ_mv
+        MAX_PRICE = max_price
         TRAIL_START = start_trailing
         TRAIL_DROP = drawdown_limit
 
     cfg = Config()
 
-    # --- 1. 获取大盘 (MA20 稳健风控) ---
+    # --- 1. 获取大盘 ---
     @st.cache_data(ttl=86400, persist=True)
     def get_market_sentiment(start, end):
         try:
@@ -99,21 +110,24 @@ if run_btn:
         except:
             return pd.DataFrame()
 
-    def select_stocks_v14(df):
+    # --- 选股逻辑 (加入市值和价格过滤) ---
+    def select_stocks_v14_custom(df):
         if df.empty: return []
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
         
-        # V14 黄金标准：
-        # 1. 放宽至 15% (不错过)
-        # 2. 依然坚持低吸 (不追高)
+        # 评分展示
+        df['rank_score'] = df['bias'].apply(lambda x: 100 - (x + 0.03) * 200)
+
         condition = (
             (df['bias'] > -0.03) & (df['bias'] < 0.15) & 
             (df['winner_rate'] < 70) &
-            (df['circ_mv'] > 300000) &  
+            # === 新增过滤条件 ===
+            (df['circ_mv'] > cfg.MIN_CIRC_MV) &       # 侧边栏控制市值
+            (df['close'] < cfg.MAX_PRICE) &           # 侧边栏控制股价
+            # ===================
             (df['turnover_rate'] > 1.5)
         )
-        # 优先买 乖离率低 的 (越跌越买)
-        return df[condition].sort_values('bias', ascending=True).head(5)['ts_code'].tolist()
+        return df[condition].sort_values('bias', ascending=True).head(5)
 
     # --- 4. 回测循环 ---
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
@@ -139,16 +153,14 @@ if run_btn:
         price_map_open = {}
         price_map_close = {}
         price_map_high = {}
-        price_map_low = {}
-
+        
         if not df_price.empty:
             df_price = df_price.set_index('ts_code')
             price_map_open = df_price['open'].to_dict()
             price_map_close = df_price['close'].to_dict()
             price_map_high = df_price['high'].to_dict()
-            price_map_low = df_price['low'].to_dict()
-
-        # 1. Sell Logic (严谨 T+1)
+        
+        # 1. Sell Logic
         codes_to_sell = []
         current_date_obj = pd.to_datetime(date)
 
@@ -158,7 +170,6 @@ if run_btn:
             if code in price_map_close:
                 curr_price = price_map_close[code]
                 high_today = price_map_high.get(code, curr_price)
-                low_today = price_map_low.get(code, curr_price)
                 
                 if high_today > pos['high_since_buy']: pos['high_since_buy'] = high_today
                 
@@ -170,13 +181,14 @@ if run_btn:
                 reason = ""
                 sell_price = curr_price
                 
-                if (low_today - cost) / cost <= cfg.STOP_LOSS:
+                if (curr_price - cost) / cost <= cfg.STOP_LOSS: 
                     reason = "止损"
                     sell_price = cost * (1 + cfg.STOP_LOSS)
                 elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
                     reason = f"移动止盈({drawdown*100:.1f}%)"
+                # === 使用动态的超时天数 ===
                 elif (current_date_obj - pd.to_datetime(pos['date'])).days >= cfg.MAX_HOLD_DAYS:
-                    reason = "超时换股(10天)"
+                    reason = f"超时换股({cfg.MAX_HOLD_DAYS}天)"
                 
                 if reason:
                     revenue = pos['vol'] * sell_price * (1 - cfg.FEE_RATE)
@@ -187,7 +199,7 @@ if run_btn:
         
         for c in codes_to_sell: del positions[c]
 
-        # 2. Buy Logic (仅大盘安全时)
+        # 2. Buy Logic
         if not is_market_safe: buy_queue = [] 
         
         for code in buy_queue:
@@ -203,11 +215,12 @@ if run_btn:
                     trade_log.append({'date': date, 'code': code, 'action': 'BUY', 'price': buy_price, 'reason': '低吸(T+1)'})
         buy_queue = []
 
-        # 3. Select
+        # 3. Select (使用新逻辑)
         if is_market_safe and not df_strat.empty and len(positions) < cfg.MAX_POSITIONS:
-            targets = select_stocks_v14(df_strat.reset_index())
-            for code in targets:
-                if code not in positions: buy_queue.append(code)
+            target_df = select_stocks_v14_custom(df_strat.reset_index())
+            for i, row in target_df.iterrows():
+                if row['ts_code'] not in positions: 
+                    buy_queue.append(row['ts_code'])
 
         # 4. Settle
         total = cash
@@ -227,12 +240,12 @@ if run_btn:
         total_sells = len([t for t in trade_log if t['action']=='SELL'])
         win_rate = (wins / total_sells * 100) if total_sells > 0 else 0
         
-        st.subheader("🏆 V14.0 黄金狙击报告")
+        st.subheader("🔧 V14.1 定制版报告")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("区间收益", f"{ret:.2f}%")
         c2.metric("交易次数", len(trade_log))
         c3.metric("真实胜率", f"{win_rate:.1f}%")
-        c4.metric("持仓情况", len(positions))
+        c4.metric("最新持仓", len(positions))
         
         st.line_chart(df_res['asset'])
         with st.expander("交易明细"):
