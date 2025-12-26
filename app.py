@@ -7,13 +7,12 @@ import altair as alt
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V18.5 胜率拯救", layout="wide")
-st.title("🚑 V18.5 胜率拯救计划 (寻找舒适区)")
+st.set_page_config(page_title="V18.5 极速版", layout="wide")
+st.title("🚑 V18.5 胜率拯救 (极速复用缓存版)")
 st.markdown("""
-### 💔 痛点：39% 的胜率无法实盘
-* **原因**：Rank 1 股票波动极大，-5% 的止损线经常被“假摔”击穿。
-* **对策**：测试 **宽止损** 策略。
-* **目标**：找到一个胜率 > 50% 且 期望收益 > 0 的平衡点。
+### ⚡️ 极速模式已激活
+* **机制**：已恢复使用旧版缓存函数，无需重新下载数据。
+* **目标**：测试 **宽止损 (-5% ~ -15%)** 对胜率的影响。
 """)
 
 # ==========================================
@@ -32,7 +31,7 @@ with st.sidebar:
     # === 关键：止损滑块 ===
     st.subheader("🛡️ 止损防线测试")
     stop_loss_input = st.slider("止损线 (-%)", 5.0, 15.0, 5.0, step=0.5, 
-                                help="数值越大，给主力的空间越大。试试调到 8% 或 10%？")
+                                help="数值越大，给主力的空间越大。")
     
     st.caption(f"当前设置：跌破 **-{stop_loss_input}%** 止损")
     
@@ -41,7 +40,7 @@ with st.sidebar:
     TRAIL_DROP_PCT = 3.0
     MAX_HOLD_DAYS = 10
 
-run_btn = st.button("🚀 计算胜率变化", type="primary", use_container_width=True)
+run_btn = st.button("🚀 计算胜率变化 (秒级)", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -69,9 +68,9 @@ if run_btn:
 
     cfg = Config()
 
-    # --- 数据函数 ---
+    # --- 关键：改回老函数名，复用 V18.1 缓存 ---
     @st.cache_data(ttl=60)
-    def get_market_sentiment_v5(start, end):
+    def get_market_sentiment(start, end):
         try:
             real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
             df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
@@ -81,12 +80,12 @@ if run_btn:
         except: return {}
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_price_data_v5(date):
+    def fetch_price_data(date):  # <--- 改回原名
         try: return pro.daily(trade_date=date)
         except: return pd.DataFrame()
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_strategy_data_v5(date):
+    def fetch_strategy_data(date): # <--- 改回原名
         try:
             df_daily = pro.daily(trade_date=date)
             if df_daily.empty: return pd.DataFrame()
@@ -114,7 +113,7 @@ if run_btn:
         return sorted_df.iloc[0]
 
     # --- 回测循环 ---
-    market_safe_map = get_market_sentiment_v5(cfg.START_DATE, cfg.END_DATE)
+    market_safe_map = get_market_sentiment(cfg.START_DATE, cfg.END_DATE)
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
     dates = sorted(cal_df['cal_date'].tolist())
     
@@ -126,10 +125,11 @@ if run_btn:
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
         is_market_safe = market_safe_map.get(date, False) 
-        status_box.text(f"Testing StopLoss {stop_loss_input}%: {date}")
+        status_box.text(f"Scanning: {date}")
 
-        df_price = fetch_price_data_v5(date)
-        df_strat = fetch_strategy_data_v5(date)
+        # 使用旧缓存函数
+        df_price = fetch_price_data(date)
+        df_strat = fetch_strategy_data(date)
         
         price_map_open = {}
         price_map_close = {}
@@ -170,10 +170,9 @@ if run_btn:
                 reason = ""
                 sell_price = curr_price
                 
-                # === 核心：使用动态止损 cfg.STOP_LOSS ===
+                # === 动态止损逻辑 ===
                 if (low_today - cost) / cost <= cfg.STOP_LOSS:
                     reason = "止损"
-                    # 这里模拟：一旦触碰止损线，立即成交
                     sell_price = cost * (1 + cfg.STOP_LOSS)
                 elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
                     reason = "止盈"
@@ -223,26 +222,12 @@ if run_btn:
         st.subheader(f"🛡️ 止损 {stop_loss_input}% 测试结果")
         
         c1, c2, c3 = st.columns(3)
-        c1.metric("真实胜率", f"{win_rate:.1f}%", delta=f"比39%提升了 {win_rate-39:.1f}%" if win_rate>39 else "无提升")
-        c2.metric("单笔期望", f"{avg_ret:.2f}%", help="如果这个数还是正的，且胜率上去了，那就成功了！")
-        c3.metric("止损触发率", f"{stop_loss_counts/total_trades*100:.1f}%", help="有多少单子是被止损打掉的")
+        c1.metric("真实胜率", f"{win_rate:.1f}%")
+        c2.metric("单笔期望", f"{avg_ret:.2f}%")
+        c3.metric("止损触发率", f"{stop_loss_counts/total_trades*100:.1f}%")
         
         st.divider()
         if win_rate > 50:
-            st.success(f"✅ 成功！当止损放宽到 -{stop_loss_input}% 时，胜率突破了 50%！这才是适合人类操作的策略。")
+            st.success(f"✅ 胜率突破 50%！当前设置为：-{stop_loss_input}%")
         else:
-            st.warning(f"⚠️ 胜率依然不足 50%。 Rank 1 的波动可能超乎想象，请尝试继续放宽，或者我们需要换 Rank 2-5 了。")
-            
-        # 胜率 vs 收益 散点图
-        st.subheader("📊 盈亏分布图")
-        chart = alt.Chart(df_res).mark_circle(size=60).encode(
-            x=alt.X('return_pct', title='单笔收益 (%)'),
-            y='count()',
-            color=alt.condition(
-                alt.datum.return_pct > 0,
-                alt.value("#d32f2f"),
-                alt.value("#2e7d32")
-            ),
-            tooltip=['code', 'buy_date', 'return_pct', 'reason']
-        )
-        st.altair_chart(chart, use_container_width=True)
+            st.warning(f"⚠️ 胜率仍为 {win_rate:.1f}%。")
