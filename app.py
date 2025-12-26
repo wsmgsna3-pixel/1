@@ -7,35 +7,41 @@ import altair as alt
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V18.4 决战高开", layout="wide")
-st.title("🧪 V18.4 黄金实验室 (数据强制修复版)")
+st.set_page_config(page_title="V18.5 胜率拯救", layout="wide")
+st.title("🚑 V18.5 胜率拯救计划 (寻找舒适区)")
 st.markdown("""
-### 🕵️‍♂️ 决战时刻：抓捕“高开龙”
-* **修复机制**：强制刷新所有缓存数据，确保 `pre_close` (昨收价) 100% 准确。
-* **实验目标**：揭开 **Gap > 0** (高开) 的真实收益率面纱。
-* **预期**：如果高开组胜率 > 60%，这就是策略的最后一块拼图！
+### 💔 痛点：39% 的胜率无法实盘
+* **原因**：Rank 1 股票波动极大，-5% 的止损线经常被“假摔”击穿。
+* **对策**：测试 **宽止损** 策略。
+* **目标**：找到一个胜率 > 50% 且 期望收益 > 0 的平衡点。
 """)
 
 # ==========================================
 # 侧边栏
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 实验参数")
+    st.header("⚙️ 核心参数")
     my_token = st.text_input("Tushare Token", type="password")
     
     start_date = st.text_input("开始日期", value="20240504")
     end_date = st.text_input("结束日期", value="20251226")
     
     st.divider()
-    st.success("🔒 价格锁定: 11.0 - 20.0 元")
+    st.success("🔒 黄金区间: 11.0 - 20.0 元")
     
-    # 基础策略参数
-    STOP_LOSS_PCT = 5.0
-    TRAIL_START_PCT = 8.0
+    # === 关键：止损滑块 ===
+    st.subheader("🛡️ 止损防线测试")
+    stop_loss_input = st.slider("止损线 (-%)", 5.0, 15.0, 5.0, step=0.5, 
+                                help="数值越大，给主力的空间越大。试试调到 8% 或 10%？")
+    
+    st.caption(f"当前设置：跌破 **-{stop_loss_input}%** 止损")
+    
+    # 其他固定参数
+    TRAIL_START_PCT = 8.0 
     TRAIL_DROP_PCT = 3.0
     MAX_HOLD_DAYS = 10
 
-run_btn = st.button("🚀 启动最终验证", type="primary", use_container_width=True)
+run_btn = st.button("🚀 计算胜率变化", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -54,7 +60,8 @@ if run_btn:
         END_DATE = end_date
         MIN_PRICE = 11.0
         MAX_PRICE = 20.0
-        STOP_LOSS = - (STOP_LOSS_PCT / 100.0) - 0.0001
+        # 动态止损
+        STOP_LOSS = - (stop_loss_input / 100.0) - 0.0001
         TRAIL_START = TRAIL_START_PCT / 100.0
         TRAIL_DROP = TRAIL_DROP_PCT / 100.0
         MAX_HOLD_DAYS = MAX_HOLD_DAYS
@@ -62,9 +69,9 @@ if run_btn:
 
     cfg = Config()
 
-    # --- 数据函数 (重命名以强制刷新缓存) ---
+    # --- 数据函数 ---
     @st.cache_data(ttl=60)
-    def get_market_sentiment_v4(start, end):
+    def get_market_sentiment_v5(start, end):
         try:
             real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
             df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
@@ -74,18 +81,12 @@ if run_btn:
         except: return {}
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_price_data_v4(date):
-        # 强制获取 pre_close
-        try: 
-            df = pro.daily(trade_date=date)
-            # 简单清洗，确保 columns 存在
-            if 'pre_close' not in df.columns:
-                return pd.DataFrame()
-            return df
+    def fetch_price_data_v5(date):
+        try: return pro.daily(trade_date=date)
         except: return pd.DataFrame()
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_strategy_data_v4(date):
+    def fetch_strategy_data_v5(date):
         try:
             df_daily = pro.daily(trade_date=date)
             if df_daily.empty: return pd.DataFrame()
@@ -113,31 +114,27 @@ if run_btn:
         return sorted_df.iloc[0]
 
     # --- 回测循环 ---
-    market_safe_map = get_market_sentiment_v4(cfg.START_DATE, cfg.END_DATE)
+    market_safe_map = get_market_sentiment_v5(cfg.START_DATE, cfg.END_DATE)
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
     dates = sorted(cal_df['cal_date'].tolist())
     
     active_signals = [] 
     finished_signals = [] 
-    
-    # 调试计数器
-    debug_gap_calc_count = 0
 
     progress_bar = st.progress(0)
     
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
         is_market_safe = market_safe_map.get(date, False) 
-        status_box.text(f"Scanning: {date} | Gap Calc: {debug_gap_calc_count}")
+        status_box.text(f"Testing StopLoss {stop_loss_input}%: {date}")
 
-        df_price = fetch_price_data_v4(date)
-        df_strat = fetch_strategy_data_v4(date)
+        df_price = fetch_price_data_v5(date)
+        df_strat = fetch_strategy_data_v5(date)
         
         price_map_open = {}
         price_map_close = {}
         price_map_high = {}
         price_map_low = {}
-        price_map_pre_close = {} 
         
         if not df_price.empty:
             df_price = df_price.set_index('ts_code')
@@ -145,7 +142,6 @@ if run_btn:
             price_map_close = df_price['close'].to_dict()
             price_map_high = df_price['high'].to_dict()
             price_map_low = df_price['low'].to_dict()
-            price_map_pre_close = df_price['pre_close'].to_dict()
         
         # 1. 更新信号
         signals_still_active = []
@@ -153,20 +149,9 @@ if run_btn:
         
         for sig in active_signals:
             code = sig['code']
-            
-            # 补全 Gap 数据
             if current_date_obj <= pd.to_datetime(sig['buy_date']):
                 if code in price_map_high:
                      sig['highest'] = max(sig['highest'], price_map_high[code])
-                
-                # === 强制计算 Gap ===
-                if sig['gap'] is None:
-                    if code in price_map_open and code in price_map_pre_close:
-                        open_p = price_map_open[code]
-                        pre_c = price_map_pre_close[code]
-                        sig['gap'] = (open_p - pre_c) / pre_c * 100
-                        debug_gap_calc_count += 1
-                
                 signals_still_active.append(sig)
                 continue
 
@@ -185,8 +170,10 @@ if run_btn:
                 reason = ""
                 sell_price = curr_price
                 
+                # === 核心：使用动态止损 cfg.STOP_LOSS ===
                 if (low_today - cost) / cost <= cfg.STOP_LOSS:
                     reason = "止损"
+                    # 这里模拟：一旦触碰止损线，立即成交
                     sell_price = cost * (1 + cfg.STOP_LOSS)
                 elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
                     reason = "止盈"
@@ -198,8 +185,7 @@ if run_btn:
                     ret = (sell_price - cost) / cost - cfg.FEE_RATE * 2
                     finished_signals.append({
                         'code': code, 'buy_date': sig['buy_date'],
-                        'return': ret, 'reason': reason,
-                        'gap': sig['gap']
+                        'return': ret, 'reason': reason
                     })
                 else:
                     signals_still_active.append(sig)
@@ -216,8 +202,7 @@ if run_btn:
                 if code in price_map_open:
                     active_signals.append({
                         'code': code, 'buy_date': date,
-                        'buy_price': price_map_open[code], 'highest': price_map_open[code],
-                        'gap': None 
+                        'buy_price': price_map_open[code], 'highest': price_map_open[code]
                     })
 
     # --- 结果展示 ---
@@ -228,34 +213,36 @@ if run_btn:
         df_res = pd.DataFrame(finished_signals)
         df_res['return_pct'] = df_res['return'] * 100
         
-        # 显式统计缺失情况
-        missing_gap_count = df_res['gap'].isna().sum()
-        df_res['gap'] = df_res['gap'].fillna(0) # 仅用于画图，不影响High组
+        total_trades = len(df_res)
+        win_trades = len(df_res[df_res['return'] > 0])
+        win_rate = win_trades / total_trades * 100
+        avg_ret = df_res['return'].mean() * 100
         
-        df_high = df_res[df_res['gap'] > 0]
-        df_low = df_res[df_res['gap'] <= 0]
+        stop_loss_counts = len(df_res[df_res['reason']=='止损'])
         
-        st.subheader(f"🧠 最终情绪分析 (11-20元)")
-        st.info(f"数据体检：成功计算Gap {len(df_res) - missing_gap_count} 笔，缺失 {missing_gap_count} 笔。")
+        st.subheader(f"🛡️ 止损 {stop_loss_input}% 测试结果")
         
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("真实胜率", f"{win_rate:.1f}%", delta=f"比39%提升了 {win_rate-39:.1f}%" if win_rate>39 else "无提升")
+        c2.metric("单笔期望", f"{avg_ret:.2f}%", help="如果这个数还是正的，且胜率上去了，那就成功了！")
+        c3.metric("止损触发率", f"{stop_loss_counts/total_trades*100:.1f}%", help="有多少单子是被止损打掉的")
         
-        with c1:
-            st.error(f"🔥 高开组 (Gap > 0)")
-            if not df_high.empty:
-                high_win = len(df_high[df_high['return']>0]) / len(df_high) * 100
-                high_avg = df_high['return'].mean() * 100
-                st.metric("胜率", f"{high_win:.1f}%", delta="VS 低开")
-                st.metric("期望收益", f"{high_avg:.2f}%")
-                st.metric("样本数", f"{len(df_high)}")
-            else:
-                st.write("依然无高开数据？(那可能真是策略选不到)")
-                
-        with c2:
-            st.success(f"🧊 低开组 (Gap ≤ 0)")
-            if not df_low.empty:
-                low_win = len(df_low[df_low['return']>0]) / len(df_low) * 100
-                low_avg = df_low['return'].mean() * 100
-                st.metric("胜率", f"{low_win:.1f}%")
-                st.metric("期望收益", f"{low_avg:.2f}%")
-                st.metric("样本数", f"{len(df_low)}")
+        st.divider()
+        if win_rate > 50:
+            st.success(f"✅ 成功！当止损放宽到 -{stop_loss_input}% 时，胜率突破了 50%！这才是适合人类操作的策略。")
+        else:
+            st.warning(f"⚠️ 胜率依然不足 50%。 Rank 1 的波动可能超乎想象，请尝试继续放宽，或者我们需要换 Rank 2-5 了。")
+            
+        # 胜率 vs 收益 散点图
+        st.subheader("📊 盈亏分布图")
+        chart = alt.Chart(df_res).mark_circle(size=60).encode(
+            x=alt.X('return_pct', title='单笔收益 (%)'),
+            y='count()',
+            color=alt.condition(
+                alt.datum.return_pct > 0,
+                alt.value("#d32f2f"),
+                alt.value("#2e7d32")
+            ),
+            tooltip=['code', 'buy_date', 'return_pct', 'reason']
+        )
+        st.altair_chart(chart, use_container_width=True)
