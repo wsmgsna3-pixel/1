@@ -7,12 +7,12 @@ import altair as alt
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V18.5 极速版", layout="wide")
-st.title("🚑 V18.5 胜率拯救 (极速复用缓存版)")
+st.set_page_config(page_title="V18.6 缓存借用版", layout="wide")
+st.title("🚑 V18.6 胜率拯救 (借用 V18.4 缓存)")
 st.markdown("""
-### ⚡️ 极速模式已激活
-* **机制**：已恢复使用旧版缓存函数，无需重新下载数据。
-* **目标**：测试 **宽止损 (-5% ~ -15%)** 对胜率的影响。
+### ⚡️ 极速复活
+* **机制**：直接读取您刚才在 V18.4 中下载好的数据。
+* **目标**：立刻测试 **宽止损 (-5% ~ -15%)** 能否将胜率拉回 50%。
 """)
 
 # ==========================================
@@ -31,7 +31,7 @@ with st.sidebar:
     # === 关键：止损滑块 ===
     st.subheader("🛡️ 止损防线测试")
     stop_loss_input = st.slider("止损线 (-%)", 5.0, 15.0, 5.0, step=0.5, 
-                                help="数值越大，给主力的空间越大。")
+                                help="数值越大，给主力的空间越大。建议从 8.0 开始测。")
     
     st.caption(f"当前设置：跌破 **-{stop_loss_input}%** 止损")
     
@@ -40,7 +40,7 @@ with st.sidebar:
     TRAIL_DROP_PCT = 3.0
     MAX_HOLD_DAYS = 10
 
-run_btn = st.button("🚀 计算胜率变化 (秒级)", type="primary", use_container_width=True)
+run_btn = st.button("🚀 计算胜率 (秒级)", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -68,9 +68,9 @@ if run_btn:
 
     cfg = Config()
 
-    # --- 关键：改回老函数名，复用 V18.1 缓存 ---
+    # --- 关键：使用 _v4 后缀，借用 V18.4 的缓存 ---
     @st.cache_data(ttl=60)
-    def get_market_sentiment(start, end):
+    def get_market_sentiment_v4(start, end):
         try:
             real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
             df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
@@ -80,12 +80,17 @@ if run_btn:
         except: return {}
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_price_data(date):  # <--- 改回原名
-        try: return pro.daily(trade_date=date)
+    def fetch_price_data_v4(date):  
+        # 复用 V18.4 的缓存
+        try: 
+            df = pro.daily(trade_date=date)
+            # 为了兼容性，不管有没有 pre_close 都返回
+            return df
         except: return pd.DataFrame()
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_strategy_data(date): # <--- 改回原名
+    def fetch_strategy_data_v4(date): 
+        # 复用 V18.4 的缓存
         try:
             df_daily = pro.daily(trade_date=date)
             if df_daily.empty: return pd.DataFrame()
@@ -113,7 +118,7 @@ if run_btn:
         return sorted_df.iloc[0]
 
     # --- 回测循环 ---
-    market_safe_map = get_market_sentiment(cfg.START_DATE, cfg.END_DATE)
+    market_safe_map = get_market_sentiment_v4(cfg.START_DATE, cfg.END_DATE)
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
     dates = sorted(cal_df['cal_date'].tolist())
     
@@ -125,11 +130,11 @@ if run_btn:
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
         is_market_safe = market_safe_map.get(date, False) 
-        status_box.text(f"Scanning: {date}")
+        status_box.text(f"Testing StopLoss {stop_loss_input}%: {date}")
 
-        # 使用旧缓存函数
-        df_price = fetch_price_data(date)
-        df_strat = fetch_strategy_data(date)
+        # 使用 _v4 函数
+        df_price = fetch_price_data_v4(date)
+        df_strat = fetch_strategy_data_v4(date)
         
         price_map_open = {}
         price_map_close = {}
@@ -170,7 +175,7 @@ if run_btn:
                 reason = ""
                 sell_price = curr_price
                 
-                # === 动态止损逻辑 ===
+                # === 动态止损 ===
                 if (low_today - cost) / cost <= cfg.STOP_LOSS:
                     reason = "止损"
                     sell_price = cost * (1 + cfg.STOP_LOSS)
@@ -230,4 +235,4 @@ if run_btn:
         if win_rate > 50:
             st.success(f"✅ 胜率突破 50%！当前设置为：-{stop_loss_input}%")
         else:
-            st.warning(f"⚠️ 胜率仍为 {win_rate:.1f}%。")
+            st.warning(f"⚠️ 胜率仍为 {win_rate:.1f}%。请继续尝试放宽止损。")
