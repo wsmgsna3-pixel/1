@@ -7,12 +7,13 @@ import altair as alt
 # ==========================================
 # 页面配置
 # ==========================================
-st.set_page_config(page_title="V18.6 缓存借用版", layout="wide")
-st.title("🚑 V18.6 胜率拯救 (借用 V18.4 缓存)")
+st.set_page_config(page_title="V18.7 最终稳定版", layout="wide")
+st.title("🛡️ V18.7 黄金实验室 (宽止损·最终稳定版)")
 st.markdown("""
-### ⚡️ 极速复活
-* **机制**：直接读取您刚才在 V18.4 中下载好的数据。
-* **目标**：立刻测试 **宽止损 (-5% ~ -15%)** 能否将胜率拉回 50%。
+### 📝 明日行动指南
+1.  **首次运行**：请手动清除缓存 (Clear Cache)，耐心等待数据下载 (约1小时)。
+2.  **快速测试**：数据下载完成后，**拖动左侧止损滑块**，结果将秒级更新。
+3.  **核心目标**：找到让胜率 > 50% 的那个止损点 (可能是 -8% 或 -10%)。
 """)
 
 # ==========================================
@@ -30,8 +31,8 @@ with st.sidebar:
     
     # === 关键：止损滑块 ===
     st.subheader("🛡️ 止损防线测试")
-    stop_loss_input = st.slider("止损线 (-%)", 5.0, 15.0, 5.0, step=0.5, 
-                                help="数值越大，给主力的空间越大。建议从 8.0 开始测。")
+    stop_loss_input = st.slider("止损线 (-%)", 5.0, 15.0, 8.0, step=0.5, 
+                                help="数值越大，给主力的空间越大。建议直接从 8.0% 开始测。")
     
     st.caption(f"当前设置：跌破 **-{stop_loss_input}%** 止损")
     
@@ -40,7 +41,7 @@ with st.sidebar:
     TRAIL_DROP_PCT = 3.0
     MAX_HOLD_DAYS = 10
 
-run_btn = st.button("🚀 计算胜率 (秒级)", type="primary", use_container_width=True)
+run_btn = st.button("🚀 启动回测 (首次需等待)", type="primary", use_container_width=True)
 
 if run_btn:
     if not my_token:
@@ -68,9 +69,9 @@ if run_btn:
 
     cfg = Config()
 
-    # --- 关键：使用 _v4 后缀，借用 V18.4 的缓存 ---
-    @st.cache_data(ttl=60)
-    def get_market_sentiment_v4(start, end):
+    # --- 标准函数名 (保证缓存稳定) ---
+    @st.cache_data(ttl=86400) # 24小时缓存
+    def get_market_sentiment_final(start, end):
         try:
             real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
             df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
@@ -80,17 +81,12 @@ if run_btn:
         except: return {}
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_price_data_v4(date):  
-        # 复用 V18.4 的缓存
-        try: 
-            df = pro.daily(trade_date=date)
-            # 为了兼容性，不管有没有 pre_close 都返回
-            return df
+    def fetch_price_data_final(date):  
+        try: return pro.daily(trade_date=date)
         except: return pd.DataFrame()
 
     @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_strategy_data_v4(date): 
-        # 复用 V18.4 的缓存
+    def fetch_strategy_data_final(date): 
         try:
             df_daily = pro.daily(trade_date=date)
             if df_daily.empty: return pd.DataFrame()
@@ -118,7 +114,7 @@ if run_btn:
         return sorted_df.iloc[0]
 
     # --- 回测循环 ---
-    market_safe_map = get_market_sentiment_v4(cfg.START_DATE, cfg.END_DATE)
+    market_safe_map = get_market_sentiment_final(cfg.START_DATE, cfg.END_DATE)
     cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
     dates = sorted(cal_df['cal_date'].tolist())
     
@@ -130,11 +126,10 @@ if run_btn:
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
         is_market_safe = market_safe_map.get(date, False) 
-        status_box.text(f"Testing StopLoss {stop_loss_input}%: {date}")
+        status_box.text(f"Scanning: {date}")
 
-        # 使用 _v4 函数
-        df_price = fetch_price_data_v4(date)
-        df_strat = fetch_strategy_data_v4(date)
+        df_price = fetch_price_data_final(date)
+        df_strat = fetch_strategy_data_final(date)
         
         price_map_open = {}
         price_map_close = {}
@@ -235,4 +230,17 @@ if run_btn:
         if win_rate > 50:
             st.success(f"✅ 胜率突破 50%！当前设置为：-{stop_loss_input}%")
         else:
-            st.warning(f"⚠️ 胜率仍为 {win_rate:.1f}%。请继续尝试放宽止损。")
+            st.warning(f"⚠️ 胜率仍为 {win_rate:.1f}%。")
+        
+        st.subheader("📊 盈亏分布")
+        chart = alt.Chart(df_res).mark_circle(size=60).encode(
+            x=alt.X('return_pct', title='单笔收益 (%)'),
+            y='count()',
+            color=alt.condition(
+                alt.datum.return_pct > 0,
+                alt.value("#d32f2f"),
+                alt.value("#2e7d32")
+            ),
+            tooltip=['code', 'buy_date', 'return_pct', 'reason']
+        ).interactive()
+        st.altair_chart(chart, use_container_width=True)
