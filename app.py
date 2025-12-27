@@ -10,72 +10,80 @@ from datetime import datetime, timedelta
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V33.1 终极修正版", layout="wide")
+st.set_page_config(page_title="V33.3 稳健增强版", layout="wide")
 
 # ==========================================
-# 2. 侧边栏：系统维护 & 版本验证
+# 2. 侧边栏：系统维护
 # ==========================================
 st.sidebar.header("🛠️ 系统控制台")
+st.sidebar.success("✅ 当前版本：V33.3 (超时修复版)")
 
-# --- 版本验证区 (如果您看不到这个，说明还是旧版) ---
-st.sidebar.success("✅ 当前运行版本：V33.1")
-st.sidebar.info("📅 日期算法：已启用强排序逻辑")
-
-# --- 强制重置按钮 ---
-if st.sidebar.button("🔥 强制重置系统 (缓存清理)", type="primary"):
+# 仅保留缓存清理，不含强制重启
+if st.sidebar.button("🧹 清理缓存 (数据卡顿时用)", type="primary"):
     st.cache_data.clear()
     st.cache_resource.clear()
     st.rerun()
 
 # ==========================================
-# 3. 全局缓存与智能工具
+# 3. 全局缓存与网络增强
 # ==========================================
+
+# --- 核心修复：带重试机制的 API 初始化 ---
 @st.cache_resource
 def get_pro_api(token):
     if not token: return None
     ts.set_token(token)
-    return ts.pro_api()
+    # timeout=60：将超时时间延长到 60秒，防止 Tushare 繁忙时报错
+    return ts.pro_api(timeout=60)
 
-# --- 修复核心：强逻辑日期回溯 ---
+# --- 辅助工具：API 重试装饰器 ---
+def retry_api_call(func, *args, retries=3, **kwargs):
+    """
+    如果 API 调用超时，自动重试 3 次，防止直接报错崩溃。
+    """
+    for i in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if i == retries - 1: # 最后一次尝试也失败
+                st.error(f"网络连接失败，请检查 Token 或稍后重试。错误: {e}")
+                return pd.DataFrame() # 返回空表避免 Crash
+            time.sleep(1) # 休息1秒再重试
+    return pd.DataFrame()
+
+# --- 强逻辑日期回溯 ---
 def get_latest_trade_date(_pro, curr_date_str):
-    """
-    智能寻找最近的交易日 (强排序版)。
-    解决 Tushare 数据乱序导致回溯到 10月28日 的问题。
-    """
     try:
-        # 1. 往前找 60 天的日历
+        # 1. 往前找 60 天
         end_dt = pd.to_datetime(curr_date_str)
         start_dt = end_dt - timedelta(days=60)
         
-        df = _pro.trade_cal(exchange='', start_date=start_dt.strftime('%Y%m%d'), 
+        # 使用重试机制调用
+        df = retry_api_call(_pro.trade_cal, exchange='', start_date=start_dt.strftime('%Y%m%d'), 
                             end_date=curr_date_str, is_open='1')
         
-        if df.empty:
-            return curr_date_str
+        if df.empty: return curr_date_str
             
-        # 2. !!! 核心修复：强制按日期倒序排序 !!!
-        # 这样第一行（iloc[0]）永远是离今天最近的那一天
+        # 2. 强制倒序，取最近一天
         df = df.sort_values('cal_date', ascending=False)
-        
-        # 3. 取第一行
-        latest_date = df['cal_date'].iloc[0]
-        return latest_date
-    except Exception as e:
+        return df['cal_date'].iloc[0]
+    except Exception:
         return curr_date_str
 
 @st.cache_data(ttl=86400 * 7)
 def fetch_daily_atomic_data(date, _pro):
     if _pro is None: return {}
     try:
-        df_daily = _pro.daily(trade_date=date)
-        df_basic = _pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
-        df_names = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
+        # 使用重试机制包裹每一个关键请求
+        df_daily = retry_api_call(_pro.daily, trade_date=date)
+        df_basic = retry_api_call(_pro.daily_basic, trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
+        df_names = retry_api_call(_pro.stock_basic, exchange='', list_status='L', fields='ts_code,name,industry')
         
-        df_cyq = _pro.cyq_perf(trade_date=date)
+        df_cyq = retry_api_call(_pro.cyq_perf, trade_date=date)
         if df_cyq.empty: 
              for i in range(1, 4):
                  prev = (pd.to_datetime(date) - pd.Timedelta(days=i)).strftime('%Y%m%d')
-                 df_cyq = _pro.cyq_perf(trade_date=prev)
+                 df_cyq = retry_api_call(_pro.cyq_perf, trade_date=prev)
                  if not df_cyq.empty: break
         
         return {'daily': df_daily, 'basic': df_basic, 'cyq': df_cyq, 'names': df_names}
@@ -86,7 +94,11 @@ def get_market_sentiment(start, end, _pro):
     if _pro is None: return {}
     try:
         real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
-        df = _pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
+        # 增加重试
+        df = retry_api_call(_pro.index_daily, ts_code='000001.SH', start_date=real_start, end_date=end)
+        
+        if df.empty: return {}
+        
         df = df.sort_values('trade_date', ascending=True)
         df['ma20'] = df['close'].rolling(20).mean()
         return df.set_index('trade_date')['close'].gt(df.set_index('trade_date')['ma20']).to_dict()
@@ -146,7 +158,7 @@ cfg_trail_start = st.sidebar.slider("止盈启动 (+%)", 5.0, 15.0, 8.0, step=0.
 cfg_trail_drop = st.sidebar.slider("回落卖出 (-%)", 1.0, 5.0, 3.0, step=0.5) / 100.0
 stop_loss_decimal = cfg_stop_loss / 100.0
 
-# --- 动态日期 (自动更新为今天) ---
+# 动态日期
 today = datetime.now()
 default_end_date = today.strftime('%Y%m%d')
 default_start_date = f"{today.year}0101"
@@ -159,153 +171,141 @@ end_date = st.sidebar.text_input("结束日期", value=default_end_date)
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V33.1 终极修正版 (日期算法升级)")
+st.title("🚀 V33.3 稳健增强版 (抗网络波动)")
 
 tab1, tab2 = st.tabs(["📡 智能实盘扫描", "🧪 历史分仓回测"])
 
-# --- Tab 1: 智能实盘 ---
 with tab1:
     col_d, col_b = st.columns([3, 1])
     with col_d:
         scan_date_input = st.date_input("选择日期 (支持自动回溯)", value=pd.Timestamp.now())
     scan_date_str = scan_date_input.strftime('%Y%m%d')
     
-    if col_b.button("开始扫描", type="primary", use_container_width=True):
+    if col_b.button("开始扫描", type="primary"):
         if not pro:
             st.error("请先输入 Token")
             st.stop()
-            
-        with st.spinner("正在校对交易日历..."):
-            # 智能修正日期 (V33修复版)
-            real_date_str = get_latest_trade_date(pro, scan_date_str)
-            
-            # 显示日期切换信息
-            if real_date_str != scan_date_str:
-                st.info(f"📅 日期校正：您选择的 **{scan_date_str}** 非交易日，系统已锁定最近的交易日：**{real_date_str}**")
-            
-            # 获取数据
-            snap = fetch_daily_atomic_data(real_date_str, pro)
-            # 运行策略
-            fleet = run_strategy_logic(snap, cfg_min_price, cfg_max_price, cfg_max_turnover, cfg_position_count)
-            
-            if fleet is not None and not fleet.empty:
-                st.success(f"⚓ 成功选出 {len(fleet)} 只标的 (基于 {real_date_str} 数据)")
+        
+        # 增加 try-except 保护
+        try:
+            with st.spinner("智能校对交易日..."):
+                real_date_str = get_latest_trade_date(pro, scan_date_str)
+                if real_date_str != scan_date_str:
+                    st.info(f"📅 自动切换至最近交易日：**{real_date_str}**")
                 
-                st.dataframe(fleet[['ts_code', 'name', 'close', 'bias', 'turnover_rate', 'winner_rate', 'industry']].style.format({
-                    'close': '{:.2f}', 'bias': '{:.4f}', 'turnover_rate': '{:.2f}', 'winner_rate': '{:.1f}'
-                }), hide_index=True)
+                snap = fetch_daily_atomic_data(real_date_str, pro)
+                fleet = run_strategy_logic(snap, cfg_min_price, cfg_max_price, cfg_max_turnover, cfg_position_count)
                 
-                st.info(f"""
-                **📝 交易计划：**
-                1.  **标的**：{', '.join(fleet['name'].tolist())}
-                2.  **买入**：下个交易日开盘买入。
-                3.  **风控**：止损 -{cfg_stop_loss}%，持股 {cfg_max_hold} 天。
-                """)
-            else:
-                st.warning(f"在 {real_date_str} 未找到符合条件的标的。建议适当放宽‘换手率’或‘价格’参数。")
+                if fleet is not None and not fleet.empty:
+                    st.success(f"⚓ 选出 {len(fleet)} 只标的 (基于 {real_date_str})")
+                    st.dataframe(fleet[['ts_code', 'name', 'close', 'bias', 'turnover_rate', 'winner_rate', 'industry']].style.format({
+                        'close': '{:.2f}', 'bias': '{:.4f}', 'turnover_rate': '{:.2f}', 'winner_rate': '{:.1f}'
+                    }), hide_index=True)
+                    st.info(f"**计划**：明日开盘买入，止损 -{cfg_stop_loss}%，持股 {cfg_max_hold} 天。")
+                else:
+                    st.warning(f"在 {real_date_str} 未找到标的。")
+        except Exception as e:
+            st.error(f"扫描过程中发生网络错误，请稍后重试。详细信息: {e}")
 
-# --- Tab 2: 回测 ---
 with tab2:
     if st.button("🚀 运行回测", type="primary", use_container_width=True):
         if not pro:
             st.error("Token 无效")
             st.stop()
             
-        cal_df = pro.trade_cal(exchange='', start_date=start_date, end_date=end_date, is_open='1')
-        dates = sorted(cal_df['cal_date'].tolist())
-        market_safe_map = get_market_sentiment(start_date, end_date, pro)
-        
-        active_signals = [] 
-        finished_signals = [] 
-        
-        progress_bar = st.progress(0)
-        
-        for i, date in enumerate(dates):
-            progress_bar.progress((i + 1) / len(dates))
-            if i % 20 == 0: gc.collect()
+        try:
+            # 这里的 trade_cal 也加上了重试保护
+            cal_df = retry_api_call(pro.trade_cal, exchange='', start_date=start_date, end_date=end_date, is_open='1')
             
-            snap = fetch_daily_atomic_data(date, pro)
-            price_map = {}
-            if snap and not snap['daily'].empty:
-                price_map = snap['daily'].set_index('ts_code')[['open','high','low','close']].to_dict('index')
+            if cal_df.empty:
+                st.error("无法获取交易日历，可能是网络连接问题，请重试。")
+                st.stop()
+                
+            dates = sorted(cal_df['cal_date'].tolist())
+            market_safe_map = get_market_sentiment(start_date, end_date, pro)
             
-            is_market_safe = market_safe_map.get(date, False)
+            active_signals = [] 
+            finished_signals = [] 
+            progress_bar = st.progress(0)
             
-            # 持仓
-            signals_still_active = []
-            curr_dt = pd.to_datetime(date)
-            
-            for sig in active_signals:
-                code = sig['code']
-                if curr_dt <= pd.to_datetime(sig['buy_date']):
-                    if code in price_map: sig['highest'] = max(sig['highest'], price_map[code]['high'])
-                    signals_still_active.append(sig)
-                    continue
+            for i, date in enumerate(dates):
+                progress_bar.progress((i + 1) / len(dates))
+                if i % 20 == 0: gc.collect()
+                
+                snap = fetch_daily_atomic_data(date, pro)
+                price_map = {}
+                if snap and not snap['daily'].empty:
+                    price_map = snap['daily'].set_index('ts_code')[['open','high','low','close']].to_dict('index')
+                
+                is_market_safe = market_safe_map.get(date, False)
+                
+                # 持仓
+                signals_still_active = []
+                curr_dt = pd.to_datetime(date)
+                for sig in active_signals:
+                    code = sig['code']
+                    if curr_dt <= pd.to_datetime(sig['buy_date']):
+                        if code in price_map: sig['highest'] = max(sig['highest'], price_map[code]['high'])
+                        signals_still_active.append(sig)
+                        continue
 
-                if code in price_map:
-                    ph, pl, pc = price_map[code]['high'], price_map[code]['low'], price_map[code]['close']
-                    if ph > sig['highest']: sig['highest'] = ph
-                    
-                    cost = sig['buy_price']
-                    peak = sig['highest']
-                    
-                    reason = ""
-                    sell_p = pc
-                    
-                    if (pl - cost) / cost <= -stop_loss_decimal:
-                        reason = "止损"
-                        sell_p = cost * (1 - stop_loss_decimal)
-                    elif (peak - cost)/cost >= cfg_trail_start and (peak - pc)/peak >= cfg_trail_drop:
-                        reason = "止盈"
-                        sell_p = peak * (1 - cfg_trail_drop)
-                    elif (curr_dt - pd.to_datetime(sig['buy_date'])).days >= cfg_max_hold:
-                        reason = "超时"
-                    
-                    if reason:
-                        ret = (sell_p - cost) / cost - 0.0006
-                        finished_signals.append({
-                            'code': code, 'buy_date': sig['buy_date'], 
-                            'ret': ret, 'reason': reason, 'rank': sig['rank']
-                        })
+                    if code in price_map:
+                        ph, pl, pc = price_map[code]['high'], price_map[code]['low'], price_map[code]['close']
+                        if ph > sig['highest']: sig['highest'] = ph
+                        cost = sig['buy_price']
+                        peak = sig['highest']
+                        reason = ""
+                        sell_p = pc
+                        
+                        if (pl - cost) / cost <= -stop_loss_decimal:
+                            reason = "止损"
+                            sell_p = cost * (1 - stop_loss_decimal)
+                        elif (peak - cost)/cost >= cfg_trail_start and (peak - pc)/peak >= cfg_trail_drop:
+                            reason = "止盈"
+                            sell_p = peak * (1 - cfg_trail_drop)
+                        elif (curr_dt - pd.to_datetime(sig['buy_date'])).days >= cfg_max_hold:
+                            reason = "超时"
+                        
+                        if reason:
+                            ret = (sell_p - cost) / cost - 0.0006
+                            finished_signals.append({'ret': ret, 'rank': sig['rank']})
+                        else:
+                            signals_still_active.append(sig)
                     else:
                         signals_still_active.append(sig)
-                else:
-                    signals_still_active.append(sig)
-            active_signals = signals_still_active
+                active_signals = signals_still_active
+                
+                # 买入
+                if is_market_safe:
+                    fleet = run_strategy_logic(snap, cfg_min_price, cfg_max_price, cfg_max_turnover, cfg_position_count)
+                    if fleet is not None and not fleet.empty:
+                        for rank_idx, (_, row) in enumerate(fleet.iterrows()):
+                            code = row['ts_code']
+                            if code in price_map:
+                                active_signals.append({
+                                    'code': code, 'buy_date': date, 
+                                    'buy_price': price_map[code]['open'], 'highest': price_map[code]['open'],
+                                    'rank': rank_idx + 1
+                                })
             
-            # 买入
-            if is_market_safe:
-                fleet = run_strategy_logic(snap, cfg_min_price, cfg_max_price, cfg_max_turnover, cfg_position_count)
-                if fleet is not None and not fleet.empty:
-                    for rank_idx, (_, row) in enumerate(fleet.iterrows()):
-                        code = row['ts_code']
-                        if code in price_map:
-                            active_signals.append({
-                                'code': code, 'buy_date': date, 
-                                'buy_price': price_map[code]['open'], 'highest': price_map[code]['open'],
-                                'rank': rank_idx + 1
-                            })
-        
-        progress_bar.empty()
-        
-        if finished_signals:
-            df_res = pd.DataFrame(finished_signals)
-            df_res['ret_pct'] = df_res['ret'] * 100
+            progress_bar.empty()
             
-            st.divider()
-            st.markdown(f"### 📊 报告 (Top {cfg_position_count})")
-            
-            avg_ret = df_res['ret'].mean() * 100
-            win_rate = (df_res['ret'] > 0).mean() * 100
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("单笔平均期望", f"{avg_ret:.2f}%")
-            c2.metric("胜率", f"{win_rate:.1f}%")
-            c3.metric("总交易次数", f"{len(df_res)}")
-            
-            st.subheader("🏆 各名次表现")
-            rank_stats = df_res.groupby('rank')['ret_pct'].agg(['count', 'mean', 'sum', lambda x: (x>0).mean()*100])
-            rank_stats.columns = ['交易数', '单笔期望%', '总收益%', '胜率%']
-            st.table(rank_stats.style.format("{:.2f}").background_gradient(subset=['单笔期望%'], cmap='Greens'))
-        else:
-            st.warning("无交易数据")
+            if finished_signals:
+                df_res = pd.DataFrame(finished_signals)
+                df_res['ret_pct'] = df_res['ret'] * 100
+                st.divider()
+                avg_ret = df_res['ret'].mean() * 100
+                win_rate = (df_res['ret'] > 0).mean() * 100
+                c1, c2, c3 = st.columns(3)
+                c1.metric("单笔平均期望", f"{avg_ret:.2f}%")
+                c2.metric("胜率", f"{win_rate:.1f}%")
+                c3.metric("交易次数", f"{len(df_res)}")
+                
+                st.subheader("🏆 各名次表现")
+                rank_stats = df_res.groupby('rank')['ret_pct'].agg(['count', 'mean', 'sum', lambda x: (x>0).mean()*100])
+                rank_stats.columns = ['交易数', '单笔期望%', '总收益%', '胜率%']
+                st.table(rank_stats.style.format("{:.2f}").background_gradient(subset=['单笔期望%'], cmap='Greens'))
+            else:
+                st.warning("无交易数据")
+        except Exception as e:
+            st.error(f"回测过程中发生错误: {e}")
