@@ -3,18 +3,17 @@ import tushare as ts
 import pandas as pd
 import numpy as np
 import altair as alt
-import datetime
 import time
 
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V24.0 原子战舰", layout="wide")
+st.set_page_config(page_title="V25.0 原子战舰", layout="wide")
 
 # ==========================================
 # 2. 侧边栏：极速控制台
 # ==========================================
-st.sidebar.header("🎛️ V24.0 控制台")
+st.sidebar.header("🎛️ 极速参数面板")
 
 # Token
 my_token = st.sidebar.text_input("Tushare Token", type="password")
@@ -23,8 +22,10 @@ st.sidebar.divider()
 
 # --- 选股参数 (热调整：绝不触发重下数据) ---
 st.sidebar.subheader("🎯 选股标准 (热切换)")
-cfg_min_price = st.sidebar.number_input("最低价 (元)", value=11.0, step=0.5)
-cfg_max_price = st.sidebar.number_input("最高价 (元)", value=20.0, step=0.5)
+# 使用 columns 让界面更紧凑，参考 V30
+c1, c2 = st.sidebar.columns(2)
+cfg_min_price = c1.number_input("最低价", value=11.0, step=0.5)
+cfg_max_price = c2.number_input("最高价", value=20.0, step=0.5)
 cfg_max_turnover = st.sidebar.slider("最大换手率 (%)", 1.0, 10.0, 3.0, step=0.5)
 
 st.sidebar.divider()
@@ -45,8 +46,8 @@ end_date = st.sidebar.text_input("结束日期", value="20251226")
 # ==========================================
 # 3. 核心功能
 # ==========================================
-st.title("🚀 V24.0 原子战舰 (参考 V30 缓存架构)")
-st.caption("核心逻辑：将数据拆解为‘单日原子快照’。调整侧边栏参数**不会**触发重新下载。")
+st.title("🚀 V25.0 原子战舰 (V30同款架构)")
+st.caption("核心技术：数据层与逻辑层彻底分离。调整参数**无需**重新下载数据。")
 
 if not my_token:
     st.warning("👈 请先在左侧输入 Tushare Token")
@@ -59,25 +60,29 @@ except Exception as e:
     st.error(f"Token 无效: {e}")
     st.stop()
 
-# --- 核心：复刻 V30.12.3 的缓存逻辑 ---
-# 这是一个“原子化”的函数，只负责拿某一天的纯数据，不带任何业务逻辑参数！
+# ==========================================
+# 4. 数据层 (Data Layer) - 只负责下载和缓存
+# ==========================================
+
+# 这里的参数只有 date！没有价格、换手率等业务参数。
+# 所以无论业务参数怎么变，这个缓存永远有效！
 @st.cache_data(ttl=86400 * 7) 
-def fetch_daily_atomic_snapshot(date):
+def fetch_daily_atomic_data(date):
     """
     原子化获取单日全市场数据。
-    参考 nb.txt 中的 fetch_and_cache_daily_data 设计。
+    不做任何筛选，原样下载。
     """
     try:
-        # 1. 基础行情 (Open/High/Low/Close)
+        # 1. 基础行情
         df_daily = pro.daily(trade_date=date)
         
-        # 2. 每日指标 (换手、市值、PE)
+        # 2. 每日指标
         df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
         
-        # 3. 股票名称 (一次性获取，防止 KeyError)
+        # 3. 股票名称
         df_names = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
         
-        # 4. 筹码数据 (Rank 1 核心)
+        # 4. 筹码数据
         df_cyq = pro.cyq_perf(trade_date=date)
         if df_cyq.empty: # 容错回溯
              for i in range(1, 4):
@@ -85,13 +90,13 @@ def fetch_daily_atomic_snapshot(date):
                  df_cyq = pro.cyq_perf(trade_date=prev)
                  if not df_cyq.empty: break
         
+        # 打包返回，不进行 merge，因为 merge 也可以在逻辑层做，保持数据层纯净
         return {'daily': df_daily, 'basic': df_basic, 'names': df_names, 'cyq': df_cyq}
     except:
         return {}
 
-# 辅助：获取大盘情绪
 @st.cache_data(ttl=86400)
-def get_market_sentiment_atomic(start, end):
+def get_market_sentiment(start, end):
     try:
         real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
         df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
@@ -100,37 +105,42 @@ def get_market_sentiment_atomic(start, end):
         return df.set_index('trade_date')['close'].gt(df.set_index('trade_date')['ma20']).to_dict()
     except: return {}
 
-# --- 纯逻辑处理 (运行在内存中，极快) ---
-def process_day_logic(snapshot, min_p, max_p, max_to):
+# ==========================================
+# 5. 逻辑层 (Logic Layer) - 纯内存计算，极快
+# ==========================================
+
+def run_strategy_memory(snapshot, p_min, p_max, to_max):
     """
-    这是纯计算逻辑，输入是 snapshot（缓存的数据）和 参数。
+    纯内存筛选。速度是毫秒级的。
     """
     if not snapshot: return None
     
-    d1 = snapshot.get('daily', pd.DataFrame())
-    d2 = snapshot.get('basic', pd.DataFrame())
-    d3 = snapshot.get('names', pd.DataFrame())
-    d4 = snapshot.get('cyq', pd.DataFrame())
+    d1 = snapshot.get('daily')
+    d2 = snapshot.get('basic')
+    d3 = snapshot.get('names')
+    d4 = snapshot.get('cyq')
     
-    if d1.empty or d2.empty or d3.empty or d4.empty: return None
-    if 'cost_50pct' not in d4.columns: return None
+    if d1 is None or d1.empty: return None
+    if d2 is None or d2.empty: return None
+    if d4 is None or d4.empty or 'cost_50pct' not in d4.columns: return None
     
-    # 内存合并
+    # 内存合并 (Merge 是很快的)
     m1 = pd.merge(d1, d2, on='ts_code')
-    m2 = pd.merge(m1, d3, on='ts_code')
-    df = pd.merge(m2, d4[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code')
+    if d3 is not None and not d3.empty:
+        m1 = pd.merge(m1, d3, on='ts_code')
+    df = pd.merge(m1, d4[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code')
     
-    # 计算 Bias
+    # 计算因子
     df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
     
-    # 筛选 (使用传入的参数)
+    # === 核心：这里的筛选使用传入的参数 ===
     condition = (
         (df['bias'] > -0.03) & (df['bias'] < 0.15) & 
         (df['winner_rate'] < 70) &
         (df['circ_mv'] > 300000) &  
-        (df['close'] >= min_p) & 
-        (df['close'] <= max_p) & 
-        (df['turnover_rate'] < max_to)
+        (df['close'] >= p_min) & 
+        (df['close'] <= p_max) & 
+        (df['turnover_rate'] < to_max)
     )
     
     sorted_df = df[condition].sort_values('bias', ascending=True)
@@ -138,66 +148,69 @@ def process_day_logic(snapshot, min_p, max_p, max_to):
     return sorted_df.iloc[0]
 
 # ==========================================
-# 4. 双塔显示
+# 6. 主程序
 # ==========================================
-tab1, tab2 = st.tabs(["📡 实盘扫描 (今日)", "🧪 历史回测 (参数热调整)"])
+tab1, tab2 = st.tabs(["📡 实盘扫描", "🧪 历史回测"])
 
 # --- Tab 1: 实盘 ---
 with tab1:
-    st.subheader("📡 实盘选股")
-    scan_date_input = st.date_input("选择日期", value=pd.Timestamp.now())
+    col_d, col_b = st.columns([3,1])
+    with col_d:
+        scan_date_input = st.date_input("选择日期", value=pd.Timestamp.now())
     scan_date_str = scan_date_input.strftime('%Y%m%d')
     
-    if st.button("开始扫描", type="primary"):
-        with st.spinner("正在获取原子快照..."):
-            # 1. 拿数据 (缓存)
-            snap = fetch_daily_atomic_snapshot(scan_date_str)
-            # 2. 跑逻辑 (实时)
-            champion = process_day_logic(snap, cfg_min_price, cfg_max_price, cfg_max_turnover)
+    if col_b.button("开始扫描", type="primary", use_container_width=True):
+        with st.spinner("读取原子数据..."):
+            snap = fetch_daily_atomic_data(scan_date_str)
+            # 调用逻辑层
+            champion = run_strategy_memory(snap, cfg_min_price, cfg_max_price, cfg_max_turnover)
             
             if champion is not None:
-                st.success(f"🏆 冠军代码：{champion['ts_code']} | {champion['name']}")
+                st.success(f"🏆 冠军：{champion['ts_code']} | {champion['name']}")
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("现价", f"{champion['close']}元")
+                c1.metric("现价", f"{champion['close']}")
                 c2.metric("Bias", f"{champion['bias']:.4f}")
-                c3.metric("换手率", f"{champion['turnover_rate']:.2f}%")
+                c3.metric("换手", f"{champion['turnover_rate']:.2f}%")
                 c4.metric("获利盘", f"{champion['winner_rate']:.1f}%")
             else:
                 st.warning("无符合条件的标的。")
 
-# --- Tab 2: 回测 ---
+# --- Tab 2: 回测 (参数秒级调整) ---
 with tab2:
-    st.subheader("🧪 极速回测")
-    st.info("💡 提示：因为采用了 V30 的缓存架构，第一次运行会下载每一天的数据（有进度条）。跑完一次后，**调整任何侧边栏参数，都无需等待，立刻出结果**。")
+    st.caption("ℹ️ 说明：第一次运行会下载数据。下载完成后，调整侧边栏参数，点击运行，结果秒出。")
     
     if st.button("🚀 运行回测", type="primary", use_container_width=True):
         
-        # 1. 获取日期序列
+        # 1. 获取日期
         cal_df = pro.trade_cal(exchange='', start_date=start_date, end_date=end_date, is_open='1')
         dates = sorted(cal_df['cal_date'].tolist())
-        market_safe_map = get_market_sentiment_atomic(start_date, end_date)
+        market_safe_map = get_market_sentiment(start_date, end_date)
         
         active_signals = [] 
         finished_signals = [] 
         
-        # 进度条 (致敬 V30 风格)
-        progress_bar = st.progress(0, text="启动回测引擎...")
+        # 进度条
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
         for i, date in enumerate(dates):
-            progress_bar.progress((i + 1) / len(dates), text=f"正在分析: {date} (数据命中缓存)")
+            # 更新进度
+            progress_bar.progress((i + 1) / len(dates))
             
-            # === A. 获取数据 (缓存命中率 100% 后极快) ===
-            snap = fetch_daily_atomic_snapshot(date)
+            # === A. 数据层 (有缓存则极快，无缓存则下载) ===
+            snap = fetch_daily_atomic_data(date)
             
-            # 构建价格查询字典 (加速卖出判断)
+            # 构建价格查询字典 (加速)
             price_map = {}
             if snap and not snap['daily'].empty:
-                d_indexed = snap['daily'].set_index('ts_code')
-                price_map = d_indexed[['open', 'high', 'low', 'close']].to_dict('index')
+                d_idx = snap['daily'].set_index('ts_code')
+                price_map = d_idx[['open', 'high', 'low', 'close']].to_dict('index')
             
             is_market_safe = market_safe_map.get(date, False)
             
-            # === B. 持仓处理 (实时风控参数) ===
+            # === B. 逻辑层 (纯内存计算) ===
+            
+            # 1. 持仓管理 (使用实时参数 cfg_xxx)
             signals_still_active = []
             current_date_obj = pd.to_datetime(date)
             
@@ -219,12 +232,11 @@ with tab2:
                     cost = sig['buy_price']
                     peak = sig['highest']
                     peak_ret = (peak - cost) / cost
-                    drawdown = (peak - curr_close) / peak
                     
                     reason = ""
                     sell_price = curr_close
                     
-                    # 实时参数
+                    # 实时计算止盈止损
                     if (curr_low - cost) / cost <= -cfg_stop_loss:
                         reason = "止损"
                         sell_price = cost * (1 - cfg_stop_loss)
@@ -245,11 +257,10 @@ with tab2:
                     signals_still_active.append(sig)
             active_signals = signals_still_active
             
-            # === C. 买入逻辑 (实时筛选参数) ===
+            # 2. 选股买入 (使用实时参数 cfg_xxx)
             if is_market_safe:
-                # 这一步调用逻辑层，传入参数。
-                # 无论参数怎么变，snap 是不变的，所以不需要重新下载。
-                champion = process_day_logic(snap, cfg_min_price, cfg_max_price, cfg_max_turnover)
+                # 这里传入的 snap 是缓存的，cfg 参数是实时的
+                champion = run_strategy_memory(snap, cfg_min_price, cfg_max_price, cfg_max_turnover)
                 
                 if champion is not None:
                     code = champion['ts_code']
@@ -259,7 +270,7 @@ with tab2:
                             'buy_price': price_map[code]['open'], 'highest': price_map[code]['open']
                         })
 
-        progress_bar.empty()
+        status_text.text("分析完成")
         
         if finished_signals:
             df_res = pd.DataFrame(finished_signals)
@@ -270,19 +281,19 @@ with tab2:
             total_ret = df_res['return'].sum() * 100
             
             st.divider()
-            st.markdown("### 📊 V24.0 回测报告")
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("真实胜率", f"{win_rate:.1f}%")
-            col2.metric("单笔期望", f"{avg_ret:.2f}%")
-            col3.metric("虚拟总收益", f"{total_ret:.1f}%")
-            col4.metric("交易次数", f"{len(df_res)}")
+            st.markdown("### 📊 回测结果")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("胜率", f"{win_rate:.1f}%")
+            c2.metric("期望", f"{avg_ret:.2f}%")
+            c3.metric("总收益", f"{total_ret:.1f}%")
+            c4.metric("交易数", f"{len(df_res)}")
             
             chart = alt.Chart(df_res).mark_bar().encode(
-                x=alt.X("return_pct", bin=alt.Bin(maxbins=40)),
+                x=alt.X("return_pct", bin=alt.Bin(maxbins=30)),
                 y='count()',
-                color=alt.condition(alt.datum.return_pct > 0, alt.value("#d32f2f"), alt.value("#2e7d32"))
+                color=alt.condition(alt.datum.return_pct > 0, alt.value("red"), alt.value("green"))
             )
             st.altair_chart(chart, use_container_width=True)
             st.dataframe(df_res)
         else:
-            st.warning("该区间内无交易。")
+            st.info("区间内无交易。")
