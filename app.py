@@ -10,10 +10,25 @@ from datetime import datetime, timedelta
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V32.0 完美指挥官", layout="wide")
+st.set_page_config(page_title="V33.1 终极修正版", layout="wide")
 
 # ==========================================
-# 2. 全局缓存与智能工具
+# 2. 侧边栏：系统维护 & 版本验证
+# ==========================================
+st.sidebar.header("🛠️ 系统控制台")
+
+# --- 版本验证区 (如果您看不到这个，说明还是旧版) ---
+st.sidebar.success("✅ 当前运行版本：V33.1")
+st.sidebar.info("📅 日期算法：已启用强排序逻辑")
+
+# --- 强制重置按钮 ---
+if st.sidebar.button("🔥 强制重置系统 (缓存清理)", type="primary"):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.rerun()
+
+# ==========================================
+# 3. 全局缓存与智能工具
 # ==========================================
 @st.cache_resource
 def get_pro_api(token):
@@ -21,31 +36,31 @@ def get_pro_api(token):
     ts.set_token(token)
     return ts.pro_api()
 
-# --- 修复版：更稳健的日期回溯 ---
+# --- 修复核心：强逻辑日期回溯 ---
 def get_latest_trade_date(_pro, curr_date_str):
     """
-    智能寻找最近的交易日。
-    修复逻辑：扩大回溯窗口至60天，确保覆盖长假。
+    智能寻找最近的交易日 (强排序版)。
+    解决 Tushare 数据乱序导致回溯到 10月28日 的问题。
     """
     try:
-        # 如果当天是交易日，直接返回
-        df_curr = _pro.trade_cal(exchange='', start_date=curr_date_str, end_date=curr_date_str, is_open='1')
-        if not df_curr.empty:
-            return curr_date_str
-            
-        # 否则往前找 60 天
+        # 1. 往前找 60 天的日历
         end_dt = pd.to_datetime(curr_date_str)
         start_dt = end_dt - timedelta(days=60)
         
         df = _pro.trade_cal(exchange='', start_date=start_dt.strftime('%Y%m%d'), 
                             end_date=curr_date_str, is_open='1')
         
-        if not df.empty:
-            # 取最后一个，即最近的一个交易日
-            return df['cal_date'].iloc[-1]
+        if df.empty:
+            return curr_date_str
             
-        return curr_date_str # 兜底
-    except:
+        # 2. !!! 核心修复：强制按日期倒序排序 !!!
+        # 这样第一行（iloc[0]）永远是离今天最近的那一天
+        df = df.sort_values('cal_date', ascending=False)
+        
+        # 3. 取第一行
+        latest_date = df['cal_date'].iloc[0]
+        return latest_date
+    except Exception as e:
         return curr_date_str
 
 @st.cache_data(ttl=86400 * 7)
@@ -78,7 +93,7 @@ def get_market_sentiment(start, end, _pro):
     except: return {}
 
 # ==========================================
-# 3. 逻辑层
+# 4. 逻辑层
 # ==========================================
 def run_strategy_logic(snapshot, p_min, p_max, to_max, top_n=1):
     if not snapshot: return None
@@ -107,7 +122,7 @@ def run_strategy_logic(snapshot, p_min, p_max, to_max, top_n=1):
     return sorted_df.head(top_n)
 
 # ==========================================
-# 4. 侧边栏：配置中心
+# 5. 侧边栏：配置中心
 # ==========================================
 st.sidebar.header("🎛️ 指挥官控制台")
 token_input = st.sidebar.text_input("Tushare Token", type="password")
@@ -115,8 +130,7 @@ pro = get_pro_api(token_input)
 
 st.sidebar.divider()
 st.sidebar.subheader("⚓ 仓位管理")
-# 这里的滑块决定了显示几只股票。默认设为3，避免误解。
-cfg_position_count = st.sidebar.slider("显示股票数量 (Top N)", 1, 5, 3, help="想看更多备选？请拉大这个数字。")
+cfg_position_count = st.sidebar.slider("显示股票数量 (Top N)", 1, 5, 3)
 
 st.sidebar.divider()
 st.sidebar.subheader("🎯 上帝参数 (默认最优)")
@@ -132,22 +146,20 @@ cfg_trail_start = st.sidebar.slider("止盈启动 (+%)", 5.0, 15.0, 8.0, step=0.
 cfg_trail_drop = st.sidebar.slider("回落卖出 (-%)", 1.0, 5.0, 3.0, step=0.5) / 100.0
 stop_loss_decimal = cfg_stop_loss / 100.0
 
-# --- 动态日期 (修复不更新的问题) ---
+# --- 动态日期 (自动更新为今天) ---
 today = datetime.now()
-# 默认回测结束日期为今天
 default_end_date = today.strftime('%Y%m%d')
-# 默认回测开始日期为今年年初
 default_start_date = f"{today.year}0101"
 
 st.sidebar.divider()
 st.sidebar.subheader("⏳ 时间设置")
 start_date = st.sidebar.text_input("开始日期", value=default_start_date)
-end_date = st.sidebar.text_input("结束日期", value=default_end_date, help="已自动更新为今天")
+end_date = st.sidebar.text_input("结束日期", value=default_end_date)
 
 # ==========================================
-# 5. 主程序
+# 6. 主程序
 # ==========================================
-st.title("🚀 V32.0 完美指挥官 (智能修复版)")
+st.title("🚀 V33.1 终极修正版 (日期算法升级)")
 
 tab1, tab2 = st.tabs(["📡 智能实盘扫描", "🧪 历史分仓回测"])
 
@@ -155,7 +167,6 @@ tab1, tab2 = st.tabs(["📡 智能实盘扫描", "🧪 历史分仓回测"])
 with tab1:
     col_d, col_b = st.columns([3, 1])
     with col_d:
-        # 默认选中今天
         scan_date_input = st.date_input("选择日期 (支持自动回溯)", value=pd.Timestamp.now())
     scan_date_str = scan_date_input.strftime('%Y%m%d')
     
@@ -165,11 +176,12 @@ with tab1:
             st.stop()
             
         with st.spinner("正在校对交易日历..."):
-            # 智能修正日期
+            # 智能修正日期 (V33修复版)
             real_date_str = get_latest_trade_date(pro, scan_date_str)
             
+            # 显示日期切换信息
             if real_date_str != scan_date_str:
-                st.info(f"📅 您选择的 **{scan_date_str}** 是非交易日，系统已自动切换至最近的交易日：**{real_date_str}**")
+                st.info(f"📅 日期校正：您选择的 **{scan_date_str}** 非交易日，系统已锁定最近的交易日：**{real_date_str}**")
             
             # 获取数据
             snap = fetch_daily_atomic_data(real_date_str, pro)
@@ -179,7 +191,6 @@ with tab1:
             if fleet is not None and not fleet.empty:
                 st.success(f"⚓ 成功选出 {len(fleet)} 只标的 (基于 {real_date_str} 数据)")
                 
-                # 隐藏索引，防止误解
                 st.dataframe(fleet[['ts_code', 'name', 'close', 'bias', 'turnover_rate', 'winner_rate', 'industry']].style.format({
                     'close': '{:.2f}', 'bias': '{:.4f}', 'turnover_rate': '{:.2f}', 'winner_rate': '{:.1f}'
                 }), hide_index=True)
