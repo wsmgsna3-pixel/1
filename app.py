@@ -1,185 +1,215 @@
 import streamlit as st
-import tushare as ts
 import pandas as pd
 import numpy as np
+import tushare as ts
 import altair as alt
 import time
 import random
+import gc  # 引入垃圾回收机制
 
 # ==========================================
-# 1. 页面配置
+# 1. 页面配置 (严格遵循 V30 结构)
 # ==========================================
-st.set_page_config(page_title="V27.0 炼金术士", layout="wide")
-
-# ==========================================
-# 2. 侧边栏：参数边界设定
-# ==========================================
-st.sidebar.header("⚗️ 炼金实验室")
-
-my_token = st.sidebar.text_input("Tushare Token", type="password")
-
-st.sidebar.divider()
-st.sidebar.subheader("1. 设定参数尝试范围")
-st.sidebar.info("系统将在您设定的范围内随机抽取参数进行演练。")
-
-# 价格范围
-c1, c2 = st.sidebar.columns(2)
-opt_min_price_low = c1.number_input("最低价下限", 3.0)
-opt_min_price_high = c2.number_input("最低价上限", 15.0, value=11.0)
-
-# 换手率范围
-opt_turnover_low = st.sidebar.number_input("换手率下限", 0.5, value=1.0)
-opt_turnover_high = st.sidebar.number_input("换手率上限", 10.0, value=5.0)
-
-# 止损范围
-opt_stop_low = st.sidebar.slider("止损范围 (%)", 1, 15, (3, 8))
-
-# 持股天数
-opt_hold_low = st.sidebar.slider("持股天数范围", 1, 20, (3, 15))
-
-# 止盈参数 (固定或小范围微调)
-opt_trail_start = 0.08 # 暂时固定，减少复杂度，也可以放开
-opt_trail_drop = 0.03
-
-st.sidebar.divider()
-st.sidebar.subheader("2. 训练强度")
-sim_rounds = st.sidebar.slider("模拟次数 (轮)", 50, 500, 100, help="次数越多越精准，但耗时越长。建议先跑100次看看。")
-
-# 回测区间
-start_date = st.sidebar.text_input("开始日期", value="20250101")
-end_date = st.sidebar.text_input("结束日期", value="20251226")
+st.set_page_config(page_title="V28.0 炼金术士(稳定版)", layout="wide")
 
 # ==========================================
-# 3. 核心功能
+# 2. 全局缓存 (复刻 V30 架构)
 # ==========================================
-st.title("⚗️ V27.0 炼金术士 (多参数蒙特卡洛优化)")
-st.markdown("""
-### 🚀 寻找最优解
-不要手动一个一个试了。让算法帮您在 **7维参数空间** 中寻找收益最高的组合。
-""")
 
-if not my_token:
-    st.warning("👈 请输入 Token")
-    st.stop()
+# 使用 cache_resource 缓存 API 连接，避免重复连接导致卡顿
+@st.cache_resource
+def get_pro_api(token):
+    if not token: return None
+    ts.set_token(token)
+    return ts.pro_api()
 
-ts.set_token(my_token)
-try:
-    pro = ts.pro_api()
-except:
-    st.error("Token 无效")
-    st.stop()
-
-# --- 原子数据层 (缓存) ---
-@st.cache_data(ttl=86400 * 7) 
-def fetch_daily_atomic_data(date):
+# 原子化数据缓存：只认日期，不认参数
+@st.cache_data(ttl=86400 * 7)
+def fetch_daily_atomic_data(date, _pro):
+    """
+    获取单日全量数据。
+    注意：_pro 参数前加下划线，告诉 Streamlit 不要对 API 对象进行哈希（防止卡死）。
+    """
+    if _pro is None: return {}
     try:
-        df_daily = pro.daily(trade_date=date)
-        df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
-        df_cyq = pro.cyq_perf(trade_date=date)
-        if df_cyq.empty:
+        # 1. 基础行情
+        df_daily = _pro.daily(trade_date=date)
+        
+        # 2. 每日指标
+        df_basic = _pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
+        
+        # 3. 筹码数据 (Rank 1 核心)
+        df_cyq = _pro.cyq_perf(trade_date=date)
+        if df_cyq.empty: 
+             # 简单回溯3天
              for i in range(1, 4):
                  prev = (pd.to_datetime(date) - pd.Timedelta(days=i)).strftime('%Y%m%d')
-                 df_cyq = pro.cyq_perf(trade_date=prev)
+                 df_cyq = _pro.cyq_perf(trade_date=prev)
                  if not df_cyq.empty: break
+        
         return {'daily': df_daily, 'basic': df_basic, 'cyq': df_cyq}
-    except: return {}
+    except Exception:
+        return {}
 
+# 大盘风控数据
 @st.cache_data(ttl=86400)
-def get_market_sentiment(start, end):
+def get_market_sentiment(start, end, _pro):
+    if _pro is None: return {}
     try:
         real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
-        df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
+        df = _pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
         df = df.sort_values('trade_date', ascending=True)
         df['ma20'] = df['close'].rolling(20).mean()
         return df.set_index('trade_date')['close'].gt(df.set_index('trade_date')['ma20']).to_dict()
     except: return {}
 
-# --- 逻辑层 (极速运算) ---
-def run_strategy_once(snapshot, p_min, p_max, to_max):
+# ==========================================
+# 3. 纯内存逻辑 (毫秒级运算)
+# ==========================================
+def run_strategy_logic(snapshot, params):
+    """
+    params: 字典，包含所有 7 个动态参数
+    """
     if not snapshot: return None
     d1, d2, d4 = snapshot.get('daily'), snapshot.get('basic'), snapshot.get('cyq')
-    if d1 is None or d1.empty or d2 is None or d2.empty or d4 is None or d4.empty or 'cost_50pct' not in d4.columns: return None
     
+    if d1 is None or d1.empty or d2 is None or d2.empty or d4 is None or d4.empty: return None
+    if 'cost_50pct' not in d4.columns: return None
+    
+    # 内存合并
     m1 = pd.merge(d1, d2, on='ts_code')
     df = pd.merge(m1, d4[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code')
+    
     df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
     
-    # 动态参数筛选
+    # === 7 参数过滤 ===
     condition = (
         (df['bias'] > -0.03) & (df['bias'] < 0.15) & 
         (df['winner_rate'] < 70) &
         (df['circ_mv'] > 300000) &  
-        (df['close'] >= p_min) & 
-        (df['close'] <= p_max) & 
-        (df['turnover_rate'] < to_max)
+        (df['close'] >= params['min_price']) &      # 1. 最低价
+        (df['close'] <= params['max_price']) &      # 2. 最高价
+        (df['turnover_rate'] < params['turnover'])  # 3. 换手率
     )
+    
     sorted_df = df[condition].sort_values('bias', ascending=True)
     if sorted_df.empty: return None
     return sorted_df.iloc[0]
 
 # ==========================================
-# 4. 蒙特卡洛引擎
+# 4. 侧边栏：炼金实验室
 # ==========================================
-if st.button("🔥 开始蒙特卡洛训练", type="primary"):
+st.sidebar.header("⚗️ 炼金参数配置")
+
+token_input = st.sidebar.text_input("Tushare Token", type="password")
+pro = get_pro_api(token_input)
+
+st.sidebar.divider()
+st.sidebar.info("💡 设定 7 个参数的尝试范围，系统将自动寻找最优解。")
+
+# --- 7 参数 范围设定 ---
+# 1. 最低价
+p_min_range = st.sidebar.slider("1. 最低价范围", 4.0, 15.0, (5.0, 11.0))
+# 2. 最高价 (通常 Rank 1 不会太高，固定一下上限即可)
+p_max_fixed = st.sidebar.number_input("2. 最高价上限 (固定)", value=20.0)
+# 3. 换手率
+to_range = st.sidebar.slider("3. 换手率范围", 1.0, 10.0, (2.0, 5.0))
+# 4. 止损
+sl_range = st.sidebar.slider("4. 止损范围 (%)", 3.0, 15.0, (5.0, 10.0))
+# 5. 止盈启动
+tp_start_range = st.sidebar.slider("5. 止盈启动范围 (%)", 5.0, 15.0, (6.0, 10.0))
+# 6. 回落卖出
+tp_drop_range = st.sidebar.slider("6. 回落卖出范围 (%)", 1.0, 5.0, (2.0, 4.0))
+# 7. 持股天数
+hold_range = st.sidebar.slider("7. 持股天数范围", 5, 20, (8, 15))
+
+st.sidebar.divider()
+sim_rounds = st.sidebar.number_input("🤖 演练次数 (建议 50-100)", value=50, step=10)
+start_date = st.sidebar.text_input("开始日期", value="20250101")
+end_date = st.sidebar.text_input("结束日期", value="20251226")
+
+# ==========================================
+# 5. 主程序：蒙特卡洛引擎
+# ==========================================
+st.title("⚗️ V28.0 炼金术士 (稳定架构版)")
+st.caption("针对您提出的 7 参数优化难题，使用随机演练算法寻找最优解。")
+
+if st.button("🔥 开始寻找上帝参数", type="primary", use_container_width=True):
     
-    # 1. 预加载数据 (只做一次)
-    cal_df = pro.trade_cal(exchange='', start_date=start_date, end_date=end_date, is_open='1')
-    dates = sorted(cal_df['cal_date'].tolist())
-    market_safe_map = get_market_sentiment(start_date, end_date)
-    
-    cache_snapshots = {}
-    preload_bar = st.progress(0, text="预加载数据中 (IO操作)...")
-    for i, date in enumerate(dates):
-        preload_bar.progress((i+1)/len(dates))
-        cache_snapshots[date] = fetch_daily_atomic_data(date)
-    preload_bar.empty()
-    
-    # 2. 生成随机参数组
-    params_pool = []
+    if not pro:
+        st.error("请先输入 Token")
+        st.stop()
+
+    # 1. 准备日期和风控数据
+    with st.spinner("正在初始化数据..."):
+        cal_df = pro.trade_cal(exchange='', start_date=start_date, end_date=end_date, is_open='1')
+        dates = sorted(cal_df['cal_date'].tolist())
+        market_safe_map = get_market_sentiment(start_date, end_date, pro)
+        
+        # 预加载数据到内存 (加速后续计算)
+        # 注意：这里我们做一个简单的内存缓存，避免重复调用 atomic 函数
+        memory_snapshots = {}
+        preload_bar = st.progress(0, "预加载数据 (IO)...")
+        for i, date in enumerate(dates):
+            memory_snapshots[date] = fetch_daily_atomic_data(date, pro)
+            preload_bar.progress((i+1)/len(dates))
+        preload_bar.empty()
+
+    # 2. 生成随机参数池
+    # 这是解决“不知道哪个参数好”的最佳办法：生成一堆随机组合去跑！
+    param_pool = []
     for _ in range(sim_rounds):
-        params_pool.append({
-            'min_price': round(random.uniform(opt_min_price_low, opt_min_price_high), 1),
-            'max_turnover': round(random.uniform(opt_turnover_low, opt_turnover_high), 1),
-            'stop_loss': round(random.uniform(opt_stop_low[0], opt_stop_low[1]), 1) / 100.0,
-            'max_hold': random.randint(opt_hold_low[0], opt_hold_low[1])
+        param_pool.append({
+            'min_price': round(random.uniform(p_min_range[0], p_min_range[1]), 1),
+            'max_price': p_max_fixed,
+            'turnover': round(random.uniform(to_range[0], to_range[1]), 1),
+            'stop_loss': round(random.uniform(sl_range[0], sl_range[1]), 1) / 100.0,
+            'trail_start': round(random.uniform(tp_start_range[0], tp_start_range[1]), 1) / 100.0,
+            'trail_drop': round(random.uniform(tp_drop_range[0], tp_drop_range[1]), 1) / 100.0,
+            'max_hold': random.randint(hold_range[0], hold_range[1])
         })
     
+    # 3. 疯狂演练
     results = []
-    
-    # 3. 疯狂训练
-    train_bar = st.progress(0, text="AI 正在疯狂演练...")
+    main_bar = st.progress(0, "AI 正在演练...")
     start_time = time.time()
     
-    for idx, params in enumerate(params_pool):
-        train_bar.progress((idx+1)/sim_rounds, text=f"正在演练第 {idx+1}/{sim_rounds} 组参数...")
+    for idx, params in enumerate(param_pool):
+        # 显式回收内存，防止卡死
+        if idx % 10 == 0: gc.collect()
+        
+        main_bar.progress((idx+1)/sim_rounds, f"正在演练第 {idx+1}/{sim_rounds} 组策略...")
         
         active_signals = [] 
-        finished_returns = []
+        returns = []
         
-        # 极速回测循环
         for date in dates:
-            snap = cache_snapshots.get(date)
+            snap = memory_snapshots.get(date)
+            # 构建简易 Price Map
             price_map = {}
             if snap and not snap['daily'].empty:
-                 # 简单构建 price_map，这里为了速度只取需要的
-                 # 注意：为了极速，这里可以进一步优化，但先保持逻辑清晰
-                 price_map = snap['daily'].set_index('ts_code')[['open','high','low','close']].to_dict('index')
+                # 只取需要的列，节省内存
+                price_map = snap['daily'].set_index('ts_code')[['open','high','low','close']].to_dict('index')
             
             is_market_safe = market_safe_map.get(date, False)
             
-            # 持仓
+            # --- 持仓 ---
             signals_still_active = []
             curr_dt = pd.to_datetime(date)
             
             for sig in active_signals:
                 code = sig['code']
+                # 还没到买入日
                 if curr_dt <= pd.to_datetime(sig['buy_date']):
                     if code in price_map: sig['highest'] = max(sig['highest'], price_map[code]['high'])
                     signals_still_active.append(sig)
                     continue
 
                 if code in price_map:
-                    ph, pl, pc = price_map[code]['high'], price_map[code]['low'], price_map[code]['close']
+                    ph = price_map[code]['high']
+                    pl = price_map[code]['low']
+                    pc = price_map[code]['close']
+                    
                     if ph > sig['highest']: sig['highest'] = ph
                     
                     cost = sig['buy_price']
@@ -188,28 +218,28 @@ if st.button("🔥 开始蒙特卡洛训练", type="primary"):
                     reason = ""
                     sell_p = pc
                     
-                    # 使用当前 params
+                    # 使用当前轮次的随机参数
                     if (pl - cost) / cost <= -params['stop_loss']:
                         reason = "止损"
                         sell_p = cost * (1 - params['stop_loss'])
-                    elif (peak - cost)/cost >= opt_trail_start and (peak - pc)/peak >= opt_trail_drop:
+                    elif (peak - cost)/cost >= params['trail_start'] and (peak - pc)/peak >= params['trail_drop']:
                         reason = "止盈"
-                        sell_p = peak * (1 - opt_trail_drop)
+                        sell_p = peak * (1 - params['trail_drop'])
                     elif (curr_dt - pd.to_datetime(sig['buy_date'])).days >= params['max_hold']:
                         reason = "超时"
                     
                     if reason:
                         ret = (sell_p - cost) / cost - 0.0006
-                        finished_returns.append(ret)
+                        returns.append(ret)
                     else:
                         signals_still_active.append(sig)
                 else:
                     signals_still_active.append(sig)
             active_signals = signals_still_active
             
-            # 买入
+            # --- 买入 ---
             if is_market_safe:
-                champion = run_strategy_once(snap, params['min_price'], 20.0, params['max_turnover'])
+                champion = run_strategy_logic(snap, params)
                 if champion is not None:
                     code = champion['ts_code']
                     if code in price_map:
@@ -218,45 +248,50 @@ if st.button("🔥 开始蒙特卡洛训练", type="primary"):
                             'buy_price': price_map[code]['open'], 'highest': price_map[code]['open']
                         })
         
-        # 记录本轮结果
-        if finished_returns:
-            total_ret = sum(finished_returns) * 100
-            win_rate = len([r for r in finished_returns if r > 0]) / len(finished_returns) * 100
-            results.append({
-                '最低价': params['min_price'],
-                '最大换手': params['max_turnover'],
-                '止损(%)': round(params['stop_loss']*100, 1),
-                '持股天数': params['max_hold'],
-                '总收益%': round(total_ret, 1),
-                '胜率%': round(win_rate, 1),
-                '交易次数': len(finished_returns)
-            })
-    
-    train_bar.empty()
-    st.success(f"演练完成！耗时 {time.time()-start_time:.1f} 秒")
+        # 统计本轮结果
+        if returns:
+            tot = sum(returns) * 100
+            win = len([r for r in returns if r > 0]) / len(returns) * 100
+            exp = np.mean(returns) * 100
+            
+            # 记录结果 (把参数和结果拍平存进去)
+            record = params.copy()
+            # 把百分比还原成阅读友好的数值
+            record['stop_loss'] *= 100
+            record['trail_start'] *= 100
+            record['trail_drop'] *= 100
+            record['total_ret'] = tot
+            record['win_rate'] = win
+            record['expectancy'] = exp
+            record['trades'] = len(returns)
+            results.append(record)
+            
+    main_bar.empty()
+    st.success(f"演练完成！耗时 {time.time()-start_time:.1f}s")
     
     if results:
         df_res = pd.DataFrame(results)
         
-        # 1. 敏感度分析 (Correlation)
-        st.subheader("📊 敏感度分析：哪个参数最重要？")
-        corr = df_res[['最低价', '最大换手', '止损(%)', '持股天数', '总收益%']].corr()['总收益%'].drop('总收益%')
+        st.divider()
+        st.subheader("🏆 参数排行榜 (按总收益)")
+        
+        # 格式化一下显示
+        show_cols = ['total_ret', 'win_rate', 'expectancy', 'trades', 
+                     'min_price', 'turnover', 'stop_loss', 'max_hold']
+        
+        df_show = df_res.sort_values('total_ret', ascending=False)[show_cols].head(10)
+        st.dataframe(df_show.style.format("{:.2f}").background_gradient(subset=['total_ret'], cmap='Reds'))
+        
+        st.markdown("""
+        **🔎 观察要点：**
+        1. 看 **TOP 1** 的参数组合，这就是当前的“上帝参数”。
+        2. 看 **前10名** 的参数有没有共性？(比如最低价是不是都在 5-6元？)
+        """)
+        
+        # 简单的参数相关性图
+        st.subheader("📊 哪个参数最重要？")
+        corr = df_res.corr()['total_ret'].drop(['total_ret', 'win_rate', 'expectancy', 'trades'])
         st.bar_chart(corr)
-        st.caption("💡 柱子越高（或越低），说明该参数对收益率的影响越大！")
         
-        # 2. 散点图 (寻找最优区域)
-        st.subheader("🎯 参数分布图 (颜色越红收益越高)")
-        chart = alt.Chart(df_res).mark_circle(size=60).encode(
-            x='最低价',
-            y='最大换手',
-            color=alt.Color('总收益%', scale=alt.Scale(scheme='turbo')),
-            tooltip=['最低价', '最大换手', '止损(%)', '持股天数', '总收益%', '胜率%']
-        ).interactive()
-        st.altair_chart(chart, use_container_width=True)
-        
-        # 3. TOP 10 榜单
-        st.subheader("🏆 上帝参数 TOP 10")
-        top_10 = df_res.sort_values('总收益%', ascending=False).head(10)
-        st.dataframe(top_10)
     else:
-        st.warning("无有效回测数据")
+        st.warning("无回测结果")
