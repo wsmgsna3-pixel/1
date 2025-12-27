@@ -11,13 +11,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V37.2 详情回归版", layout="wide")
+st.set_page_config(page_title="V37.4 精准输入版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
 st.sidebar.header("🛠️ 系统控制台")
-st.sidebar.success("✅ V37.2 (含交易详情表)")
+st.sidebar.success("✅ V37.4 (全数字输入框)")
 
 if st.sidebar.button("🔥 强制重启", type="primary"):
     st.cache_data.clear()
@@ -25,9 +25,8 @@ if st.sidebar.button("🔥 强制重启", type="primary"):
     os._exit(0)
 
 # ==========================================
-# 3. 数据引擎 (保留 V37.1 的死磕重试机制)
+# 3. 数据引擎 (稳定版)
 # ==========================================
-
 @st.cache_resource
 def get_pro_api(token):
     if not token: return None
@@ -46,12 +45,11 @@ def get_latest_trade_date(_pro, curr_date_str):
     except:
         return curr_date_str
 
-# --- 下载任务 (带重试) ---
 def fetch_day_task_robust(date, token):
     max_retries = 5
     for i in range(max_retries):
         try:
-            time.sleep(0.1) # 防封
+            time.sleep(0.1)
             ts.set_token(token)
             local_pro = ts.pro_api(timeout=30)
             
@@ -60,7 +58,6 @@ def fetch_day_task_robust(date, token):
             
             d2 = local_pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
             
-            # 真筹码
             d4 = local_pro.cyq_perf(trade_date=date)
             if d4.empty:
                  prev_day = (pd.to_datetime(date) - timedelta(days=1)).strftime('%Y%m%d')
@@ -74,7 +71,6 @@ def fetch_day_task_robust(date, token):
             time.sleep(1 + i)
     return None
 
-# --- 多线程下载 ---
 @st.cache_data(ttl=3600)
 def fetch_data_parallel_robust(dates, token):
     results = {}
@@ -86,7 +82,6 @@ def fetch_data_parallel_robust(dates, token):
         total = len(dates)
         done = 0
         success = 0
-        
         for future in as_completed(future_map):
             done += 1
             data = future.result()
@@ -107,7 +102,7 @@ def get_names(token):
     except: return pd.DataFrame()
 
 # ==========================================
-# 4. 逻辑层 (Rank 1 真筹码)
+# 4. 逻辑层
 # ==========================================
 def run_strategy_rank1(snapshot, names_df, p_min, p_max, to_max, top_n):
     if not snapshot: return None
@@ -142,21 +137,37 @@ def run_strategy_rank1(snapshot, names_df, p_min, p_max, to_max, top_n):
         return None
 
 # ==========================================
-# 5. 侧边栏
+# 5. 侧边栏 (全数字输入框版)
 # ==========================================
 st.sidebar.header("🎛️ 尊享控制台")
 token_input = st.sidebar.text_input("Tushare Token", type="password")
 pro = get_pro_api(token_input)
 
 st.sidebar.divider()
-cfg_position_count = st.sidebar.slider("Top N", 1, 5, 3)
-cfg_min_price = st.sidebar.number_input("最低价", 8.1)
-cfg_max_price = st.sidebar.number_input("最高价", 20.0)
-cfg_max_turnover = st.sidebar.slider("换手率上限", 0.5, 5.0, 2.1)
+st.sidebar.caption("👇 全键盘精准输入模式")
+
+# 修改1：Top N 改为数字输入，step=1
+cfg_position_count = st.sidebar.number_input("Top N (每日持仓数)", value=3, min_value=1, max_value=10, step=1)
+
+# 修改2：最低价/最高价 保持数字输入，明确 step=0.1
+col_p1, col_p2 = st.sidebar.columns(2)
+with col_p1:
+    cfg_min_price = st.sidebar.number_input("最低价(元)", value=8.1, min_value=0.0, step=0.1)
+with col_p2:
+    cfg_max_price = st.sidebar.number_input("最高价(元)", value=20.0, min_value=0.0, step=0.1)
+
+# 修改3：换手率 改为数字输入，不再是滑块！
+cfg_max_turnover = st.sidebar.number_input("换手率上限(%)", value=2.1, min_value=0.1, max_value=20.0, step=0.1, help="直接输入数字，或用+/-微调")
 
 st.sidebar.divider()
-cfg_stop_loss = st.sidebar.number_input("止损%", 8.5)
-cfg_max_hold = st.sidebar.number_input("持股天", 15)
+
+# 修改4：止损/持仓天数 保持数字输入
+col_s1, col_s2 = st.sidebar.columns(2)
+with col_s1:
+    cfg_stop_loss = st.sidebar.number_input("止损线(%)", value=8.5, min_value=0.0, step=0.1)
+with col_s2:
+    cfg_max_hold = st.sidebar.number_input("持仓天数", value=15, min_value=1, step=1)
+
 cfg_trail_start = 0.08
 cfg_trail_drop = 0.03
 stop_loss_decimal = cfg_stop_loss / 100.0
@@ -168,7 +179,7 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V37.2 详情回归版 (含交易清单)")
+st.title("🚀 V37.4 精准输入版")
 
 tab1, tab2 = st.tabs(["📡 智能实盘", "🧪 并发回测"])
 
@@ -238,7 +249,7 @@ with tab2:
             curr_dt = pd.to_datetime(date)
             next_active = []
             
-            # 持仓更新
+            # 持仓
             for sig in active_signals:
                 code = sig['code']
                 if curr_dt <= pd.to_datetime(sig['buy_date']):
@@ -268,9 +279,8 @@ with tab2:
                     
                     if reason:
                         ret = (sell_p - cost) / cost - 0.0006
-                        # --- 关键：存入详情，包括股票名称 ---
                         finished_signals.append({
-                            'name': sig.get('name', code), # 存名称
+                            'name': sig.get('name', code),
                             'code': code,
                             'buy_date': sig['buy_date'],
                             'sell_date': date,
@@ -292,7 +302,7 @@ with tab2:
                     if code in price_map:
                         active_signals.append({
                             'code': code, 
-                            'name': row['name'] if 'name' in row else code, # 记录买入时的名称
+                            'name': row['name'] if 'name' in row else code,
                             'buy_date': date, 
                             'buy_price': price_map[code]['open'], 
                             'highest': price_map[code]['open'],
@@ -306,8 +316,6 @@ with tab2:
             df_res['ret_pct'] = df_res['ret'] * 100
             
             st.divider()
-            
-            # 1. 统计概览
             c1, c2, c3 = st.columns(3)
             c1.metric("单笔期望", f"{df_res['ret'].mean()*100:.2f}%")
             c2.metric("胜率", f"{(df_res['ret']>0).mean()*100:.1f}%")
@@ -317,7 +325,6 @@ with tab2:
             rank_stats = df_res.groupby('rank')['ret_pct'].agg(['count', 'mean', 'sum', lambda x: (x>0).mean()*100])
             st.table(rank_stats.style.format("{:.2f}").background_gradient(subset=['mean'], cmap='RdYlGn'))
             
-            # 2. 详细交易清单 (这就是您要找的表格)
             st.subheader("📋 交易详情 (复盘专用)")
             st.dataframe(
                 df_res[['name', 'code', 'buy_date', 'sell_date', 'ret_pct', 'rank', 'reason']].sort_values('buy_date', ascending=False),
