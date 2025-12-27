@@ -10,15 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V40.3 黄金击球实战版", layout="wide")
+st.set_page_config(page_title="V40.4 避雷针过滤版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
-st.sidebar.header("🔥 趋势狩猎 (V40.3)")
-st.sidebar.success("✅ 多线程引擎已启动")
-st.sidebar.success("✅ 真筹码数据已加载")
-st.sidebar.info("核心：**获利盘>80%** + **涨幅2%~7%**")
+st.sidebar.header("🔥 趋势狩猎 (V40.4)")
+st.sidebar.success("✅ 自动过滤长上影线")
+st.sidebar.info("逻辑：获利盘>80% + 涨幅2%~7% + **最高点回撤<1.5%**")
 
 if st.sidebar.button("🔄 强制重启系统", type="primary"):
     st.cache_data.clear()
@@ -26,7 +25,7 @@ if st.sidebar.button("🔄 强制重启系统", type="primary"):
     os._exit(0)
 
 # ==========================================
-# 3. 数据引擎 (多线程 + 真筹码)
+# 3. 数据引擎
 # ==========================================
 @st.cache_resource
 def get_pro_api(token):
@@ -35,38 +34,26 @@ def get_pro_api(token):
     return ts.pro_api(timeout=60) 
 
 def fetch_day_task_right_side(date, token):
-    """
-    单日数据下载任务：同时获取行情 + 筹码
-    """
     max_retries = 5
     for i in range(max_retries):
         try:
-            time.sleep(0.1) # 防封
+            time.sleep(0.1)
             ts.set_token(token)
             local_pro = ts.pro_api(timeout=30)
             
-            # 1. 基础行情 (涨跌幅, 收盘价)
+            # 我们需要 high 字段来计算上影线
             d_today = local_pro.daily(trade_date=date)
-            
-            # 2. 每日指标 (换手率, 流通市值)
             d_basic = local_pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
             
-            # 3. 真筹码数据 (您的核心优势)
-            # 尝试获取当日筹码
             d_cyq = local_pro.cyq_perf(trade_date=date)
-            
             if d_cyq.empty:
-                # 如果当日没出（比如盘中），尝试取前一日的作为参考
                 prev_date = (pd.to_datetime(date) - timedelta(days=1)).strftime('%Y%m%d')
                 d_cyq = local_pro.cyq_perf(trade_date=prev_date)
 
             if not d_today.empty and not d_cyq.empty:
                 return {'date': date, 'daily': d_today, 'basic': d_basic, 'cyq': d_cyq}
-            
-            # 如果依然空，可能是周末或休市，跳过
             if d_today.empty: return None
-            raise ValueError("Data incomplete") # 抛错重试
-            
+            raise ValueError("Incomplete")
         except:
             if i == max_retries - 1: return None
             time.sleep(1 + i)
@@ -74,26 +61,17 @@ def fetch_day_task_right_side(date, token):
 
 @st.cache_data(ttl=3600)
 def fetch_data_parallel_right(dates, token):
-    """
-    5线程并发下载引擎
-    """
     results = {}
-    progress_bar = st.progress(0, text="🔥 多线程引擎启动：正在扫描全市场筹码...")
-    
+    progress_bar = st.progress(0, text="全市场扫描中...")
     with ThreadPoolExecutor(max_workers=5) as executor:
         future_map = {executor.submit(fetch_day_task_right_side, d, token): d for d in dates}
         total = len(dates)
         done = 0
-        success = 0
-        
         for future in as_completed(future_map):
             done += 1
             data = future.result()
-            if data:
-                results[data['date']] = data
-                success += 1
-            progress_bar.progress(done / total, text=f"📥 猎取进度: {done}/{total} (成功: {success})")
-            
+            if data: results[data['date']] = data
+            progress_bar.progress(done / total, text=f"📥 进度: {done}/{total}")
     progress_bar.empty()
     return results
 
@@ -105,9 +83,9 @@ def get_names(token):
     except: return pd.DataFrame()
 
 # ==========================================
-# 4. 逻辑层 (黄金击球区 + 筹码背书)
+# 4. 逻辑层 (增加上影线过滤)
 # ==========================================
-def run_strategy_golden_zone(snapshot, names_df, min_winner, min_chg, max_chg, top_n):
+def run_strategy_golden_zone_strict(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, top_n):
     if not snapshot: return None
     d_today = snapshot.get('daily') 
     d_basic = snapshot.get('basic')
@@ -116,26 +94,26 @@ def run_strategy_golden_zone(snapshot, names_df, min_winner, min_chg, max_chg, t
     if d_today is None or d_today.empty or d_cyq is None or d_cyq.empty: return None
     
     try:
-        # 合并三张表
         m1 = pd.merge(d_today, d_basic, on='ts_code', how='inner')
         if names_df is not None:
             m1 = pd.merge(m1, names_df, on='ts_code', how='left')
         
-        # 这里的 d_cyq 就是您的 10000 积分换来的真数据
         df = pd.merge(m1, d_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
         
-        # 核心逻辑：
-        # 1. winner_rate >= 80% (真筹码背书)
-        # 2. pct_chg 在 2%~7% (黄金击球区，拒绝骗炮)
+        # --- 核心计算 ---
+        # 1. 计算回撤 (High - Close) / Close * 100
+        # 如果这个值很大，说明上影线很长
+        df['shadow_pct'] = (df['high'] - df['close']) / df['close'] * 100
+        
         condition = (
             (df['winner_rate'] >= min_winner) &     
             (df['pct_chg'] >= min_chg) &            
-            (df['pct_chg'] <= max_chg) &            
+            (df['pct_chg'] <= max_chg) &    
+            (df['shadow_pct'] <= max_shadow) &      # <--- 关键过滤：回撤不能超过 1.5%
             (df['circ_mv'] > 300000) &              
             (~df['name'].str.contains('ST'))        
         )
         
-        # 强者恒强：按获利盘排序
         sorted_df = df[condition].sort_values('winner_rate', ascending=False)
         return sorted_df.head(top_n)
     except:
@@ -150,16 +128,17 @@ pro = get_pro_api(token_input)
 
 st.sidebar.divider()
 cfg_position_count = st.sidebar.number_input("每日持仓数", value=3, min_value=1, step=1)
+cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=80.0, step=1.0)
 
-# 这就是您的“大价钱”起作用的地方
-cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=80.0, step=1.0, help="只有主力高度控盘的票才买")
-
-st.sidebar.caption("👇 黄金击球区 (避开长上影)")
 col_c1, col_c2 = st.sidebar.columns(2)
 with col_c1:
-    cfg_min_chg = st.sidebar.number_input("最小涨幅(%)", value=2.0, step=0.5, help="确认上涨")
+    cfg_min_chg = st.sidebar.number_input("最小涨幅(%)", value=2.0, step=0.5)
 with col_c2:
-    cfg_max_chg = st.sidebar.number_input("最大涨幅(%)", value=7.0, step=0.5, help="拒绝追高")
+    cfg_max_chg = st.sidebar.number_input("最大涨幅(%)", value=7.0, step=0.5)
+
+# --- 新增：上影线风控 ---
+st.sidebar.caption("👇 避雷针风控")
+cfg_max_shadow = st.sidebar.number_input("允许最大回落(%)", value=1.5, step=0.1, help="例如设为1.5%，如果最高涨7%，收盘必须在5.5%以上，否则不买")
 
 st.sidebar.divider()
 st.sidebar.caption("🛡️ 右侧风控")
@@ -180,51 +159,41 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V40.3 黄金击球实战版 (真筹码+多线程)")
-st.info("💡 策略逻辑：利用 **真筹码数据** 筛选获利盘 > 80% 的股票，并在 **下午 14:30** 确认涨幅在 **2%~7%** 时买入。")
+st.title("🚀 V40.4 避雷针过滤版")
+st.info("💡 新增风控：如果股价从当日最高点回落超过 **1.5%**，视为上涨乏力（上影线太长），系统将自动剔除，防止骗炮。")
 
 tab1, tab2 = st.tabs(["🏹 实盘扫描", "📈 趋势回测"])
 
 with tab1:
     col_d, col_b = st.columns([3, 1])
     with col_d:
-        # 默认选“昨天”，实盘时结合“今天实时涨幅”
         yesterday = datetime.now() - timedelta(days=1)
-        scan_date_input = st.date_input("选择日期 (建议选昨天)", value=yesterday)
+        scan_date_input = st.date_input("选择日期 (选昨天)", value=yesterday)
     scan_date_str = scan_date_input.strftime('%Y%m%d')
     
-    if col_b.button("扫描黄金机会", type="primary"):
+    if col_b.button("扫描纯净机会", type="primary"):
         if not pro: st.stop()
-        with st.spinner(f"正在调取真筹码数据分析 {scan_date_str}..."):
+        with st.spinner(f"正在分析 {scan_date_str} (自动剔除避雷针)..."):
             
             data = fetch_day_task_right_side(scan_date_str, token_input)
             names_df = get_names(token_input)
             
             if data:
-                # 扫描
-                fleet = run_strategy_golden_zone(data, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, 20)
+                fleet = run_strategy_golden_zone_strict(data, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, cfg_max_shadow, 20)
                 
                 if fleet is not None and not fleet.empty:
-                    st.success(f"🔥 发现 {len(fleet)} 只筹码完美的潜力股")
-                    st.markdown("👇 **实盘操作指南 (14:30 执行)：**")
-                    st.markdown("""
-                    请在交易软件中查看以下股票**今天的表现**：
-                    1.  **涨幅在 2% ~ 7% 之间？** (确认趋势)
-                    2.  **K线是实心阳线？** (拒绝避雷针)
-                    3.  **满足则现价买入！**
-                    """)
-                    st.dataframe(fleet[['ts_code', 'name', 'close', 'pct_chg', 'winner_rate', 'industry']].style.format({
-                        'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'winner_rate': '{:.1f}%'
+                    st.success(f"🔥 发现 {len(fleet)} 只形态完美的股票")
+                    st.dataframe(fleet[['ts_code', 'name', 'close', 'pct_chg', 'shadow_pct', 'winner_rate']].style.format({
+                        'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'shadow_pct': '{:.2f}%', 'winner_rate': '{:.1f}%'
                     }), hide_index=True)
                 else:
-                    st.warning(f"昨日无符合条件的股票。")
+                    st.warning(f"昨日无符合条件的股票 (可能都被上影线过滤掉了)。")
             else:
                 st.error("数据获取失败。")
 
 with tab2:
-    if st.button("🚀 启动模拟回测 (尾盘买入)", type="primary", use_container_width=True):
+    if st.button("🚀 启动纯净回测", type="primary", use_container_width=True):
         if not token_input: st.stop()
-        
         try:
             ts.set_token(token_input)
             pro = ts.pro_api()
@@ -253,7 +222,7 @@ with tab2:
             curr_dt = pd.to_datetime(date)
             next_active = []
             
-            # --- 持仓管理 ---
+            # --- 持仓 ---
             for sig in active_signals:
                 code = sig['code']
                 if curr_dt <= pd.to_datetime(sig['buy_date']):
@@ -272,7 +241,6 @@ with tab2:
                     reason = ""
                     sell_p = pc
                     
-                    # 1. 破位止损
                     if (pl - cost) / cost <= -stop_loss_decimal:
                         reason = "破位止损"
                         sell_p = cost * (1 - stop_loss_decimal)
@@ -299,12 +267,11 @@ with tab2:
             active_signals = next_active
             
             # --- 选股 ---
-            fleet = run_strategy_golden_zone(snap, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, cfg_position_count)
+            fleet = run_strategy_golden_zone_strict(snap, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, cfg_max_shadow, cfg_position_count)
             if fleet is not None and not fleet.empty:
                 for _, row in fleet.iterrows():
                     code = row['ts_code']
                     if code in price_map:
-                        # 模拟：14:30 确认在区间内，以【收盘价】买入
                         active_signals.append({
                             'code': code, 
                             'name': row['name'] if 'name' in row else code,
