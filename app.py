@@ -4,71 +4,56 @@ import pandas as pd
 import numpy as np
 import altair as alt
 
-# ==========================================
-# 页面配置
-# ==========================================
-st.set_page_config(page_title="V19.0 因子挖掘", layout="wide")
-st.title("⛏️ V19.0 因子挖掘机 (寻找胜率之钥)")
-st.markdown("""
-### 🔍 寻找“X因子”
-我们保持 **-5% 窄止损** (保护心态)，尝试通过添加 **过滤条件** 来提升胜率。
-我们将测试以下四大金刚对胜率的影响：
-1.  **获利盘 (Winner Rate)**: 筹码结构是否健康？
-2.  **换手率 (Turnover)**: 人气是否还在？
-3.  **市盈率 (PE)**: 是错杀绩优股还是垃圾股？
-4.  **流通市值 (MV)**: 盘子大小的影响？
-""")
+# 1. Page Config 必须放在最前面，且不再变动
+st.set_page_config(page_title="V19.2 因子挖掘", layout="wide")
 
 # ==========================================
-# 侧边栏
+# 侧边栏配置
 # ==========================================
-with st.sidebar:
-    st.header("⚙️ 核心参数")
-    my_token = st.text_input("Tushare Token", type="password")
-    
-    start_date = st.text_input("开始日期", value="20240504")
-    end_date = st.text_input("结束日期", value="20251226")
-    
-    st.divider()
-    st.success("🔒 黄金区间: 11.0 - 20.0 元")
-    st.info("🛡️ 止损: 固定 -5% (回归人性)")
-    
-    # 基础参数
-    STOP_LOSS = -0.0501
-    TRAIL_START = 0.08
-    TRAIL_DROP = 0.03
-    MAX_HOLD_DAYS = 10
+st.sidebar.header("⚙️ 核心参数")
+my_token = st.sidebar.text_input("Tushare Token", type="password")
 
-run_btn = st.button("🚀 启动因子扫描", type="primary", use_container_width=True)
+start_date = st.sidebar.text_input("开始日期", value="20240504")
+end_date = st.sidebar.text_input("结束日期", value="20251226")
 
+st.sidebar.divider()
+st.sidebar.success("🔒 黄金区间: 11.0 - 20.0 元")
+st.sidebar.info("🛡️ 止损: 固定 -5%")
+
+run_btn = st.sidebar.button("🚀 启动因子扫描", type="primary", use_container_width=True)
+
+# ==========================================
+# 核心逻辑区
+# ==========================================
 if run_btn:
     if not my_token:
         st.error("请输入 Token")
         st.stop()
+    
+    # 设置 Token
     ts.set_token(my_token)
-    status_box = st.empty()
     try:
         pro = ts.pro_api()
     except Exception as e:
         st.error(f"连接失败: {e}")
         st.stop()
 
-    class Config:
-        START_DATE = start_date
-        END_DATE = end_date
-        MIN_PRICE = 11.0
-        MAX_PRICE = 20.0
-        STOP_LOSS = STOP_LOSS
-        TRAIL_START = TRAIL_START
-        TRAIL_DROP = TRAIL_DROP
-        MAX_HOLD_DAYS = MAX_HOLD_DAYS
-        FEE_RATE = 0.0003
+    # 配置参数
+    CFG_START = start_date
+    CFG_END = end_date
+    CFG_MIN_PRICE = 11.0
+    CFG_MAX_PRICE = 20.0
+    CFG_STOP_LOSS = -0.0501
+    CFG_TRAIL_START = 0.08
+    CFG_TRAIL_DROP = 0.03
+    CFG_MAX_HOLD = 10
+    CFG_FEE = 0.0003
 
-    cfg = Config()
+    status_box = st.empty()
 
-    # --- 缓存函数 ---
+    # --- 数据获取函数 (移除 persist=True，恢复纯净) ---
     @st.cache_data(ttl=86400)
-    def get_market_sentiment_v19(start, end):
+    def get_market_sentiment_pure(start, end):
         try:
             real_start = (pd.to_datetime(start) - pd.Timedelta(days=90)).strftime('%Y%m%d')
             df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end)
@@ -77,13 +62,13 @@ if run_btn:
             return df.set_index('trade_date')['close'].gt(df.set_index('trade_date')['ma20']).to_dict()
         except: return {}
 
-    @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_price_data_v19(date):
+    @st.cache_data(ttl=86400)
+    def fetch_price_data_pure(date):
         try: return pro.daily(trade_date=date)
         except: return pd.DataFrame()
 
-    @st.cache_data(ttl=86400, persist=True, show_spinner=False)
-    def fetch_strategy_data_v19(date):
+    @st.cache_data(ttl=86400)
+    def fetch_strategy_data_pure(date):
         try:
             df_daily = pro.daily(trade_date=date)
             if df_daily.empty: return pd.DataFrame()
@@ -100,19 +85,20 @@ if run_btn:
         df['bias'] = (df['close'] - df['cost_50pct']) / df['cost_50pct']
         condition = (
             (df['bias'] > -0.03) & (df['bias'] < 0.15) & 
-            # 暂时放宽 winner_rate 限制，以便测试它的分布
             (df['circ_mv'] > 300000) &  
             (df['turnover_rate'] > 1.5) &
-            (df['close'] >= cfg.MIN_PRICE) &
-            (df['close'] <= cfg.MAX_PRICE) 
+            (df['close'] >= CFG_MIN_PRICE) &
+            (df['close'] <= CFG_MAX_PRICE) 
         )
         sorted_df = df[condition].sort_values('bias', ascending=True)
         if sorted_df.empty: return None
-        return sorted_df.iloc[0] # 返回 Series，包含所有特征
+        return sorted_df.iloc[0]
 
-    # --- 回测循环 ---
-    market_safe_map = get_market_sentiment_v19(cfg.START_DATE, cfg.END_DATE)
-    cal_df = pro.trade_cal(exchange='', start_date=cfg.START_DATE, end_date=cfg.END_DATE, is_open='1')
+    # --- 主循环 ---
+    st.title("⛏️ V19.2 因子挖掘机 (纯净修复版)")
+    
+    market_safe_map = get_market_sentiment_pure(CFG_START, CFG_END)
+    cal_df = pro.trade_cal(exchange='', start_date=CFG_START, end_date=CFG_END, is_open='1')
     dates = sorted(cal_df['cal_date'].tolist())
     
     active_signals = [] 
@@ -123,10 +109,10 @@ if run_btn:
     for i, date in enumerate(dates):
         progress_bar.progress((i + 1) / len(dates))
         is_market_safe = market_safe_map.get(date, False) 
-        status_box.text(f"Mining Factors: {date}")
+        status_box.text(f"Scanning: {date}")
 
-        df_price = fetch_price_data_v19(date)
-        df_strat = fetch_strategy_data_v19(date)
+        df_price = fetch_price_data_pure(date)
+        df_strat = fetch_strategy_data_pure(date)
         
         price_map_open = {}
         price_map_close = {}
@@ -140,7 +126,7 @@ if run_btn:
             price_map_high = df_price['high'].to_dict()
             price_map_low = df_price['low'].to_dict()
         
-        # 1. 更新信号
+        # 1. 更新在手信号
         signals_still_active = []
         current_date_obj = pd.to_datetime(date)
         
@@ -167,18 +153,17 @@ if run_btn:
                 reason = ""
                 sell_price = curr_price
                 
-                if (low_today - cost) / cost <= cfg.STOP_LOSS:
+                if (low_today - cost) / cost <= CFG_STOP_LOSS:
                     reason = "止损"
-                    sell_price = cost * (1 + cfg.STOP_LOSS)
-                elif peak_ret >= cfg.TRAIL_START and drawdown >= cfg.TRAIL_DROP:
+                    sell_price = cost * (1 + CFG_STOP_LOSS)
+                elif peak_ret >= CFG_TRAIL_START and drawdown >= CFG_TRAIL_DROP:
                     reason = "止盈"
-                    sell_price = peak * (1 - cfg.TRAIL_DROP) 
-                elif (current_date_obj - pd.to_datetime(sig['buy_date'])).days >= cfg.MAX_HOLD_DAYS:
+                    sell_price = peak * (1 - CFG_TRAIL_DROP) 
+                elif (current_date_obj - pd.to_datetime(sig['buy_date'])).days >= CFG_MAX_HOLD:
                     reason = "超时"
                 
                 if reason:
-                    ret = (sell_price - cost) / cost - cfg.FEE_RATE * 2
-                    # === 保存因子数据 ===
+                    ret = (sell_price - cost) / cost - CFG_FEE * 2
                     finished_signals.append({
                         'code': code, 'buy_date': sig['buy_date'],
                         'return': ret, 'reason': reason,
@@ -194,7 +179,7 @@ if run_btn:
         
         active_signals = signals_still_active
 
-        # 2. 发出新信号
+        # 2. 选股
         if is_market_safe and not df_strat.empty:
             target_row = select_rank_1_features(df_strat.reset_index())
             if target_row is not None:
@@ -203,7 +188,6 @@ if run_btn:
                     active_signals.append({
                         'code': code, 'buy_date': date,
                         'buy_price': price_map_open[code], 'highest': price_map_open[code],
-                        # 记录买入时的身体指标
                         'winner_rate': target_row['winner_rate'],
                         'pe_ttm': target_row['pe_ttm'],
                         'turnover_rate': target_row['turnover_rate'],
@@ -217,74 +201,44 @@ if run_btn:
     if finished_signals:
         df_res = pd.DataFrame(finished_signals)
         df_res['return_pct'] = df_res['return'] * 100
-        df_res['is_win'] = df_res['return'] > 0
         
-        base_win_rate = df_res['is_win'].mean() * 100
+        st.subheader("🔍 因子体检报告 (基于 -5% 止损)")
+        st.info("观察哪个分区的胜率显著高于 40%，那就是我们要找的胜率之钥！")
         
-        st.subheader(f"📊 基础胜率 (止损 -5%): {base_win_rate:.1f}%")
-        st.write("让我们看看能不能通过过滤因子把胜率提上去！")
-        
-        # === 因子 1: 获利盘 (Chip) ===
+        # 1. 获利盘
         st.divider()
-        st.subheader("1. 获利盘 (Winner Rate) 分析")
-        c1, c2 = st.columns(2)
-        # 将获利盘分桶：0-1%, 1-5%, 5-10%, >10%
+        st.markdown("### 1. 获利盘 (Winner Rate)")
         bins = [-1, 1, 5, 10, 100]
         labels = ['极低 (0-1%)', '低 (1-5%)', '中 (5-10%)', '高 (>10%)']
-        df_res['chip_group'] = pd.cut(df_res['winner_rate'], bins=bins, labels=labels)
-        chip_stats = df_res.groupby('chip_group').apply(lambda x: pd.Series({
-            '胜率': (x['return']>0).mean()*100, 
-            '样本数': len(x),
-            '期望收益': x['return'].mean()*100
-        }))
-        c1.table(chip_stats)
-        c2.info("💡 假设：获利盘太低(0-1%)可能是‘死鱼’；稍微高一点(>5%)可能有资金护盘。")
-
-        # === 因子 2: 换手率 (Turnover) ===
+        df_res['group'] = pd.cut(df_res['winner_rate'], bins=bins, labels=labels)
+        stats = df_res.groupby('group')['return'].agg(['count', lambda x: (x>0).mean()*100, 'mean'])
+        stats.columns = ['样本数', '胜率%', '期望收益%']
+        stats['期望收益%'] = stats['期望收益%'] * 100
+        st.table(stats)
+        
+        # 2. 换手率
         st.divider()
-        st.subheader("2. 换手率 (Turnover) 分析")
-        c1, c2 = st.columns(2)
+        st.markdown("### 2. 换手率 (Turnover)")
         bins_to = [0, 3, 5, 8, 100]
         labels_to = ['缩量 (<3%)', '温和 (3-5%)', '活跃 (5-8%)', '放量 (>8%)']
-        df_res['turnover_group'] = pd.cut(df_res['turnover_rate'], bins=bins_to, labels=labels_to)
-        to_stats = df_res.groupby('turnover_group').apply(lambda x: pd.Series({
-            '胜率': (x['return']>0).mean()*100, 
-            '样本数': len(x),
-            '期望收益': x['return'].mean()*100
-        }))
-        c1.table(to_stats)
-        c2.info("💡 假设：Rank 1 如果伴随‘缩量’ (<3%)，可能跌不动了；如果‘巨量’，可能还在出货。")
+        df_res['group'] = pd.cut(df_res['turnover_rate'], bins=bins_to, labels=labels_to)
+        stats_to = df_res.groupby('group')['return'].agg(['count', lambda x: (x>0).mean()*100, 'mean'])
+        stats_to.columns = ['样本数', '胜率%', '期望收益%']
+        stats_to['期望收益%'] = stats_to['期望收益%'] * 100
+        st.table(stats_to)
         
-        # === 因子 3: 市盈率 (PE) ===
+        # 3. 市盈率
         st.divider()
-        st.subheader("3. 估值 (PE) 分析")
-        c1, c2 = st.columns(2)
+        st.markdown("### 3. 市盈率 (PE)")
         bins_pe = [-1000, 0, 30, 60, 10000]
-        labels_pe = ['亏损股 (<0)', '绩优股 (0-30)', '成长股 (30-60)', '高估/泡沫 (>60)']
-        df_res['pe_group'] = pd.cut(df_res['pe_ttm'], bins=bins_pe, labels=labels_pe)
-        pe_stats = df_res.groupby('pe_group').apply(lambda x: pd.Series({
-            '胜率': (x['return']>0).mean()*100, 
-            '样本数': len(x),
-            '期望收益': x['return'].mean()*100
-        }))
-        c1.table(pe_stats)
-        c2.info("💡 假设：亏损股的反弹可能是‘诈尸’，胜率低；绩优股的反弹可能是‘错杀修复’。")
+        labels_pe = ['亏损股 (<0)', '绩优股 (0-30)', '成长股 (30-60)', '高估 (>60)']
+        df_res['group'] = pd.cut(df_res['pe_ttm'], bins=bins_pe, labels=labels_pe)
+        stats_pe = df_res.groupby('group')['return'].agg(['count', lambda x: (x>0).mean()*100, 'mean'])
+        stats_pe.columns = ['样本数', '胜率%', '期望收益%']
+        stats_pe['期望收益%'] = stats_pe['期望收益%'] * 100
+        st.table(stats_pe)
+    else:
+        st.warning("无交易记录")
 
-        # === 智能推荐 ===
-        st.divider()
-        st.subheader("🤖 AI 策略优化建议")
-        best_filter = ""
-        best_win_rate = 0
-        
-        # 简单的遍历寻找最佳单因子
-        for g_name, stats in [('获利盘', chip_stats), ('换手率', to_stats), ('PE', pe_stats)]:
-            for idx, row in stats.iterrows():
-                if row['样本数'] > 20 and row['胜率'] > best_win_rate:
-                    best_win_rate = row['胜率']
-                    best_filter = f"{g_name} 为 {idx}"
-        
-        if best_win_rate > 50:
-            st.success(f"🎉 发现潜力！如果只做 【{best_filter}】 的股票，胜率可达 {best_win_rate:.1f}%！")
-            st.markdown(f"建议您在实盘代码中加入这个过滤条件，即可在 **-5% 止损** 下实现正收益。")
-        else:
-            st.warning(f"即便加了过滤，最高胜率也只有 {best_win_rate:.1f}%。可能 Rank 1 策略本身确实太激进了。")
+else:
+    st.info("👈 请在左侧输入 Token 并点击启动")
