@@ -10,14 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V46.0 竞价止损版", layout="wide")
+st.set_page_config(page_title="V46.1 激进风控版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
-st.sidebar.header("🛡️ 趋势狩猎 (V46.0)")
-st.sidebar.success("✅ **新增：T+1 竞价风控**")
-st.sidebar.info("若次日大幅低开，开盘直接核按钮(止损)")
+st.sidebar.header("🛡️ 趋势狩猎 (V46.1)")
+st.sidebar.success("✅ **逻辑升级：T+1 不胜即走**")
+st.sidebar.info("T+1收盘若浮亏，强制卖出，绝不留单过夜")
 
 if st.sidebar.button("🔄 强制重启系统", type="primary"):
     st.cache_data.clear()
@@ -103,7 +103,7 @@ def get_names(token):
 # ==========================================
 # 4. 逻辑层
 # ==========================================
-def run_strategy_v46(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
+def run_strategy_v46_1(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
     # 1. 大盘风控
     market_status = "OK"
     if enable_market_filter and index_df is not None and not index_df.empty:
@@ -128,7 +128,7 @@ def run_strategy_v46(snapshot, names_df, min_winner, min_chg, max_chg, max_shado
         df = pd.merge(m1, d_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
         df['shadow_pct'] = (df['high'] - df['close']) / df['close'] * 100
         
-        # Step 0: 剔除创业板 (保留之前优化的成果)
+        # Step 0: 剔除创业板
         df = df[~df['ts_code'].str.startswith('30')]
 
         total = len(df)
@@ -186,8 +186,9 @@ cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=50.0, step=
 
 # --- 新增：竞价风控参数 ---
 st.sidebar.divider()
-st.sidebar.caption("👇 T+1 竞价风控")
-cfg_open_stop = st.sidebar.number_input("竞价止损线(%)", value=-2.0, step=0.5, max_value=0.0, help="如果次日开盘低于买入价2%，直接卖出")
+st.sidebar.caption("👇 T+1 激进风控")
+cfg_open_stop = st.sidebar.number_input("竞价止损线(%)", value=-2.0, step=0.5, max_value=0.0)
+st.sidebar.markdown("**核心规则：T+1 收盘价 < 买入价，强制卖出！**")
 
 st.sidebar.divider()
 col_h1, col_h2 = st.sidebar.columns(2)
@@ -217,7 +218,7 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V46.0 竞价止损版")
+st.title("🚀 V46.1 激进风控版 (T+1 不胜即走)")
 
 tab1, tab2 = st.tabs(["🩺 实盘漏斗诊断", "📈 全年回测"])
 
@@ -238,7 +239,7 @@ with tab1:
             names_df = get_names(token_input)
             
             if data:
-                result, debug_info = run_strategy_v46(data, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
+                result, debug_info = run_strategy_v46_1(data, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
                 
                 if debug_info:
                     st.divider()
@@ -307,26 +308,31 @@ with tab2:
                     if ph > sig['highest']: sig['highest'] = ph
                     cost = sig['buy_price']
                     
-                    # --- V46.0 新增逻辑: 竞价风控 ---
-                    # 检查是否是持仓第一天 (T+1)
+                    # --- V46.1 激进风控 ---
                     held_days = (curr_dt - pd.to_datetime(sig['buy_date'])).days
-                    is_t1 = (held_days <= 1) # 简化判断，实际应判断交易日，但此处近似可行
+                    is_t1 = (held_days == 1) # 严格 Day 1
                     
                     t1_open_pct = 0.0
                     reason = ""
                     sell_p = pc
                     
-                    # 1. T+1 开盘大跌 -> 竞价止损
+                    # 1. 竞价风控: 开盘大跌直接跑
                     if is_t1:
                         open_p = p['open']
                         t1_ret = (open_p - cost) / cost
-                        t1_open_pct = t1_ret # 记录下来给用户看
-                        
+                        t1_open_pct = t1_ret
                         if t1_ret < open_stop_decimal:
                             reason = "竞价止损"
-                            sell_p = open_p # 按开盘价卖出
+                            sell_p = open_p
                     
-                    # 2. 如果没触发竞价止损，继续走常规逻辑
+                    # 2. 如果没触发竞价止损，看是否触发“不胜即走”
+                    if not reason and is_t1:
+                        # 收盘价 <= 买入价，说明没赚钱
+                        if pc <= cost:
+                            reason = "T+1平推"
+                            sell_p = pc # 按收盘价卖出
+
+                    # 3. 常规风控
                     if not reason:
                         peak = sig['highest']
                         if (pl - cost) / cost <= -stop_loss_decimal:
@@ -340,7 +346,6 @@ with tab2:
                     
                     if reason:
                         ret = (sell_p - cost) / cost - 0.001
-                        # 记录 t1_open_pct 方便分析
                         finished_signals.append({
                             'name': sig.get('name', code), 
                             'code': code, 
@@ -356,7 +361,7 @@ with tab2:
                     next_active.append(sig)
             active_signals = next_active
             
-            result, _ = run_strategy_v46(snap, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
+            result, _ = run_strategy_v46_1(snap, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
             
             if isinstance(result, str) and result == "MARKET_BAD":
                 skipped_days += 1
@@ -377,7 +382,7 @@ with tab2:
             c2.metric("胜率", f"{(df_res['ret']>0).mean()*100:.1f}%")
             c3.metric("交易次数", f"{len(df_res)}")
             
-            st.subheader("📋 交易详情 (含 T+1 开盘数据)")
+            st.subheader("📋 交易详情")
             st.dataframe(df_res[['name', 'code', 'buy_date', 'sell_date', 'ret', 'reason', 't1_open_pct']].style.format({'ret': '{:.2%}'}), use_container_width=True)
         else:
             st.warning("无交易")
