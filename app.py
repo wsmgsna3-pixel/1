@@ -10,14 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V45.1 精准剔除版", layout="wide")
+st.set_page_config(page_title="V46.0 竞价止损版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
-st.sidebar.header("🛡️ 趋势狩猎 (V45.1)")
-st.sidebar.success("✅ **板块优化：剔除创业板 (300)**")
-st.sidebar.info("只做主板 + 科创板 (688)")
+st.sidebar.header("🛡️ 趋势狩猎 (V46.0)")
+st.sidebar.success("✅ **新增：T+1 竞价风控**")
+st.sidebar.info("若次日大幅低开，开盘直接核按钮(止损)")
 
 if st.sidebar.button("🔄 强制重启系统", type="primary"):
     st.cache_data.clear()
@@ -101,9 +101,9 @@ def get_names(token):
     except: return pd.DataFrame()
 
 # ==========================================
-# 4. 逻辑层 (增加黑名单)
+# 4. 逻辑层
 # ==========================================
-def run_strategy_v45_1(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
+def run_strategy_v46(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
     # 1. 大盘风控
     market_status = "OK"
     if enable_market_filter and index_df is not None and not index_df.empty:
@@ -128,11 +128,10 @@ def run_strategy_v45_1(snapshot, names_df, min_winner, min_chg, max_chg, max_sha
         df = pd.merge(m1, d_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
         df['shadow_pct'] = (df['high'] - df['close']) / df['close'] * 100
         
+        # Step 0: 剔除创业板 (保留之前优化的成果)
+        df = df[~df['ts_code'].str.startswith('30')]
+
         total = len(df)
-        
-        # Step 0: 黑名单过滤 (剔除 30 开头的创业板)
-        df = df[~df['ts_code'].str.startswith('30')] # <--- 核心修改
-        c_board = len(df)
         
         # Step 1: 价格 > 10
         df = df[df['close'] >= min_price]
@@ -156,7 +155,6 @@ def run_strategy_v45_1(snapshot, names_df, min_winner, min_chg, max_chg, max_sha
         
         debug_info = {
             "total": total,
-            "after_filter_300": c_board, # 记录这一步杀掉了多少
             "after_price": c_price,
             "after_chg": c_chg,
             "after_shadow": c_shadow,
@@ -164,7 +162,6 @@ def run_strategy_v45_1(snapshot, names_df, min_winner, min_chg, max_chg, max_sha
             "market_status": market_status
         }
         
-        # 排序
         sorted_df = df.sort_values('winner_rate', ascending=False)
             
         if show_debug:
@@ -184,32 +181,34 @@ pro = get_pro_api(token_input)
 
 st.sidebar.divider()
 use_market_filter = st.sidebar.checkbox("开启大盘风控 (上证20日线)", value=False)
-
 cfg_position_count = st.sidebar.number_input("持仓数", value=3)
 cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=50.0, step=1.0) 
 
+# --- 新增：竞价风控参数 ---
 st.sidebar.divider()
-st.sidebar.caption("👇 黄金击球区 (3.0% ~ 7.5%)")
+st.sidebar.caption("👇 T+1 竞价风控")
+cfg_open_stop = st.sidebar.number_input("竞价止损线(%)", value=-2.0, step=0.5, max_value=0.0, help="如果次日开盘低于买入价2%，直接卖出")
+
+st.sidebar.divider()
 col_h1, col_h2 = st.sidebar.columns(2)
 with col_h1:
     cfg_min_pct_chg = st.sidebar.number_input("最小涨幅(%)", value=3.0, step=0.5)
 with col_h2:
     cfg_max_pct_chg = st.sidebar.number_input("最大涨幅(%)", value=7.5, step=0.5)
 
-st.sidebar.divider()
 cfg_min_price = st.sidebar.number_input("最低股价(元)", value=10.0, step=0.1)
 cfg_max_shadow = st.sidebar.number_input("最大上影线(%)", value=1.5, step=0.1)
 
-st.sidebar.divider()
 col_s1, col_s2 = st.sidebar.columns(2)
 with col_s1:
-    cfg_stop_loss = st.sidebar.number_input("止损(%)", value=6.0)
+    cfg_stop_loss = st.sidebar.number_input("盘中止损(%)", value=6.0)
 with col_s2:
     cfg_max_hold = st.sidebar.number_input("持仓天", value=5)
 
 cfg_trail_start = 0.10 
 cfg_trail_drop = 0.03  
 stop_loss_decimal = cfg_stop_loss / 100.0
+open_stop_decimal = cfg_open_stop / 100.0
 
 today = datetime.now()
 start_date = st.sidebar.text_input("开始日期", value=f"{today.year}0101")
@@ -218,7 +217,7 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V45.1 精准剔除版")
+st.title("🚀 V46.0 竞价止损版")
 
 tab1, tab2 = st.tabs(["🩺 实盘漏斗诊断", "📈 全年回测"])
 
@@ -239,7 +238,7 @@ with tab1:
             names_df = get_names(token_input)
             
             if data:
-                result, debug_info = run_strategy_v45_1(data, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
+                result, debug_info = run_strategy_v46(data, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
                 
                 if debug_info:
                     st.divider()
@@ -248,11 +247,10 @@ with tab1:
                     
                     funnel_data = [
                         {"步骤": "1. 初始全市场", "剩余数量": debug_info['total']},
-                        {"步骤": f"2. 剔除创业板(300)", "剩余数量": debug_info['after_filter_300']},
-                        {"步骤": f"3. 价格>10元", "剩余数量": debug_info['after_price']},
-                        {"步骤": f"4. 涨幅 {cfg_min_pct_chg}%~{cfg_max_pct_chg}%", "剩余数量": debug_info['after_chg']},
-                        {"步骤": f"5. 上影线<{cfg_max_shadow}%", "剩余数量": debug_info['after_shadow']},
-                        {"步骤": f"6. 获利盘>{cfg_min_winner}%", "剩余数量": debug_info['after_winner']},
+                        {"步骤": f"2. 价格>10元", "剩余数量": debug_info['after_price']},
+                        {"步骤": f"3. 涨幅 {cfg_min_pct_chg}%~{cfg_max_pct_chg}%", "剩余数量": debug_info['after_chg']},
+                        {"步骤": f"4. 上影线<{cfg_max_shadow}%", "剩余数量": debug_info['after_shadow']},
+                        {"步骤": f"5. 获利盘>{cfg_min_winner}%", "剩余数量": debug_info['after_winner']},
                     ]
                     st.dataframe(pd.DataFrame(funnel_data), use_container_width=True, hide_index=True)
                     
@@ -308,29 +306,57 @@ with tab2:
                     ph, pl, pc = p['high'], p['low'], p['close']
                     if ph > sig['highest']: sig['highest'] = ph
                     cost = sig['buy_price']
-                    peak = sig['highest']
+                    
+                    # --- V46.0 新增逻辑: 竞价风控 ---
+                    # 检查是否是持仓第一天 (T+1)
+                    held_days = (curr_dt - pd.to_datetime(sig['buy_date'])).days
+                    is_t1 = (held_days <= 1) # 简化判断，实际应判断交易日，但此处近似可行
+                    
+                    t1_open_pct = 0.0
                     reason = ""
                     sell_p = pc
                     
-                    if (pl - cost) / cost <= -stop_loss_decimal:
-                        reason = "破位止损"
-                        sell_p = cost * (1 - stop_loss_decimal)
-                    elif (peak - cost)/cost >= cfg_trail_start and (peak - pc)/peak >= cfg_trail_drop:
-                        reason = "高位止盈"
-                        sell_p = peak * (1 - cfg_trail_drop)
-                    elif (curr_dt - pd.to_datetime(sig['buy_date'])).days >= cfg_max_hold:
-                        reason = "动力不足"
+                    # 1. T+1 开盘大跌 -> 竞价止损
+                    if is_t1:
+                        open_p = p['open']
+                        t1_ret = (open_p - cost) / cost
+                        t1_open_pct = t1_ret # 记录下来给用户看
+                        
+                        if t1_ret < open_stop_decimal:
+                            reason = "竞价止损"
+                            sell_p = open_p # 按开盘价卖出
+                    
+                    # 2. 如果没触发竞价止损，继续走常规逻辑
+                    if not reason:
+                        peak = sig['highest']
+                        if (pl - cost) / cost <= -stop_loss_decimal:
+                            reason = "破位止损"
+                            sell_p = cost * (1 - stop_loss_decimal)
+                        elif (peak - cost)/cost >= cfg_trail_start and (peak - pc)/peak >= cfg_trail_drop:
+                            reason = "高位止盈"
+                            sell_p = peak * (1 - cfg_trail_drop)
+                        elif held_days >= cfg_max_hold:
+                            reason = "动力不足"
                     
                     if reason:
                         ret = (sell_p - cost) / cost - 0.001
-                        finished_signals.append({'name': sig.get('name', code), 'code': code, 'buy_date': sig['buy_date'], 'sell_date': date, 'ret': ret, 'reason': reason})
+                        # 记录 t1_open_pct 方便分析
+                        finished_signals.append({
+                            'name': sig.get('name', code), 
+                            'code': code, 
+                            'buy_date': sig['buy_date'], 
+                            'sell_date': date, 
+                            'ret': ret, 
+                            'reason': reason,
+                            't1_open_pct': f"{t1_open_pct*100:.2f}%" if is_t1 else "N/A"
+                        })
                     else:
                         next_active.append(sig)
                 else:
                     next_active.append(sig)
             active_signals = next_active
             
-            result, _ = run_strategy_v45_1(snap, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
+            result, _ = run_strategy_v46(snap, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
             
             if isinstance(result, str) and result == "MARKET_BAD":
                 skipped_days += 1
@@ -350,6 +376,8 @@ with tab2:
             c1.metric("单笔期望", f"{df_res['ret'].mean()*100:.2f}%")
             c2.metric("胜率", f"{(df_res['ret']>0).mean()*100:.1f}%")
             c3.metric("交易次数", f"{len(df_res)}")
-            st.dataframe(df_res[['name', 'code', 'buy_date', 'sell_date', 'ret', 'reason']].style.format({'ret': '{:.2%}'}), use_container_width=True)
+            
+            st.subheader("📋 交易详情 (含 T+1 开盘数据)")
+            st.dataframe(df_res[['name', 'code', 'buy_date', 'sell_date', 'ret', 'reason', 't1_open_pct']].style.format({'ret': '{:.2%}'}), use_container_width=True)
         else:
             st.warning("无交易")
