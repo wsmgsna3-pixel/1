@@ -10,14 +10,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V43.0 诊断调试版", layout="wide")
+st.set_page_config(page_title="V43.1 修复调试版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
-st.sidebar.header("🛡️ 趋势狩猎 (V43.0)")
-st.sidebar.success("✅ **功能：大盘风控可关闭**")
-st.sidebar.info("新增：选股漏斗诊断，查看过滤详情")
+st.sidebar.header("🛡️ 趋势狩猎 (V43.1)")
+st.sidebar.success("✅ **已修复：回测报错**")
+st.sidebar.success("✅ **已修复：诊断按钮无响应**")
+st.sidebar.info("请尝试：取消大盘风控 + 诊断漏斗")
 
 if st.sidebar.button("🔄 强制重启系统", type="primary"):
     st.cache_data.clear()
@@ -38,11 +39,13 @@ def fetch_index_data(token, start_date, end_date):
     try:
         ts.set_token(token)
         pro = ts.pro_api()
+        # 多取60天算均线
         real_start = (pd.to_datetime(start_date) - timedelta(days=60)).strftime('%Y%m%d')
         df = pro.index_daily(ts_code='000001.SH', start_date=real_start, end_date=end_date)
         if df.empty: return pd.DataFrame()
         df = df.sort_values('trade_date')
         df['ma20'] = df['close'].rolling(20).mean()
+        # 裁剪
         df = df[df['trade_date'] >= start_date]
         return df.set_index('trade_date')
     except: return pd.DataFrame()
@@ -54,15 +57,20 @@ def fetch_day_task_right_side(date, token):
             time.sleep(0.1 + np.random.random() * 0.2)
             ts.set_token(token)
             local_pro = ts.pro_api(timeout=45)
+            
             d_today = local_pro.daily(trade_date=date)
             if d_today.empty: return None 
+            
             d_basic = local_pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv,pe_ttm')
+            
             d_cyq = local_pro.cyq_perf(trade_date=date)
             if d_cyq.empty:
                 prev_date = (pd.to_datetime(date) - timedelta(days=1)).strftime('%Y%m%d')
                 d_cyq = local_pro.cyq_perf(trade_date=prev_date)
+
             if not d_today.empty and not d_cyq.empty:
                 return {'date': date, 'daily': d_today, 'basic': d_basic, 'cyq': d_cyq}
+            
             raise ValueError("Data incomplete")
         except:
             if i == max_retries - 1: return None 
@@ -73,6 +81,7 @@ def fetch_day_task_right_side(date, token):
 def fetch_data_parallel_right(dates, token):
     results = {}
     progress_bar = st.progress(0, text="启动下载引擎...")
+    
     with ThreadPoolExecutor(max_workers=4) as executor:
         future_map = {executor.submit(fetch_day_task_right_side, d, token): d for d in dates}
         total = len(dates)
@@ -83,6 +92,7 @@ def fetch_data_parallel_right(dates, token):
             if data:
                 results[data['date']] = data
             progress_bar.progress(done / total, text=f"📥 进度: {done}/{total}")
+            
     progress_bar.empty()
     return results
 
@@ -94,20 +104,22 @@ def get_names(token):
     except: return pd.DataFrame()
 
 # ==========================================
-# 4. 逻辑层 (带漏斗统计)
+# 4. 逻辑层 (修复比较错误的 Bug)
 # ==========================================
 def run_strategy_debug(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
-    # 1. 大盘风控
+    # --- 1. 大盘风控 ---
     market_status = "OK"
+    # 只有当开关开启，且数据存在时，才检查
     if enable_market_filter and index_df is not None and not index_df.empty:
         if curr_date in index_df.index:
             idx_today = index_df.loc[curr_date]
             if idx_today['close'] < idx_today['ma20']:
                 market_status = "BAD"
-                if not show_debug: # 如果不是调试模式，直接返回
+                # 如果是回测模式(show_debug=False)，大盘不好直接返回
+                if not show_debug: 
                     return "MARKET_BAD", None
 
-    # 2. 个股筛选
+    # --- 2. 个股筛选 ---
     if not snapshot: return "NO_DATA", None
     d_today = snapshot.get('daily') 
     d_basic = snapshot.get('basic')
@@ -120,29 +132,32 @@ def run_strategy_debug(snapshot, names_df, min_winner, min_chg, max_chg, max_sha
         m1 = pd.merge(d_today, d_basic, on='ts_code', how='inner')
         if names_df is not None:
             m1 = pd.merge(m1, names_df, on='ts_code', how='left')
+        
         df = pd.merge(m1, d_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
+        
+        # 计算上影线
         df['shadow_pct'] = (df['high'] - df['close']) / df['close'] * 100
         
         # --- 漏斗统计 ---
         total_count = len(df)
         
-        # 步骤 1: 价格门槛
+        # Step 1: 价格
         df_price = df[df['close'] >= min_price]
         count_price = len(df_price)
         
-        # 步骤 2: 涨幅门槛
+        # Step 2: 涨幅
         df_chg = df_price[(df_price['pct_chg'] >= min_chg) & (df_price['pct_chg'] <= max_chg)]
         count_chg = len(df_chg)
         
-        # 步骤 3: 避雷针门槛
+        # Step 3: 上影线
         df_shadow = df_chg[df_chg['shadow_pct'] <= max_shadow]
         count_shadow = len(df_shadow)
         
-        # 步骤 4: 获利盘门槛
+        # Step 4: 获利盘
         df_final = df_shadow[df_shadow['winner_rate'] >= min_winner]
         count_final = len(df_final)
         
-        # 排除 ST
+        # 排除垃圾股
         df_final = df_final[~df_final['name'].str.contains('ST', na=False)]
         df_final = df_final[df_final['circ_mv'] > 300000]
         
@@ -155,13 +170,17 @@ def run_strategy_debug(snapshot, names_df, min_winner, min_chg, max_chg, max_sha
             "market_status": market_status
         }
         
-        if market_status == "BAD" and not show_debug:
-             return "MARKET_BAD", None
-
+        # 如果是诊断模式，大盘不好也要返回数据(为了看漏斗)，但在外面处理展示
+        if show_debug:
+             sorted_df = df_final.sort_values('winner_rate', ascending=False)
+             return sorted_df.head(top_n), debug_info
+        
+        # 如果是回测模式，大盘不好上面已经return了，这里直接返回结果
         sorted_df = df_final.sort_values('winner_rate', ascending=False)
-        return sorted_df.head(top_n), debug_info
+        return sorted_df.head(top_n), None
         
     except Exception as e:
+        print(f"Strategy Error: {e}")
         return "ERROR", None
 
 # ==========================================
@@ -172,11 +191,11 @@ token_input = st.sidebar.text_input("Tushare Token", type="password")
 pro = get_pro_api(token_input)
 
 st.sidebar.divider()
-# --- 开关 ---
-use_market_filter = st.sidebar.checkbox("开启大盘风控 (上证20日线)", value=True, help="取消勾选可强制回测所有日期")
+# --- 开关 (默认开启) ---
+use_market_filter = st.sidebar.checkbox("开启大盘风控 (上证20日线)", value=True, help="取消勾选 = 无视大盘，强制买入")
 
 cfg_position_count = st.sidebar.number_input("持仓数", value=3)
-cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=50.0, step=1.0) # 默认改低一点试试
+cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=50.0, step=1.0) # 建议先设低点看看
 
 col_c1, col_c2 = st.sidebar.columns(2)
 with col_c1:
@@ -205,7 +224,7 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V43.0 诊断调试版")
+st.title("🚀 V43.1 修复调试版")
 
 tab1, tab2 = st.tabs(["🩺 实盘漏斗诊断", "📈 全年回测"])
 
@@ -220,37 +239,49 @@ with tab1:
         if not pro: st.stop()
         
         with st.spinner("正在解剖数据..."):
+            # 获取大盘
             idx_start = (pd.to_datetime(scan_date_str) - timedelta(days=60)).strftime('%Y%m%d')
             idx_df = fetch_index_data(token_input, idx_start, scan_date_str)
             
+            # 获取个股
             data = fetch_day_task_right_side(scan_date_str, token_input)
             names_df = get_names(token_input)
             
             if data:
-                # 开启 show_debug=True，强制返回统计信息
+                # 必须开启 show_debug=True
                 result, debug_info = run_strategy_debug(data, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
                 
                 if debug_info:
-                    st.subheader("🕵️‍♂️ 选股漏斗 (数据真相)")
+                    st.divider()
+                    st.subheader(f"📅 日期：{scan_date_str} 数据解剖")
                     
-                    # 1. 大盘状态
-                    market_str = "🟢 绿灯 (安全)" if debug_info['market_status'] == "OK" else "🔴 红灯 (危险)"
-                    if not use_market_filter: market_str += " [已强制无视]"
-                    st.metric("大盘环境", market_str)
+                    # 1. 大盘状态展示
+                    m_status = debug_info['market_status']
+                    if m_status == "BAD":
+                        if use_market_filter:
+                            st.error("🛑 大盘状态：红灯 (20日线下) -> 🚫 系统将拒绝开仓")
+                        else:
+                            st.warning("🛑 大盘状态：红灯 (20日线下) -> ⚠️ 您已强制无视风险，继续选股")
+                    else:
+                        st.success("🟢 大盘状态：绿灯 (20日线上) -> ✅ 允许开仓")
                     
-                    # 2. 漏斗图
+                    # 2. 漏斗图 (关键！)
+                    st.markdown("#### 🕵️‍♂️ 选股过滤器详解")
                     c1, c2, c3, c4, c5 = st.columns(5)
                     c1.metric("1.全市场", debug_info['total'])
-                    c2.metric("2.价格>10元", debug_info['after_price'], f"-{debug_info['total']-debug_info['after_price']} 只")
-                    c3.metric("3.涨幅2~7%", debug_info['after_chg'], f"-{debug_info['after_price']-debug_info['after_chg']} 只")
-                    c4.metric("4.上影线<1.5%", debug_info['after_shadow'], f"-{debug_info['after_chg']-debug_info['after_shadow']} 只")
-                    c5.metric(f"5.获利盘>{cfg_min_winner}%", debug_info['after_winner'], f"-{debug_info['after_shadow']-debug_info['after_winner']} 只")
+                    c2.metric("2.价格>10元", debug_info['after_price'], f"剩 {debug_info['after_price']}")
+                    c3.metric("3.涨幅2~7%", debug_info['after_chg'], f"剩 {debug_info['after_chg']}")
+                    c4.metric("4.上影线<1.5%", debug_info['after_shadow'], f"剩 {debug_info['after_shadow']}")
+                    c5.metric(f"5.获利盘>{cfg_min_winner}%", debug_info['after_winner'], f"剩 {debug_info['after_winner']}")
                     
-                    if debug_info['after_winner'] == 0:
-                        st.error("结论：没有任何股票满足条件。请根据上方漏斗查看是哪一步杀得太狠，并调整对应参数。")
+                    # 3. 结果展示
+                    if isinstance(result, pd.DataFrame) and not result.empty:
+                        st.success(f"最终选出 {len(result)} 只股票：")
+                        st.dataframe(result[['ts_code', 'name', 'close', 'pct_chg', 'shadow_pct', 'winner_rate']].style.format({
+                            'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'shadow_pct': '{:.2f}%', 'winner_rate': '{:.1f}%'
+                        }), hide_index=True)
                     else:
-                        st.success(f"最终选出 {len(result)} 只股票")
-                        st.dataframe(result[['ts_code', 'name', 'close', 'pct_chg', 'shadow_pct', 'winner_rate']], hide_index=True)
+                        st.info("虽然有数据进入漏斗，但最终结果为空 (可能因为大盘风控或条件太严)。")
 
 with tab2:
     if st.button("🚀 启动回测", type="primary", use_container_width=True):
@@ -321,9 +352,11 @@ with tab2:
             active_signals = next_active
             
             # 选股
+            # 这里的 debug=False, 所以 result 要么是 DataFrame, 要么是 "MARKET_BAD", 要么是 "NO_DATA"
             result, _ = run_strategy_debug(snap, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
             
-            if result == "MARKET_BAD":
+            # --- 修复后的判断逻辑 ---
+            if isinstance(result, str) and result == "MARKET_BAD":
                 skipped_days += 1
             elif isinstance(result, pd.DataFrame) and not result.empty:
                 for _, row in result.iterrows():
@@ -336,10 +369,9 @@ with tab2:
         if finished_signals:
             df_res = pd.DataFrame(finished_signals)
             st.divider()
-            if use_market_filter:
-                st.info(f"🛡️ 风控开启：共 {len(valid_dates)} 天，其中 {skipped_days} 天因大盘不好停止开仓。")
-            else:
-                st.warning("⚠️ 风控关闭：已无视大盘环境，强制全时段交易。")
+            
+            status_text = "🛡️ 风控开启" if use_market_filter else "⚠️ 风控关闭"
+            st.info(f"{status_text}：共 {len(valid_dates)} 天，其中 {skipped_days} 天因大盘红灯停止开仓。")
                 
             c1, c2, c3 = st.columns(3)
             c1.metric("单笔期望", f"{df_res['ret'].mean()*100:.2f}%")
