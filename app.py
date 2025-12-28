@@ -10,14 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V44.1 混合战法版", layout="wide")
+st.set_page_config(page_title="V45.0 终极实战版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
-st.sidebar.header("🛡️ 趋势狩猎 (V44.1)")
-st.sidebar.success("✅ **逻辑修正：回归筹码排序**")
-st.sidebar.info("地板看绝对涨幅，天花板看相对强度")
+st.sidebar.header("🛡️ 趋势狩猎 (V45.0)")
+st.sidebar.success("✅ **逻辑回归：绝对涨幅筛选**")
+st.sidebar.info("锁定黄金区间：3.0% ~ 7.5%")
 
 if st.sidebar.button("🔄 强制重启系统", type="primary"):
     st.cache_data.clear()
@@ -101,14 +101,9 @@ def get_names(token):
     except: return pd.DataFrame()
 
 # ==========================================
-# 4. 逻辑层 (混合筛选)
+# 4. 逻辑层 (回归绝对涨幅)
 # ==========================================
-def get_limit_pct(ts_code):
-    if ts_code.startswith('688') or ts_code.startswith('30'): return 20.0
-    elif ts_code.startswith('8') or ts_code.startswith('4'): return 30.0
-    else: return 10.0
-
-def run_strategy_hybrid(snapshot, names_df, min_winner, min_pct_chg, max_strength, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, sort_by_winner=True, show_debug=False):
+def run_strategy_v45(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
     # 1. 大盘风控
     market_status = "OK"
     if enable_market_filter and index_df is not None and not index_df.empty:
@@ -131,29 +126,24 @@ def run_strategy_hybrid(snapshot, names_df, min_winner, min_pct_chg, max_strengt
             m1 = pd.merge(m1, names_df, on='ts_code', how='left')
         
         df = pd.merge(m1, d_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
-        
-        # 计算辅助指标
-        df['limit_cap'] = df['ts_code'].apply(get_limit_pct)
-        df['strength'] = df['pct_chg'] / df['limit_cap']
         df['shadow_pct'] = (df['high'] - df['close']) / df['close'] * 100
         
         total = len(df)
         
-        # Step 1: 价格
+        # Step 1: 价格 > 10
         df = df[df['close'] >= min_price]
         c_price = len(df)
         
-        # Step 2: 混合涨幅筛选 (核心逻辑)
-        # 地板：用绝对涨幅 (pct_chg >= 3.0)，保证捕捉启动
-        # 天花板：用相对强度 (strength <= 0.8)，防止主板追高，但允许科创板飞
-        df = df[(df['pct_chg'] >= min_pct_chg) & (df['strength'] <= max_strength)]
-        c_filter = len(df)
+        # Step 2: 绝对涨幅 (核心回归)
+        # 不管什么板，必须在 3.0% ~ 7.5% 之间
+        df = df[(df['pct_chg'] >= min_chg) & (df['pct_chg'] <= max_chg)]
+        c_chg = len(df)
         
-        # Step 3: 上影线
+        # Step 3: 上影线 (风控)
         df = df[df['shadow_pct'] <= max_shadow]
         c_shadow = len(df)
         
-        # Step 4: 获利盘
+        # Step 4: 获利盘 (筹码)
         df = df[df['winner_rate'] >= min_winner]
         c_winner = len(df)
         
@@ -164,17 +154,14 @@ def run_strategy_hybrid(snapshot, names_df, min_winner, min_pct_chg, max_strengt
         debug_info = {
             "total": total,
             "after_price": c_price,
-            "after_hybrid_filter": c_filter,
+            "after_chg": c_chg,
             "after_shadow": c_shadow,
             "after_winner": c_winner,
             "market_status": market_status
         }
         
-        # 排序逻辑：回归 winner_rate
-        if sort_by_winner:
-            sorted_df = df.sort_values('winner_rate', ascending=False)
-        else:
-            sorted_df = df.sort_values('strength', ascending=False)
+        # 排序：按获利盘排序 (买筹码最好的)
+        sorted_df = df.sort_values('winner_rate', ascending=False)
             
         if show_debug:
              return sorted_df.head(top_n), debug_info
@@ -192,19 +179,18 @@ token_input = st.sidebar.text_input("Tushare Token", type="password")
 pro = get_pro_api(token_input)
 
 st.sidebar.divider()
-use_market_filter = st.sidebar.checkbox("开启大盘风控 (上证20日线)", value=False)
-sort_by_winner = st.sidebar.checkbox("优先买筹码好的 (推荐)", value=True, help="取消则按涨幅强度排序(追高)")
+use_market_filter = st.sidebar.checkbox("开启大盘风控 (上证20日线)", value=False, help="震荡市建议关闭，单边熊市建议开启")
 
 cfg_position_count = st.sidebar.number_input("持仓数", value=3)
 cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=50.0, step=1.0) 
 
 st.sidebar.divider()
-st.sidebar.caption("👇 混合筛选 (地板看涨幅，天花板看强度)")
+st.sidebar.caption("👇 黄金击球区 (绝对涨幅)")
 col_h1, col_h2 = st.sidebar.columns(2)
 with col_h1:
-    cfg_min_pct_chg = st.sidebar.number_input("最小涨幅(%)", value=3.0, step=0.5, help="低于3%不买，无论什么板")
+    cfg_min_pct_chg = st.sidebar.number_input("最小涨幅(%)", value=3.0, step=0.5, help="低于3%动能不足")
 with col_h2:
-    cfg_max_strength = st.sidebar.number_input("最大强度系数", value=0.8, step=0.05, help="主板<8%，科创<16%")
+    cfg_max_pct_chg = st.sidebar.number_input("最大涨幅(%)", value=7.5, step=0.5, help="高于7.5%容易追高")
 
 st.sidebar.divider()
 cfg_min_price = st.sidebar.number_input("最低股价(元)", value=10.0, step=0.1)
@@ -228,7 +214,7 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V44.1 混合战法版")
+st.title("🚀 V45.0 终极实战版")
 
 tab1, tab2 = st.tabs(["🩺 实盘漏斗诊断", "📈 全年回测"])
 
@@ -236,11 +222,12 @@ with tab1:
     col_d, col_b = st.columns([3, 1])
     with col_d:
         def_date = datetime.now() - timedelta(days=2) 
-        scan_date_input = st.date_input("选择诊断日期", value=def_date)
+        scan_date_input = st.date_input("选择诊断日期 (避开周末)", value=def_date)
     scan_date_str = scan_date_input.strftime('%Y%m%d')
     
     if col_b.button("开始诊断", type="primary"):
         if not pro: st.stop()
+        
         with st.spinner(f"正在分析 {scan_date_str} 数据..."):
             idx_start = (pd.to_datetime(scan_date_str) - timedelta(days=60)).strftime('%Y%m%d')
             idx_df = fetch_index_data(token_input, idx_start, scan_date_str)
@@ -248,7 +235,7 @@ with tab1:
             names_df = get_names(token_input)
             
             if data:
-                result, debug_info = run_strategy_hybrid(data, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_strength, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, sort_by_winner, show_debug=True)
+                result, debug_info = run_strategy_v45(data, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
                 
                 if debug_info:
                     st.divider()
@@ -257,16 +244,16 @@ with tab1:
                     
                     funnel_data = [
                         {"步骤": "1. 初始全市场", "剩余数量": debug_info['total']},
-                        {"步骤": "2. 价格>10元", "剩余数量": debug_info['after_price']},
-                        {"步骤": f"3. 混合筛选 (>{cfg_min_pct_chg}% & <强度{cfg_max_strength})", "剩余数量": debug_info['after_hybrid_filter']},
-                        {"步骤": "4. 避雷针风控", "剩余数量": debug_info['after_shadow']},
-                        {"步骤": "5. 获利盘筹码", "剩余数量": debug_info['after_winner']},
+                        {"步骤": f"2. 价格>10元", "剩余数量": debug_info['after_price']},
+                        {"步骤": f"3. 涨幅 {cfg_min_pct_chg}%~{cfg_max_pct_chg}%", "剩余数量": debug_info['after_chg']},
+                        {"步骤": f"4. 上影线<{cfg_max_shadow}%", "剩余数量": debug_info['after_shadow']},
+                        {"步骤": f"5. 获利盘>{cfg_min_winner}%", "剩余数量": debug_info['after_winner']},
                     ]
                     st.dataframe(pd.DataFrame(funnel_data), use_container_width=True, hide_index=True)
                     
                     if isinstance(result, pd.DataFrame) and not result.empty:
-                        st.dataframe(result[['ts_code', 'name', 'close', 'pct_chg', 'strength', 'shadow_pct', 'winner_rate']].style.format({
-                            'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'strength': '{:.2f}', 'shadow_pct': '{:.2f}%', 'winner_rate': '{:.1f}%'
+                        st.dataframe(result[['ts_code', 'name', 'close', 'pct_chg', 'shadow_pct', 'winner_rate']].style.format({
+                            'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'shadow_pct': '{:.2f}%', 'winner_rate': '{:.1f}%'
                         }), hide_index=True)
             else:
                 st.error(f"❌ 无法获取 {scan_date_str} 的数据。")
@@ -338,7 +325,7 @@ with tab2:
                     next_active.append(sig)
             active_signals = next_active
             
-            result, _ = run_strategy_hybrid(snap, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_strength, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, sort_by_winner, show_debug=False)
+            result, _ = run_strategy_v45(snap, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_pct_chg, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
             
             if isinstance(result, str) and result == "MARKET_BAD":
                 skipped_days += 1
