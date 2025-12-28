@@ -10,14 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V43.3 漏斗表格版", layout="wide")
+st.set_page_config(page_title="V44.0 智能评分版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
-st.sidebar.header("🛡️ 趋势狩猎 (V43.3)")
-st.sidebar.success("✅ **优化：诊断结果表格化**")
-st.sidebar.info("方便复制与记录")
+st.sidebar.header("🛡️ 趋势狩猎 (V44.0)")
+st.sidebar.success("✅ **逻辑升级：自适应涨幅强度**")
+st.sidebar.info("主板涨5% = 科创板涨10% (同等强度)")
 
 if st.sidebar.button("🔄 强制重启系统", type="primary"):
     st.cache_data.clear()
@@ -55,6 +55,9 @@ def fetch_day_task_right_side(date, token):
             ts.set_token(token)
             local_pro = ts.pro_api(timeout=45)
             
+            # 1. 必须获取涨跌停价(limit)来计算强度
+            # Tushare daily 接口里并没有 limit_up，需要 daily_basic 或者 limit_list
+            # 这里我们用一个简便方法：根据 code 后缀判断
             d_today = local_pro.daily(trade_date=date)
             if d_today.empty: return None 
             
@@ -97,13 +100,24 @@ def fetch_data_parallel_right(dates, token):
 def get_names(token):
     try:
         ts.set_token(token)
-        return ts.pro_api().stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
+        return ts.pro_api().stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market')
     except: return pd.DataFrame()
 
 # ==========================================
-# 4. 逻辑层
+# 4. 逻辑层 (自适应强度评分)
 # ==========================================
-def run_strategy_debug(snapshot, names_df, min_winner, min_chg, max_chg, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
+def get_limit_pct(ts_code):
+    """
+    根据股票代码判断涨停幅度
+    """
+    if ts_code.startswith('688') or ts_code.startswith('30'): # 科创板/创业板
+        return 20.0
+    elif ts_code.startswith('8') or ts_code.startswith('4'): # 北交所
+        return 30.0
+    else: # 主板
+        return 10.0
+
+def run_strategy_smart_score(snapshot, names_df, min_winner, min_strength, max_strength, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
     # --- 1. 大盘风控 ---
     market_status = "OK"
     if enable_market_filter and index_df is not None and not index_df.empty:
@@ -111,15 +125,13 @@ def run_strategy_debug(snapshot, names_df, min_winner, min_chg, max_chg, max_sha
             idx_today = index_df.loc[curr_date]
             if idx_today['close'] < idx_today['ma20']:
                 market_status = "BAD"
-                if not show_debug: 
-                    return "MARKET_BAD", None
+                if not show_debug: return "MARKET_BAD", None
 
     # --- 2. 个股筛选 ---
     if not snapshot: return "NO_DATA", None
     d_today = snapshot.get('daily') 
     d_basic = snapshot.get('basic')
     d_cyq = snapshot.get('cyq')   
-    
     if d_today is None or d_today.empty: return "NO_DATA", None
     
     try:
@@ -128,49 +140,57 @@ def run_strategy_debug(snapshot, names_df, min_winner, min_chg, max_chg, max_sha
             m1 = pd.merge(m1, names_df, on='ts_code', how='left')
         
         df = pd.merge(m1, d_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
+        
+        # === 核心：计算相对强度 ===
+        # 1. 识别涨跌停限制
+        df['limit_cap'] = df['ts_code'].apply(get_limit_pct)
+        # 2. 计算强度分 (0~1.0)
+        df['strength'] = df['pct_chg'] / df['limit_cap']
+        # 3. 计算上影线
         df['shadow_pct'] = (df['high'] - df['close']) / df['close'] * 100
         
-        # --- 漏斗统计 ---
-        total_count = len(df)
+        # --- 漏斗 ---
+        total = len(df)
         
-        # Step 1: 价格
-        df_price = df[df['close'] >= min_price]
-        count_price = len(df_price)
+        # 价格
+        df = df[df['close'] >= min_price]
+        c_price = len(df)
         
-        # Step 2: 涨幅
-        df_chg = df_price[(df_price['pct_chg'] >= min_chg) & (df_price['pct_chg'] <= max_chg)]
-        count_chg = len(df_chg)
+        # 强度 (自适应)
+        # min_strength 0.3 表示主板涨3%，科创涨6%
+        df = df[(df['strength'] >= min_strength) & (df['strength'] <= max_strength)]
+        c_strength = len(df)
         
-        # Step 3: 上影线
-        df_shadow = df_chg[df_chg['shadow_pct'] <= max_shadow]
-        count_shadow = len(df_shadow)
+        # 上影线
+        df = df[df['shadow_pct'] <= max_shadow]
+        c_shadow = len(df)
         
-        # Step 4: 获利盘
-        df_final = df_shadow[df_shadow['winner_rate'] >= min_winner]
-        count_final = len(df_final)
+        # 获利盘
+        df = df[df['winner_rate'] >= min_winner]
+        c_winner = len(df)
         
-        # 排除 ST
-        df_final = df_final[~df_final['name'].str.contains('ST', na=False)]
-        df_final = df_final[df_final['circ_mv'] > 300000]
+        # 排除ST
+        df = df[~df['name'].str.contains('ST', na=False)]
+        df = df[df['circ_mv'] > 300000]
         
         debug_info = {
-            "total": total_count,
-            "after_price": count_price,
-            "after_chg": count_chg,
-            "after_shadow": count_shadow,
-            "after_winner": count_final,
+            "total": total,
+            "after_price": c_price,
+            "after_strength": c_strength,
+            "after_shadow": c_shadow,
+            "after_winner": c_winner,
             "market_status": market_status
         }
         
         if show_debug:
-             sorted_df = df_final.sort_values('winner_rate', ascending=False)
+             # 按强度排序
+             sorted_df = df.sort_values('strength', ascending=False)
              return sorted_df.head(top_n), debug_info
         
-        sorted_df = df_final.sort_values('winner_rate', ascending=False)
+        sorted_df = df.sort_values('strength', ascending=False)
         return sorted_df.head(top_n), None
         
     except Exception as e:
-        print(f"Error: {e}")
         return "ERROR", None
 
 # ==========================================
@@ -186,12 +206,20 @@ use_market_filter = st.sidebar.checkbox("开启大盘风控 (上证20日线)", v
 cfg_position_count = st.sidebar.number_input("持仓数", value=3)
 cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=50.0, step=1.0) 
 
-col_c1, col_c2 = st.sidebar.columns(2)
-with col_c1:
-    cfg_min_chg = st.sidebar.number_input("最小涨幅(%)", value=2.0, step=0.5)
-with col_c2:
-    cfg_max_chg = st.sidebar.number_input("最大涨幅(%)", value=7.0, step=0.5)
+# --- 新参数：强度系数 ---
+st.sidebar.divider()
+st.sidebar.caption("👇 自适应强度 (关键)")
+st.sidebar.markdown("""
+- **0.3** = 主板3% / 科创6%
+- **0.7** = 主板7% / 科创14%
+""")
+col_str1, col_str2 = st.sidebar.columns(2)
+with col_str1:
+    cfg_min_strength = st.sidebar.number_input("最小强度系数", value=0.3, step=0.05, help="0.3代表达到涨停板的30%力度")
+with col_str2:
+    cfg_max_strength = st.sidebar.number_input("最大强度系数", value=0.8, step=0.05, help="0.8代表达到涨停板的80%力度(防止追高)")
 
+st.sidebar.divider()
 cfg_min_price = st.sidebar.number_input("最低股价(元)", value=10.0, step=0.1)
 cfg_max_shadow = st.sidebar.number_input("最大上影线(%)", value=1.5, step=0.1)
 
@@ -213,7 +241,7 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V43.3 漏斗表格版")
+st.title("🚀 V44.0 智能评分版 (自适应强度)")
 
 tab1, tab2 = st.tabs(["🩺 实盘漏斗诊断", "📈 全年回测"])
 
@@ -235,38 +263,33 @@ with tab1:
             names_df = get_names(token_input)
             
             if data:
-                result, debug_info = run_strategy_debug(data, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
+                result, debug_info = run_strategy_smart_score(data, names_df, cfg_min_winner, cfg_min_strength, cfg_max_strength, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
                 
                 if debug_info:
                     st.divider()
                     st.subheader(f"📅 诊断报告：{scan_date_str}")
                     
                     if debug_info['market_status'] == "BAD":
-                         st.error("大盘风控：🔴 红灯 (20日线下)")
+                         st.error("大盘风控：🔴 红灯")
                     else:
-                         st.success("大盘风控：🟢 绿灯 (20日线上)")
+                         st.success("大盘风控：🟢 绿灯")
                     
-                    # --- 表格化展示漏斗数据 (方便复制) ---
                     funnel_data = [
-                        {"步骤": "1. 初始全市场", "剩余数量": debug_info['total'], "淘汰数量": 0, "说明": "A股全市场"},
-                        {"步骤": "2. 价格门槛", "剩余数量": debug_info['after_price'], "淘汰数量": debug_info['total'] - debug_info['after_price'], "说明": f"股价 >= {cfg_min_price}元"},
-                        {"步骤": "3. 涨幅筛选", "剩余数量": debug_info['after_chg'], "淘汰数量": debug_info['after_price'] - debug_info['after_chg'], "说明": f"涨幅 {cfg_min_chg}% ~ {cfg_max_chg}%"},
-                        {"步骤": "4. 避雷针风控", "剩余数量": debug_info['after_shadow'], "淘汰数量": debug_info['after_chg'] - debug_info['after_shadow'], "说明": f"上影线 <= {cfg_max_shadow}%"},
-                        {"步骤": "5. 获利盘筹码", "剩余数量": debug_info['after_winner'], "淘汰数量": debug_info['after_shadow'] - debug_info['after_winner'], "说明": f"获利盘 >= {cfg_min_winner}%"},
+                        {"步骤": "1. 初始全市场", "剩余数量": debug_info['total']},
+                        {"步骤": "2. 价格>10元", "剩余数量": debug_info['after_price']},
+                        {"步骤": f"3. 强度 {cfg_min_strength}~{cfg_max_strength}", "剩余数量": debug_info['after_strength'], "说明": "主板3%~8% / 科创6%~16%"},
+                        {"步骤": "4. 避雷针风控", "剩余数量": debug_info['after_shadow']},
+                        {"步骤": "5. 获利盘筹码", "剩余数量": debug_info['after_winner']},
                     ]
-                    df_funnel = pd.DataFrame(funnel_data)
-                    st.markdown("#### 🕵️‍♂️ 选股漏斗表")
-                    st.dataframe(df_funnel, use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(funnel_data), use_container_width=True, hide_index=True)
                     
                     if isinstance(result, pd.DataFrame) and not result.empty:
-                        st.markdown("#### 🏆 最终入选股票")
-                        st.dataframe(result[['ts_code', 'name', 'close', 'pct_chg', 'shadow_pct', 'winner_rate']].style.format({
-                            'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'shadow_pct': '{:.2f}%', 'winner_rate': '{:.1f}%'
+                        st.markdown("#### 🏆 最终入选 (含强度分)")
+                        st.dataframe(result[['ts_code', 'name', 'close', 'pct_chg', 'strength', 'shadow_pct', 'winner_rate']].style.format({
+                            'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'strength': '{:.2f}', 'shadow_pct': '{:.2f}%', 'winner_rate': '{:.1f}%'
                         }), hide_index=True)
-                    else:
-                        st.warning("漏斗筛选后无股票剩余。")
             else:
-                st.error(f"❌ 无法获取 {scan_date_str} 的数据 (可能是周末/休市)。")
+                st.error(f"❌ 无法获取 {scan_date_str} 的数据。")
 
 with tab2:
     if st.button("🚀 启动回测", type="primary", use_container_width=True):
@@ -336,7 +359,8 @@ with tab2:
                     next_active.append(sig)
             active_signals = next_active
             
-            result, _ = run_strategy_debug(snap, names_df, cfg_min_winner, cfg_min_chg, cfg_max_chg, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
+            # 选股
+            result, _ = run_strategy_smart_score(snap, names_df, cfg_min_winner, cfg_min_strength, cfg_max_strength, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
             
             if isinstance(result, str) and result == "MARKET_BAD":
                 skipped_days += 1
