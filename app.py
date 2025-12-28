@@ -10,14 +10,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="V44.0 智能评分版", layout="wide")
+st.set_page_config(page_title="V44.1 混合战法版", layout="wide")
 
 # ==========================================
 # 2. 系统控制台
 # ==========================================
-st.sidebar.header("🛡️ 趋势狩猎 (V44.0)")
-st.sidebar.success("✅ **逻辑升级：自适应涨幅强度**")
-st.sidebar.info("主板涨5% = 科创板涨10% (同等强度)")
+st.sidebar.header("🛡️ 趋势狩猎 (V44.1)")
+st.sidebar.success("✅ **逻辑修正：回归筹码排序**")
+st.sidebar.info("地板看绝对涨幅，天花板看相对强度")
 
 if st.sidebar.button("🔄 强制重启系统", type="primary"):
     st.cache_data.clear()
@@ -55,9 +55,6 @@ def fetch_day_task_right_side(date, token):
             ts.set_token(token)
             local_pro = ts.pro_api(timeout=45)
             
-            # 1. 必须获取涨跌停价(limit)来计算强度
-            # Tushare daily 接口里并没有 limit_up，需要 daily_basic 或者 limit_list
-            # 这里我们用一个简便方法：根据 code 后缀判断
             d_today = local_pro.daily(trade_date=date)
             if d_today.empty: return None 
             
@@ -100,25 +97,19 @@ def fetch_data_parallel_right(dates, token):
 def get_names(token):
     try:
         ts.set_token(token)
-        return ts.pro_api().stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,market')
+        return ts.pro_api().stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
     except: return pd.DataFrame()
 
 # ==========================================
-# 4. 逻辑层 (自适应强度评分)
+# 4. 逻辑层 (混合筛选)
 # ==========================================
 def get_limit_pct(ts_code):
-    """
-    根据股票代码判断涨停幅度
-    """
-    if ts_code.startswith('688') or ts_code.startswith('30'): # 科创板/创业板
-        return 20.0
-    elif ts_code.startswith('8') or ts_code.startswith('4'): # 北交所
-        return 30.0
-    else: # 主板
-        return 10.0
+    if ts_code.startswith('688') or ts_code.startswith('30'): return 20.0
+    elif ts_code.startswith('8') or ts_code.startswith('4'): return 30.0
+    else: return 10.0
 
-def run_strategy_smart_score(snapshot, names_df, min_winner, min_strength, max_strength, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, show_debug=False):
-    # --- 1. 大盘风控 ---
+def run_strategy_hybrid(snapshot, names_df, min_winner, min_pct_chg, max_strength, max_shadow, min_price, top_n, index_df, curr_date, enable_market_filter, sort_by_winner=True, show_debug=False):
+    # 1. 大盘风控
     market_status = "OK"
     if enable_market_filter and index_df is not None and not index_df.empty:
         if curr_date in index_df.index:
@@ -127,7 +118,7 @@ def run_strategy_smart_score(snapshot, names_df, min_winner, min_strength, max_s
                 market_status = "BAD"
                 if not show_debug: return "MARKET_BAD", None
 
-    # --- 2. 个股筛选 ---
+    # 2. 个股筛选
     if not snapshot: return "NO_DATA", None
     d_today = snapshot.get('daily') 
     d_basic = snapshot.get('basic')
@@ -141,31 +132,28 @@ def run_strategy_smart_score(snapshot, names_df, min_winner, min_strength, max_s
         
         df = pd.merge(m1, d_cyq[['ts_code', 'cost_50pct', 'winner_rate']], on='ts_code', how='inner')
         
-        # === 核心：计算相对强度 ===
-        # 1. 识别涨跌停限制
+        # 计算辅助指标
         df['limit_cap'] = df['ts_code'].apply(get_limit_pct)
-        # 2. 计算强度分 (0~1.0)
         df['strength'] = df['pct_chg'] / df['limit_cap']
-        # 3. 计算上影线
         df['shadow_pct'] = (df['high'] - df['close']) / df['close'] * 100
         
-        # --- 漏斗 ---
         total = len(df)
         
-        # 价格
+        # Step 1: 价格
         df = df[df['close'] >= min_price]
         c_price = len(df)
         
-        # 强度 (自适应)
-        # min_strength 0.3 表示主板涨3%，科创涨6%
-        df = df[(df['strength'] >= min_strength) & (df['strength'] <= max_strength)]
-        c_strength = len(df)
+        # Step 2: 混合涨幅筛选 (核心逻辑)
+        # 地板：用绝对涨幅 (pct_chg >= 3.0)，保证捕捉启动
+        # 天花板：用相对强度 (strength <= 0.8)，防止主板追高，但允许科创板飞
+        df = df[(df['pct_chg'] >= min_pct_chg) & (df['strength'] <= max_strength)]
+        c_filter = len(df)
         
-        # 上影线
+        # Step 3: 上影线
         df = df[df['shadow_pct'] <= max_shadow]
         c_shadow = len(df)
         
-        # 获利盘
+        # Step 4: 获利盘
         df = df[df['winner_rate'] >= min_winner]
         c_winner = len(df)
         
@@ -176,18 +164,21 @@ def run_strategy_smart_score(snapshot, names_df, min_winner, min_strength, max_s
         debug_info = {
             "total": total,
             "after_price": c_price,
-            "after_strength": c_strength,
+            "after_hybrid_filter": c_filter,
             "after_shadow": c_shadow,
             "after_winner": c_winner,
             "market_status": market_status
         }
         
+        # 排序逻辑：回归 winner_rate
+        if sort_by_winner:
+            sorted_df = df.sort_values('winner_rate', ascending=False)
+        else:
+            sorted_df = df.sort_values('strength', ascending=False)
+            
         if show_debug:
-             # 按强度排序
-             sorted_df = df.sort_values('strength', ascending=False)
              return sorted_df.head(top_n), debug_info
         
-        sorted_df = df.sort_values('strength', ascending=False)
         return sorted_df.head(top_n), None
         
     except Exception as e:
@@ -202,22 +193,18 @@ pro = get_pro_api(token_input)
 
 st.sidebar.divider()
 use_market_filter = st.sidebar.checkbox("开启大盘风控 (上证20日线)", value=False)
+sort_by_winner = st.sidebar.checkbox("优先买筹码好的 (推荐)", value=True, help="取消则按涨幅强度排序(追高)")
 
 cfg_position_count = st.sidebar.number_input("持仓数", value=3)
 cfg_min_winner = st.sidebar.number_input("最低获利盘(%)", value=50.0, step=1.0) 
 
-# --- 新参数：强度系数 ---
 st.sidebar.divider()
-st.sidebar.caption("👇 自适应强度 (关键)")
-st.sidebar.markdown("""
-- **0.3** = 主板3% / 科创6%
-- **0.7** = 主板7% / 科创14%
-""")
-col_str1, col_str2 = st.sidebar.columns(2)
-with col_str1:
-    cfg_min_strength = st.sidebar.number_input("最小强度系数", value=0.3, step=0.05, help="0.3代表达到涨停板的30%力度")
-with col_str2:
-    cfg_max_strength = st.sidebar.number_input("最大强度系数", value=0.8, step=0.05, help="0.8代表达到涨停板的80%力度(防止追高)")
+st.sidebar.caption("👇 混合筛选 (地板看涨幅，天花板看强度)")
+col_h1, col_h2 = st.sidebar.columns(2)
+with col_h1:
+    cfg_min_pct_chg = st.sidebar.number_input("最小涨幅(%)", value=3.0, step=0.5, help="低于3%不买，无论什么板")
+with col_h2:
+    cfg_max_strength = st.sidebar.number_input("最大强度系数", value=0.8, step=0.05, help="主板<8%，科创<16%")
 
 st.sidebar.divider()
 cfg_min_price = st.sidebar.number_input("最低股价(元)", value=10.0, step=0.1)
@@ -241,7 +228,7 @@ end_date = st.sidebar.text_input("结束日期", value=today.strftime('%Y%m%d'))
 # ==========================================
 # 6. 主程序
 # ==========================================
-st.title("🚀 V44.0 智能评分版 (自适应强度)")
+st.title("🚀 V44.1 混合战法版")
 
 tab1, tab2 = st.tabs(["🩺 实盘漏斗诊断", "📈 全年回测"])
 
@@ -254,37 +241,30 @@ with tab1:
     
     if col_b.button("开始诊断", type="primary"):
         if not pro: st.stop()
-        
         with st.spinner(f"正在分析 {scan_date_str} 数据..."):
             idx_start = (pd.to_datetime(scan_date_str) - timedelta(days=60)).strftime('%Y%m%d')
             idx_df = fetch_index_data(token_input, idx_start, scan_date_str)
-            
             data = fetch_day_task_right_side(scan_date_str, token_input)
             names_df = get_names(token_input)
             
             if data:
-                result, debug_info = run_strategy_smart_score(data, names_df, cfg_min_winner, cfg_min_strength, cfg_max_strength, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, show_debug=True)
+                result, debug_info = run_strategy_hybrid(data, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_strength, cfg_max_shadow, cfg_min_price, 20, idx_df, scan_date_str, use_market_filter, sort_by_winner, show_debug=True)
                 
                 if debug_info:
                     st.divider()
-                    st.subheader(f"📅 诊断报告：{scan_date_str}")
-                    
-                    if debug_info['market_status'] == "BAD":
-                         st.error("大盘风控：🔴 红灯")
-                    else:
-                         st.success("大盘风控：🟢 绿灯")
+                    if debug_info['market_status'] == "BAD": st.error("大盘风控：🔴 红灯")
+                    else: st.success("大盘风控：🟢 绿灯")
                     
                     funnel_data = [
                         {"步骤": "1. 初始全市场", "剩余数量": debug_info['total']},
                         {"步骤": "2. 价格>10元", "剩余数量": debug_info['after_price']},
-                        {"步骤": f"3. 强度 {cfg_min_strength}~{cfg_max_strength}", "剩余数量": debug_info['after_strength'], "说明": "主板3%~8% / 科创6%~16%"},
+                        {"步骤": f"3. 混合筛选 (>{cfg_min_pct_chg}% & <强度{cfg_max_strength})", "剩余数量": debug_info['after_hybrid_filter']},
                         {"步骤": "4. 避雷针风控", "剩余数量": debug_info['after_shadow']},
                         {"步骤": "5. 获利盘筹码", "剩余数量": debug_info['after_winner']},
                     ]
                     st.dataframe(pd.DataFrame(funnel_data), use_container_width=True, hide_index=True)
                     
                     if isinstance(result, pd.DataFrame) and not result.empty:
-                        st.markdown("#### 🏆 最终入选 (含强度分)")
                         st.dataframe(result[['ts_code', 'name', 'close', 'pct_chg', 'strength', 'shadow_pct', 'winner_rate']].style.format({
                             'close': '{:.2f}', 'pct_chg': '{:.2f}%', 'strength': '{:.2f}', 'shadow_pct': '{:.2f}%', 'winner_rate': '{:.1f}%'
                         }), hide_index=True)
@@ -324,7 +304,6 @@ with tab2:
             curr_dt = pd.to_datetime(date)
             next_active = []
             
-            # 持仓
             for sig in active_signals:
                 code = sig['code']
                 if curr_dt <= pd.to_datetime(sig['buy_date']):
@@ -359,8 +338,7 @@ with tab2:
                     next_active.append(sig)
             active_signals = next_active
             
-            # 选股
-            result, _ = run_strategy_smart_score(snap, names_df, cfg_min_winner, cfg_min_strength, cfg_max_strength, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, show_debug=False)
+            result, _ = run_strategy_hybrid(snap, names_df, cfg_min_winner, cfg_min_pct_chg, cfg_max_strength, cfg_max_shadow, cfg_min_price, cfg_position_count, index_df, date, use_market_filter, sort_by_winner, show_debug=False)
             
             if isinstance(result, str) and result == "MARKET_BAD":
                 skipped_days += 1
@@ -375,10 +353,7 @@ with tab2:
         if finished_signals:
             df_res = pd.DataFrame(finished_signals)
             st.divider()
-            
-            status_text = "🛡️ 风控开启" if use_market_filter else "⚠️ 风控关闭"
-            st.info(f"{status_text}：共 {len(valid_dates)} 天，其中 {skipped_days} 天因大盘红灯停止开仓。")
-            
+            st.info(f"风控检测：{skipped_days} 天空仓")
             c1, c2, c3 = st.columns(3)
             c1.metric("单笔期望", f"{df_res['ret'].mean()*100:.2f}%")
             c2.metric("胜率", f"{(df_res['ret']>0).mean()*100:.1f}%")
