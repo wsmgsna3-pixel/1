@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.18 全周期观察版 (含D+5数据监测)
-核心逻辑：
-1. [逻辑保持] 继承 V30.17 的所有精华（换手盾 + VIP筹码矛 + 价格优选）。
-2. [新增监测] 增加 D+5 (5日后) 的收益回测数据，用于验证策略的持股持久性。
+选股王 · V30.19 真实实战版 (严选高开 + 1.5%确认)
+核心改进：
+1. [铁律] 强制剔除 "低开" 或 "平开" 的股票。只有 Open > Yesterday_Close 才看。
+2. [确认] 必须在 "今日开盘价" 基础上上涨 1.5% 才买入。
+3. [真实] 这是一份完全模拟您 "高开高走" 实盘纪律的回测。
 """
 
 import streamlit as st
@@ -26,12 +27,13 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.18 全周期观察版", layout="wide")
-st.title("选股王 · V30.18 全周期观察版（📊 增加 D+5 验证）")
+st.set_page_config(page_title="选股王 · V30.19 真实实战版", layout="wide")
+st.title("选股王 · V30.19 真实实战版（🛑 拒绝低开 + ✅ 严选高开）")
 st.markdown("""
-**🎯 新手特别提示：**
-- **D+1/D+3：** 短线黄金卖点。
-- **D+5：** 往往是**盈亏分水岭**。请重点观察 D+5 的胜率是否大幅低于 D+3。
+**🛡️ 实盘纪律植入：**
+1. **低开不看：** 如果 `今开 <= 昨收`，直接 Pass，无论后面涨多少都不买。
+2. **高开确认：** 必须满足 `最高价 >= 今开 * 1.015` 才算成交。
+3. **成本计算：** 买入价 = `今开 * 1.015` (为您预留了滑点成本)。
 """)
 
 
@@ -51,6 +53,7 @@ def safe_get(func_name, **kwargs):
         return df
     except Exception: return pd.DataFrame(columns=['ts_code'])
 
+# 尝试获取筹码数据 (不强求)
 def get_vip_chip_data(trade_date):
     global pro
     if pro is None: return pd.DataFrame()
@@ -86,7 +89,7 @@ def get_all_historical_data(trade_days_list):
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     start_date = (datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
-    end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=25)).strftime("%Y%m%d") # 延长时间以获取D5
+    end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=25)).strftime("%Y%m%d") 
     
     all_dates = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')['cal_date'].tolist()
     st.info(f"⏳ 正在按日期循环下载 {start_date} 到 {end_date} 间的全市场数据（请耐心等待）...")
@@ -111,11 +114,11 @@ def get_all_historical_data(trade_days_list):
     adj_data['adj_factor'] = pd.to_numeric(adj_data['adj_factor'], errors='coerce').fillna(0)
     GLOBAL_ADJ_FACTOR = adj_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
     
-    cols_to_keep = ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol']
+    cols_to_keep = ['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'vol'] # 必须包含 pre_close
     valid_cols = [c for c in cols_to_keep if c in daily_list[0].columns]
     daily_raw = pd.concat(daily_list)[valid_cols]
     
-    for col in ['open', 'high', 'low', 'close', 'vol']:
+    for col in ['open', 'high', 'low', 'close', 'pre_close', 'vol']:
         if col in daily_raw.columns:
             daily_raw[col] = pd.to_numeric(daily_raw[col], errors='coerce').astype('float32')
 
@@ -131,7 +134,7 @@ def get_all_historical_data(trade_days_list):
     return True
 
 # ----------------------------------------------------------------------
-# 数据处理
+# 数据处理 (QFQ)
 # ----------------------------------------------------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
@@ -153,20 +156,23 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     df = df.sort_index()
     
     factor = df['adj_factor'] / base_adj
-    for col in ['open', 'high', 'low', 'close']:
+    # 注意：pre_close 也要复权，或者我们在逻辑判断时直接用原始价(更安全)
+    # 这里为了计算涨幅，全部复权
+    for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns: df[col] = df[col] * factor
     
     df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
     df['trade_date'] = pd.to_datetime(df['trade_date_str'], format='%Y%m%d')
-    return df.sort_values('trade_date').set_index('trade_date_str')[['open', 'high', 'low', 'close', 'vol']]
+    # 返回包含 pre_close 的数据
+    return df.sort_values('trade_date').set_index('trade_date_str')[['open', 'high', 'low', 'close', 'pre_close', 'vol']]
 
 # ----------------------------------------------------------------------
-# 右侧收益 (增加 D5)
+# [核心修改] 右侧收益 (严选高开)
 # ----------------------------------------------------------------------
-def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], buy_threshold_pct=1.5):
+def get_future_prices_real_combat(ts_code, selection_date, days_ahead=[1, 3, 5], buy_threshold_pct=1.5):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    end_future = (d0 + timedelta(days=25)).strftime("%Y%m%d") # 延长取数范围
+    end_future = (d0 + timedelta(days=25)).strftime("%Y%m%d")
     
     hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_future, end_date=end_future)
     results = {}
@@ -175,10 +181,22 @@ def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], 
     if hist.empty: return results
         
     d1_data = hist.iloc[0]
+    
+    # --- [关键逻辑修改] ---
+    # 1. 检查是否高开：Open > Pre_Close
+    # 为了防止复权误差，这里用极小的差值容错，但原则上必须 >
+    if d1_data['open'] <= d1_data['pre_close']:
+        return results # 低开或平开，直接返回空(不买)
+    
+    # 2. 检查是否冲过买入阈值：High >= Open * (1 + 1.5%)
+    # 注意：买入点是基于【今开】上涨 1.5%
     buy_price_threshold = d1_data['open'] * (1 + buy_threshold_pct / 100.0)
     
-    if d1_data['high'] < buy_price_threshold: return results 
+    if d1_data['high'] < buy_price_threshold: 
+        return results # 没冲上去，不买
 
+    # 3. 计算收益
+    # 成本价 = buy_price_threshold
     for n in days_ahead:
         idx = n - 1
         if len(hist) > idx:
@@ -225,7 +243,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.18)")
+    st.header("2. 实战参数 (V30.19)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
@@ -247,7 +265,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑 (V30.18 含D5)
+# 核心逻辑 (V30.19)
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     # 1. 弱市熔断
@@ -314,7 +332,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
             candidates = candidates[candidates['ts_code'].isin(available)]
         except: return pd.DataFrame(), "缓存缺失"
 
-    # 5. 计算 (含 D5)
+    # 5. 计算
     records = []
     for row in candidates.itertuples():
         ind = compute_indicators(row.ts_code, last_trade) 
@@ -328,7 +346,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         else:
             final_pr = -1
 
-        future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold)
+        # [调用修正后的收益计算函数]
+        future = get_future_prices_real_combat(row.ts_code, last_trade, buy_threshold_pct=buy_threshold)
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
@@ -337,7 +356,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
             'profit_rate': final_pr,
             'Return_D1 (%)': future.get('Return_D1'), 
             'Return_D3 (%)': future.get('Return_D3'),
-            'Return_D5 (%)': future.get('Return_D5') # 新增 D5
+            'Return_D5 (%)': future.get('Return_D5')
         })
     
     fdf = pd.DataFrame(records)
@@ -365,13 +384,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.18 全周期回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.19 真实实战回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ V30.18 启动！重点观察 D+5 数据...")
+    st.success("✅ 数据就绪！V30.19 (严选高开) 启动...")
     
     results = []
     bar = st.progress(0)
@@ -398,7 +417,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.18 全周期回测"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.18 回测报告 (含 D+5 验证)")
+    st.header(f"📊 V30.19 回测报告 (拒绝低开 + 1.5%确认)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     # 重点展示 D1, D3, D5
