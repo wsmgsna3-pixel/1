@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.7 终极稳定版 (防崩溃 + 冠军策略)
-修复日志：
-1. [核心修复] 增加了对 stock_basic 数据缺失('name'字段)的容错处理，防止 KeyError。
-2. [运行稳定] 主程序增加 Try-Except 机制，遇到单日数据异常自动跳过，不中断回测。
-3. [策略内核] 保持 V30.7 逻辑：资金流前50 + 涨幅前50，MACD*10000 评分，1.5% 右侧买入。
+选股王 · V30.15 尊享版 (10000积分·筹码大师)
+💎 尊享升级：
+1. [VIP数据] 启用 Tushare 10000积分专属接口 `cyq_perf` (每日筹码及胜率)。
+2. [筹码排雷] 剔除 获利盘比例 < 60% 的股票 (拒绝上方套牢盘太重的伪强势股)。
+3. [蓝天加速] 对 获利盘比例 > 90% 的股票给予 20% 评分加成 (锁定筹码断层的真龙头)。
+4. [核心逻辑] 保持 V30.7 冠军底色：资金流+MACD+右侧确认。
 """
 
 import streamlit as st
@@ -27,9 +28,14 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.7 终极稳定版", layout="wide")
-st.title("选股王 · V30.7 终极稳定版（🛡️ 全自动容错 + 👑 冠军策略）")
-st.markdown("🎯 **当前策略：** 资金流/涨幅双赛道 + 弱市空仓 + 右侧 1.5% 确认。已修复 Tushare 数据缺失导致的崩溃问题。")
+st.set_page_config(page_title="选股王 · V30.15 尊享版", layout="wide")
+st.title("选股王 · V30.15 尊享版（💎 筹码胜率 + 👑 冠军策略）")
+st.markdown("""
+**🎯 10000积分 VIP 策略：** - **基础：** 资金流/涨幅双赛道 + MACD 评分
+- **VIP加持：** 使用 `cyq_perf` 接口透视主力底牌。
+    - ❌ **剔除** 获利盘 < 60% 的套牢股。
+    - 🚀 **重仓** 获利盘 > 90% 的“蓝天大道”股。
+""")
 
 
 # ---------------------------
@@ -212,8 +218,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.7)")
-    # 默认值 1.5%
+    st.header("2. 实战参数 (V30.15 VIP)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
@@ -235,7 +240,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑 (增强健壮性版)
+# 核心逻辑 (V30.15 尊享版)
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     # 1. 弱市熔断
@@ -249,12 +254,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 
     pool = daily_all.reset_index(drop=True)
     
-    # [修复点] 更稳健地获取 stock_basic
+    # 基础信息
     basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
     if not basic.empty:
         pool = pool.merge(basic, on='ts_code', how='left')
     
-    # [关键修复] 如果 name 列因为数据缺失不存在，给一个默认值 'Unknown' 防止 KeyError
     if 'name' not in pool.columns:
         pool['name'] = 'Unknown'
 
@@ -268,6 +272,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         mf = mf[['ts_code', 'net_mf']].fillna(0)
         pool = pool.merge(mf, on='ts_code', how='left')
     
+    # --- [💎 VIP 独占] 拉取筹码获利盘数据 ---
+    # 10000积分权限接口，获取当天全市场的筹码情况
+    cyq = safe_get('cyq_perf', trade_date=last_trade)
+    if not cyq.empty and 'profit_rate' in cyq.columns:
+        cyq = cyq[['ts_code', 'profit_rate']].drop_duplicates(subset=['ts_code'])
+        pool = pool.merge(cyq, on='ts_code', how='left')
+    else:
+        # 如果没取到（比如非交易日或权限不够），给个默认值避免报错
+        pool['profit_rate'] = np.nan
+        
     for c in ['turnover_rate','circ_mv','net_mf']: 
         if c not in pool.columns: pool[c] = 0.0
 
@@ -276,7 +290,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
     
-    # 过滤 ST (确保 name 存在后再 filter，否则会报错)
     df = df[~df['name'].str.contains('ST|退', case=False, na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     
@@ -313,26 +326,49 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         ind = compute_indicators(row.ts_code, last_trade) 
         if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
         
+        # [💎 VIP 逻辑 A] 筹码排雷
+        # 获取获利盘比例 (注意：Tushare profit_rate 通常是 0-100 的数值，但也可能视接口而定)
+        # 我们做个动态判断：如果最大值 > 1，说明是百分制；否则是小数制
+        profit_rate = getattr(row, 'profit_rate', np.nan)
+        
+        # 如果能获取到筹码数据，且获利盘 < 60% (套牢盘重)，直接剔除
+        # 这里假设是百分制(0-100)，如果是小数制则 * 100 处理
+        if pd.notna(profit_rate):
+             # 简单归一化处理，防止量纲不同
+             pr_score = profit_rate if profit_rate > 1.0 else profit_rate * 100
+             if pr_score < 60: 
+                 continue # ⛔ 只有 60% 以下的人赚钱，说明 40% 以上的人套牢，压力太大，不玩
+        else:
+             pr_score = 60 # 取不到数据时给个及格分，不误杀
+
         future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold)
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
             'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
             'macd': ind['macd_val'], 'volatility': ind['volatility'],
+            'profit_rate': pr_score, # 记录下来看看
             'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3')
         })
     
     fdf = pd.DataFrame(records)
-    if fdf.empty: return pd.DataFrame(), "无正向MACD股票"
+    if fdf.empty: return pd.DataFrame(), "无优质筹码MACD股票"
 
-    # 6. 评分 (MACD * 10000)
+    # 6. 评分 (加入筹码胜率加成)
     s_vol = fdf['volatility']
     if s_vol.max() != s_vol.min():
         s_vol = (s_vol - s_vol.min()) / (s_vol.max() - s_vol.min())
     else: s_vol = 0.5
     
-    fdf['综合评分'] = fdf['macd'] * 10000 + (1 - s_vol) * 0.3
-    fdf['策略'] = '绝对MACD优势'
+    # 基础分：MACD * 10000
+    base_score = fdf['macd'] * 10000 + (1 - s_vol) * 0.3
+    
+    # [💎 VIP 逻辑 B] 蓝天加速
+    # 如果获利盘 > 90% (筹码断层)，给予 1.2倍 加成
+    chip_bonus = fdf['profit_rate'].apply(lambda x: 1.2 if x >= 90 else 1.0)
+    
+    fdf['综合评分'] = base_score * chip_bonus
+    fdf['策略'] = 'VIP筹码龙头'
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
@@ -340,13 +376,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 # ---------------------------
 # 主程序 (防崩溃循环)
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 VIP 尊享回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V30.7 冠军版回测...")
+    st.success("✅ VIP 数据就绪！开始 V30.15 尊享版回测...")
     
     results = []
     bar = st.progress(0)
@@ -354,7 +390,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
     
     for i, date in enumerate(trade_days):
         try:
-            # === Try-Except 结构，防止单日数据错误搞崩全盘 ===
             df, msg = run_backtest_for_a_day(date, TOP_BACKTEST, FINAL_POOL, BUY_THRESHOLD_PCT)
             if not df.empty:
                 df['Trade_Date'] = date
@@ -363,9 +398,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
                 pass 
                 
         except Exception as e:
-            # 捕获错误，打印警告，但不停止运行！
-            # 如果错误是关于 'name' 的，其实已经被 run_backtest_for_a_day 内部修复了，
-            # 这里是防止其他未知的网络错误。
             st.warning(f"⚠️ {date} 数据计算异常，已自动跳过。原因: {str(e)}")
             error_count += 1
             
@@ -374,7 +406,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
     bar.empty()
     
     if error_count > 0:
-        st.warning(f"💡 提示：回测过程中有 {error_count} 个交易日因Tushare数据缺失被跳过，不影响整体结果。")
+        st.warning(f"💡 提示：回测过程中有 {error_count} 个交易日因数据异常被跳过。")
     
     if not results:
         st.error("区间内无有效强市交易日，或所有数据均下载失败。")
@@ -383,7 +415,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日冠军回测"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.7 回测报告 (暴力MACD + {BUY_THRESHOLD_PCT}%确认)")
+    st.header(f"📊 V30.15 尊享回测报告 (筹码胜率 > 60% + 1.5%确认)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(2)
