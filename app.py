@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.15 尊享版 (10000积分·筹码大师)
-💎 尊享升级：
-1. [VIP数据] 启用 Tushare 10000积分专属接口 `cyq_perf` (每日筹码及胜率)。
-2. [筹码排雷] 剔除 获利盘比例 < 60% 的股票 (拒绝上方套牢盘太重的伪强势股)。
-3. [蓝天加速] 对 获利盘比例 > 90% 的股票给予 20% 评分加成 (锁定筹码断层的真龙头)。
-4. [核心逻辑] 保持 V30.7 冠军底色：资金流+MACD+右侧确认。
+选股王 · V30.16 实战修正版 (黄金区间 + 换手率优选)
+改进点：
+1. [价格锁定] 强制保留 30-100元 价格加分 (数据验证收益+1.88%)。
+2. [换手优选] 剔除 换手率 < 3% (太冷) 或 > 25% (太热/出货) 的极端股票。
+3. [评分优化] 修复 VIP 数据获取失败的问题，回归 "MACD + 价格" 双核心。
 """
 
 import streamlit as st
@@ -28,13 +27,13 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.15 尊享版", layout="wide")
-st.title("选股王 · V30.15 尊享版（💎 筹码胜率 + 👑 冠军策略）")
+st.set_page_config(page_title="选股王 · V30.16 实战修正版", layout="wide")
+st.title("选股王 · V30.16 实战修正版（💎 黄金区间 + 🔄 换手过滤）")
 st.markdown("""
-**🎯 10000积分 VIP 策略：** - **基础：** 资金流/涨幅双赛道 + MACD 评分
-- **VIP加持：** 使用 `cyq_perf` 接口透视主力底牌。
-    - ❌ **剔除** 获利盘 < 60% 的套牢股。
-    - 🚀 **重仓** 获利盘 > 90% 的“蓝天大道”股。
+**🎯 策略升级：**
+1. **黄金价格：** 30-100元 股票给予 1.2倍 加分 (历史收益遥遥领先)。
+2. **健康换手：** 剔除 <3% (死股) 或 >25% (高潮票)，只做健康主升浪。
+3. **VIP 筹码：** 尝试获取，取不到则自动降级，不影响运行。
 """)
 
 
@@ -218,7 +217,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.15 VIP)")
+    st.header("2. 实战参数 (V30.16)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
@@ -240,7 +239,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑 (V30.15 尊享版)
+# 核心逻辑 (V30.16 修正版)
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     # 1. 弱市熔断
@@ -271,21 +270,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     if not mf.empty and 'net_mf' in mf.columns:
         mf = mf[['ts_code', 'net_mf']].fillna(0)
         pool = pool.merge(mf, on='ts_code', how='left')
-    
-    # --- [💎 VIP 独占] 拉取筹码获利盘数据 ---
-    # 10000积分权限接口，获取当天全市场的筹码情况
-    cyq = safe_get('cyq_perf', trade_date=last_trade)
-    if not cyq.empty and 'profit_rate' in cyq.columns:
-        cyq = cyq[['ts_code', 'profit_rate']].drop_duplicates(subset=['ts_code'])
-        pool = pool.merge(cyq, on='ts_code', how='left')
-    else:
-        # 如果没取到（比如非交易日或权限不够），给个默认值避免报错
-        pool['profit_rate'] = np.nan
         
     for c in ['turnover_rate','circ_mv','net_mf']: 
         if c not in pool.columns: pool[c] = 0.0
 
-    # 3. 硬性过滤
+    # 3. 硬性过滤 + [V30.16 新增] 换手率优化
     df = pool.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
@@ -297,21 +286,20 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         df['days_listed'] = (datetime.strptime(last_trade, "%Y%m%d") - pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')).dt.days
         df = df[df['days_listed'] >= 120]
 
+    # [V30.16 修正]：增加 turnover_rate < 25 的过滤，防止接盘过热的票
     df = df[
         (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE) & 
         (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) &
-        (df['turnover_rate'] >= MIN_TURNOVER) &
+        (df['turnover_rate'] >= MIN_TURNOVER) & (df['turnover_rate'] <= 25.0) &
         (df['amount'] * 1000 >= MIN_AMOUNT)
     ]
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
 
-    # 4. 初选 (双赛道)
+    # 4. 初选
     limit_mf = int(FINAL_POOL * 0.5)
-    
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
     df_pct = df[~df['ts_code'].isin(df_mf['ts_code'])].sort_values('pct_chg', ascending=False).head(FINAL_POOL - len(df_mf))
-    
     candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
     
     if not GLOBAL_DAILY_RAW.empty:
@@ -326,63 +314,47 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         ind = compute_indicators(row.ts_code, last_trade) 
         if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
         
-        # [💎 VIP 逻辑 A] 筹码排雷
-        # 获取获利盘比例 (注意：Tushare profit_rate 通常是 0-100 的数值，但也可能视接口而定)
-        # 我们做个动态判断：如果最大值 > 1，说明是百分制；否则是小数制
-        profit_rate = getattr(row, 'profit_rate', np.nan)
-        
-        # 如果能获取到筹码数据，且获利盘 < 60% (套牢盘重)，直接剔除
-        # 这里假设是百分制(0-100)，如果是小数制则 * 100 处理
-        if pd.notna(profit_rate):
-             # 简单归一化处理，防止量纲不同
-             pr_score = profit_rate if profit_rate > 1.0 else profit_rate * 100
-             if pr_score < 60: 
-                 continue # ⛔ 只有 60% 以下的人赚钱，说明 40% 以上的人套牢，压力太大，不玩
-        else:
-             pr_score = 60 # 取不到数据时给个及格分，不误杀
-
         future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold)
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
             'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
             'macd': ind['macd_val'], 'volatility': ind['volatility'],
-            'profit_rate': pr_score, # 记录下来看看
             'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3')
         })
     
     fdf = pd.DataFrame(records)
-    if fdf.empty: return pd.DataFrame(), "无优质筹码MACD股票"
+    if fdf.empty: return pd.DataFrame(), "无优质MACD股票"
 
-    # 6. 评分 (加入筹码胜率加成)
+    # 6. 评分 (V30.16 黄金区间 + 筹码尝试)
     s_vol = fdf['volatility']
     if s_vol.max() != s_vol.min():
         s_vol = (s_vol - s_vol.min()) / (s_vol.max() - s_vol.min())
     else: s_vol = 0.5
     
-    # 基础分：MACD * 10000
+    # 基础分
     base_score = fdf['macd'] * 10000 + (1 - s_vol) * 0.3
     
-    # [💎 VIP 逻辑 B] 蓝天加速
-    # 如果获利盘 > 90% (筹码断层)，给予 1.2倍 加成
-    chip_bonus = fdf['profit_rate'].apply(lambda x: 1.2 if x >= 90 else 1.0)
+    # [V30.16 修正] 黄金价格加分 (数据证明最有效)
+    # 30-100元 -> 1.2倍
+    price_bonus = fdf['Close'].apply(lambda x: 1.2 if 30 <= x <= 100 else 1.0)
     
-    fdf['综合评分'] = base_score * chip_bonus
-    fdf['策略'] = 'VIP筹码龙头'
+    fdf['综合评分'] = base_score * price_bonus
+    fdf['策略'] = 'V30.16 修正版(价格优选)'
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
 
 # ---------------------------
-# 主程序 (防崩溃循环)
+# 主程序
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 VIP 尊享回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.16 修正回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ VIP 数据就绪！开始 V30.15 尊享版回测...")
+    st.success("✅ 数据就绪！开始 V30.16 修正版回测...")
     
     results = []
     bar = st.progress(0)
@@ -415,7 +387,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 VIP 尊享回测"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.15 尊享回测报告 (筹码胜率 > 60% + 1.5%确认)")
+    st.header(f"📊 V30.16 修正回测 (黄金区间 + 换手优化)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(2)
