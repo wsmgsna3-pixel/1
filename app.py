@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.16 实战修正版 (黄金区间 + 换手率优选)
-改进点：
-1. [价格锁定] 强制保留 30-100元 价格加分 (数据验证收益+1.88%)。
-2. [换手优选] 剔除 换手率 < 3% (太冷) 或 > 25% (太热/出货) 的极端股票。
-3. [评分优化] 修复 VIP 数据获取失败的问题，回归 "MACD + 价格" 双核心。
+选股王 · V30.18 全周期观察版 (含D+5数据监测)
+核心逻辑：
+1. [逻辑保持] 继承 V30.17 的所有精华（换手盾 + VIP筹码矛 + 价格优选）。
+2. [新增监测] 增加 D+5 (5日后) 的收益回测数据，用于验证策略的持股持久性。
 """
 
 import streamlit as st
@@ -27,13 +26,12 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.16 实战修正版", layout="wide")
-st.title("选股王 · V30.16 实战修正版（💎 黄金区间 + 🔄 换手过滤）")
+st.set_page_config(page_title="选股王 · V30.18 全周期观察版", layout="wide")
+st.title("选股王 · V30.18 全周期观察版（📊 增加 D+5 验证）")
 st.markdown("""
-**🎯 策略升级：**
-1. **黄金价格：** 30-100元 股票给予 1.2倍 加分 (历史收益遥遥领先)。
-2. **健康换手：** 剔除 <3% (死股) 或 >25% (高潮票)，只做健康主升浪。
-3. **VIP 筹码：** 尝试获取，取不到则自动降级，不影响运行。
+**🎯 新手特别提示：**
+- **D+1/D+3：** 短线黄金卖点。
+- **D+5：** 往往是**盈亏分水岭**。请重点观察 D+5 的胜率是否大幅低于 D+3。
 """)
 
 
@@ -52,6 +50,16 @@ def safe_get(func_name, **kwargs):
             return pd.DataFrame(columns=['ts_code']) 
         return df
     except Exception: return pd.DataFrame(columns=['ts_code'])
+
+def get_vip_chip_data(trade_date):
+    global pro
+    if pro is None: return pd.DataFrame()
+    try:
+        df = pro.cyq_perf(trade_date=trade_date)
+        if df is not None and not df.empty:
+            return df[['ts_code', 'profit_rate']]
+    except: pass
+    return pd.DataFrame()
 
 def get_trade_days(end_date_str, num_days):
     start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 3)).strftime("%Y%m%d")
@@ -78,7 +86,7 @@ def get_all_historical_data(trade_days_list):
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     start_date = (datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
-    end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=20)).strftime("%Y%m%d")
+    end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=25)).strftime("%Y%m%d") # 延长时间以获取D5
     
     all_dates = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')['cal_date'].tolist()
     st.info(f"⏳ 正在按日期循环下载 {start_date} 到 {end_date} 间的全市场数据（请耐心等待）...")
@@ -153,12 +161,12 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df.sort_values('trade_date').set_index('trade_date_str')[['open', 'high', 'low', 'close', 'vol']]
 
 # ----------------------------------------------------------------------
-# 右侧收益
+# 右侧收益 (增加 D5)
 # ----------------------------------------------------------------------
 def get_future_prices_right_side(ts_code, selection_date, days_ahead=[1, 3, 5], buy_threshold_pct=1.5):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    end_future = (d0 + timedelta(days=20)).strftime("%Y%m%d")
+    end_future = (d0 + timedelta(days=25)).strftime("%Y%m%d") # 延长取数范围
     
     hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_future, end_date=end_future)
     results = {}
@@ -217,7 +225,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.16)")
+    st.header("2. 实战参数 (V30.18)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
@@ -239,7 +247,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑 (V30.16 修正版)
+# 核心逻辑 (V30.18 含D5)
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     # 1. 弱市熔断
@@ -252,20 +260,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     if daily_all.empty: return pd.DataFrame(), f"数据缺失"
 
     pool = daily_all.reset_index(drop=True)
-    
-    # 基础信息
     basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
-    if not basic.empty:
-        pool = pool.merge(basic, on='ts_code', how='left')
-    
-    if 'name' not in pool.columns:
-        pool['name'] = 'Unknown'
+    if not basic.empty: pool = pool.merge(basic, on='ts_code', how='left')
+    if 'name' not in pool.columns: pool['name'] = 'Unknown'
 
     d_basic = safe_get('daily_basic', trade_date=last_trade, fields='ts_code,turnover_rate,circ_mv,total_mv')
-    if not d_basic.empty:
-        pool = pool.merge(d_basic, on='ts_code', how='left')
+    if not d_basic.empty: pool = pool.merge(d_basic, on='ts_code', how='left')
     
-    # 资金流
     mf = safe_get('moneyflow', trade_date=last_trade)
     if not mf.empty and 'net_mf' in mf.columns:
         mf = mf[['ts_code', 'net_mf']].fillna(0)
@@ -274,26 +275,31 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     for c in ['turnover_rate','circ_mv','net_mf']: 
         if c not in pool.columns: pool[c] = 0.0
 
-    # 3. 硬性过滤 + [V30.16 新增] 换手率优化
+    # --- VIP 筹码 ---
+    chip_df = get_vip_chip_data(last_trade)
+    chip_available = False
+    if not chip_df.empty:
+        pool = pool.merge(chip_df, on='ts_code', how='left')
+        chip_available = True
+    else:
+        pool['profit_rate'] = np.nan
+
+    # 3. 过滤
     df = pool.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
-    
     df = df[~df['name'].str.contains('ST|退', case=False, na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
-    
     if 'list_date' in df.columns:
         df['days_listed'] = (datetime.strptime(last_trade, "%Y%m%d") - pd.to_datetime(df['list_date'], format='%Y%m%d', errors='coerce')).dt.days
         df = df[df['days_listed'] >= 120]
 
-    # [V30.16 修正]：增加 turnover_rate < 25 的过滤，防止接盘过热的票
     df = df[
         (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE) & 
         (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) &
         (df['turnover_rate'] >= MIN_TURNOVER) & (df['turnover_rate'] <= 25.0) &
         (df['amount'] * 1000 >= MIN_AMOUNT)
     ]
-    
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票"
 
     # 4. 初选
@@ -308,39 +314,50 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
             candidates = candidates[candidates['ts_code'].isin(available)]
         except: return pd.DataFrame(), "缓存缺失"
 
-    # 5. 深度计算
+    # 5. 计算 (含 D5)
     records = []
     for row in candidates.itertuples():
         ind = compute_indicators(row.ts_code, last_trade) 
         if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
         
+        profit_rate = getattr(row, 'profit_rate', np.nan)
+        if chip_available and pd.notna(profit_rate):
+            pr_val = profit_rate if profit_rate > 1.0 else profit_rate * 100
+            if pr_val < 60: continue 
+            final_pr = pr_val
+        else:
+            final_pr = -1
+
         future = get_future_prices_right_side(row.ts_code, last_trade, buy_threshold_pct=buy_threshold)
         
         records.append({
             'ts_code': row.ts_code, 'name': getattr(row, 'name', row.ts_code),
             'Close': row.close, 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
             'macd': ind['macd_val'], 'volatility': ind['volatility'],
-            'Return_D1 (%)': future.get('Return_D1'), 'Return_D3 (%)': future.get('Return_D3')
+            'profit_rate': final_pr,
+            'Return_D1 (%)': future.get('Return_D1'), 
+            'Return_D3 (%)': future.get('Return_D3'),
+            'Return_D5 (%)': future.get('Return_D5') # 新增 D5
         })
     
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "无优质MACD股票"
 
-    # 6. 评分 (V30.16 黄金区间 + 筹码尝试)
+    # 6. 评分
     s_vol = fdf['volatility']
     if s_vol.max() != s_vol.min():
         s_vol = (s_vol - s_vol.min()) / (s_vol.max() - s_vol.min())
     else: s_vol = 0.5
     
-    # 基础分
     base_score = fdf['macd'] * 10000 + (1 - s_vol) * 0.3
     
-    # [V30.16 修正] 黄金价格加分 (数据证明最有效)
-    # 30-100元 -> 1.2倍
-    price_bonus = fdf['Close'].apply(lambda x: 1.2 if 30 <= x <= 100 else 1.0)
-    
-    fdf['综合评分'] = base_score * price_bonus
-    fdf['策略'] = 'V30.16 修正版(价格优选)'
+    def calculate_bonus(row):
+        if row['profit_rate'] >= 90: return 1.3, 'VIP筹码主导'
+        elif 30 <= row['Close'] <= 100: return 1.1, '价格优选(备用)'
+        else: return 1.0, '基础评分'
+
+    fdf[['bonus', '策略']] = fdf.apply(lambda x: pd.Series(calculate_bonus(x)), axis=1)
+    fdf['综合评分'] = base_score * fdf['bonus']
     
     fdf = fdf.sort_values('综合评分', ascending=False).head(TOP_BACKTEST)
     return fdf.reset_index(drop=True), None
@@ -348,13 +365,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.16 修正回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.18 全周期回测"):
     
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     
     if not get_all_historical_data(trade_days): st.stop()
-    st.success("✅ 数据就绪！开始 V30.16 修正版回测...")
+    st.success("✅ V30.18 启动！重点观察 D+5 数据...")
     
     results = []
     bar = st.progress(0)
@@ -366,32 +383,27 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.16 修正回测"):
             if not df.empty:
                 df['Trade_Date'] = date
                 results.append(df)
-            elif msg:
-                pass 
-                
+            elif msg: pass 
         except Exception as e:
-            st.warning(f"⚠️ {date} 数据计算异常，已自动跳过。原因: {str(e)}")
+            st.warning(f"⚠️ {date} 数据计算异常。原因: {str(e)}")
             error_count += 1
-            
         bar.progress((i + 1) / len(trade_days))
         
     bar.empty()
     
-    if error_count > 0:
-        st.warning(f"💡 提示：回测过程中有 {error_count} 个交易日因数据异常被跳过。")
-    
     if not results:
-        st.error("区间内无有效强市交易日，或所有数据均下载失败。")
+        st.error("无结果。")
         st.stop()
         
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.16 修正回测 (黄金区间 + 换手优化)")
+    st.header(f"📊 V30.18 回测报告 (含 D+5 验证)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
-    cols = st.columns(2)
-    for idx, n in enumerate([1, 3]):
+    # 重点展示 D1, D3, D5
+    cols = st.columns(3)
+    for idx, n in enumerate([1, 3, 5]):
         col = f'Return_D{n} (%)' 
         valid = all_res.dropna(subset=[col])
         if not valid.empty:
