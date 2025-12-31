@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.21 智能加权版 (软约束防过拟合)
+选股王 · V30.22 终极形态版 (暴力MACD + 黄金形态加持)
 核心逻辑：
-1. [基石] 依然使用 V30.20 的 "MACD(8,17,5) + 放量 + 趋势" 作为底座。
-2. [进化] 将 "价格/MACD值/波动率/涨幅" 转化为 "加分项"，而不是 "过滤项"。
-3. [防过拟合] 参数范围适当放宽，避免死板卡位。
+1. [基石] 沿用 V30.20 的 "MACD(8,17,5) + 放量(>1.2倍) + 趋势(>MA20)" 铁律。
+2. [修正] 删除了对 "大MACD" 的歧视。MACD 越大，基础分越高。
+3. [加权] 只保留数据验证有效的加分项：
+   - 价格舒适区 (40-80元) -> +10%
+   - 涨停板确认 (涨幅>9.5%) -> +10%
+   - 波动率适中 (4%-8%) -> +5%
 """
 
 import streamlit as st
@@ -26,15 +29,17 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V30.21 智能加权版", layout="wide")
-st.title("选股王 · V30.21 智能加权版（🧠 软约束 + 动态评分）")
+st.set_page_config(page_title="选股王 · V30.22 终极形态版", layout="wide")
+st.title("选股王 · V30.22 终极形态版（🔥 暴力MACD + 🏆 黄金形态）")
 st.markdown("""
-**🛡️ 防过拟合机制：**
-* **不搞一刀切：** 没有硬性删除代码。
-* **智能加分：** * 价格舒适区 (40-80元) -> **+10% 分**
-    * 启动初期 (MACD 1.5-3.0) -> **+10% 分**
-    * 涨停板确认 (涨幅 > 9.5%) -> **+10% 分**
-    * 波动率适中 (4%-8%) -> **+5% 分**
+**🛠️ 策略逻辑终极调整：**
+1. **基础分：** 完全由 **改进版MACD (8,17,5)** 决定，数值越大分越高。
+2. **硬门槛：** 必须 **放量 (>1.2倍)** 且 **站上20日线**。
+3. **加分项 (锦上添花)：**
+    * ✅ **价格舒适** (40-80元)
+    * ✅ **涨停确认** (涨幅>9.5%)
+    * ✅ **波适中** (4%-8%)
+    * ❌ **已删除** "MACD启动点" 加分 (不再压制大龙头的得分)。
 """)
 
 # ---------------------------
@@ -52,16 +57,6 @@ def safe_get(func_name, **kwargs):
             return pd.DataFrame(columns=['ts_code']) 
         return df
     except Exception: return pd.DataFrame(columns=['ts_code'])
-
-def get_vip_chip_data(trade_date):
-    global pro
-    if pro is None: return pd.DataFrame()
-    try:
-        df = pro.cyq_perf(trade_date=trade_date)
-        if df is not None and not df.empty:
-            return df[['ts_code', 'profit_rate']]
-    except: pass
-    return pd.DataFrame()
 
 def get_trade_days(end_date_str, num_days):
     start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 3)).strftime("%Y%m%d")
@@ -162,7 +157,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df.sort_values('trade_date').set_index('trade_date_str')[['open', 'high', 'low', 'close', 'pre_close', 'vol']]
 
 # ----------------------------------------------------------------------
-# 核心买入计算 (保持 V30.20 逻辑)
+# 核心买入计算 (实盘严选)
 # ----------------------------------------------------------------------
 def get_future_prices_real_combat(ts_code, selection_date, days_ahead=[1, 3, 5], buy_threshold_pct=1.5):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -176,10 +171,10 @@ def get_future_prices_real_combat(ts_code, selection_date, days_ahead=[1, 3, 5],
     if hist.empty: return results
     d1_data = hist.iloc[0]
     
-    # 拒绝低开
+    # 1. 拒绝低开
     if d1_data['open'] <= d1_data['pre_close']: return results 
     
-    # 确认 +1.5%
+    # 2. 确认 +1.5%
     buy_price_threshold = d1_data['open'] * (1 + buy_threshold_pct / 100.0)
     if d1_data['high'] < buy_price_threshold: return results 
 
@@ -203,8 +198,6 @@ def compute_indicators(ts_code, end_date):
     df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     close = df['close']
     vol = df['vol']
-    
-    res['last_close'] = close.iloc[-1] 
     
     # 1. 改进版 MACD (8, 17, 5)
     ema_fast = close.ewm(span=8, adjust=False).mean()
@@ -246,7 +239,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("**回测天数 (N)**", value=50, step=1))
     
     st.markdown("---")
-    st.header("2. 实战参数 (V30.21)")
+    st.header("2. 实战参数 (V30.22)")
     BUY_THRESHOLD_PCT = st.number_input("买入确认阈值 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
@@ -265,7 +258,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api() 
 
 # ----------------------------------------------------------------------
-# 核心逻辑 (V30.21 智能加权)
+# 核心逻辑 (V30.22 终极形态)
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
     # 1. 弱市熔断
@@ -313,12 +306,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
             candidates = candidates[candidates['ts_code'].isin(available)]
         except: return pd.DataFrame(), "缓存缺失"
 
-    # 4. 深度计算
+    # 4. 深度计算 (硬门槛)
     records = []
     for row in candidates.itertuples():
         ind = compute_indicators(row.ts_code, last_trade) 
         
-        # [基础硬门槛 - 保持不变]
+        # [V30.20 硬门槛 - 保留]
+        # 必须是上升趋势 & 必须放量
         if ind.get('close_current', 0) <= ind.get('ma20_current', 0): continue
         if ind.get('vol_current', 0) <= ind.get('ma5_vol_current', 0) * 1.2: continue
         if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
@@ -335,37 +329,33 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
         })
     
     fdf = pd.DataFrame(records)
-    if fdf.empty: return pd.DataFrame(), "无优质股票"
+    if fdf.empty: return pd.DataFrame(), "无优质放量股票"
 
-    # 5. [核心修改] 智能加权评分 (防过拟合)
-    
-    # 基础分：MACD (0~10000)
+    # 5. [核心修改] 终极评分系统
+    # 基础分：MACD 绝对值 (数值越大越强)
     base_score = fdf['macd'] * 10000 
     
-    # 动态加分函数 (软约束)
+    # 动态加分 (只保留有效项)
     def calculate_smart_bonus(row):
         bonus = 1.0
         tags = []
         
-        # A. 价格舒适区 (放宽到 40-80)
+        # A. 价格舒适区 (40-80) -> +10%
         if 40 <= row['Close'] <= 80:
             bonus += 0.1
             tags.append('价格佳')
             
-        # B. MACD 启动区 (放宽到 1.5-3.0)
-        if 1.5 <= row['macd'] <= 3.0:
-            bonus += 0.1
-            tags.append('启动点')
-            
-        # C. 涨停板确认 (放宽到 > 9.5%)
+        # B. 涨停板确认 (>9.5%) -> +10%
         if row['Pct_Chg (%)'] >= 9.5:
             bonus += 0.1
             tags.append('板确认')
             
-        # D. 波动率适中 (放宽到 4.0-8.0)
+        # C. 波动率适中 (4.0-8.0) -> +5%
         if 4.0 <= row['volatility'] <= 8.0:
             bonus += 0.05
             tags.append('波适中')
+            
+        # [删除了 MACD启动点 加分] -> 让大MACD回归王者地位
             
         return bonus, "+".join(tags)
 
@@ -378,12 +368,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, buy_threshold):
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.21 智能加权回测"):
+if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.22 终极回测"):
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days: st.stop()
     if not get_all_historical_data(trade_days): st.stop()
     
-    st.success("✅ V30.21 (智能加权版) 启动...")
+    st.success("✅ V30.22 (终极形态) 启动...")
     results = []
     bar = st.progress(0)
     
@@ -404,7 +394,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日 V30.21 智能加权回测"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.21 回测报告 (软约束防过拟合)")
+    st.header(f"📊 V30.22 回测报告 (暴力MACD + 黄金形态)")
     st.markdown(f"**有效交易天数：** {all_res['Trade_Date'].nunique()} 天")
 
     cols = st.columns(3)
