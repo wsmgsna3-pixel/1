@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 稳定尊享版 (2线程防限流)
+选股王 · V30.12.3 敏捷改进版 (MACD 8-17-5)
 ------------------------------------------------
-版本特性 (Stable Edition):
-1. **稳定并发**：2 线程下载，杜绝 Tushare 限流报错。
-2. **向量化计算**：全市场矩阵计算，计算速度极快。
-3. **特色数据**：利用 cyq_perf (筹码获利盘) 捕捉主升浪。
-4. **实战风控**：
-   - 涨停板买入限制 (防止一字板偷价)
-   - 动态止损逻辑
+版本特性 (Agile Edition):
+1. **策略升级**：MACD 参数调整为 (8, 17, 5)，更灵敏捕捉起涨点。
+2. **稳定并发**：2 线程下载，杜绝 Tushare 限流报错。
+3. **向量化计算**：全市场矩阵计算，计算速度极快。
+4. **特色数据**：利用 cyq_perf (筹码获利盘) 捕捉主升浪。
 ------------------------------------------------
 """
 
@@ -36,12 +34,12 @@ GLOBAL_CHIP_DATA = {} # 筹码数据缓存
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3 稳定版", layout="wide")
-st.title("🛡️ 选股王 V30.12.3：稳定实战版")
+st.set_page_config(page_title="选股王 V30.12.3 敏捷版", layout="wide")
+st.title("⚡ 选股王 V30.12.3：MACD(8,17,5) 敏捷版")
 st.markdown("""
-**⚙️ 系统状态：**
-* **并发模式**：2 线程 (防限流安全模式)
-* **计算引擎**：向量化矩阵计算
+**⚙️ 策略变更：**
+* **MACD 参数**：由 (12,26,9) 调整为 **(8, 17, 5)**
+* **逻辑**：更敏感的均线系统，旨在提前发现超短线爆发信号。
 """)
 
 # ---------------------------
@@ -104,13 +102,13 @@ def load_industry_mapping():
         return {}
 
 # ---------------------------
-# 核心：批量指标计算 (向量化)
+# 核心：批量指标计算 (向量化) - 已修改 MACD
 # ---------------------------
 def calculate_all_indicators_vectorized(daily_df, adj_df):
     """
-    一次性计算所有股票的 RSI, MACD, MA，替换原本低效的循环。
+    一次性计算所有股票的 RSI, MACD, MA
     """
-    st.info("⚡ 正在进行全市场向量化指标计算 (利用 pandas 矩阵加速)...")
+    st.info("⚡ 正在进行全市场向量化指标计算 (MACD 8-17-5)...")
     
     # 1. 准备数据：合并复权因子
     df = daily_df.copy()
@@ -118,18 +116,21 @@ def calculate_all_indicators_vectorized(daily_df, adj_df):
         df = df.join(adj_df['adj_factor'])
 
     # 简单前复权处理计算用于指标的价格
-    # 这里只要保证相对趋势正确即可
     df['adj_factor'] = df['adj_factor'].fillna(1.0)
     df['close_calc'] = df['close'] * df['adj_factor']
     
     # 2. 按股票代码分组计算
     grouped = df.groupby(level='ts_code')
     
-    # --- MACD (12, 26, 9) ---
-    ema12 = grouped['close_calc'].transform(lambda x: x.ewm(span=12, adjust=False).mean())
-    ema26 = grouped['close_calc'].transform(lambda x: x.ewm(span=26, adjust=False).mean())
-    df['diff'] = ema12 - ema26
-    df['dea'] = df.groupby(level='ts_code')['diff'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+    # === [修改点] MACD (8, 17, 5) ===
+    # 快线 8
+    ema_fast = grouped['close_calc'].transform(lambda x: x.ewm(span=8, adjust=False).mean())
+    # 慢线 17
+    ema_slow = grouped['close_calc'].transform(lambda x: x.ewm(span=17, adjust=False).mean())
+    
+    df['diff'] = ema_fast - ema_slow
+    # 信号线 5
+    df['dea'] = df.groupby(level='ts_code')['diff'].transform(lambda x: x.ewm(span=5, adjust=False).mean())
     df['macd'] = (df['diff'] - df['dea']) * 2
     
     # --- RSI (12) ---
@@ -176,7 +177,7 @@ def get_all_data_and_calc(trade_days_full_list):
             a = safe_get('adj_factor', trade_date=date)
             return d, a
 
-        # ▼▼▼ 修改：改为 2 线程，极其安全 ▼▼▼
+        # 改为 2 线程，极其安全
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_to_date = {executor.submit(fetch_daily, date): date for date in trade_days_full_list}
             
@@ -209,7 +210,7 @@ def get_all_data_and_calc(trade_days_full_list):
     return True
 
 # ---------------------------
-# 回测逻辑 (修复 Bug 版)
+# 回测逻辑
 # ---------------------------
 def run_backtest_optimized(target_date, TOP_K, PARAMS):
     """
@@ -263,7 +264,7 @@ def run_backtest_optimized(target_date, TOP_K, PARAMS):
     
     # 5. 循环筛选
     for ts_code, row in df.iterrows():
-        # === [修复] 初始化变量 ===
+        # 初始化变量
         ind_code = None
         
         # 板块过滤
@@ -281,7 +282,7 @@ def run_backtest_optimized(target_date, TOP_K, PARAMS):
         # 均线多头
         if row['close'] < row['ma60']: continue
         
-        # 计算得分
+        # 计算得分 (注意：这里的 macd 已经是 8-17-5 的值了)
         score = row['macd'] * 1000
         if win_rate > 90: score += 1000
         if row['rsi'] > 90: score += 3000 
@@ -294,7 +295,6 @@ def run_backtest_optimized(target_date, TOP_K, PARAMS):
             'rsi': row['rsi'],
             'winner_rate': win_rate,
             'Score': score,
-            # === [修复] 安全的判断逻辑 ===
             'Sector_Boost': 'Yes' if (ind_code and ind_code in strong_industry_codes) else 'No'
         })
         
@@ -315,10 +315,9 @@ def run_backtest_optimized(target_date, TOP_K, PARAMS):
             d1_data = future_data.iloc[0]
             
             # 一字涨停无法买入判断
-            # 涨幅限制：主板10%，科创20%。这里用 9.5% 和 19.5% 近似判断
             limit_ratio = 1.195 if code.startswith('688') or code.startswith('300') else 1.095
             
-            # 使用 D1 的 pre_close，如果没有则用 T日的 close (current_close)
+            # 使用 D1 的 pre_close，如果没有则用 T日的 close
             ref_close = d1_data.get('pre_close', current_close)
             if pd.isna(ref_close): ref_close = current_close
             
@@ -331,8 +330,6 @@ def run_backtest_optimized(target_date, TOP_K, PARAMS):
             # 确保买入价不超过涨停价
             limit_up_price = ref_close * (1.20 if limit_ratio > 1.1 else 1.10)
             if buy_price > limit_up_price:
-                # 如果滑点后超过涨停，说明只能排队，假设买不进或者按涨停价成交
-                # 这里严格一点，直接算买不进，或者按涨停价算
                 buy_price = limit_up_price 
                 
             rets = []
@@ -348,7 +345,6 @@ def run_backtest_optimized(target_date, TOP_K, PARAMS):
             return np.nan, np.nan, np.nan
 
     # 批量计算收益
-    # 使用 lambda 传入当天的收盘价，辅助涨停判断
     returns = final_df.apply(lambda row: get_returns_safe(row['ts_code'], row['Close']), axis=1)
     
     if not returns.empty:
@@ -363,7 +359,7 @@ def run_backtest_optimized(target_date, TOP_K, PARAMS):
 # UI 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("⚙️ 稳定版参数配置")
+    st.header("⚙️ 敏捷版参数配置")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
@@ -389,7 +385,7 @@ if TS_TOKEN:
     ts.set_token(TS_TOKEN)
     pro = ts.pro_api()
 
-if st.button("🚀 启动稳定回测"):
+if st.button("🚀 启动敏捷回测"):
     if not TS_TOKEN: st.error("请输入 Token"); st.stop()
     
     full_dates = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
@@ -422,7 +418,7 @@ if st.button("🚀 启动稳定回测"):
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.12.3 稳定版仪表盘")
+        st.header("📊 V30.12.3 敏捷版仪表盘 (MACD 8-17-5)")
         
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
@@ -440,7 +436,7 @@ if st.button("🚀 启动稳定回测"):
         st.download_button(
             label="📥 下载回测结果 (CSV)",
             data=csv,
-            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_stable_export.csv",
+            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_agile_export.csv",
             mime="text/csv",
         )
             
