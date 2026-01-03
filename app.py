@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 Pro (最终收益修复版)
+选股王 · V30.12.3 (纯单线程·绝对稳定版)
 ------------------------------------------------
-修复日志：
-1. **核心修复**：修正收益率计算中的索引错误 (xs -> loc)，彻底解决收益为 0 的问题。
-2. **逻辑校正**：强制确保交易日历按日期升序排列，防止回测顺序错乱。
-3. **稳健性**：保留了单线程自动补全数据的机制，确保数据完整。
+修改核心：
+1. **纯单线程**：移除所有并发，一行行代码逐天拉取，拒绝花里胡哨，由慢变稳。
+2. **逻辑修复**：修正了计算次日收益时的索引错误 (loc替换xs)，解决“全0收益”问题。
+3. **进度可视**：由于单线程稍慢，增加了详细的进度条。
 ------------------------------------------------
 """
 
@@ -16,7 +16,6 @@ import tushare as ts
 from datetime import datetime, timedelta
 import warnings
 import time
-import concurrent.futures
 
 warnings.filterwarnings("ignore")
 
@@ -26,15 +25,11 @@ warnings.filterwarnings("ignore")
 GLOBAL_DATA = {
     'daily': pd.DataFrame(),
     'daily_basic': pd.DataFrame(),
-    'moneyflow': pd.DataFrame(),
-    'adj_factor': pd.DataFrame()
+    'moneyflow': pd.DataFrame()
 }
 pro = None
 
-# ---------------------------
-# 页面配置
-# ---------------------------
-st.set_page_config(page_title="选股王 2025 最终版", layout="wide")
+st.set_page_config(page_title="选股王 稳定版", layout="wide")
 
 # ---------------------------
 # 工具函数
@@ -56,8 +51,7 @@ def get_real_trade_date(date_str):
         start = (datetime.strptime(date_str, '%Y%m%d') - timedelta(days=10)).strftime('%Y%m%d')
         end = date_str
         df = pro.trade_cal(exchange='', start_date=start, end_date=end, is_open='1')
-        if not df.empty:
-            return df['cal_date'].iloc[-1]
+        if not df.empty: return df['cal_date'].iloc[-1]
         return date_str
     except:
         return date_str
@@ -67,26 +61,13 @@ def get_trade_cal(start_date, end_date):
     try:
         df = pro.trade_cal(exchange='', start_date=start_date, end_date=end_date)
         df = df[df['is_open'] == 1]
-        return sorted(df['cal_date'].tolist()) # 强制升序
+        return sorted(df['cal_date'].tolist())
     except:
         return []
 
 # ---------------------------
-# 核心：双模数据预加载
+# 核心：纯单线程数据预加载
 # ---------------------------
-def fetch_worker(dt, api_type):
-    try:
-        if api_type == 'daily':
-            return pro.daily(trade_date=dt)
-        elif api_type == 'adj_factor':
-            return pro.adj_factor(trade_date=dt)
-        elif api_type == 'daily_basic':
-            return pro.daily_basic(trade_date=dt, fields='ts_code,trade_date,turnover_rate,circ_mv,total_mv,pe,pb')
-        elif api_type == 'moneyflow':
-            return pro.moneyflow(trade_date=dt)
-    except:
-        return None
-
 def prefetch_data(trade_days):
     global pro, GLOBAL_DATA
     if not trade_days: return False
@@ -94,58 +75,81 @@ def prefetch_data(trade_days):
     status_text = st.empty()
     progress_bar = st.progress(0)
     
-    data_types = ['daily', 'daily_basic', 'adj_factor', 'moneyflow']
+    # 容器
+    all_daily = []
+    all_basic = []
+    all_mf = []
     
-    for d_type in data_types:
-        status_text.text(f"🚀 正在拉取 {d_type} ...")
-        results = []
+    total_days = len(trade_days)
+    
+    # ----------------------------------------
+    # 单线程循环：一天一天拉，稳如老狗
+    # ----------------------------------------
+    for i, date in enumerate(trade_days):
+        # 进度提示
+        progress = (i + 1) / total_days
+        progress_bar.progress(progress, text=f"正在拉取: {date} ({i+1}/{total_days})")
         
-        # 1. 并发拉取
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            future_to_date = {executor.submit(fetch_worker, d, d_type): d for d in trade_days}
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_date):
-                data = future.result()
-                if data is not None and not data.empty:
-                    results.append(data)
-                completed += 1
-                base_progress = data_types.index(d_type) * 0.25
-                curr_progress = base_progress + (completed / len(trade_days)) * 0.25
-                progress_bar.progress(min(curr_progress, 1.0))
-
-        # 2. 补漏 (单线程)
-        if d_type in ['daily', 'daily_basic'] and len(results) < len(trade_days):
-            existing_dates = set()
-            for df in results:
-                if 'trade_date' in df.columns and not df.empty:
-                    existing_dates.add(df['trade_date'].iloc[0])
+        try:
+            # 1. 拉取行情
+            df_d = pro.daily(trade_date=date)
+            if df_d is not None and not df_d.empty:
+                all_daily.append(df_d)
             
-            missing_dates = [d for d in trade_days if d not in existing_dates]
-            if missing_dates:
-                status_text.warning(f"⚠️ {d_type} 正在单线程补全 {len(missing_dates)} 天数据...")
-                for md in missing_dates:
-                    retry_data = fetch_worker(md, d_type)
-                    if retry_data is not None and not retry_data.empty:
-                        results.append(retry_data)
-
-        # 合并
-        if results:
-            full_df = pd.concat(results)
-            if 'trade_date' in full_df.columns:
-                full_df['trade_date'] = full_df['trade_date'].astype(str).str.strip()
-            if 'ts_code' in full_df.columns:
-                full_df['ts_code'] = full_df['ts_code'].astype(str).str.strip()
+            # 2. 拉取每日指标 (关键)
+            df_b = pro.daily_basic(trade_date=date, fields='ts_code,trade_date,turnover_rate,circ_mv,total_mv,pe,pb')
+            if df_b is not None and not df_b.empty:
+                all_basic.append(df_b)
+                
+            # 3. 拉取资金流 (可选)
+            df_m = pro.moneyflow(trade_date=date)
+            if df_m is not None and not df_m.empty:
+                all_mf.append(df_m)
             
-            full_df.drop_duplicates(subset=['trade_date', 'ts_code'], inplace=True)
-            full_df.set_index(['trade_date', 'ts_code'], inplace=True)
-            full_df.sort_index(inplace=True)
-            GLOBAL_DATA[d_type] = full_df
-        else:
-            if d_type == 'daily_basic':
-                st.error("❌ 严重错误：daily_basic 数据拉取失败。")
-                return False
+            # 【关键】稍微歇一下，防止接口报错，保证成功率
+            time.sleep(0.05) 
+            
+        except Exception as e:
+            st.warning(f"{date} 数据获取失败，已跳过。错误: {e}")
+            time.sleep(1) # 出错多歇会
+            continue
 
-    status_text.success("✅ 数据加载完成！")
+    status_text.text("正在合并数据...")
+    
+    # 合并数据
+    if all_daily:
+        full_daily = pd.concat(all_daily)
+        full_daily['trade_date'] = full_daily['trade_date'].astype(str).str.strip()
+        full_daily['ts_code'] = full_daily['ts_code'].astype(str).str.strip()
+        full_daily.drop_duplicates(subset=['trade_date', 'ts_code'], inplace=True)
+        full_daily.set_index(['trade_date', 'ts_code'], inplace=True)
+        full_daily.sort_index(inplace=True)
+        GLOBAL_DATA['daily'] = full_daily
+    else:
+        st.error("❌ 每日行情数据为空，无法回测")
+        return False
+        
+    if all_basic:
+        full_basic = pd.concat(all_basic)
+        full_basic['trade_date'] = full_basic['trade_date'].astype(str).str.strip()
+        full_basic['ts_code'] = full_basic['ts_code'].astype(str).str.strip()
+        full_basic.drop_duplicates(subset=['trade_date', 'ts_code'], inplace=True)
+        full_basic.set_index(['trade_date', 'ts_code'], inplace=True)
+        full_basic.sort_index(inplace=True)
+        GLOBAL_DATA['daily_basic'] = full_basic
+    else:
+        st.error("❌ 每日指标数据(daily_basic)为空，无法回测")
+        return False
+        
+    if all_mf:
+        full_mf = pd.concat(all_mf)
+        full_mf['trade_date'] = full_mf['trade_date'].astype(str).str.strip()
+        full_mf['ts_code'] = full_mf['ts_code'].astype(str).str.strip()
+        full_mf.set_index(['trade_date', 'ts_code'], inplace=True)
+        full_mf.sort_index(inplace=True)
+        GLOBAL_DATA['moneyflow'] = full_mf
+
+    status_text.success("✅ 所有数据加载完成！(单线程模式)")
     time.sleep(0.5)
     status_text.empty()
     progress_bar.empty()
@@ -157,24 +161,25 @@ def prefetch_data(trade_days):
 def run_strategy(current_date, params):
     try:
         idx = pd.IndexSlice
-        # 必须有 daily 和 daily_basic
+        # 检查数据是否存在
         if current_date not in GLOBAL_DATA['daily'].index.get_level_values(0): return pd.DataFrame()
         if current_date not in GLOBAL_DATA['daily_basic'].index.get_level_values(0): return pd.DataFrame()
             
-        daily_today = GLOBAL_DATA['daily'].loc[idx[current_date, :]]
-        basic_today = GLOBAL_DATA['daily_basic'].loc[idx[current_date, :]]
+        daily_today = GLOBAL_DATA['daily'].loc[idx[current_date, :]].copy()
+        basic_today = GLOBAL_DATA['daily_basic'].loc[idx[current_date, :]].copy()
         
-        # 合并
+        # 1. 基础合并
         df = daily_today.reset_index()
         if 'ts_code' not in df.columns: df['ts_code'] = df.index
         basic_temp = basic_today.reset_index()
         if 'ts_code' not in basic_temp.columns: basic_temp['ts_code'] = basic_temp.index
         
+        # Inner Join: 只保留同时有行情和指标的票
         df = pd.merge(df, basic_temp[['ts_code', 'circ_mv', 'turnover_rate']], on='ts_code', how='inner')
         
-        # 资金流
+        # 2. 资金流 (Left Join)
         try:
-            if current_date in GLOBAL_DATA['moneyflow'].index.get_level_values(0):
+            if 'moneyflow' in GLOBAL_DATA and current_date in GLOBAL_DATA['moneyflow'].index.get_level_values(0):
                 mf_today = GLOBAL_DATA['moneyflow'].loc[idx[current_date, :]]
                 mf_temp = mf_today.reset_index()
                 if 'ts_code' not in mf_temp.columns: mf_temp['ts_code'] = mf_temp.index
@@ -185,32 +190,47 @@ def run_strategy(current_date, params):
         except:
             df['net_mf'] = 0
 
-        # 过滤
+        # --- 3. 筛选逻辑 ---
+        # 过滤垃圾股
         df = df[df['close'] >= params['min_price']]
-        df = df[df['pct_chg'] < 9.5]
+        # 过滤涨跌停
+        df = df[df['pct_chg'] < 9.5] 
+        df = df[df['pct_chg'] > -9.5]
+        # 换手率
         df = df[(df['turnover_rate'] >= params['min_turnover']) & (df['turnover_rate'] <= params['max_turnover'])]
-        
+        # 市值
         df['circ_mv_yi'] = df['circ_mv'] / 10000
         df = df[(df['circ_mv_yi'] >= params['min_mv']) & (df['circ_mv_yi'] <= params['max_mv'])]
         
+        # 上影线过滤
+        df['max_oc'] = df[['open', 'close']].max(axis=1)
+        df['upper_shadow'] = (df['high'] - df['max_oc']) / df['close']
+        df = df[df['upper_shadow'] <= 0.05]
+        
         if df.empty: return pd.DataFrame()
 
-        # 评分
+        # --- 4. 评分 ---
         df['score'] = df['turnover_rate']
+        # 资金流加分
         df.loc[df['net_mf'] > 0, 'score'] += 20
-        df['upper_shadow'] = (df['high'] - df['close']) / df['close']
-        df.loc[df['upper_shadow'] < 0.01, 'score'] += 10
+        # 实体饱满度加分
+        df['body_len'] = (df['close'] - df['open']).abs()
+        df['hl_len'] = df['high'] - df['low']
+        # 防止除0
+        df.loc[df['hl_len'] == 0, 'hl_len'] = 0.01
+        df['body_ratio'] = df['body_len'] / df['hl_len']
+        df.loc[df['body_ratio'] > 0.5, 'score'] += 10
         
         return df.sort_values(by='score', ascending=False).head(params['top_k'])
 
-    except Exception:
+    except Exception as e:
         return pd.DataFrame()
 
 # ---------------------------
 # 主程序
 # ---------------------------
 def main():
-    st.title("🚀 选股王 2025 最终修复版")
+    st.title("🚀 选股王 2025 (单线程稳定版)")
     
     c1, c2 = st.columns([3, 1])
     with c1:
@@ -241,7 +261,7 @@ def main():
             pro = init_tushare(token)
             if not pro: return
         
-        # 日期修正
+        # 自动日期修正
         start_str = start_date.strftime('%Y%m%d')
         end_str = end_date.strftime('%Y%m%d')
         today_str = datetime.now().strftime('%Y%m%d')
@@ -253,11 +273,12 @@ def main():
             st.error("无有效交易日")
             return
         
-        st.info(f"回测区间: {trade_days[0]} - {trade_days[-1]} | {len(trade_days)} 天")
+        st.info(f"回测区间: {trade_days[0]} - {trade_days[-1]} | {len(trade_days)} 天 (单线程拉取中，请耐心等待...)")
         
+        # 1. 执行预加载 (单线程)
         if not prefetch_data(trade_days): return
         
-        # 回测
+        # 2. 执行回测
         params = {'min_price': min_price, 'min_mv': min_mv, 'max_mv': max_mv, 
                   'min_turnover': 3.0, 'max_turnover': 30.0, 'top_k': top_k}
         
@@ -265,31 +286,36 @@ def main():
         progress = st.progress(0)
         
         for i, date in enumerate(trade_days):
-            progress.progress((i+1)/len(trade_days), text=f"分析: {date}")
+            progress.progress((i+1)/len(trade_days), text=f"回测分析: {date}")
             selected = run_strategy(date, params)
             
             if not selected.empty:
-                # 获取次日数据计算收益
+                # 收益计算逻辑
                 if i + 1 < len(trade_days):
                     next_date = trade_days[i+1]
                     try:
                         idx = pd.IndexSlice
                         if next_date in GLOBAL_DATA['daily'].index.get_level_values(0):
-                            # 这里获取的已经是只有 ts_code 索引的 DF
                             next_quotes = GLOBAL_DATA['daily'].loc[idx[next_date, :]]
                             
                             for _, row in selected.iterrows():
                                 code = row['ts_code']
                                 ret = 0.0
-                                # 【关键修复】使用 .loc 而不是 .xs
+                                # 【核心修复点】: 使用 .loc 直接获取，不使用 .xs
+                                # 因为 next_quotes 的索引只有 ts_code 这一层了
                                 if code in next_quotes.index:
                                     try:
                                         nb = next_quotes.loc[code]
-                                        # 如果有重复代码，取第一行
+                                        # 如果是 DataFrame (极少数情况) 取第一行
                                         if isinstance(nb, pd.DataFrame): nb = nb.iloc[0]
-                                        # 计算当日涨幅 (Close - Open) / Open
-                                        ret = (nb['close'] - nb['open']) / nb['open'] * 100
-                                    except: pass
+                                        
+                                        # 收益率: (收 - 开) / 开
+                                        if nb['open'] > 0:
+                                            ret = (nb['close'] - nb['open']) / nb['open'] * 100
+                                        else:
+                                            ret = 0.0
+                                    except: 
+                                        ret = 0.0
                                 
                                 results.append({'日期': date, '代码': code, '收益(%)': ret})
                     except: pass
@@ -299,8 +325,8 @@ def main():
         if results:
             df_res = pd.DataFrame(results)
             st.divider()
+            st.subheader("📊 最终回测报告")
             
-            # 统计
             daily_ret = df_res.groupby('日期')['收益(%)'].mean().reset_index()
             daily_ret['策略净值'] = (1 + daily_ret['收益(%)']/100).cumprod()
             
@@ -317,7 +343,7 @@ def main():
             st.area_chart(daily_ret.set_index('日期')['策略净值'])
             st.dataframe(df_res)
         else:
-            st.warning("未触发选股信号")
+            st.warning("在此期间未触发选股信号")
 
 if __name__ == '__main__':
     main()
