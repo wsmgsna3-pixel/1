@@ -5,6 +5,5 @@ tushare
 joblib
 plotly
 tushare
-pandas
-numpy
+scipy
 matplotlib
