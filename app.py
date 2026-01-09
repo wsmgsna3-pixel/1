@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 最终实战定制版
+选股王 · V30.12.3 最终实战定制版 (含乖离率风控)
 ------------------------------------------------
 版本特性 (User Customized):
 1. **参数固化**：
@@ -14,6 +14,8 @@
 3. **系统增强**：
    - 单线程模式 (100% 稳定，防封号，防丢包)
    - 资金流数据防抖 (防止排名乱跳)
+4. **新增风控**：
+   - 乖离率 (Bias20) > 25% 剔除 (拒绝一字板买不进的高位股)
 ------------------------------------------------
 """
 
@@ -44,7 +46,8 @@ st.set_page_config(page_title="选股王 V30.12.3 实战版", layout="wide")
 st.title("选股王 V30.12.3：最终实战定制版")
 st.markdown("""
 **🎯 实战铁律 (Top 3 策略)：**
-1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.
+1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉).
+   放弃 Rank 4-5.
 2. **科创板纪律**：若选出 688/300 开头的票，**必须 RSI > 90** 才能上，否则剔除顺延.
 3. **风控底线**：昨日涨幅 > 19% 一律不碰.
 """)
@@ -62,7 +65,6 @@ def safe_get(func_name, **kwargs):
     try:
         for _ in range(3):
             try:
-                # 修复点：这里之前有格式乱码，已清理
                 if kwargs.get('is_index'):
                     df = pro.index_daily(**kwargs)
                 else:
@@ -219,7 +221,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     
     for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns:
-            df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
+           df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
     
     df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
     df = df.sort_values('trade_date_str').set_index('trade_date_str')
@@ -312,9 +314,9 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (最终稳定版)
+# 核心回测逻辑函数 (最终稳定版 - 含乖离率风控)
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, BIAS_LIMIT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
     
     market_state = get_market_state(last_trade)
@@ -393,6 +395,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
+        # === 新增：乖离率 (Bias20) 风控 ===
+        # 即使是强市，如果偏离均线太多也意味着是一字板或高位风险
+        bias_val = (d0_close - ind['ma20']) / ind['ma20'] * 100
+        if bias_val > BIAS_LIMIT: 
+            continue
+        
         # 基础风控
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
@@ -454,8 +462,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
+    
     col1, col2 = st.columns(2)
-    # [修改点 1] 最低股价默认 10.0
     MIN_PRICE = col1.number_input("最低股价", value=10.0, help="厌恶低价股，默认设为10元")
     MIN_MV = col2.number_input("最小市值(亿)", value=50.0)
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
@@ -463,7 +471,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
     
-    # [修改点 2] 筹码获利盘默认 70.0
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0, 
                                       help="设为70以激活科创板妖股。低于此比例直接剔除")
     
@@ -471,15 +478,17 @@ with st.sidebar:
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
                                  help="⭐ 核心风控：定死19.0，精准剔除20CM涨停的深套股")
     
+    # [修改点：新增乖离率参数]
+    BIAS_LIMIT = st.number_input("乖离率阈值 (Bias%)", value=25.0,
+                                 help="收盘价偏离MA20超过此比例则剔除，防止买在连板高位。")
+    
     RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0, 
-                              help="设为100表示不拦截。")
+                               help="设为100表示不拦截。")
     
     st.markdown("---")
     st.subheader("📊 形态参数")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.5)
-    # [修改点 3] 上影线默认 5.0
     MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=5.0, help="最佳平衡点")
-    # [修改点 4] 实体位置默认 0.6
     MIN_BODY_POS = st.number_input("实体位置", value=0.6, help="0.6表示允许适当下影线")
     MAX_TURNOVER_RATE = st.number_input("换手率 (%)", value=20.0)
 
@@ -502,7 +511,8 @@ if st.button(f"🚀 启动 V30.12.3 实战版回测"):
     bar = st.progress(0, text="回测引擎流水线启动...")
     
     for i, date in enumerate(trade_days_list):
-        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE)
+        # 传递新的 BIAS_LIMIT 参数
+        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, BIAS_LIMIT, MIN_PRICE)
         if not res.empty:
             res['Trade_Date'] = date
             results.append(res)
