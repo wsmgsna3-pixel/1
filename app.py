@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 黄金实战版 (显示排名优化版)
+选股王 · V30.12.4 黄金实战版 (防崩溃断点续传版)
 ------------------------------------------------
 版本特性:
-1. **显性排名**：结果表第一列直接显示 Rank 1, 2, 3，一目了然。
-2. **核心逻辑**：Top 3 策略 + 股价>20元 + 科创RSI>90。
-3. **参数固化**：最低股价 >= 20.0 (稳健大肉)。
+1. **断点续传**：支持崩溃后接力跑，不再从头开始。
+2. **显性排名**：Rank 1, 2, 3 一目了然。
+3. **核心逻辑**：Top 3 策略 + 股价>20元 + 科创RSI>90。
 ------------------------------------------------
 """
 
@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import concurrent.futures 
+import os
 
 warnings.filterwarnings("ignore")
 
@@ -32,8 +33,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3 实战版", layout="wide")
-st.title("选股王 V30.12.3：黄金实战版 (含排名)")
+st.set_page_config(page_title="选股王 V30.12.4 防崩溃版", layout="wide")
+st.title("选股王 V30.12.4：黄金实战版 (防崩溃)")
 
 # 实战心法看板
 with st.expander("📌 实战心法 (提高胜率必看)", expanded=True):
@@ -278,8 +279,6 @@ def compute_indicators(ts_code, end_date):
     res['last_high'] = df['high'].iloc[-1]
     res['last_low'] = df['low'].iloc[-1]
     
-    # === 回归传统 MACD (12, 26, 9) ===
-    # 逻辑：稳定压倒一切，拒绝燥热信号
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     diff = ema12 - ema26
@@ -428,10 +427,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
     
-    # === [新增] 显性排名逻辑 ===
-    # 选出 Top K
     final_df = fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST).copy()
-    # 插入 Rank 列 (1, 2, 3...)
     final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
     
     return final_df, None
@@ -440,15 +436,19 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 黄金实战版")
+    st.header("V30.12.4 黄金实战版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天，太长容易卡顿")
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="保持 Top 5, 实盘重点看 Rank 1-3")
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="实盘重点看 Rank 1-3")
+    
+    st.markdown("---")
+    # [新增] 断点续传开关
+    RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=False, help="如果上次崩溃了，勾选此项可继续跑，不用从头开始。")
+    CHECKPOINT_FILE = "backtest_checkpoint.csv"
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
     col1, col2 = st.columns(2)
-    # [修改点] 默认改为 20.0
     MIN_PRICE = col1.number_input("最低股价", value=20.0, help="20元以上回撤最小")
     MIN_MV = col2.number_input("最小市值(亿)", value=50.0)
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
@@ -472,34 +472,69 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 黄金版"):
-    st.cache_data.clear() # 强制清除缓存，防止数据错误
-    trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
+if st.button(f"🚀 启动 V30.12.4"):
+    # 续传逻辑准备
+    processed_dates = set()
+    results = []
     
+    if RESUME_CHECKPOINT and os.path.exists(CHECKPOINT_FILE):
+        try:
+            existing_df = pd.read_csv(CHECKPOINT_FILE)
+            # 确保日期格式统一
+            existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
+            processed_dates = set(existing_df['Trade_Date'].unique())
+            results.append(existing_df)
+            st.success(f"✅ 检测到断点存档，已加载 {len(processed_dates)} 个交易日的数据，将跳过这些日期继续回测...")
+        except Exception as e:
+            st.warning(f"⚠️ 存档文件读取失败 ({str(e)})，将重新开始...")
+            if os.path.exists(CHECKPOINT_FILE): os.remove(CHECKPOINT_FILE)
+    else:
+        # 如果不续传，或者没有存档，就清理掉旧的
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+            st.info("🗑️ 已清理旧存档，开始新一轮回测...")
+    
+    # 获取日期列表
+    trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     if not trade_days_list:
         st.error("❌ 无法获取交易日期列表，请检查网络或 Token。")
         st.stop()
-        
-    if not get_all_historical_data(trade_days_list):
-        st.stop()
-        
-    results = []
-    bar = st.progress(0, text="回测引擎流水线启动...")
     
-    for i, date in enumerate(trade_days_list):
-        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE)
-        if not res.empty:
-            res['Trade_Date'] = date
-            results.append(res)
-        
-        bar.progress((i+1)/len(trade_days_list), text=f"正在分析第 {i+1} 天: {date}")
-        
-    bar.empty()
+    # 过滤掉已经跑过的日期
+    dates_to_run = [d for d in trade_days_list if d not in processed_dates]
     
+    if not dates_to_run:
+        st.warning("🎉 所有日期都已回测完毕！直接展示结果。")
+    else:
+        # 只有在需要跑新数据时才加载全量数据
+        if not get_all_historical_data(trade_days_list):
+            st.stop()
+            
+        bar = st.progress(0, text="回测引擎流水线启动...")
+        
+        for i, date in enumerate(dates_to_run):
+            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE)
+            if not res.empty:
+                res['Trade_Date'] = date
+                # === 关键：实时写入硬盘 ===
+                is_first_write = not os.path.exists(CHECKPOINT_FILE)
+                res.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first_write, encoding='utf-8-sig')
+                results.append(res)
+            
+            bar.progress((i+1)/len(dates_to_run), text=f"正在分析: {date} (已完成 {i+1}/{len(dates_to_run)})")
+        
+        bar.empty()
+    
+    # 结果展示
     if results:
         all_res = pd.concat(results)
+        # 确保按日期倒序，Rank正序
+        all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
+        all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header("📊 V30.12.3 统计仪表盘")
+        st.header("📊 V30.12.4 统计仪表盘")
+        
+        # 动态计算最新的统计结果
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -510,17 +545,18 @@ if st.button(f"🚀 启动 V30.12.3 黄金版"):
                 cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
         
         st.subheader("📋 回测清单 (Rank 3 是重点)")
-        # 把 Rank 放在第一列显示
+        
         display_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','winner_rate','Sector_Boost']
-        st.dataframe(all_res[display_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]), use_container_width=True)
+        st.dataframe(all_res[display_cols], use_container_width=True)
         
+        # 重新生成一份完整的 CSV 供下载
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            label="📥 下载回测结果 (CSV)",
+            label="📥 下载完整结果 (CSV)",
             data=csv,
-            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_simulation_export.csv",
+            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_final_export.csv",
             mime="text/csv",
         )
     else:
