@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.22.5 融合实战版 (基于 V30.12.3 深度定制)
+选股王 · V30.22.6 评分修正版 (修复Rank倒挂问题)
 ------------------------------------------------
-核心特性:
-1. [基底] 严格基于 V30.12.3 源码修改，保留所有原有函数结构和界面布局。
-2. [风控] 植入 V30.22 核心风控：
-   - 3天限1板 (拒绝连板接力)
-   - 20日涨幅 < 40% (拒绝鱼尾)
-   - 5日乖离率 < 15% (拒绝超买)
-3. [策略] 保留 RSI>90 奖励、筹码获利盘限制等原版逻辑。
-4. [稳定] 强制单线程模式，确保数据完整。
+版本更新：
+1. [评分修正] 实施方案A+B：
+   - RSI改为抛物线打分：75-85分权重最高，>90分倒扣分。
+   - 引入乖离率负反馈：乖离率过大进行降权打击。
+   - 目的：将 Rank 1 从“接盘侠”修正为“主升浪”，解决倒挂问题。
+2. [基底] 保持 V30.22.5 所有风控逻辑 (3天限1板, 20日涨幅<40%)。
+3. [结构] 保持单线程、UI布局不变。
 ------------------------------------------------
 """
 
@@ -36,16 +35,15 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置 (保持原版)
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.22.5 实战版", layout="wide")
-st.title("选股王 V30.22.5：最终实战定制版")
+st.set_page_config(page_title="选股王 V30.22.6 修正版", layout="wide")
+st.title("选股王 V30.22.6：评分逻辑修正版")
 st.markdown("""
-**🎯 实战铁律 (Top 3 策略)：**
-1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.
-2. **科创板纪律**：若选出 688/300 开头的票，**必须 RSI > 90** 才能上，否则剔除顺延.
-3. **风控底线**：
-   - 昨日涨幅 > 19% 一律不碰.
-   - [span_0](start_span)3天内涨停 >= 2次 一律不碰.[span_0](end_span)
-   - [span_1](start_span)20日累计涨幅 > 40% 一律不碰.[span_1](end_span)
+**🎯 评分系统大升级 (解决 Rank 1 亏损问题)：**
+1. **RSI 新规**：不再盲目奖励 RSI>90。
+   - **RSI 75-85**：**+3000分** (主升浪甜点区，锁定真龙).
+   - **RSI > 90**：**-1000分** (倒扣分，防止买在山顶).
+2. **乖离率惩罚**：偏离 5日线 > 10% 开始扣分，防止透支.
+3. **预期效果**：原来的 Rank 4 (赚钱票) 将会晋升为 Rank 1。
 """)
 
 # ---------------------------
@@ -204,7 +202,6 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     if pd.isna(latest_adj_factor): return pd.DataFrame() 
 
     try:
-        # 使用切片获取数据，避免大量内存拷贝
         daily_df = GLOBAL_DAILY_RAW.loc[ts_code]
         daily_df = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)]
         adj_series = GLOBAL_ADJ_FACTOR.loc[ts_code]['adj_factor']
@@ -249,9 +246,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 必须平开或高开
     if next_open < d0_qfq_close: return results 
-    # 必须有1.5%的上冲
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
         
@@ -285,9 +280,7 @@ def compute_indicators(ts_code, end_date):
     res['last_high'] = df['high'].iloc[-1]
     res['last_low'] = df['low'].iloc[-1]
     
-    # === 风控数据准备 (植入 V30.22 逻辑) ===
-    # 1. 3天限1板检查数据
-    # 取最近3天 (包含今天)
+    # === 风控数据准备 ===
     recent_3 = df.tail(3)
     limit_count = 0
     for _, row in recent_3.iterrows():
@@ -295,16 +288,14 @@ def compute_indicators(ts_code, end_date):
             limit_count += 1
     res['limit_count_3d'] = limit_count
     
-    # 2. 20日累计涨幅检查数据
-    # 确保数据足够
     if len(df) >= 20:
         price_20_ago = close.iloc[-20]
         res['gain_20d'] = (res['last_close'] - price_20_ago) / price_20_ago * 100
     else:
         res['gain_20d'] = 0.0
 
-    # 3. 5日乖离率检查数据
     ma5 = close.tail(5).mean()
+    # 保存乖离率数据供评分使用
     res['bias_ma5'] = (res['last_close'] - ma5) / ma5 * 100
     
     # === 原有指标 ===
@@ -336,7 +327,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (最终稳定版 + V30.22风控)
+# 核心回测逻辑函数 (评分修正版)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
@@ -345,12 +336,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty: return pd.DataFrame(), f"数据缺失 {last_trade}"
 
-    # === 安全获取 stock_basic ===
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
     if stock_basic.empty or 'name' not in stock_basic.columns:
         stock_basic = safe_get('stock_basic', list_status='L')
     
-    # 筹码数据
     chip_dict = {}
     try:
         chip_df = safe_get('cyq_perf', trade_date=last_trade)
@@ -375,7 +364,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         existing_cols = [c for c in needed_cols if c in daily_basic.columns]
         df = df.merge(daily_basic[existing_cols], on='ts_code', how='left')
     
-    # === 资金流防抖逻辑 ===
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
     if not mf_raw.empty:
         mf = mf_raw[['ts_code','net_mf_amount']].rename(columns={'net_mf_amount':'net_mf'})
@@ -391,7 +379,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     
-    # === 基础初筛 ===
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= 2000.0)]
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
@@ -401,38 +388,29 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     candidates = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)
     records = []
     
-    # 定义风控阈值 (硬编码，基于 V30.22 要求)
-    # MAX_LIMIT_COUNT = 1 (已隐含在 limit_count >= 2 的判断中)
+    # 固化风控参数
     MAX_20D_GAIN_VAL = 40.0
     MAX_BIAS_MA5_VAL = 15.0
 
     for row in candidates.itertuples():
-        # 板块过滤
         if GLOBAL_STOCK_INDUSTRY and strong_industry_codes:
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
             if ind_code and (ind_code not in strong_industry_codes): continue
         
-        # 1. 19% 涨幅限制
         if row.pct_chg > MAX_PREV_PCT: continue
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
         
-        # === V30.22 新增风控拦截 ===
-        # 2. [span_2](start_span)3天限1板 (>=2 则剔除)[span_2](end_span)
+        # === 核心硬风控 ===
         if ind['limit_count_3d'] >= 2: continue
-        
-        # 3. [span_3](start_span)20日累计涨幅 < 40%[span_3](end_span)
         if ind['gain_20d'] > MAX_20D_GAIN_VAL: continue
-        
-        # 4. [span_4](start_span)5日乖离率 < 15%[span_4](end_span)
         if ind['bias_ma5'] > MAX_BIAS_MA5_VAL: continue
-        # ===========================
+        # ================
 
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
-        # 市场状态风控
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
             if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
@@ -445,7 +423,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue
 
-        # 筹码风控
         win_rate = chip_dict.get(row.ts_code, None)
         if win_rate is not None:
             if win_rate < CHIP_MIN_WIN_RATE: continue
@@ -455,6 +432,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 'macd': ind['macd_val'], 'net_mf': row.net_mf,
+            'bias_ma5': ind['bias_ma5'], # 传递乖离率给评分函数
             'Return_D1 (%)': future.get('Return_D1', np.nan),
             'Return_D3 (%)': future.get('Return_D3', np.nan),
             'Return_D5 (%)': future.get('Return_D5', np.nan),
@@ -465,14 +443,29 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
+    # === 核心修改：动态评分逻辑 ===
     def dynamic_score(r):
+        # 1. 基础分
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         if r['winner_rate'] > 90: base_score += 1000
         
-        # === RSI 策略：维持 3000分 重奖 ===
-        # 注意：虽然这里有重奖，但前面风控已经剔除了连板和20日涨幅过高的股
-        # 所以这里只会选出 "刚启动的首板" 或 "极强的一字板"
-        if r['rsi'] > 90: base_score += 3000
+        # 2. [修正] RSI 抛物线评分 (拒绝 >90 的过热股)
+        # 75-85 是最佳主升浪区域 -> 加重分
+        if 75 <= r['rsi'] <= 85:
+            base_score += 3000
+        # 85-90 开始警戒 -> 加分减少
+        elif 85 < r['rsi'] <= 90:
+            base_score += 1500
+        # >90 极度危险 -> 倒扣分 (把 Rank 1 压下去)
+        elif r['rsi'] > 90:
+            base_score -= 1000 
+            
+        # 3. [修正] 乖离率负反馈
+        # 偏离5日线太多说明透支
+        if r['bias_ma5'] > 10.0:
+            base_score *= 0.8 # 打八折
+        elif r['bias_ma5'] > 12.0:
+            base_score *= 0.6 # 打六折
             
         if r['market_state'] == 'Strong':
             penalty = 0
@@ -506,7 +499,6 @@ with st.sidebar:
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0, 
                                       help="设为70以激活科创板妖股。低于此比例直接剔除")
     
-    # 20CM 铁血风控
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
                                  help="⭐ 核心风控：定死19.0，精准剔除20CM涨停的深套股")
     
