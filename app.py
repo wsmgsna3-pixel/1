@@ -37,7 +37,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V30.12.10 极速版", layout="wide")
-st.title("替补")
+st.title("选股王 V30.12.10：极速缓存版 (秒级重启)")
 
 # ---------------------------
 # 基础 API 函数
@@ -415,7 +415,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
-            if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
+            # [修复]: 解除弱势市场抄底限制，仅保留站上20日线
+            if d0_close < ind['ma20']: continue 
+            
         if d0_close < ind['ma60']: continue
         
         upper_shadow = (ind['last_high'] - d0_close) / d0_close * 100
