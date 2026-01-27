@@ -37,7 +37,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="替补", layout="wide")
-st.title("选股王 V30.12.10：极速缓存版 (秒级重启)")
+st.title("替补")
 
 # ---------------------------
 # 基础 API 函数
