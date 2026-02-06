@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.11 启动版 (Bug修复)
+选股王 · V30.12.11 终极验证版 (无门槛买入)
 ------------------------------------------------
-针对痛点：解决“买入即巅峰”、只能吃到鱼尾巴的问题。
+版本目标：验证“Rank 2 无脑买入”的可行性。
 核心改动：
-1. 【剔除】RSI>90 的强制要求，不再只追高潮股。
-2. 【新增】乖离率(Bias)风控，股价离20日线太远(>20%)不买。
-3. 【优化】打分逻辑，重赏 RSI 60-85 之间的“主升浪初期”股票。
-4. 【修复】数据合并时的 KeyError 报错问题。
+1. 【移除】买入时的“高开”和“冲高”限制。
+2. 【逻辑】默认以次日“开盘价”买入，计算 D+1/D+3/D+5 收益。
+3. 【策略】保留 RSI 60-85 加分与乖离率风控，确保选股逻辑不变。
 ------------------------------------------------
 """
 
@@ -36,8 +35,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.11 启动版", layout="wide")
-st.title("选股王 V30.12.11：提前启动版 (Bug修复)")
+st.set_page_config(page_title="选股王 V30.12.11 验证版", layout="wide")
+st.title("选股王 V30.12.11：终极验证版 (无条件开盘买入)")
 
 # ---------------------------
 # 基础 API 函数
@@ -233,6 +232,9 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
         
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
+# ==============================================================================
+# 【核心修改】：无条件开盘买入逻辑
+# ==============================================================================
 def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
@@ -244,18 +246,19 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     if hist.empty or len(hist) < 1: return results
     
     hist['open'] = pd.to_numeric(hist['open'], errors='coerce')
-    hist['high'] = pd.to_numeric(hist['high'], errors='coerce')
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
     
     d1_data = hist.iloc[0]
     next_open = d1_data['open']
-    next_high = d1_data['high']
     
-    # 【买入条件】
-    if next_open <= d0_qfq_close: return results 
-    target_buy_price = next_open * 1.015
-    if next_high < target_buy_price: return results
-        
+    # -----------------------------------------------------------
+    # 【验证专用逻辑】：
+    # 只要有数据，就默认以“开盘价”买入。
+    # 不再判断 next_open > d0_qfq_close (高开)
+    # 不再判断 next_high > 1.015 (冲高)
+    # -----------------------------------------------------------
+    target_buy_price = next_open 
+    
     for n in days_ahead:
         col = f'Return_D{n}'
         if len(hist) >= n:
@@ -320,7 +323,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (修改重点)
+# 核心回测逻辑函数
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
@@ -388,18 +391,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
-        # === V30.12.11 核心修改 ===
+        # === V30.12.11 核心策略保留 ===
         
-        # 1. 【删除】创业板/科创板必须 RSI>90 的高位接盘条款
-        # if row.ts_code.startswith('688') or row.ts_code.startswith('300'):
-        #     if d0_rsi <= 90: continue
-        
-        # 2. 【新增】乖离率风控：如果股价偏离20日线超过 20%，视为过热，不追
-        # 这能有效过滤掉那些已经连涨很多天的票
+        # 1. 乖离率风控
         MAX_BIAS = 20.0 
         if ind.get('bias_20', 0) > MAX_BIAS: continue
 
-        # 3. 基础趋势保障
+        # 2. 基础趋势保障
         if d0_close < ind['ma20']: continue 
         if market_state == 'Weak' and d0_rsi > RSI_LIMIT: continue
 
@@ -409,7 +407,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         win_rate = chip_dict.get(row.ts_code, 50) 
         if win_rate < CHIP_MIN_WIN_RATE: continue
 
+        # 3. 获取未来收益 (无门槛买入版)
         future = get_future_prices(row.ts_code, last_trade, d0_close)
+        
+        # 只要未来有数据，就加入记录
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 'macd': ind['macd_val'], 'net_mf': row.net_mf,
@@ -424,19 +425,19 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
-    # 4. 【打分逻辑修改】：奖励启动，惩罚过高
+    # 4. 【打分逻辑保留】：Rank 2 依然是之前那个 Rank 2
     def dynamic_score(r):
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         if r['winner_rate'] > 90: base_score += 1000
         
-        # 修改点：奖励黄金区间 (RSI 60-85)，视为“主升浪初期”
+        # 奖励黄金区间 (RSI 60-85)
         if 60 <= r['rsi'] <= 85:
             base_score += 2000
-        # 修改点：惩罚极端过热 (RSI > 90)，视为“鱼尾风险”
+        # 惩罚极端过热
         elif r['rsi'] > 90:
-            base_score -= 1000  # 倒扣分，让它排后面去
+            base_score -= 1000 
             
-        # 修改点：奖励乖离率较低的票（还没飞太远）
+        # 奖励乖离率安全
         if r['bias_20'] < 10.0:
             base_score += 1000
 
@@ -457,7 +458,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.11 启动版")
+    st.header("V30.12.11 终极验证版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
@@ -468,13 +469,13 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除")
-    CHECKPOINT_FILE = "backtest_checkpoint_v11.csv"
+    CHECKPOINT_FILE = "backtest_checkpoint_v11_unlocked.csv"
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
     col1, col2 = st.columns(2)
-    MIN_PRICE = col1.number_input("最低股价", value=10.0) # 放宽
-    MIN_MV = col2.number_input("最小市值(亿)", value=30.0) # 放宽
+    MIN_PRICE = col1.number_input("最低股价", value=10.0) 
+    MIN_MV = col2.number_input("最小市值(亿)", value=30.0) 
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
@@ -495,7 +496,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.11"):
+if st.button(f"🚀 启动终极验证"):
     processed_dates = set()
     results = []
     
@@ -537,7 +538,7 @@ if st.button(f"🚀 启动 V30.12.11"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header(f"📊 统计仪表盘")
+        st.header(f"📊 验证版统计仪表盘 (无条件买入)")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -549,6 +550,6 @@ if st.button(f"🚀 启动 V30.12.11"):
         
         st.dataframe(all_res, use_container_width=True)
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果", csv, f"export.csv", "text/csv")
+        st.download_button("📥 下载验证结果", csv, f"export_unlocked.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果")
