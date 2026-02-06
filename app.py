@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.11 提前启动版
+选股王 · V30.12.11 启动版 (Bug修复)
 ------------------------------------------------
 针对痛点：解决“买入即巅峰”、只能吃到鱼尾巴的问题。
 核心改动：
 1. 【剔除】RSI>90 的强制要求，不再只追高潮股。
 2. 【新增】乖离率(Bias)风控，股价离20日线太远(>20%)不买。
 3. 【优化】打分逻辑，重赏 RSI 60-85 之间的“主升浪初期”股票。
+4. 【修复】数据合并时的 KeyError 报错问题。
 ------------------------------------------------
 """
 
@@ -36,7 +37,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V30.12.11 启动版", layout="wide")
-st.title("选股王 V30.12.11：提前启动版 (拒绝追高)")
+st.title("选股王 V30.12.11：提前启动版 (Bug修复)")
 
 # ---------------------------
 # 基础 API 函数
@@ -347,7 +348,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = daily_all.merge(stock_basic[['ts_code','name']], on='ts_code', how='left')
     daily_basic = safe_get('daily_basic', trade_date=last_trade)
     if not daily_basic.empty:
-        df = df.merge(daily_basic[['ts_code','turnover_rate','circ_mv','amount']], on='ts_code', how='left')
+        # [修复] 仅获取 daily_basic 中确实存在的字段，防止 Key Error
+        needed_cols = ['ts_code','turnover_rate','circ_mv']
+        existing_cols = [c for c in needed_cols if c in daily_basic.columns]
+        df = df.merge(daily_basic[existing_cols], on='ts_code', how='left')
     
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
     if not mf_raw.empty:
@@ -355,6 +359,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     else:
         df['net_mf'] = 0 
     
+    # 填充可能缺失的字段
+    for col in ['net_mf', 'turnover_rate', 'circ_mv', 'amount']:
+        if col not in df.columns: df[col] = 0
+
     df['net_mf'] = df['net_mf'].fillna(0)
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     df = df[~df['name'].str.contains('ST|退', na=False)]
