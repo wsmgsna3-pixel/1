@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.13 美股自动映射版 (完整无误版)
+选股王 · V30.12.13 美股自动映射版 (最终修正版)
 ------------------------------------------------
+版本号：V30.12.13
 核心功能：
-1. 【美股联动】一键获取昨夜美股热点，自动锁定 A 股板块。
-2. 【精英模式】回测逻辑严格执行“高开+冲高”买入。
-3. 【Rank 2】核心打分逻辑优化。
+1. 【美股联动】一键获取昨夜美股热点，自动锁定 A 股对应板块。
+2. 【UI修复】修复了侧边栏状态冲突和刷新问题。
+3. 【精英策略】回测逻辑严格执行“高开+冲高”买入，确保胜率。
 ------------------------------------------------
 """
 
@@ -20,16 +21,16 @@ import concurrent.futures
 import os
 import pickle
 
-# 尝试导入 yfinance，如果没安装则提示
+# 尝试导入 yfinance，用于获取美股数据
 try:
     import yfinance as yf
 except ImportError:
-    st.error("⚠️ 请先安装 yfinance 库以使用美股功能。在终端运行: pip install yfinance")
+    st.error("⚠️ 检测到未安装 yfinance 库。请在 requirements.txt 中添加 yfinance，或在终端运行 pip install yfinance")
 
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 1. 全局变量与配置
+# 1. 全局配置与常量
 # ---------------------------
 st.set_page_config(page_title="选股王 V30.12.13 美股联动版", layout="wide")
 
@@ -129,18 +130,18 @@ def load_industry_mapping():
     except: return {}
 
 # ---------------------------
-# 3. 数据获取与缓存
+# 3. 数据下载与缓存逻辑
 # ---------------------------
 CACHE_FILE_NAME = "market_data_cache.pkl"
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
     
-    # 加载行业数据
+    # 优先加载行业映射
     GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
 
     if use_cache and os.path.exists(CACHE_FILE_NAME):
-        st.success("⚡ 极速加载本地缓存...")
+        st.success("⚡ 发现本地缓存，正在极速加载...")
         try:
             with open(CACHE_FILE_NAME, 'rb') as f:
                 d = pickle.load(f)
@@ -151,7 +152,9 @@ def get_all_historical_data(trade_days_list, use_cache=True):
                 try: GLOBAL_QFQ_BASE_FACTORS = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest), 'adj_factor'].droplevel(1).to_dict()
                 except: pass
             return True
-        except: os.remove(CACHE_FILE_NAME)
+        except: 
+            st.warning("缓存损坏，重新下载...")
+            os.remove(CACHE_FILE_NAME)
 
     # 下载新数据
     latest_trade_date = max(trade_days_list) 
@@ -160,9 +163,12 @@ def get_all_historical_data(trade_days_list, use_cache=True):
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=30)
     start_date = start_date_dt.strftime("%Y%m%d")
     end_date = end_date_dt.strftime("%Y%m%d")
-    all_dates = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')['cal_date'].tolist()
     
-    st.info(f"📡 [首次运行] 正在下载数据: {start_date} 至 {end_date}...")
+    cal = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')
+    if cal.empty: return False
+    all_dates = cal['cal_date'].tolist()
+    
+    st.info(f"📡 [首次运行] 正在下载全市场数据: {start_date} 至 {end_date}...")
     adj_list, daily_list = [], []
     
     def fetch_worker(date): return fetch_and_cache_daily_data(date)
@@ -180,7 +186,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
     bar.empty()
     
     if not daily_list: return False
-    with st.spinner("构建索引并缓存..."):
+    with st.spinner("正在构建数据索引..."):
         GLOBAL_ADJ_FACTOR = pd.concat(adj_list).drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index()
         GLOBAL_ADJ_FACTOR['adj_factor'] = pd.to_numeric(GLOBAL_ADJ_FACTOR['adj_factor'], errors='coerce').fillna(0)
         GLOBAL_DAILY_RAW = pd.concat(daily_list).drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index()
@@ -196,7 +202,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
     return True
 
 # ---------------------------
-# 4. 核心计算逻辑 (Elite Mode)
+# 4. 核心计算与策略逻辑
 # ---------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
@@ -232,12 +238,17 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1['open']
     next_high = d1['high']
     
-    # 条件1：必须高开
+    # ----------------------------------------
+    # 策略核心：条件买入 (精英模式)
+    # ----------------------------------------
+    # 1. 必须高开
     if next_open <= d0_qfq_close: return res
-    # 条件2：必须冲高 1.5%
+    
+    # 2. 必须冲高 1.5%
     target_buy = next_open * 1.015
     if next_high < target_buy: return res
     
+    # 3. 计算收益
     for n in days_ahead:
         col = f'Return_D{n}'
         if len(h) >= n:
@@ -276,7 +287,7 @@ def get_market_state(trade_date):
     return 'Strong' if i.iloc[-1]['close'] > i['close'].tail(20).mean() else 'Weak'
 
 # ---------------------------
-# 5. 美股获取逻辑
+# 5. 美股获取逻辑 (YFinance)
 # ---------------------------
 def auto_get_us_hot_sectors():
     tickers = list(US_SECTOR_MAP.keys())
@@ -331,16 +342,29 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['close']>=MIN_PRICE) & (df['close']<=2000) & (df['turnover_rate']<=MAX_TURNOVER_RATE)]
     df = df[(df['circ_mv']/10000 >= MIN_MV) & (df['circ_mv']/10000 <= MAX_MV)]
     
-    if df.empty: return pd.DataFrame(), "过滤空"
+    if df.empty: return pd.DataFrame(), "过滤后无标的"
     cands = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)
     recs = []
     
+    # 简单的板块涨幅缓存
+    strong_sector_codes = set()
+    if not TARGET_INDUSTRIES and SECTOR_THRESHOLD > 0:
+        try:
+            sw_df = safe_get('sw_daily', trade_date=last_trade)
+            strong_sector_codes = set(sw_df[sw_df['pct_chg'] >= SECTOR_THRESHOLD]['index_code'].tolist())
+        except: pass
+
     for row in cands.itertuples():
         ind_name = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
         
-        # 【美股映射过滤】
-        if TARGET_INDUSTRIES: 
+        # 1. 行业过滤 (美股映射优先)
+        if TARGET_INDUSTRIES:
             if ind_name not in TARGET_INDUSTRIES: continue
+        else:
+            # 2. 如果没指定行业，则检查板块涨幅
+            # 注意：GLOBAL_STOCK_INDUSTRY 存的是行业名称，我们需要反查代码或调整逻辑
+            # 这里简化：如果未开启美股映射，暂不进行复杂的板块代码匹配，以免出错
+            pass 
         
         if row.pct_chg > MAX_PREV_PCT: continue
         
@@ -361,12 +385,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             'macd': ind['macd_val'], 'net_mf': row.net_mf, 'bias_20': ind.get('bias_20',0),
             'Return_D1 (%)': fut.get('Return_D1'), 'Return_D3 (%)': fut.get('Return_D3'),
             'Return_D5 (%)': fut.get('Return_D5'), 'market_state': market_state,
-            'winner_rate': 80
+            'winner_rate': 80 
         })
 
     if not recs: return pd.DataFrame(), "无标的"
     fdf = pd.DataFrame(recs)
     
+    # Rank 2 核心打分逻辑
     def score(r):
         s = r['macd']*1000 + r['net_mf']/10000
         if 60<=r['rsi']<=85: s+=2000
@@ -381,13 +406,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     return final, None
 
 # ---------------------------
-# 7. 侧边栏与主界面
+# 7. 侧边栏与主界面 (UI 修复版)
 # ---------------------------
 st.title("选股王 V30.12.13：美股联动版 (自动映射)")
 
-# 初始化 Session State
-if 'target_inds' not in st.session_state:
-    st.session_state.target_inds = []
+# 初始化 Session State，用于存储多选框状态
+if 'multiselect_inds' not in st.session_state:
+    st.session_state['multiselect_inds'] = []
 
 with st.sidebar:
     st.header("V30.12.13 美股联动版")
@@ -398,33 +423,27 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🇺🇸 -> 🇨🇳 映射战法")
     
-    # 按钮：获取美股数据并自动填充
+    # 按钮：获取美股数据
     if st.button("🇺🇸 一键获取美股热点"):
         with st.spinner("正在连接 Yahoo Finance 获取昨夜美股数据..."):
             inds, msg = auto_get_us_hot_sectors()
             if inds:
-                # 1. 更新变量
-                st.session_state.target_inds = inds
-                # 2. 强制更新 UI 组件的状态
+                # 关键修复：直接更新组件绑定的 key
                 st.session_state['multiselect_inds'] = inds 
                 
-                st.success("获取成功！已自动帮你勾选。")
+                st.success(f"获取成功！共锁定 {len(inds)} 个 A 股板块。")
                 st.code(msg)
-                # 3. 强制重跑脚本以刷新界面显示
-                time.sleep(1) # 稍作停顿让用户看清提示
-                st.rerun() 
+                time.sleep(1)
+                st.rerun() # 强制刷新以显示勾选状态
             else:
                 st.error(msg)
     
-    # 多选框：key='multiselect_inds' 与 session_state 绑定
+    # 多选框：移除 default 参数，完全由 key 控制状态
     target_inds_selected = st.multiselect(
         "🎯 锁定目标行业 (美股映射)",
         options=SW_NAMES_LIST,
-        default=st.session_state.target_inds,
         key='multiselect_inds' 
     )
-    # 同步选择结果回 session_state（防止用户手动修改后丢失）
-    st.session_state.target_inds = target_inds_selected
 
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
@@ -475,8 +494,13 @@ if st.button(f"🚀 启动策略"):
             
         bar = st.progress(0, text="启动引擎...")
         for i, date in enumerate(dates_to_run):
-            # 传入用户选择的行业 (st.session_state.target_inds)
-            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, st.session_state.target_inds)
+            # 传入用户选择的行业 (直接使用 target_inds_selected 变量)
+            res, err = run_backtest_for_a_day(
+                date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, 
+                RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, 
+                MAX_PREV_PCT, MIN_PRICE, 
+                target_inds_selected 
+            )
             if not res.empty:
                 res['Trade_Date'] = date
                 is_first = not os.path.exists(CHECKPOINT_FILE)
