@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.13 美股自动映射版 (最终修正版)
+选股王 · V30.12.14 真实历史回测版
 ------------------------------------------------
-版本号：V30.12.13
+版本号：V30.12.14 (Tushare Pro 专属)
 核心功能：
-1. 【美股联动】一键获取昨夜美股热点，自动锁定 A 股对应板块。
-2. 【UI修复】修复了侧边栏状态冲突和刷新问题。
-3. 【精英策略】回测逻辑严格执行“高开+冲高”买入，确保胜率。
+1. 【真·历史回测】使用 Tushare 获取美股 ETF 历史日线。
+2. 【动态映射】每一天回测都基于“当时”的美股热点（Top 3）。
+3. 【精英策略】坚持 Rank 2 + 高开冲高买入。
 ------------------------------------------------
 """
 
@@ -21,40 +21,36 @@ import concurrent.futures
 import os
 import pickle
 
-# 尝试导入 yfinance，用于获取美股数据
-try:
-    import yfinance as yf
-except ImportError:
-    st.error("⚠️ 检测到未安装 yfinance 库。请在 requirements.txt 中添加 yfinance，或在终端运行 pip install yfinance")
-
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 1. 全局配置与常量
+# 1. 全局配置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.13 美股联动版", layout="wide")
+st.set_page_config(page_title="选股王 V30.12.14 真实回测版", layout="wide")
 
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
 GLOBAL_QFQ_BASE_FACTORS = {} 
 GLOBAL_STOCK_INDUSTRY = {} 
+GLOBAL_US_DATA = pd.DataFrame() # 存储美股 ETF 历史数据
 
-# --- 美股 ETF -> A股申万行业 映射表 ---
-US_SECTOR_MAP = {
-    'XLK': {'name': '科技(XLK)', 'cn_inds': ['电子', '计算机', '通信']},
-    'SOXX': {'name': '半导体(SOXX)', 'cn_inds': ['电子']}, 
-    'XLC': {'name': '通信服务(XLC)', 'cn_inds': ['传媒', '通信']},
-    'XLV': {'name': '医药(XLV)', 'cn_inds': ['医药生物', '美容护理']},
-    'XLY': {'name': '可选消费(XLY)', 'cn_inds': ['汽车', '家用电器', '商贸零售', '纺织服饰']},
-    'XLP': {'name': '必选消费(XLP)', 'cn_inds': ['食品饮料', '农林牧渔']},
-    'XLE': {'name': '能源(XLE)', 'cn_inds': ['石油石化', '煤炭']},
-    'XLF': {'name': '金融(XLF)', 'cn_inds': ['银行', '非银金融']},
-    'XLI': {'name': '工业(XLI)', 'cn_inds': ['机械设备', '电力设备', '国防军工', '建筑装饰']},
-    'XLB': {'name': '材料(XLB)', 'cn_inds': ['有色金属', '基础化工', '钢铁', '建筑材料']},
-    'XLRE': {'name': '房地产(XLRE)', 'cn_inds': ['房地产']},
-    'XLU': {'name': '公用事业(XLU)', 'cn_inds': ['公用事业', '环保', '电力设备']}
+# --- 美股 ETF 代码表 (Tushare 格式) ---
+US_ETF_MAP = {
+    'XLK.US': {'name': '科技(XLK)', 'cn_inds': ['电子', '计算机', '通信']},
+    'SOXX.US': {'name': '半导体(SOXX)', 'cn_inds': ['电子']}, 
+    'XLC.US': {'name': '通信(XLC)', 'cn_inds': ['传媒', '通信']},
+    'XLV.US': {'name': '医药(XLV)', 'cn_inds': ['医药生物', '美容护理']},
+    'XLY.US': {'name': '可选(XLY)', 'cn_inds': ['汽车', '家用电器', '商贸零售', '纺织服饰']},
+    'XLP.US': {'name': '必选(XLP)', 'cn_inds': ['食品饮料', '农林牧渔']},
+    'XLE.US': {'name': '能源(XLE)', 'cn_inds': ['石油石化', '煤炭']},
+    'XLF.US': {'name': '金融(XLF)', 'cn_inds': ['银行', '非银金融']},
+    'XLI.US': {'name': '工业(XLI)', 'cn_inds': ['机械设备', '电力设备', '国防军工', '建筑装饰']},
+    'XLB.US': {'name': '材料(XLB)', 'cn_inds': ['有色金属', '基础化工', '钢铁', '建筑材料']},
+    'XLRE.US': {'name': '地产(XLRE)', 'cn_inds': ['房地产']},
+    'XLU.US': {'name': '公用(XLU)', 'cn_inds': ['公用事业', '环保', '电力设备']}
 }
+US_TICKERS = list(US_ETF_MAP.keys())
 
 # --- 申万一级行业列表 ---
 SW_INDUSTRIES = {
@@ -73,7 +69,7 @@ SW_INDUSTRIES = {
 SW_NAMES_LIST = list(SW_INDUSTRIES.values())
 
 # ---------------------------
-# 2. 基础工具函数
+# 2. 基础函数
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -83,11 +79,16 @@ def safe_get(func_name, **kwargs):
     try:
         for _ in range(3):
             try:
-                if kwargs.get('is_index'): df = pro.index_daily(**kwargs)
-                else: df = func(**kwargs)
+                # 只有 index_daily 需要特殊处理，us_daily 不需要 is_index 参数
+                if kwargs.get('is_index'): 
+                    kwargs.pop('is_index')
+                    df = pro.index_daily(**kwargs)
+                else: 
+                    df = func(**kwargs)
+                
                 if df is not None and not df.empty: return df
                 time.sleep(0.5)
-            except:
+            except Exception as e:
                 time.sleep(1)
                 continue
         return pd.DataFrame(columns=['ts_code']) 
@@ -130,47 +131,125 @@ def load_industry_mapping():
     except: return {}
 
 # ---------------------------
-# 3. 数据下载与缓存逻辑
+# 3. 美股数据处理 (新增)
 # ---------------------------
-CACHE_FILE_NAME = "market_data_cache.pkl"
+@st.cache_data(ttl=3600*12)
+def get_us_history_data(start_date, end_date):
+    """批量获取美股 ETF 历史数据并缓存"""
+    global pro
+    if pro is None: return pd.DataFrame()
+    
+    all_us_data = []
+    # 稍微放宽日期范围，确保能覆盖
+    real_start = (datetime.strptime(start_date, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d")
+    
+    # 进度条
+    bar = st.progress(0, text="正在下载美股 ETF 历史数据 (Tushare)...")
+    
+    for i, ticker in enumerate(US_TICKERS):
+        try:
+            # Tushare 美股接口: us_daily
+            df = safe_get('us_daily', ts_code=ticker, start_date=real_start, end_date=end_date)
+            if not df.empty:
+                df = df[['trade_date', 'ts_code', 'pct_change']] # 保留涨跌幅
+                all_us_data.append(df)
+        except: pass
+        bar.progress((i+1)/len(US_TICKERS))
+    bar.empty()
+    
+    if not all_us_data: return pd.DataFrame()
+    
+    # 合并并重构：Index=Date, Columns=ETF, Value=Pct_Change
+    full_df = pd.concat(all_us_data)
+    # 确保日期格式统一
+    full_df['trade_date'] = pd.to_datetime(full_df['trade_date']).dt.strftime('%Y%m%d')
+    pivot_df = full_df.pivot(index='trade_date', columns='ts_code', values='pct_change')
+    return pivot_df.sort_index()
+
+def get_hot_inds_for_date(trade_date_str, top_n=3):
+    """根据 A 股交易日，查找之前最近一个美股交易日的热点"""
+    global GLOBAL_US_DATA
+    if GLOBAL_US_DATA.empty: return []
+    
+    # 找到所有小于 trade_date_str 的美股日期
+    valid_dates = GLOBAL_US_DATA.index[GLOBAL_US_DATA.index < trade_date_str]
+    if len(valid_dates) == 0: return []
+    
+    # 取最近的一天
+    target_us_date = valid_dates[-1]
+    
+    # 获取当天的涨跌幅数据
+    row = GLOBAL_US_DATA.loc[target_us_date].dropna()
+    if row.empty: return []
+    
+    # 排序取前 N 名
+    top_etfs = row.sort_values(ascending=False).head(top_n)
+    
+    # 映射到 A 股行业
+    target_inds = set()
+    for etf_code, pct in top_etfs.items():
+        if pct > 0: # 只有涨的才算热点？或者不管涨跌只要排名靠前？建议只看涨的，或者 Top3
+            info = US_ETF_MAP.get(etf_code)
+            if info:
+                target_inds.update(info['cn_inds'])
+                
+    return list(target_inds)
+
+# ---------------------------
+# 4. 数据下载与缓存逻辑
+# ---------------------------
+CACHE_FILE_NAME = "market_data_cache_v14.pkl"
 
 def get_all_historical_data(trade_days_list, use_cache=True):
-    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
+    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY, GLOBAL_US_DATA
     
-    # 优先加载行业映射
     GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
 
     if use_cache and os.path.exists(CACHE_FILE_NAME):
-        st.success("⚡ 发现本地缓存，正在极速加载...")
+        st.success("⚡ 极速加载本地缓存...")
         try:
             with open(CACHE_FILE_NAME, 'rb') as f:
                 d = pickle.load(f)
                 GLOBAL_ADJ_FACTOR = d['adj']
                 GLOBAL_DAILY_RAW = d['daily']
+                GLOBAL_US_DATA = d.get('us_data', pd.DataFrame()) # 新增美股缓存
+            
             latest = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
             if latest:
                 try: GLOBAL_QFQ_BASE_FACTORS = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest), 'adj_factor'].droplevel(1).to_dict()
                 except: pass
+            
+            # 如果缓存里没有美股数据，需要重新下载
+            if GLOBAL_US_DATA.empty:
+                st.warning("缓存中缺少美股数据，正在补充下载...")
+                start_d = min(trade_days_list)
+                end_d = max(trade_days_list)
+                GLOBAL_US_DATA = get_us_history_data(start_d, end_d)
+                # 更新缓存
+                with open(CACHE_FILE_NAME, 'wb') as f: 
+                    pickle.dump({'adj': GLOBAL_ADJ_FACTOR, 'daily': GLOBAL_DAILY_RAW, 'us_data': GLOBAL_US_DATA}, f)
+            
             return True
         except: 
-            st.warning("缓存损坏，重新下载...")
             os.remove(CACHE_FILE_NAME)
 
     # 下载新数据
-    latest_trade_date = max(trade_days_list) 
-    earliest_trade_date = min(trade_days_list)
-    start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=200)
-    end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=30)
-    start_date = start_date_dt.strftime("%Y%m%d")
-    end_date = end_date_dt.strftime("%Y%m%d")
+    latest = max(trade_days_list) 
+    earliest = min(trade_days_list)
+    s_dt = datetime.strptime(earliest, "%Y%m%d") - timedelta(days=200)
+    e_dt = datetime.strptime(latest, "%Y%m%d") + timedelta(days=30)
+    start_date = s_dt.strftime("%Y%m%d")
+    end_date = e_dt.strftime("%Y%m%d")
     
+    # 1. 下载 A 股数据
     cal = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')
     if cal.empty: return False
     all_dates = cal['cal_date'].tolist()
     
-    st.info(f"📡 [首次运行] 正在下载全市场数据: {start_date} 至 {end_date}...")
-    adj_list, daily_list = [], []
+    st.info(f"📡 正在下载数据 (A股 + 美股)...")
     
+    # 2. 并行下载 A 股
+    adj_list, daily_list = [], []
     def fetch_worker(date): return fetch_and_cache_daily_data(date)
     
     bar = st.progress(0)
@@ -185,24 +264,28 @@ def get_all_historical_data(trade_days_list, use_cache=True):
             if i%10==0: bar.progress((i+1)/len(all_dates))
     bar.empty()
     
+    # 3. 下载美股数据
+    GLOBAL_US_DATA = get_us_history_data(start_date, end_date)
+    
     if not daily_list: return False
-    with st.spinner("正在构建数据索引..."):
+    with st.spinner("构建索引..."):
         GLOBAL_ADJ_FACTOR = pd.concat(adj_list).drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index()
         GLOBAL_ADJ_FACTOR['adj_factor'] = pd.to_numeric(GLOBAL_ADJ_FACTOR['adj_factor'], errors='coerce').fillna(0)
         GLOBAL_DAILY_RAW = pd.concat(daily_list).drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index()
         
-        latest = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
-        if latest:
-            try: GLOBAL_QFQ_BASE_FACTORS = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest), 'adj_factor'].droplevel(1).to_dict()
+        latest_d = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
+        if latest_d:
+            try: GLOBAL_QFQ_BASE_FACTORS = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_d), 'adj_factor'].droplevel(1).to_dict()
             except: pass
             
         try:
-            with open(CACHE_FILE_NAME, 'wb') as f: pickle.dump({'adj': GLOBAL_ADJ_FACTOR, 'daily': GLOBAL_DAILY_RAW}, f)
+            with open(CACHE_FILE_NAME, 'wb') as f: 
+                pickle.dump({'adj': GLOBAL_ADJ_FACTOR, 'daily': GLOBAL_DAILY_RAW, 'us_data': GLOBAL_US_DATA}, f)
         except: pass
     return True
 
 # ---------------------------
-# 4. 核心计算与策略逻辑
+# 5. 核心计算
 # ---------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
@@ -222,7 +305,6 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     for c in ['open','high','low','close']: df[c] = df[c+'_qfq']
     return df[['open','high','low','close','vol']]
 
-# 【重要】精英版买入条件：高开 + 冲高 1.5%
 def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     s = (d0 + timedelta(days=1)).strftime("%Y%m%d")
@@ -238,17 +320,11 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1['open']
     next_high = d1['high']
     
-    # ----------------------------------------
-    # 策略核心：条件买入 (精英模式)
-    # ----------------------------------------
-    # 1. 必须高开
+    # 精英买入条件
     if next_open <= d0_qfq_close: return res
-    
-    # 2. 必须冲高 1.5%
     target_buy = next_open * 1.015
     if next_high < target_buy: return res
     
-    # 3. 计算收益
     for n in days_ahead:
         col = f'Return_D{n}'
         if len(h) >= n:
@@ -287,39 +363,15 @@ def get_market_state(trade_date):
     return 'Strong' if i.iloc[-1]['close'] > i['close'].tail(20).mean() else 'Weak'
 
 # ---------------------------
-# 5. 美股获取逻辑 (YFinance)
+# 6. 回测主逻辑 (集成美股历史)
 # ---------------------------
-def auto_get_us_hot_sectors():
-    tickers = list(US_SECTOR_MAP.keys())
-    try:
-        data = yf.download(tickers, period="5d", progress=False)['Close']
-        if data.empty: return [], "获取失败：数据为空"
-        
-        pct_change = data.pct_change().iloc[-1] * 100
-        pct_change = pct_change.sort_values(ascending=False)
-        top5 = pct_change.head(5)
-        
-        target_cn_inds = set()
-        msg_lines = []
-        msg_lines.append("🇺🇸 昨夜美股热点 (Top 5):")
-        
-        for etf_code, chg in top5.items():
-            info = US_SECTOR_MAP.get(etf_code)
-            if info:
-                name = info['name']
-                mapped = info['cn_inds']
-                msg_lines.append(f"{name}: {chg:.2f}% -> 🇨🇳 {','.join(mapped)}")
-                target_cn_inds.update(mapped)
-                
-        return list(target_cn_inds), "\n".join(msg_lines)
-    except Exception as e:
-        return [], f"获取失败: {str(e)}"
-
-# ---------------------------
-# 6. 回测主循环
-# ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, TARGET_INDUSTRIES):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, USE_US_MAP, TOP_N_US):
     global GLOBAL_STOCK_INDUSTRY
+    
+    # 动态获取当天的美股映射行业
+    target_inds = []
+    if USE_US_MAP:
+        target_inds = get_hot_inds_for_date(last_trade, top_n=TOP_N_US)
     
     market_state = get_market_state(last_trade)
     daily = safe_get('daily', trade_date=last_trade)
@@ -342,29 +394,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['close']>=MIN_PRICE) & (df['close']<=2000) & (df['turnover_rate']<=MAX_TURNOVER_RATE)]
     df = df[(df['circ_mv']/10000 >= MIN_MV) & (df['circ_mv']/10000 <= MAX_MV)]
     
-    if df.empty: return pd.DataFrame(), "过滤后无标的"
+    if df.empty: return pd.DataFrame(), "过滤空"
     cands = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)
     recs = []
     
-    # 简单的板块涨幅缓存
-    strong_sector_codes = set()
-    if not TARGET_INDUSTRIES and SECTOR_THRESHOLD > 0:
-        try:
-            sw_df = safe_get('sw_daily', trade_date=last_trade)
-            strong_sector_codes = set(sw_df[sw_df['pct_chg'] >= SECTOR_THRESHOLD]['index_code'].tolist())
-        except: pass
-
     for row in cands.itertuples():
+        # 美股历史映射逻辑
         ind_name = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
-        
-        # 1. 行业过滤 (美股映射优先)
-        if TARGET_INDUSTRIES:
-            if ind_name not in TARGET_INDUSTRIES: continue
-        else:
-            # 2. 如果没指定行业，则检查板块涨幅
-            # 注意：GLOBAL_STOCK_INDUSTRY 存的是行业名称，我们需要反查代码或调整逻辑
-            # 这里简化：如果未开启美股映射，暂不进行复杂的板块代码匹配，以免出错
-            pass 
+        if USE_US_MAP:
+            # 如果开启了映射，但当天美股没数据（比如美股休市），则跳过映射限制？还是严格执行？
+            # 建议：如果 target_inds 为空（没数据），则降级为不限制，或者跳过。
+            # 这里逻辑：如果 target_inds 有值，则严格过滤；如果没值，则不限制。
+            if target_inds and (ind_name not in target_inds): continue
         
         if row.pct_chg > MAX_PREV_PCT: continue
         
@@ -385,13 +426,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             'macd': ind['macd_val'], 'net_mf': row.net_mf, 'bias_20': ind.get('bias_20',0),
             'Return_D1 (%)': fut.get('Return_D1'), 'Return_D3 (%)': fut.get('Return_D3'),
             'Return_D5 (%)': fut.get('Return_D5'), 'market_state': market_state,
-            'winner_rate': 80 
+            'winner_rate': 80,
+            'us_link': 'Yes' if (USE_US_MAP and target_inds) else 'No'
         })
 
     if not recs: return pd.DataFrame(), "无标的"
     fdf = pd.DataFrame(recs)
     
-    # Rank 2 核心打分逻辑
     def score(r):
         s = r['macd']*1000 + r['net_mf']/10000
         if 60<=r['rsi']<=85: s+=2000
@@ -406,50 +447,24 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     return final, None
 
 # ---------------------------
-# 7. 侧边栏与主界面 (UI 修复版)
+# 7. UI
 # ---------------------------
-st.title("选股王 V30.12.13：美股联动版 (自动映射)")
-
-# 初始化 Session State，用于存储多选框状态
-if 'multiselect_inds' not in st.session_state:
-    st.session_state['multiselect_inds'] = []
-
 with st.sidebar:
-    st.header("V30.12.13 美股联动版")
+    st.header("V30.12.14 真实回测版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
     
     st.markdown("---")
-    st.subheader("🇺🇸 -> 🇨🇳 映射战法")
+    st.subheader("🇺🇸 历史真实联动")
+    USE_US_MAP = st.checkbox("开启美股历史回溯", value=True)
+    TOP_N_US = st.slider("选取美股 Top N 板块", 1, 5, 3) # 默认 Top 3
     
-    # 按钮：获取美股数据
-    if st.button("🇺🇸 一键获取美股热点"):
-        with st.spinner("正在连接 Yahoo Finance 获取昨夜美股数据..."):
-            inds, msg = auto_get_us_hot_sectors()
-            if inds:
-                # 关键修复：直接更新组件绑定的 key
-                st.session_state['multiselect_inds'] = inds 
-                
-                st.success(f"获取成功！共锁定 {len(inds)} 个 A 股板块。")
-                st.code(msg)
-                time.sleep(1)
-                st.rerun() # 强制刷新以显示勾选状态
-            else:
-                st.error(msg)
-    
-    # 多选框：移除 default 参数，完全由 key 控制状态
-    target_inds_selected = st.multiselect(
-        "🎯 锁定目标行业 (美股映射)",
-        options=SW_NAMES_LIST,
-        key='multiselect_inds' 
-    )
-
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
     if st.button("🗑️ 清除行情缓存"):
         if os.path.exists(CACHE_FILE_NAME): os.remove(CACHE_FILE_NAME)
-    CHECKPOINT_FILE = "backtest_checkpoint_v13.csv"
+    CHECKPOINT_FILE = "backtest_checkpoint_v14.csv"
     
     # 基础参数
     MIN_PRICE = st.number_input("最低股价", value=10.0) 
@@ -467,7 +482,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动策略"):
+if st.button(f"🚀 启动真实回测"):
     processed_dates = set()
     results = []
     
@@ -490,16 +505,17 @@ if st.button(f"🚀 启动策略"):
     if not dates_to_run:
         st.success("🎉 分析完毕")
     else:
+        # 下载 A股 + 美股历史数据
         if not get_all_historical_data(trade_days_list, use_cache=True): st.stop()
             
         bar = st.progress(0, text="启动引擎...")
         for i, date in enumerate(dates_to_run):
-            # 传入用户选择的行业 (直接使用 target_inds_selected 变量)
+            # 传入 USE_US_MAP 和 TOP_N_US
             res, err = run_backtest_for_a_day(
                 date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, 
                 RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, 
                 MAX_PREV_PCT, MIN_PRICE, 
-                target_inds_selected 
+                USE_US_MAP, TOP_N_US
             )
             if not res.empty:
                 res['Trade_Date'] = date
@@ -515,7 +531,7 @@ if st.button(f"🚀 启动策略"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header(f"📊 统计仪表盘 (精英版 - 高开买入)")
+        st.header(f"📊 统计仪表盘 (历史真实回测 - Top{TOP_N_US})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -527,6 +543,6 @@ if st.button(f"🚀 启动策略"):
         
         st.dataframe(all_res, use_container_width=True)
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果", csv, f"export_v13.csv", "text/csv")
+        st.download_button("📥 下载结果", csv, f"export_v14_real.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果")
