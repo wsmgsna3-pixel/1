@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-主力策略 · V36.1 雷霆一击 (修正版)
+主力策略 · V36.2 狂暴版 (解除RSI封印)
 ------------------------------------------------
-版本特性:
-1. **吸取 V35.1 经验**：引入 RSI "甜蜜区" (Sweet Spot) 概念。
-2. **RSI 熔断**：坚决过滤 RSI > 85 的过热标的 (防接盘)。
-3. **MOM 优化**：锁定 MOM 5-60 区间 (抓主升，避妖股)。
-4. **量能确认**：新增量比 > 1.2 条件 (拒绝无量空涨)。
+修复逻辑:
+1. **承认错误**：V36.1 的 RSI<85 限制误杀了所有真龙 (RSI通常>90)。
+2. **解除封印**：允许 RSI 无上限，鼓励 RSI > 90。
+3. **乖离率防守**：引入 Bias5 < 15% 限制，防止买在天花板。
+4. **核心目标**：找回田中精机、横店影视等"高举高打"的龙头。
 ------------------------------------------------
 """
 
@@ -35,8 +35,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="主力策略 V36.1 雷霆一击", layout="wide")
-st.title("主力策略 V36.1：雷霆一击 (RSI熔断+黄金MOM)")
+st.set_page_config(page_title="主力策略 V36.2 狂暴版", layout="wide")
+st.title("主力策略 V36.2：狂暴版 (RSI无上限+量能确认)")
 
 # ---------------------------
 # 基础 API 函数
@@ -266,6 +266,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
+    # 高开 + 1.5% 上冲确认
     if next_open <= d0_qfq_close: return results 
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
@@ -310,7 +311,7 @@ def compute_indicators(ts_code, end_date):
     res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     
     res['ma20'] = close.tail(20).mean()
-    res['ma60'] = close.tail(60).mean()
+    res['ma5'] = close.tail(5).mean() # [新增] MA5
     
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
@@ -318,7 +319,6 @@ def compute_indicators(ts_code, end_date):
     mom_series = calculate_mom(close, period=10)
     res['mom'] = mom_series.iloc[-1]
     
-    # [V36.1 新增] 量比估算 (5日平均量)
     vol_ma5 = df['vol'].rolling(5).mean().iloc[-1]
     res['vol_ratio'] = df['vol'].iloc[-1] / (vol_ma5 + 1)
     
@@ -335,7 +335,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (V36.1)
+# 核心回测逻辑函数 (V36.2)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
@@ -410,20 +410,25 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
         d0_mom = ind.get('mom', 0)
         d0_vol = ind.get('vol_ratio', 1.0)
         
-        # [V36.1 核心修改]
-        # 1. MOM 黄金区间: 5 - 60 (拒绝太弱，也拒绝太强)
-        if not (5 < d0_mom < 60): continue
+        # [V36.2 核心逻辑 - 狂暴模式]
         
-        # 2. RSI 熔断: 坚决不要 85 以上的
-        if d0_rsi > 85: continue
-        if d0_rsi < 50: continue # 也不要太弱的
+        # 1. 动量: 只要 > 5，上不封顶！
+        if d0_mom < 5: continue
         
-        # 3. 量能确认: 必须放量
+        # 2. RSI: 只要 > 50，上不封顶！(拥抱 RSI > 90)
+        if d0_rsi < 50: continue
+        
+        # 3. 量能确认 (安全绳 1)
         if d0_vol < 1.2: continue
         
+        # 4. [新增] 乖离率 (安全绳 2)
+        # 收盘价不能超过 5日线 的 15%，防止买在天线宝宝
+        bias5 = d0_close / ind['ma5']
+        if bias5 > 1.15: continue
+        
         if market_state == 'Weak':
-            if d0_rsi > RSI_LIMIT: continue
-            if d0_close < ind['ma20']: continue 
+            # 弱势市场也不能太离谱
+            if bias5 > 1.10: continue
         
         range_len = ind['last_high'] - ind['last_low']
         if range_len > 0:
@@ -448,16 +453,17 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
-    # [V36.1 评分]
+    # [V36.2 狂暴评分]
     def dynamic_score(r):
-        # 基础分
         base_score = r['mom'] * 20 + r['rsi'] * 10 + r['macd'] * 1000 + (r['net_mf'] / 10000)
-        penalty = 0
         
-        # 奖励 RSI 甜蜜区
-        if 55 < r['rsi'] < 80: base_score += 2000
+        # 奖励1: RSI > 80 (奖励真龙)
+        if r['rsi'] > 80: base_score += 3000
         
-        # 奖励量能爆发
+        # 奖励2: MOM > 20 (奖励加速)
+        if r['mom'] > 20: base_score += 2000
+        
+        # 奖励3: 量能爆炸
         if r['vol_ratio'] > 2.0: base_score += 1000
         
         return base_score
@@ -473,7 +479,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V36.1 雷霆一击")
+    st.header("V36.2 狂暴版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4)
@@ -484,7 +490,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v36.csv"
+    CHECKPOINT_FILE = "backtest_checkpoint_v36_2.csv"
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -494,10 +500,10 @@ with st.sidebar:
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
-    st.subheader("⚔️ 核心风控参数 (V36.1)")
+    st.subheader("⚔️ 核心风控参数")
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=40.0)
-    MOM_LIMIT = st.number_input("最低 MOM", value=5.0, help="V36.1建议: 5.0")
-    RSI_LIMIT = st.number_input("RSI 拦截线", value=100.0)
+    MOM_LIMIT = st.number_input("最低 MOM", value=5.0)
+    RSI_LIMIT = st.number_input("RSI 拦截线 (已失效)", value=999.0, disabled=True)
     
     st.markdown("---")
     st.subheader("📊 形态参数")
@@ -511,7 +517,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V36.1"):
+if st.button(f"🚀 启动 V36.2"):
     processed_dates = set()
     results = []
     
@@ -541,7 +547,6 @@ if st.button(f"🚀 启动 V36.1"):
         bar = st.progress(0, text="回测引擎启动...")
         
         for i, date in enumerate(dates_to_run):
-            # 注意: V36.1 增加了 MOM_LIMIT (5.0)
             res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, 999, MIN_PRICE)
             if not res.empty:
                 res['Trade_Date'] = date
@@ -559,7 +564,7 @@ if st.button(f"🚀 启动 V36.1"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header(f"📊 V36.1 统计仪表盘 (Top {TOP_BACKTEST})")
+        st.header(f"📊 V36.2 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
