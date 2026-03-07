@@ -30,13 +30,13 @@ warnings.filterwarnings(“ignore”)
 
 # ==========================================
 
-# 页面配置
+# \u9875\u9762\u914d\u7f6e
 
 # ==========================================
 
 st.set_page_config(
-page_title=“智选股 V1.0”,
-page_icon=“📈”,
+page_title=”\u667a\u9009\u80a1 V1.0”,
+page_icon=”\U0001f4c8”,
 layout=“wide”,
 initial_sidebar_state=“expanded”
 )
@@ -64,12 +64,12 @@ st.markdown(”””
 
 “””, unsafe_allow_html=True)
 
-st.title(“📈 智选股 V1.0 | 鱼身策略”)
-st.caption(“核心理念：找刚启动、还有空间的强势股 | 高开+冲高1.5%触发买入 | 止损5%”)
+st.title(”\U0001f4c8 \u667a\u9009\u80a1 V1.0 | \u9c7c\u8eab\u7b56\u7565”)
+st.caption(”\u6838\u5fc3\u7406\u5ff5\uff1a\u627e\u521a\u542f\u52a8\u3001\u8fd8\u6709\u7a7a\u95f4\u7684\u5f3a\u52bf\u80a1 | \u9ad8\u5f00+\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165 | \u6b62\u635f5%”)
 
 # ==========================================
 
-# 全局变量
+# \u5168\u5c40\u53d8\u91cf
 
 # ==========================================
 
@@ -79,7 +79,7 @@ CHECKPOINT_FILE = “smart_screener_checkpoint.csv”
 
 # ==========================================
 
-# Tushare 基础函数
+# Tushare \u57fa\u7840\u51fd\u6570
 
 # ==========================================
 
@@ -102,22 +102,22 @@ return pd.DataFrame()
 
 @st.cache_data(ttl=3600 * 24 * 7)
 def load_stock_basic():
-“”“加载全A股基础信息，排除ST和北交所”””
+“””\u52a0\u8f7d\u5168A\u80a1\u57fa\u7840\u4fe1\u606f,\u6392\u9664ST\u548c\u5317\u4ea4\u6240”””
 df = safe_api(‘stock_basic’, list_status=‘L’,
 fields=‘ts_code,name,list_date,exchange’)
 if df.empty:
 return pd.DataFrame()
-# 排除ST
-df = df[~df[‘name’].str.contains(‘ST|退’, na=False)]
-# 排除北交所（以43/83/87/92开头）
+# \u6392\u9664ST
+df = df[~df[‘name’].str.contains(‘ST|\u9000’, na=False)]
+# \u6392\u9664\u5317\u4ea4\u6240(\u4ee543/83/87/92\u5f00\u5934)
 df = df[~df[‘ts_code’].str.match(r’^(43|83|87|92)’)]
-# 排除北交所exchange
+# \u6392\u9664\u5317\u4ea4\u6240exchange
 df = df[df[‘exchange’].isin([‘SSE’, ‘SZSE’])]
 return df
 
 @st.cache_data(ttl=3600 * 24 * 7)
 def load_sw_industry():
-“”“加载申万行业映射”””
+“””\u52a0\u8f7d\u7533\u4e07\u884c\u4e1a\u6620\u5c04”””
 global pro
 if pro is None:
 return {}
@@ -152,7 +152,7 @@ return sorted(days, reverse=True)[:n]
 
 # ==========================================
 
-# 数据缓存管理
+# \u6570\u636e\u7f13\u5b58\u7ba1\u7406
 
 # ==========================================
 
@@ -170,7 +170,7 @@ try:
 with open(CACHE_FILE, ‘wb’) as f:
 pickle.dump(data, f)
 except Exception as e:
-st.warning(f”缓存保存失败: {e}”)
+st.warning(f”\u7f13\u5b58\u4fdd\u5b58\u5931\u8d25: {e}”)
 
 @st.cache_data(ttl=3600 * 12)
 def fetch_daily_for_date(date):
@@ -183,12 +183,12 @@ return {‘daily’: daily, ‘adj’: adj, ‘basic’: basic, ‘chip’: chip
 
 # ==========================================
 
-# 技术指标计算
+# \u6280\u672f\u6307\u6807\u8ba1\u7b97
 
 # ==========================================
 
 def calc_indicators(close_series, vol_series, open_series, high_series, low_series):
-“”“计算所需技术指标，返回dict”””
+“””\u8ba1\u7b97\u6240\u9700\u6280\u672f\u6307\u6807,\u8fd4\u56dedict”””
 res = {}
 n = len(close_series)
 if n < 30:
@@ -204,7 +204,7 @@ res['ma10'] = np.mean(close[-10:]) if n >= 10 else np.nan
 res['ma20'] = np.mean(close[-20:]) if n >= 20 else np.nan
 res['ma60'] = np.mean(close[-60:]) if n >= 60 else np.nan
 
-# MA20方向（用最近5日MA20斜率）
+# MA20\u65b9\u5411(\u7528\u6700\u8fd15\u65e5MA20\u659c\u7387)
 if n >= 25:
     ma20_5d_ago = np.mean(close[-25:-5])
     res['ma20_slope'] = res['ma20'] - ma20_5d_ago
@@ -246,7 +246,7 @@ if n >= 15:
 else:
     res['rsi'] = 50
 
-# 量能：近5日均量 vs 近20日均量
+# \u91cf\u80fd\uff1a\u8fd15\u65e5\u5747\u91cf vs \u8fd120\u65e5\u5747\u91cf
 if n >= 20:
     avg_vol_5  = np.mean(vol[-5:])
     avg_vol_20 = np.mean(vol[-20:])
@@ -254,7 +254,7 @@ if n >= 20:
 else:
     res['vol_ratio'] = 1.0
 
-# 今日K线形态
+# \u4eca\u65e5K\u7ebf\u5f62\u6001
 res['last_close'] = close[-1]
 res['last_open']  = open_series.values[-1]
 res['last_high']  = high_series.values[-1]
@@ -269,7 +269,7 @@ if range_len > 0:
 else:
     res['body_pos'] = 1.0
 
-# 涨幅计算
+# \u6da8\u5e45\u8ba1\u7b97
 if n >= 2:
     res['pct_1d'] = (close[-1] - close[-2]) / (close[-2] + 1e-9) * 100
 if n >= 6:
@@ -277,7 +277,7 @@ if n >= 6:
 if n >= 21:
     res['pct_20d'] = (close[-1] - close[-21]) / (close[-21] + 1e-9) * 100
 
-# 鱼身判断：60日内低点到现在的涨幅
+# \u9c7c\u8eab\u5224\u65ad\uff1a60\u65e5\u5185\u4f4e\u70b9\u5230\u73b0\u5728\u7684\u6da8\u5e45
 if n >= 60:
     low_60 = np.min(close[-60:])
     res['from_bottom_pct'] = (close[-1] - low_60) / (low_60 + 1e-9) * 100
@@ -287,7 +287,7 @@ elif n >= 20:
 else:
     res['from_bottom_pct'] = 0
 
-# 连续涨停检测（用最近2日涨幅判断）
+# \u8fde\u7eed\u6da8\u505c\u68c0\u6d4b(\u7528\u6700\u8fd12\u65e5\u6da8\u5e45\u5224\u65ad)
 if n >= 3:
     pct_today = (close[-1] - close[-2]) / (close[-2] + 1e-9) * 100
     pct_yest  = (close[-2] - close[-3]) / (close[-3] + 1e-9) * 100
@@ -300,50 +300,50 @@ return res
 
 # ==========================================
 
-# 六维评分系统
+# \u516d\u7ef4\u8bc4\u5206\u7cfb\u7edf
 
 # ==========================================
 
 def calc_score(ind, winner_rate, sector_boost, market_strong):
 “””
-六维评分（满分100）：
-- 技术面        25分
-- 买入时机      20分
-- 量能健康      15分
-- 鱼身判断      15分
-- 板块热度      15分
-- 大盘环境      10分
+\u516d\u7ef4\u8bc4\u5206(\u6ee1\u5206100)\uff1a
+- \u6280\u672f\u9762        25\u5206
+- \u4e70\u5165\u65f6\u673a      20\u5206
+- \u91cf\u80fd\u5065\u5eb7      15\u5206
+- \u9c7c\u8eab\u5224\u65ad      15\u5206
+- \u677f\u5757\u70ed\u5ea6      15\u5206
+- \u5927\u76d8\u73af\u5883      10\u5206
 “””
 score = 0
 detail = {}
 
 ```
-# ===== 1. 技术面 (25分) =====
+# ===== 1. \u6280\u672f\u9762 (25\u5206) =====
 tech = 0
-# MA趋势（股价在MA20上方且MA20向上）
+# MA\u8d8b\u52bf(\u80a1\u4ef7\u5728MA20\u4e0a\u65b9\u4e14MA20\u5411\u4e0a)
 if ind.get('last_close', 0) > ind.get('ma20', 0) and ind.get('ma20_slope', 0) > 0:
     tech += 10
 elif ind.get('last_close', 0) > ind.get('ma20', 0):
     tech += 5
-# MA20在MA60上方（中长期趋势）
+# MA20\u5728MA60\u4e0a\u65b9(\u4e2d\u957f\u671f\u8d8b\u52bf)
 if ind.get('ma20', 0) > ind.get('ma60', 0):
     tech += 5
-# MACD：DIF在零轴上方且MACD柱为正
+# MACD\uff1aDIF\u5728\u96f6\u8f74\u4e0a\u65b9\u4e14MACD\u67f1\u4e3a\u6b63
 if ind.get('dif', 0) > 0 and ind.get('macd_bar', 0) > 0:
     tech += 7
 elif ind.get('dif', 0) > 0 or ind.get('macd_bar', 0) > 0:
     tech += 3
-# RSI健康区间55-70得满分，偏离扣分
+# RSI\u5065\u5eb7\u533a\u95f455-70\u5f97\u6ee1\u5206,\u504f\u79bb\u6263\u5206
 rsi = ind.get('rsi', 50)
 if 55 <= rsi <= 70:
     tech += 3
 elif 50 <= rsi < 55 or 70 < rsi <= 75:
     tech += 1
-detail['技术面'] = min(tech, 25)
+detail['\u6280\u672f\u9762'] = min(tech, 25)
 
-# ===== 2. 买入时机 (20分) =====
+# ===== 2. \u4e70\u5165\u65f6\u673a (20\u5206) =====
 timing = 0
-# 距MA20偏离度：偏离越小越好
+# \u8dddMA20\u504f\u79bb\u5ea6\uff1a\u504f\u79bb\u8d8a\u5c0f\u8d8a\u597d
 ma20 = ind.get('ma20', 0)
 last_close = ind.get('last_close', 0)
 if ma20 > 0:
@@ -355,8 +355,8 @@ if ma20 > 0:
     elif 6 < deviation <= 10:
         timing += 4
     elif deviation < 0:
-        timing += 0  # 跌破MA20不加分（已被硬性过滤）
-# 近5日涨幅：温和上涨得分，过热降分
+        timing += 0  # \u8dcc\u7834MA20\u4e0d\u52a0\u5206(\u5df2\u88ab\u786c\u6027\u8fc7\u6ee4)
+# \u8fd15\u65e5\u6da8\u5e45\uff1a\u6e29\u548c\u4e0a\u6da8\u5f97\u5206,\u8fc7\u70ed\u964d\u5206
 pct_5d = ind.get('pct_5d', 0)
 if 3 <= pct_5d <= 10:
     timing += 8
@@ -366,38 +366,38 @@ elif 10 < pct_5d <= 15:
     timing += 3
 elif pct_5d > 15:
     timing += 0
-detail['买入时机'] = min(timing, 20)
+detail['\u4e70\u5165\u65f6\u673a'] = min(timing, 20)
 
-# ===== 3. 量能健康 (15分) =====
+# ===== 3. \u91cf\u80fd\u5065\u5eb7 (15\u5206) =====
 vol = 0
 vol_ratio = ind.get('vol_ratio', 1.0)
-# 近5日均量是近20日均量的1.2-2.5倍：温和放大
+# \u8fd15\u65e5\u5747\u91cf\u662f\u8fd120\u65e5\u5747\u91cf\u76841.2-2.5\u500d\uff1a\u6e29\u548c\u653e\u5927
 if 1.2 <= vol_ratio <= 2.5:
     vol += 15
 elif 1.0 <= vol_ratio < 1.2:
     vol += 8
 elif 2.5 < vol_ratio <= 3.5:
-    vol += 5  # 放量偏大，略降分
+    vol += 5  # \u653e\u91cf\u504f\u5927,\u7565\u964d\u5206
 elif vol_ratio > 3.5:
-    vol += 0  # 爆量，危险
+    vol += 0  # \u7206\u91cf,\u5371\u9669
 elif vol_ratio < 1.0:
-    vol += 3  # 缩量，动能不足
-detail['量能健康'] = min(vol, 15)
+    vol += 3  # \u7f29\u91cf,\u52a8\u80fd\u4e0d\u8db3
+detail['\u91cf\u80fd\u5065\u5eb7'] = min(vol, 15)
 
-# ===== 4. 鱼身判断 (15分) =====
+# ===== 4. \u9c7c\u8eab\u5224\u65ad (15\u5206) =====
 fish = 0
 from_bottom = ind.get('from_bottom_pct', 0)
 if from_bottom <= 30:
-    fish += 15   # 鱼身前段，空间充足
+    fish += 15   # \u9c7c\u8eab\u524d\u6bb5,\u7a7a\u95f4\u5145\u8db3
 elif from_bottom <= 60:
-    fish += 10   # 鱼身中段，仍有机会
+    fish += 10   # \u9c7c\u8eab\u4e2d\u6bb5,\u4ecd\u6709\u673a\u4f1a
 elif from_bottom <= 100:
-    fish += 4    # 鱼尾警告，降分
+    fish += 4    # \u9c7c\u5c3e\u8b66\u544a,\u964d\u5206
 else:
-    fish += 0    # 涨幅过大，危险
-detail['鱼身判断'] = fish
+    fish += 0    # \u6da8\u5e45\u8fc7\u5927,\u5371\u9669
+detail['\u9c7c\u8eab\u5224\u65ad'] = fish
 
-# ===== 5. 板块热度 (15分) =====
+# ===== 5. \u677f\u5757\u70ed\u5ea6 (15\u5206) =====
 sector = 0
 if sector_boost > 3:
     sector += 15
@@ -405,28 +405,28 @@ elif sector_boost > 1.5:
     sector += 10
 elif sector_boost > 0:
     sector += 5
-detail['板块热度'] = sector
+detail['\u677f\u5757\u70ed\u5ea6'] = sector
 
-# ===== 6. 大盘环境 (10分) =====
+# ===== 6. \u5927\u76d8\u73af\u5883 (10\u5206) =====
 mkt = 10 if market_strong else 3
-detail['大盘环境'] = mkt
+detail['\u5927\u76d8\u73af\u5883'] = mkt
 
 total = sum(detail.values())
 
-# 风险标签
+# \u98ce\u9669\u6807\u7b7e
 if from_bottom > 100 or ind.get('consecutive_limit', False):
-    tag = '🔴 高风险'
+    tag = '\U0001f534 \u9ad8\u98ce\u9669'
 elif from_bottom > 60 or pct_5d > 15 or rsi > 80:
-    tag = '🟡 谨慎'
+    tag = '\U0001f7e1 \u8c28\u614e'
 else:
-    tag = '🟢 安全'
+    tag = '\U0001f7e2 \u5b89\u5168'
 
 return total, detail, tag
 ```
 
 # ==========================================
 
-# 单只股票完整数据获取（用于回测和实盘）
+# \u5355\u53ea\u80a1\u7968\u5b8c\u6574\u6570\u636e\u83b7\u53d6(\u7528\u4e8e\u56de\u6d4b\u548c\u5b9e\u76d8)
 
 # ==========================================
 
@@ -439,10 +439,10 @@ return pd.DataFrame()
 adj = safe_api(‘adj_factor’, ts_code=ts_code, start_date=start, end_date=end_date)
 if adj.empty:
 return daily.sort_values(‘trade_date’).reset_index(drop=True)
-# 前复权处理
+# \u524d\u590d\u6743\u5904\u7406
 daily = daily.merge(adj[[‘ts_code’, ‘trade_date’, ‘adj_factor’]], on=[‘ts_code’, ‘trade_date’], how=‘left’)
 daily[‘adj_factor’] = daily[‘adj_factor’].fillna(method=‘ffill’).fillna(1.0)
-latest_adj = daily[‘adj_factor’].iloc[0]  # 数据降序，第一条是最新
+latest_adj = daily[‘adj_factor’].iloc[0]  # \u6570\u636e\u964d\u5e8f,\u7b2c\u4e00\u6761\u662f\u6700\u65b0
 daily = daily.sort_values(‘trade_date’).reset_index(drop=True)
 latest_adj = daily[‘adj_factor’].iloc[-1]
 for col in [‘open’, ‘high’, ‘low’, ‘close’]:
@@ -451,15 +451,15 @@ return daily
 
 # ==========================================
 
-# 板块热度计算
+# \u677f\u5757\u70ed\u5ea6\u8ba1\u7b97
 
 # ==========================================
 
 @st.cache_data(ttl=3600 * 12)
 def get_sector_performance(trade_date, industry_map):
-“”“计算各申万行业5日相对大盘表现”””
+“””\u8ba1\u7b97\u5404\u7533\u4e07\u884c\u4e1a5\u65e5\u76f8\u5bf9\u5927\u76d8\u8868\u73b0”””
 start = (datetime.strptime(trade_date, “%Y%m%d”) - timedelta(days=15)).strftime(”%Y%m%d”)
-# 大盘5日涨幅
+# \u5927\u76d85\u65e5\u6da8\u5e45
 hs300 = safe_api(‘daily’, ts_code=‘000300.SH’, start_date=start, end_date=trade_date)
 if hs300.empty or len(hs300) < 5:
 return {}
@@ -467,7 +467,7 @@ hs300 = hs300.sort_values(‘trade_date’)
 mkt_5d = (hs300[‘close’].iloc[-1] - hs300[‘close’].iloc[-5]) / hs300[‘close’].iloc[-5] * 100
 
 ```
-# 申万行业指数5日涨幅
+# \u7533\u4e07\u884c\u4e1a\u6307\u65705\u65e5\u6da8\u5e45
 try:
     sw_daily = pro.sw_daily(trade_date=trade_date)
     if sw_daily.empty:
@@ -481,7 +481,7 @@ except:
 
 # ==========================================
 
-# 大盘状态判断
+# \u5927\u76d8\u72b6\u6001\u5224\u65ad
 
 # ==========================================
 
@@ -496,7 +496,7 @@ return df[‘close’].iloc[-1] > df[‘close’].tail(20).mean()
 
 # ==========================================
 
-# 核心选股函数（单日）
+# \u6838\u5fc3\u9009\u80a1\u51fd\u6570(\u5355\u65e5)
 
 # ==========================================
 
@@ -504,10 +504,10 @@ def screen_one_day(trade_date, stock_basic_df, industry_map,
 min_price, min_mv, max_mv,
 top_n=5, for_backtest=False):
 “””
-执行单日选股，返回DataFrame
-for_backtest=True时同时获取未来收益
+\u6267\u884c\u5355\u65e5\u9009\u80a1,\u8fd4\u56deDataFrame
+for_backtest=True\u65f6\u540c\u65f6\u83b7\u53d6\u672a\u6765\u6536\u76ca
 “””
-# 获取当日行情
+# \u83b7\u53d6\u5f53\u65e5\u884c\u60c5
 daily_all = safe_api(‘daily’, trade_date=trade_date)
 if daily_all.empty:
 return pd.DataFrame()
@@ -521,17 +521,17 @@ chip_dict = {}
 if not chip_df.empty and 'winner_rate' in chip_df.columns:
     chip_dict = dict(zip(chip_df['ts_code'], chip_df['winner_rate']))
 
-# 板块热度
+# \u677f\u5757\u70ed\u5ea6
 sector_perf = {}
 try:
     sector_perf = get_sector_performance(trade_date, industry_map)
 except:
     pass
 
-# 大盘状态
+# \u5927\u76d8\u72b6\u6001
 market_strong = get_market_state(trade_date)
 
-# 合并基础信息
+# \u5408\u5e76\u57fa\u7840\u4fe1\u606f
 df = daily_all.merge(stock_basic_df[['ts_code', 'name']], on='ts_code', how='inner')
 if not daily_basic.empty:
     df = df.merge(daily_basic, on='ts_code', how='left')
@@ -539,37 +539,37 @@ else:
     df['circ_mv'] = np.nan
     df['turnover_rate'] = np.nan
 
-# ===== 硬性过滤 =====
-# 价格过滤
+# ===== \u786c\u6027\u8fc7\u6ee4 =====
+# \u4ef7\u683c\u8fc7\u6ee4
 df = df[df['close'] >= min_price]
-# 市值过滤（circ_mv单位：万元）
+# \u5e02\u503c\u8fc7\u6ee4(circ_mv\u5355\u4f4d\uff1a\u4e07\u5143)
 if 'circ_mv' in df.columns:
     df = df[df['circ_mv'].notna()]
     df = df[(df['circ_mv'] >= min_mv * 10000) & (df['circ_mv'] <= max_mv * 10000)]
-# 只保留有名字的（已排除ST）
+# \u53ea\u4fdd\u7559\u6709\u540d\u5b57\u7684(\u5df2\u6392\u9664ST)
 df = df[df['name'].notna() & (df['name'] != '')]
 
 if df.empty:
     return pd.DataFrame()
 
-# 按当日涨幅排序，取前200只做深度分析（提升效率）
+# \u6309\u5f53\u65e5\u6da8\u5e45\u6392\u5e8f,\u53d6\u524d200\u53ea\u505a\u6df1\u5ea6\u5206\u6790(\u63d0\u5347\u6548\u7387)
 df = df.sort_values('pct_chg', ascending=False).head(200)
 
 records = []
 for row in df.itertuples():
     ts_code = row.ts_code
 
-    # winner_rate硬性过滤：50-85之间
+    # winner_rate\u786c\u6027\u8fc7\u6ee4\uff1a50-85\u4e4b\u95f4
     wr = chip_dict.get(ts_code, 70)
     if not (50 <= wr <= 85):
         continue
 
-    # 获取历史数据
+    # \u83b7\u53d6\u5386\u53f2\u6570\u636e
     hist = get_stock_history(ts_code, trade_date, lookback_days=90)
     if hist.empty or len(hist) < 30:
         continue
 
-    # 计算技术指标
+    # \u8ba1\u7b97\u6280\u672f\u6307\u6807
     ind = calc_indicators(
         hist['close'], hist['vol'],
         hist['open'], hist['high'], hist['low']
@@ -577,37 +577,37 @@ for row in df.itertuples():
     if not ind:
         continue
 
-    # ===== 硬性技术过滤 =====
-    # 股价必须在MA20上方
+    # ===== \u786c\u6027\u6280\u672f\u8fc7\u6ee4 =====
+    # \u80a1\u4ef7\u5fc5\u987b\u5728MA20\u4e0a\u65b9
     if ind.get('last_close', 0) < ind.get('ma20', 1):
         continue
-    # MA20必须向上
+    # MA20\u5fc5\u987b\u5411\u4e0a
     if ind.get('ma20_slope', 0) <= 0:
         continue
-    # 上影线≤5%
+    # \u4e0a\u5f71\u7ebf<=5%
     if ind.get('upper_shadow', 99) > 5:
         continue
-    # 实体位置≥60%
+    # \u5b9e\u4f53\u4f4d\u7f6e>=60%
     if ind.get('body_pos', 0) < 0.6:
         continue
-    # 排除连续涨停
+    # \u6392\u9664\u8fde\u7eed\u6da8\u505c
     if ind.get('consecutive_limit', False):
         continue
-    # 20日涨幅≤30%
+    # 20\u65e5\u6da8\u5e45<=30%
     if ind.get('pct_20d', 0) > 30:
         continue
-    # 5日涨幅≤20%
+    # 5\u65e5\u6da8\u5e45<=20%
     if ind.get('pct_5d', 0) > 20:
         continue
 
-    # 板块热度
+    # \u677f\u5757\u70ed\u5ea6
     ind_code = industry_map.get(ts_code, '')
     s_boost = sector_perf.get(ind_code, 0) if ind_code else 0
 
-    # 计算综合评分
+    # \u8ba1\u7b97\u7efc\u5408\u8bc4\u5206
     total_score, detail, tag = calc_score(ind, wr, s_boost, market_strong)
 
-    # 建议买入价区间（昨收±0.5%到+2%）
+    # \u5efa\u8bae\u4e70\u5165\u4ef7\u533a\u95f4(\u6628\u6536+-0.5%\u5230+2%)
     buy_low  = ind['last_close'] * 1.000
     buy_high = ind['last_close'] * 1.020
     stop_loss = buy_low * 0.95
@@ -631,17 +631,17 @@ for row in df.itertuples():
         'buy_high': round(buy_high, 2),
         'stop_loss': round(stop_loss, 2),
         'target': round(target, 2),
-        'market': '强势' if market_strong else '弱势',
+        'market': '\u5f3a\u52bf' if market_strong else '\u5f31\u52bf',
         'sector_boost': round(s_boost, 2),
-        '技术面': detail.get('技术面', 0),
-        '买入时机': detail.get('买入时机', 0),
-        '量能健康': detail.get('量能健康', 0),
-        '鱼身判断': detail.get('鱼身判断', 0),
-        '板块热度': detail.get('板块热度', 0),
-        '大盘环境': detail.get('大盘环境', 0),
+        '\u6280\u672f\u9762': detail.get('\u6280\u672f\u9762', 0),
+        '\u4e70\u5165\u65f6\u673a': detail.get('\u4e70\u5165\u65f6\u673a', 0),
+        '\u91cf\u80fd\u5065\u5eb7': detail.get('\u91cf\u80fd\u5065\u5eb7', 0),
+        '\u9c7c\u8eab\u5224\u65ad': detail.get('\u9c7c\u8eab\u5224\u65ad', 0),
+        '\u677f\u5757\u70ed\u5ea6': detail.get('\u677f\u5757\u70ed\u5ea6', 0),
+        '\u5927\u76d8\u73af\u5883': detail.get('\u5927\u76d8\u73af\u5883', 0),
     }
 
-    # 回测模式：模拟次日高开+冲高1.5%买入
+    # \u56de\u6d4b\u6a21\u5f0f\uff1a\u6a21\u62df\u6b21\u65e5\u9ad8\u5f00+\u51b2\u9ad81.5%\u4e70\u5165
     if for_backtest:
         future = simulate_buy(ts_code, trade_date, ind['last_close'])
         rec.update(future)
@@ -659,12 +659,12 @@ return result
 
 # ==========================================
 
-# 回测模拟买入函数
+# \u56de\u6d4b\u6a21\u62df\u4e70\u5165\u51fd\u6570
 
 # ==========================================
 
 def simulate_buy(ts_code, selection_date, d0_close):
-“”“模拟次日高开+盘中冲高1.5%触发买入，计算D1/D3/D5收益”””
+“””\u6a21\u62df\u6b21\u65e5\u9ad8\u5f00+\u76d8\u4e2d\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165,\u8ba1\u7b97D1/D3/D5\u6536\u76ca”””
 d0 = datetime.strptime(selection_date, “%Y%m%d”)
 start = (d0 + timedelta(days=1)).strftime(”%Y%m%d”)
 end   = (d0 + timedelta(days=20)).strftime(”%Y%m%d”)
@@ -685,14 +685,14 @@ d1 = hist.iloc[0]
 next_open  = float(d1['open'])
 next_high  = float(d1['high'])
 
-# 触发条件：高开（开盘价>昨收）且盘中冲高超过开盘价1.5%
+# \u89e6\u53d1\u6761\u4ef6\uff1a\u9ad8\u5f00(\u5f00\u76d8\u4ef7>\u6628\u6536)\u4e14\u76d8\u4e2d\u51b2\u9ad8\u8d85\u8fc7\u5f00\u76d8\u4ef71.5%
 if next_open <= d0_close:
     return result
 trigger_price = next_open * 1.015
 if next_high < trigger_price:
     return result
 
-# 触发成功
+# \u89e6\u53d1\u6210\u529f
 result['triggered'] = True
 result['buy_price'] = round(trigger_price, 2)
 
@@ -710,85 +710,85 @@ return result
 
 # ==========================================
 
-# ===== 侧边栏参数 =====
+# ===== \u4fa7\u8fb9\u680f\u53c2\u6570 =====
 
 with st.sidebar:
-st.header(“⚙️ 参数设置”)
+st.header(”\u2699\ufe0f \u53c2\u6570\u8bbe\u7f6e”)
 
 ```
-st.subheader("🔑 Tushare Token")
+st.subheader("\U0001f511 Tushare Token")
 ts_token = st.text_input("Token", type="password", key="token")
 
 st.divider()
-st.subheader("💰 股票池过滤")
-min_price = st.number_input("最低股价(元)", value=10.0, min_value=1.0, step=1.0)
-min_mv    = st.number_input("最小流通市值(亿)", value=50.0, min_value=10.0, step=10.0)
-max_mv    = st.number_input("最大流通市值(亿)", value=1000.0, min_value=100.0, step=100.0)
+st.subheader("\U0001f4b0 \u80a1\u7968\u6c60\u8fc7\u6ee4")
+min_price = st.number_input("\u6700\u4f4e\u80a1\u4ef7(\u5143)", value=10.0, min_value=1.0, step=1.0)
+min_mv    = st.number_input("\u6700\u5c0f\u6d41\u901a\u5e02\u503c(\u4ebf)", value=50.0, min_value=10.0, step=10.0)
+max_mv    = st.number_input("\u6700\u5927\u6d41\u901a\u5e02\u503c(\u4ebf)", value=1000.0, min_value=100.0, step=100.0)
 
 st.divider()
-st.subheader("📊 实盘选股")
-top_n = st.slider("输出Top N候选股", 3, 10, 5)
+st.subheader("\U0001f4ca \u5b9e\u76d8\u9009\u80a1")
+top_n = st.slider("\u8f93\u51faTop N\u5019\u9009\u80a1", 3, 10, 5)
 
 st.divider()
-st.subheader("🔬 回测设置")
-bt_end   = st.date_input("回测截止日期", value=datetime.now().date())
-bt_days  = st.number_input("回测天数", value=30, min_value=5, max_value=90, step=5)
-bt_top_n = st.number_input("每日推荐数", value=4, min_value=1, max_value=10)
-resume   = st.checkbox("开启断点续传", value=True)
+st.subheader("\U0001f52c \u56de\u6d4b\u8bbe\u7f6e")
+bt_end   = st.date_input("\u56de\u6d4b\u622a\u6b62\u65e5\u671f", value=datetime.now().date())
+bt_days  = st.number_input("\u56de\u6d4b\u5929\u6570", value=30, min_value=5, max_value=90, step=5)
+bt_top_n = st.number_input("\u6bcf\u65e5\u63a8\u8350\u6570", value=4, min_value=1, max_value=10)
+resume   = st.checkbox("\u5f00\u542f\u65ad\u70b9\u7eed\u4f20", value=True)
 
-if st.button("🗑️ 清除缓存"):
+if st.button("\U0001f5d1\ufe0f \u6e05\u9664\u7f13\u5b58"):
     for f in [CACHE_FILE, CHECKPOINT_FILE]:
         if os.path.exists(f):
             os.remove(f)
     st.cache_data.clear()
-    st.success("缓存已清除")
+    st.success("\u7f13\u5b58\u5df2\u6e05\u9664")
 ```
 
-# ===== Token初始化 =====
+# ===== Token\u521d\u59cb\u5316 =====
 
 if not ts_token:
-st.info(“👈 请在左侧输入 Tushare Token 后开始使用”)
+st.info(”\U0001f448 \u8bf7\u5728\u5de6\u4fa7\u8f93\u5165 Tushare Token \u540e\u5f00\u59cb\u4f7f\u7528”)
 st.stop()
 
 ts.set_token(ts_token)
 pro = ts.pro_api()
 
-# ===== 主界面标签页 =====
+# ===== \u4e3b\u754c\u9762\u6807\u7b7e\u9875 =====
 
-tab1, tab2 = st.tabs([“📡 实盘选股”, “🔬 历史回测”])
+tab1, tab2 = st.tabs([”\U0001f4e1 \u5b9e\u76d8\u9009\u80a1”, “\U0001f52c \u5386\u53f2\u56de\u6d4b”])
 
 # ==========================================
 
-# TAB1：实盘选股
+# TAB1\uff1a\u5b9e\u76d8\u9009\u80a1
 
 # ==========================================
 
 with tab1:
-st.subheader(“📡 实盘选股 | 今日候选”)
-st.caption(“收盘后运行，第二天9:25集合竞价判断高开，9:30后冲高1.5%触发买入”)
+st.subheader(”\U0001f4e1 \u5b9e\u76d8\u9009\u80a1 | \u4eca\u65e5\u5019\u9009”)
+st.caption(”\u6536\u76d8\u540e\u8fd0\u884c,\u7b2c\u4e8c\u59299:25\u96c6\u5408\u7ade\u4ef7\u5224\u65ad\u9ad8\u5f00,9:30\u540e\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165”)
 
 ```
 col1, col2 = st.columns([3, 1])
 with col1:
-    screen_date = st.date_input("选股日期（选当天收盘日）",
+    screen_date = st.date_input("\u9009\u80a1\u65e5\u671f(\u9009\u5f53\u5929\u6536\u76d8\u65e5)",
                                  value=datetime.now().date(), key='screen_date')
 with col2:
     st.write("")
     st.write("")
-    run_screen = st.button("🚀 开始选股", use_container_width=True)
+    run_screen = st.button("\U0001f680 \u5f00\u59cb\u9009\u80a1", use_container_width=True)
 
 if run_screen:
     date_str = screen_date.strftime("%Y%m%d")
 
-    with st.spinner("加载股票基础数据..."):
+    with st.spinner("\u52a0\u8f7d\u80a1\u7968\u57fa\u7840\u6570\u636e..."):
         stock_basic = load_stock_basic()
         industry_map = load_sw_industry()
 
     if stock_basic.empty:
-        st.error("无法获取股票列表，请检查Token权限")
+        st.error("\u65e0\u6cd5\u83b7\u53d6\u80a1\u7968\u5217\u8868,\u8bf7\u68c0\u67e5Token\u6743\u9650")
         st.stop()
 
-    with st.spinner(f"正在分析 {date_str} 全市场数据，请稍候..."):
+    with st.spinner(f"\u6b63\u5728\u5206\u6790 {date_str} \u5168\u5e02\u573a\u6570\u636e,\u8bf7\u7a0d\u5019..."):
         result = screen_one_day(
             date_str, stock_basic, industry_map,
             min_price, min_mv, max_mv,
@@ -796,92 +796,92 @@ if run_screen:
         )
 
     if result.empty:
-        st.warning("今日未找到符合条件的股票，可适当放宽参数")
+        st.warning("\u4eca\u65e5\u672a\u627e\u5230\u7b26\u5408\u6761\u4ef6\u7684\u80a1\u7968,\u53ef\u9002\u5f53\u653e\u5bbd\u53c2\u6570")
     else:
-        st.success(f"✅ 筛选完成，共推荐 {len(result)} 只候选股")
+        st.success(f"\u2705 \u7b5b\u9009\u5b8c\u6210,\u5171\u63a8\u8350 {len(result)} \u53ea\u5019\u9009\u80a1")
 
         market_state = get_market_state(date_str)
-        st.info(f"📊 当前大盘状态：{'🟢 强势（沪深300站上MA20）' if market_state else '🔴 弱势（沪深300跌破MA20）'}")
+        st.info(f"\U0001f4ca \u5f53\u524d\u5927\u76d8\u72b6\u6001\uff1a{'\U0001f7e2 \u5f3a\u52bf(\u6caa\u6df1300\u7ad9\u4e0aMA20)' if market_state else '\U0001f534 \u5f31\u52bf(\u6caa\u6df1300\u8dcc\u7834MA20)'}")
 
-        # 详细卡片展示
+        # \u8be6\u7ec6\u5361\u7247\u5c55\u793a
         for _, row in result.iterrows():
             with st.expander(
                 f"#{int(row['rank'])}  {row['name']} ({row['ts_code']})  "
-                f"¥{row['close']:.2f}  {row['tag']}  综合评分: {row['score']:.0f}分",
+                f"CNY{row['close']:.2f}  {row['tag']}  \u7efc\u5408\u8bc4\u5206: {row['score']:.0f}\u5206",
                 expanded=(row['rank'] <= 2)
             ):
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("今日涨幅", f"{row['pct_1d']:+.2f}%")
-                c2.metric("5日涨幅",  f"{row['pct_5d']:+.2f}%")
-                c3.metric("20日涨幅", f"{row['pct_20d']:+.2f}%")
-                c4.metric("本轮涨幅", f"{row['from_bottom']:+.1f}%",
-                          help="从近60日低点到现在的涨幅，判断鱼身/鱼尾位置")
+                c1.metric("\u4eca\u65e5\u6da8\u5e45", f"{row['pct_1d']:+.2f}%")
+                c2.metric("5\u65e5\u6da8\u5e45",  f"{row['pct_5d']:+.2f}%")
+                c3.metric("20\u65e5\u6da8\u5e45", f"{row['pct_20d']:+.2f}%")
+                c4.metric("\u672c\u8f6e\u6da8\u5e45", f"{row['from_bottom']:+.1f}%",
+                          help="\u4ece\u8fd160\u65e5\u4f4e\u70b9\u5230\u73b0\u5728\u7684\u6da8\u5e45,\u5224\u65ad\u9c7c\u8eab/\u9c7c\u5c3e\u4f4d\u7f6e")
 
                 c5, c6, c7, c8 = st.columns(4)
                 c5.metric("RSI(14)", f"{row['rsi']:.1f}")
-                c6.metric("筹码获利比", f"{row['winner_rate']:.1f}%")
-                c7.metric("量比(5/20日)", f"{row['vol_ratio']:.2f}x")
-                c8.metric("大盘环境", row['market'])
+                c6.metric("\u7b79\u7801\u83b7\u5229\u6bd4", f"{row['winner_rate']:.1f}%")
+                c7.metric("\u91cf\u6bd4(5/20\u65e5)", f"{row['vol_ratio']:.2f}x")
+                c8.metric("\u5927\u76d8\u73af\u5883", row['market'])
 
                 st.divider()
                 cc1, cc2, cc3, cc4 = st.columns(4)
-                cc1.metric("📌 建议买入价区间",
-                           f"¥{row['buy_low']:.2f} ~ ¥{row['buy_high']:.2f}")
-                cc2.metric("🛡️ 止损价(-5%)", f"¥{row['stop_loss']:.2f}")
-                cc3.metric("🎯 目标价(+8%)", f"¥{row['target']:.2f}")
-                cc4.metric("风险收益比", "1 : 1.6")
+                cc1.metric("\U0001f4cc \u5efa\u8bae\u4e70\u5165\u4ef7\u533a\u95f4",
+                           f"CNY{row['buy_low']:.2f} ~ CNY{row['buy_high']:.2f}")
+                cc2.metric("\U0001f6e1\ufe0f \u6b62\u635f\u4ef7(-5%)", f"CNY{row['stop_loss']:.2f}")
+                cc3.metric("\U0001f3af \u76ee\u6807\u4ef7(+8%)", f"CNY{row['target']:.2f}")
+                cc4.metric("\u98ce\u9669\u6536\u76ca\u6bd4", "1 : 1.6")
 
                 st.divider()
-                st.write("**六维评分分解：**")
+                st.write("**\u516d\u7ef4\u8bc4\u5206\u5206\u89e3\uff1a**")
                 score_cols = st.columns(6)
-                dims = ['技术面','买入时机','量能健康','鱼身判断','板块热度','大盘环境']
+                dims = ['\u6280\u672f\u9762','\u4e70\u5165\u65f6\u673a','\u91cf\u80fd\u5065\u5eb7','\u9c7c\u8eab\u5224\u65ad','\u677f\u5757\u70ed\u5ea6','\u5927\u76d8\u73af\u5883']
                 maxs = [25, 20, 15, 15, 15, 10]
                 for i, (dim, mx) in enumerate(zip(dims, maxs)):
                     val = row.get(dim, 0)
                     pct = val / mx * 100
-                    color = "🟢" if pct >= 70 else "🟡" if pct >= 40 else "🔴"
+                    color = "\U0001f7e2" if pct >= 70 else "\U0001f7e1" if pct >= 40 else "\U0001f534"
                     score_cols[i].metric(f"{color} {dim}", f"{val}/{mx}")
 
-        # 汇总表格
+        # \u6c47\u603b\u8868\u683c
         st.divider()
-        st.write("**汇总表格：**")
+        st.write("**\u6c47\u603b\u8868\u683c\uff1a**")
         show_df = result[['rank','name','ts_code','close','pct_1d','pct_5d',
                            'pct_20d','from_bottom','rsi','winner_rate',
                            'score','tag','buy_low','stop_loss','target']].copy()
-        show_df.columns = ['排名','名称','代码','现价','今日%','5日%','20日%',
-                            '本轮涨幅%','RSI','筹码获利%','评分','风险','建议买入','止损','目标']
+        show_df.columns = ['\u6392\u540d','\u540d\u79f0','\u4ee3\u7801','\u73b0\u4ef7','\u4eca\u65e5%','5\u65e5%','20\u65e5%',
+                            '\u672c\u8f6e\u6da8\u5e45%','RSI','\u7b79\u7801\u83b7\u5229%','\u8bc4\u5206','\u98ce\u9669','\u5efa\u8bae\u4e70\u5165','\u6b62\u635f','\u76ee\u6807']
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
         csv = show_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 导出CSV", csv,
-                           f"智选股_{date_str}.csv", "text/csv")
+        st.download_button("\U0001f4e5 \u5bfc\u51faCSV", csv,
+                           f"\u667a\u9009\u80a1_{date_str}.csv", "text/csv")
 
     st.divider()
-    st.caption("⚠️ 本工具仅供学习研究，不构成投资建议。股市有风险，投资需谨慎。")
+    st.caption("\u26a0\ufe0f \u672c\u5de5\u5177\u4ec5\u4f9b\u5b66\u4e60\u7814\u7a76,\u4e0d\u6784\u6210\u6295\u8d44\u5efa\u8bae\u3002\u80a1\u5e02\u6709\u98ce\u9669,\u6295\u8d44\u9700\u8c28\u614e\u3002")
 ```
 
 # ==========================================
 
-# TAB2：历史回测
+# TAB2\uff1a\u5386\u53f2\u56de\u6d4b
 
 # ==========================================
 
 with tab2:
-st.subheader(“🔬 历史回测 | 策略验证”)
-st.caption(“模拟：次日高开 + 盘中冲高1.5% 触发买入，持有N天后收盘价卖出，止损5%”)
+st.subheader(”\U0001f52c \u5386\u53f2\u56de\u6d4b | \u7b56\u7565\u9a8c\u8bc1”)
+st.caption(”\u6a21\u62df\uff1a\u6b21\u65e5\u9ad8\u5f00 + \u76d8\u4e2d\u51b2\u9ad81.5% \u89e6\u53d1\u4e70\u5165,\u6301\u6709N\u5929\u540e\u6536\u76d8\u4ef7\u5356\u51fa,\u6b62\u635f5%”)
 
 ```
-run_bt = st.button("🚀 启动回测", use_container_width=True)
+run_bt = st.button("\U0001f680 \u542f\u52a8\u56de\u6d4b", use_container_width=True)
 
 if run_bt:
     end_str = bt_end.strftime("%Y%m%d")
     trade_days = get_recent_trade_days(end_str, int(bt_days))
 
     if not trade_days:
-        st.error("无法获取交易日历，请检查Token")
+        st.error("\u65e0\u6cd5\u83b7\u53d6\u4ea4\u6613\u65e5\u5386,\u8bf7\u68c0\u67e5Token")
         st.stop()
 
-    # 断点续传
+    # \u65ad\u70b9\u7eed\u4f20
     processed = set()
     all_results = []
 
@@ -891,7 +891,7 @@ if run_bt:
             ckpt['trade_date'] = ckpt['trade_date'].astype(str)
             processed = set(ckpt['trade_date'].unique())
             all_results.append(ckpt)
-            st.success(f"✅ 读取断点存档，已跳过 {len(processed)} 个交易日")
+            st.success(f"\u2705 \u8bfb\u53d6\u65ad\u70b9\u5b58\u6863,\u5df2\u8df3\u8fc7 {len(processed)} \u4e2a\u4ea4\u6613\u65e5")
         except:
             if os.path.exists(CHECKPOINT_FILE):
                 os.remove(CHECKPOINT_FILE)
@@ -901,18 +901,18 @@ if run_bt:
     dates_to_run = [d for d in trade_days if d not in processed]
 
     if not dates_to_run:
-        st.success("🎉 所有日期已计算完毕！")
+        st.success("\U0001f389 \u6240\u6709\u65e5\u671f\u5df2\u8ba1\u7b97\u5b8c\u6bd5\uff01")
     else:
-        with st.spinner("加载股票基础数据..."):
+        with st.spinner("\u52a0\u8f7d\u80a1\u7968\u57fa\u7840\u6570\u636e..."):
             stock_basic = load_stock_basic()
             industry_map = load_sw_industry()
 
-        bar = st.progress(0, text="回测中...")
+        bar = st.progress(0, text="\u56de\u6d4b\u4e2d...")
         err_placeholder = st.empty()
 
         for i, date in enumerate(dates_to_run):
             bar.progress((i + 1) / len(dates_to_run),
-                          text=f"回测中: {date}  ({i+1}/{len(dates_to_run)})")
+                          text=f"\u56de\u6d4b\u4e2d: {date}  ({i+1}/{len(dates_to_run)})")
             try:
                 day_result = screen_one_day(
                     date, stock_basic, industry_map,
@@ -927,30 +927,30 @@ if run_bt:
                                       encoding='utf-8-sig')
                     all_results.append(day_result)
             except Exception as e:
-                err_placeholder.warning(f"{date} 处理异常: {e}")
+                err_placeholder.warning(f"{date} \u5904\u7406\u5f02\u5e38: {e}")
 
         bar.empty()
 
-    # ===== 回测结果展示 =====
+    # ===== \u56de\u6d4b\u7ed3\u679c\u5c55\u793a =====
     if all_results:
         final = pd.concat(all_results, ignore_index=True)
         final['trade_date'] = final['trade_date'].astype(str)
         final = final.sort_values(['trade_date', 'rank'], ascending=[False, True])
 
         st.divider()
-        st.header("📊 回测统计报告")
+        st.header("\U0001f4ca \u56de\u6d4b\u7edf\u8ba1\u62a5\u544a")
 
-        # 总体统计
+        # \u603b\u4f53\u7edf\u8ba1
         triggered = final[final['triggered'] == True] if 'triggered' in final.columns else pd.DataFrame()
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("总选股记录", f"{len(final)} 条")
-        col1.metric("涉及交易日", f"{final['trade_date'].nunique()} 天")
+        col1.metric("\u603b\u9009\u80a1\u8bb0\u5f55", f"{len(final)} \u6761")
+        col1.metric("\u6d89\u53ca\u4ea4\u6613\u65e5", f"{final['trade_date'].nunique()} \u5929")
 
         if not triggered.empty:
-            col2.metric("触发买入比例",
+            col2.metric("\u89e6\u53d1\u4e70\u5165\u6bd4\u4f8b",
                         f"{len(triggered)/len(final)*100:.1f}%",
-                        help="满足高开+冲高1.5%的比例")
+                        help="\u6ee1\u8db3\u9ad8\u5f00+\u51b2\u9ad81.5%\u7684\u6bd4\u4f8b")
             for n, key in [(1,'R_D1'), (3,'R_D3'), (5,'R_D5')]:
                 valid = triggered.dropna(subset=[key])
                 if not valid.empty:
@@ -958,41 +958,43 @@ if run_bt:
                     wr   = (valid[key] > 0).mean() * 100
                     loss = (valid[key] < -5).mean() * 100
                     col3.metric(
-                        f"D+{n} 均收益/胜率",
+                        f"D+{n} \u5747\u6536\u76ca/\u80dc\u7387",
                         f"{avg:+.2f}% / {wr:.1f}%",
-                        delta=f"亏损>5%: {loss:.1f}%"
+                        delta=f"\u4e8f\u635f>5%: {loss:.1f}%"
                     )
         else:
-            col2.info("无触发买入记录（可能日期范围内信号较少）")
+            col2.info("\u65e0\u89e6\u53d1\u4e70\u5165\u8bb0\u5f55(\u53ef\u80fd\u65e5\u671f\u8303\u56f4\u5185\u4fe1\u53f7\u8f83\u5c11)")
 
-        # Rank分层分析
+        # Rank\u5206\u5c42\u5206\u6790
         if not triggered.empty:
             st.divider()
-            st.subheader("📈 按排名分层分析（触发买入）")
+            st.subheader("\U0001f4c8 \u6309\u6392\u540d\u5206\u5c42\u5206\u6790(\u89e6\u53d1\u4e70\u5165)")
             for n, key in [(1,'R_D1'), (3,'R_D3'), (5,'R_D5')]:
                 valid = triggered.dropna(subset=[key])
                 if valid.empty:
                     continue
                 grp = valid.groupby('rank')[key].agg(
-                    均值='mean', 胜率=lambda x: (x > 0).mean() * 100, 样本='count'
+                    avg='mean', win_rate=lambda x: (x > 0).mean() * 100, n_count='count'
                 ).round(2)
-                st.write(f"**D+{n} 分层表现：**")
+                grp.columns = ['\u5747\u503c', '\u80dc\u7387%', '\u6837\u672c\u6570']
+                st.write(f"**D+{n} \u5206\u5c42\u8868\u73b0\uff1a**")
                 st.dataframe(grp, use_container_width=True)
 
-        # 风险标签分析
+        # \u98ce\u9669\u6807\u7b7e\u5206\u6790
         if not triggered.empty and 'tag' in triggered.columns:
             st.divider()
-            st.subheader("🏷️ 按风险标签分析（D+3收益）")
+            st.subheader("\U0001f3f7\ufe0f \u6309\u98ce\u9669\u6807\u7b7e\u5206\u6790(D+3\u6536\u76ca)")
             valid = triggered.dropna(subset=['R_D3'])
             if not valid.empty:
                 grp = valid.groupby('tag')['R_D3'].agg(
-                    均值='mean', 胜率=lambda x: (x > 0).mean() * 100, 样本='count'
+                    avg='mean', win_rate=lambda x: (x > 0).mean() * 100, n_count='count'
                 ).round(2)
+                grp.columns = ['\u5747\u503c', '\u80dc\u7387%', '\u6837\u672c\u6570']
                 st.dataframe(grp, use_container_width=True)
 
-        # 明细表
+        # \u660e\u7ec6\u8868
         st.divider()
-        st.subheader("📋 回测明细")
+        st.subheader("\U0001f4cb \u56de\u6d4b\u660e\u7ec6")
         show_cols = ['trade_date','rank','name','ts_code','close','pct_1d',
                      'pct_20d','from_bottom','rsi','winner_rate','score','tag',
                      'triggered','buy_price','R_D1','R_D3','R_D5']
@@ -1000,8 +1002,8 @@ if run_bt:
         st.dataframe(final[show_cols], use_container_width=True, hide_index=True)
 
         csv = final[show_cols].to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载回测结果CSV", csv,
-                           f"回测结果_{end_str}.csv", "text/csv")
+        st.download_button("\U0001f4e5 \u4e0b\u8f7d\u56de\u6d4b\u7ed3\u679cCSV", csv,
+                           f"\u56de\u6d4b\u7ed3\u679c_{end_str}.csv", "text/csv")
     else:
-        st.warning("⚠️ 回测未产生结果，请检查日期范围或Token权限")
+        st.warning("\u26a0\ufe0f \u56de\u6d4b\u672a\u4ea7\u751f\u7ed3\u679c,\u8bf7\u68c0\u67e5\u65e5\u671f\u8303\u56f4\u6216Token\u6743\u9650")
 ```
