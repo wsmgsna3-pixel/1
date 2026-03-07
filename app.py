@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 
 ## “””
-智选股 V1.0 · 新策略
+Smart Screener V1.0 - New Strategy
 
-## 核心理念：找”刚启动、还有空间”的强势股，而非”最热”的股票
+## Core idea: Find stocks just launched with room to grow
 
-选股逻辑：
+Logic:
 
-1. 股票池：全A股，排除ST、北交所，价格≥10元，流通市值≥50亿
-1. 硬性过滤：20日涨幅≤30%，5日涨幅≤20%，排除连续涨停
-1. 技术过滤：股价站上MA20且MA20向上，上影线≤5%，收盘实体位置≥60%
-1. 筹码过滤：winner_rate在50-85之间（筹码未过度获利）
-1. 六维评分：技术面25+买入时机20+量能15+鱼身判断15+板块热度15+大盘环境10
-1. 买入模拟：次日高开+盘中冲高1.5%触发，止损5%
+1. Universe: All A-shares, exclude ST and BSE, price>=10, circ_mv>=50bn
+1. Hard filters: 20d return<=30%, 5d return<=20%, no consecutive limit-up
+1. Tech filters: Price above MA20 with upward slope, upper shadow<=5%, body pos>=60%
+1. Chip filter: winner_rate 50-85% (chips not over-profitable)
+1. Six-dim score: Tech25+Timing20+Volume15+FishBody15+Sector15+Market10
+1. Buy simulation: Next day gap-up + intraday +1.5% trigger, stop loss 5%
 
 -----
 
