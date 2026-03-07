@@ -1,22 +1,20 @@
 # -*- coding: utf-8 -*-
 
-## “””
-Smart Screener V1.0 - New Strategy
+# Smart Screener V1.0
 
-## Core idea: Find stocks just launched with room to grow
+# Core idea: Find stocks just launched with room to grow, not the hottest ones.
 
-Logic:
+# Universe: All A-shares, exclude ST and BSE, min price 10, min circ_mv 50bn
 
-1. Universe: All A-shares, exclude ST and BSE, price>=10, circ_mv>=50bn
-1. Hard filters: 20d return<=30%, 5d return<=20%, no consecutive limit-up
-1. Tech filters: Price above MA20 with upward slope, upper shadow<=5%, body pos>=60%
-1. Chip filter: winner_rate 50-85% (chips not over-profitable)
-1. Six-dim score: Tech25+Timing20+Volume15+FishBody15+Sector15+Market10
-1. Buy simulation: Next day gap-up + intraday +1.5% trigger, stop loss 5%
+# Hard filters: 20d return max 30pct, 5d return max 20pct, no consecutive limit-up
 
------
+# Tech filters: Price above MA20 upward, upper shadow max 5pct, body pos min 60pct
 
-“””
+# Chip filter: winner_rate between 50 and 85 pct
+
+# Six-dim score: Tech 25 + Timing 20 + Volume 15 + FishBody 15 + Sector 15 + Market 10
+
+# Buy simulation: Next day gap-up plus intraday plus 1.5pct trigger, stop loss 5pct
 
 import streamlit as st
 import pandas as pd
