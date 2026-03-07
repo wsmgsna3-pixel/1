@@ -8,13 +8,13 @@ import time
 import os
 import pickle
 
-warnings.filterwarnings(“ignore”)
+warnings.filterwarnings(‘ignore’)
 
 st.set_page_config(
-page_title=”\u667a\u9009\u80a1 V1.0”,
-page_icon=”\U0001f4c8”,
-layout=“wide”,
-initial_sidebar_state=“expanded”
+page_title=’\u667a\u9009\u80a1 V1.0’,
+page_icon=’\U0001f4c8’,
+layout=‘wide’,
+initial_sidebar_state=‘expanded’
 )
 
 st.markdown(”””
@@ -40,12 +40,12 @@ st.markdown(”””
 
 “””, unsafe_allow_html=True)
 
-st.title(”\U0001f4c8 \u667a\u9009\u80a1 V1.0 | \u9c7c\u8eab\u7b56\u7565”)
-st.caption(”\u6838\u5fc3\u7406\u5ff5\uff1a\u627e\u521a\u542f\u52a8\u3001\u8fd8\u6709\u7a7a\u95f4\u7684\u5f3a\u52bf\u80a1 | \u9ad8\u5f00+\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165 | \u6b62\u635f5%”)
+st.title(’\U0001f4c8 \u667a\u9009\u80a1 V1.0 | \u9c7c\u8eab\u7b56\u7565’)
+st.caption(’\u6838\u5fc3\u7406\u5ff5\uff1a\u627e\u521a\u542f\u52a8\u3001\u8fd8\u6709\u7a7a\u95f4\u7684\u5f3a\u52bf\u80a1 | \u9ad8\u5f00+\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165 | \u6b62\u635f5%’)
 
 pro = None
-CACHE_FILE = “smart_screener_cache.pkl”
-CHECKPOINT_FILE = “smart_screener_checkpoint.csv”
+CACHE_FILE = ‘smart_screener_cache.pkl’
+CHECKPOINT_FILE = ‘smart_screener_checkpoint.csv’
 
 def safe_api(func_name, max_retry=3, sleep=0.5, **kwargs):
 global pro
@@ -112,7 +112,7 @@ return []
 return sorted(df[‘cal_date’].tolist())
 
 def get_recent_trade_days(end_date_str, n):
-start = (datetime.strptime(end_date_str, “%Y%m%d”) - timedelta(days=n * 3)).strftime(”%Y%m%d”)
+start = (datetime.strptime(end_date_str, ‘%Y%m%d’) - timedelta(days=n * 3)).strftime(’%Y%m%d’)
 days = get_trade_calendar(start, end_date_str)
 return sorted(days, reverse=True)[:n]
 
@@ -130,7 +130,7 @@ try:
 with open(CACHE_FILE, ‘wb’) as f:
 pickle.dump(data, f)
 except Exception as e:
-st.warning(f”\u7f13\u5b58\u4fdd\u5b58\u5931\u8d25: {e}”)
+st.warning(f’\u7f13\u5b58\u4fdd\u5b58\u5931\u8d25: {e}’)
 
 @st.cache_data(ttl=3600 * 12)
 def fetch_daily_for_date(date):
@@ -373,7 +373,7 @@ return total, detail, tag
 
 @st.cache_data(ttl=3600 * 12)
 def get_stock_history(ts_code, end_date, lookback_days=120):
-start = (datetime.strptime(end_date, “%Y%m%d”) - timedelta(days=lookback_days * 2)).strftime(”%Y%m%d”)
+start = (datetime.strptime(end_date, ‘%Y%m%d’) - timedelta(days=lookback_days * 2)).strftime(’%Y%m%d’)
 daily = safe_api(‘daily’, ts_code=ts_code, start_date=start, end_date=end_date)
 if daily is None or daily.empty or len(daily) < 30:
 return pd.DataFrame()
@@ -395,7 +395,7 @@ return daily
 @st.cache_data(ttl=3600 * 12)
 def get_sector_performance(trade_date, industry_map):
 “””\u8ba1\u7b97\u5404\u7533\u4e07\u884c\u4e1a5\u65e5\u76f8\u5bf9\u5927\u76d8\u8868\u73b0”””
-start = (datetime.strptime(trade_date, “%Y%m%d”) - timedelta(days=15)).strftime(”%Y%m%d”)
+start = (datetime.strptime(trade_date, ‘%Y%m%d’) - timedelta(days=15)).strftime(’%Y%m%d’)
 
 ```
 hs300 = safe_api('daily', ts_code='000300.SH', start_date=start, end_date=trade_date)
@@ -418,7 +418,7 @@ except:
 
 @st.cache_data(ttl=3600 * 12)
 def get_market_state(trade_date):
-start = (datetime.strptime(trade_date, “%Y%m%d”) - timedelta(days=60)).strftime(”%Y%m%d”)
+start = (datetime.strptime(trade_date, ‘%Y%m%d’) - timedelta(days=60)).strftime(’%Y%m%d’)
 df = safe_api(‘daily’, ts_code=‘000300.SH’, start_date=start, end_date=trade_date)
 if df.empty or len(df) < 20:
 return False
@@ -584,9 +584,9 @@ return result
 
 def simulate_buy(ts_code, selection_date, d0_close):
 “””\u6a21\u62df\u6b21\u65e5\u9ad8\u5f00+\u76d8\u4e2d\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165,\u8ba1\u7b97D1/D3/D5\u6536\u76ca”””
-d0 = datetime.strptime(selection_date, “%Y%m%d”)
-start = (d0 + timedelta(days=1)).strftime(”%Y%m%d”)
-end   = (d0 + timedelta(days=20)).strftime(”%Y%m%d”)
+d0 = datetime.strptime(selection_date, ‘%Y%m%d’)
+start = (d0 + timedelta(days=1)).strftime(’%Y%m%d’)
+end   = (d0 + timedelta(days=20)).strftime(’%Y%m%d’)
 
 ```
 hist = safe_api('daily', ts_code=ts_code, start_date=start, end_date=end)
@@ -624,72 +624,72 @@ return result
 ```
 
 with st.sidebar:
-st.header(”\u2699\ufe0f \u53c2\u6570\u8bbe\u7f6e”)
+st.header(’\u2699\ufe0f \u53c2\u6570\u8bbe\u7f6e’)
 
 ```
-st.subheader("\U0001f511 Tushare Token")
-ts_token = st.text_input("Token", type="password", key="token")
+st.subheader('\U0001f511 Tushare Token')
+ts_token = st.text_input('Token', type='password', key='token')
 
 st.divider()
-st.subheader("\U0001f4b0 \u80a1\u7968\u6c60\u8fc7\u6ee4")
-min_price = st.number_input("\u6700\u4f4e\u80a1\u4ef7(\u5143)", value=10.0, min_value=1.0, step=1.0)
-min_mv    = st.number_input("\u6700\u5c0f\u6d41\u901a\u5e02\u503c(\u4ebf)", value=50.0, min_value=10.0, step=10.0)
-max_mv    = st.number_input("\u6700\u5927\u6d41\u901a\u5e02\u503c(\u4ebf)", value=1000.0, min_value=100.0, step=100.0)
+st.subheader('\U0001f4b0 \u80a1\u7968\u6c60\u8fc7\u6ee4')
+min_price = st.number_input('\u6700\u4f4e\u80a1\u4ef7(\u5143)', value=10.0, min_value=1.0, step=1.0)
+min_mv    = st.number_input('\u6700\u5c0f\u6d41\u901a\u5e02\u503c(\u4ebf)', value=50.0, min_value=10.0, step=10.0)
+max_mv    = st.number_input('\u6700\u5927\u6d41\u901a\u5e02\u503c(\u4ebf)', value=1000.0, min_value=100.0, step=100.0)
 
 st.divider()
-st.subheader("\U0001f4ca \u5b9e\u76d8\u9009\u80a1")
-top_n = st.slider("\u8f93\u51faTop N\u5019\u9009\u80a1", 3, 10, 5)
+st.subheader('\U0001f4ca \u5b9e\u76d8\u9009\u80a1')
+top_n = st.slider('\u8f93\u51faTop N\u5019\u9009\u80a1', 3, 10, 5)
 
 st.divider()
-st.subheader("\U0001f52c \u56de\u6d4b\u8bbe\u7f6e")
-bt_end   = st.date_input("\u56de\u6d4b\u622a\u6b62\u65e5\u671f", value=datetime.now().date())
-bt_days  = st.number_input("\u56de\u6d4b\u5929\u6570", value=30, min_value=5, max_value=90, step=5)
-bt_top_n = st.number_input("\u6bcf\u65e5\u63a8\u8350\u6570", value=4, min_value=1, max_value=10)
-resume   = st.checkbox("\u5f00\u542f\u65ad\u70b9\u7eed\u4f20", value=True)
+st.subheader('\U0001f52c \u56de\u6d4b\u8bbe\u7f6e')
+bt_end   = st.date_input('\u56de\u6d4b\u622a\u6b62\u65e5\u671f', value=datetime.now().date())
+bt_days  = st.number_input('\u56de\u6d4b\u5929\u6570', value=30, min_value=5, max_value=90, step=5)
+bt_top_n = st.number_input('\u6bcf\u65e5\u63a8\u8350\u6570', value=4, min_value=1, max_value=10)
+resume   = st.checkbox('\u5f00\u542f\u65ad\u70b9\u7eed\u4f20', value=True)
 
-if st.button("\U0001f5d1\ufe0f \u6e05\u9664\u7f13\u5b58"):
+if st.button('\U0001f5d1\ufe0f \u6e05\u9664\u7f13\u5b58'):
     for f in [CACHE_FILE, CHECKPOINT_FILE]:
         if os.path.exists(f):
             os.remove(f)
     st.cache_data.clear()
-    st.success("\u7f13\u5b58\u5df2\u6e05\u9664")
+    st.success('\u7f13\u5b58\u5df2\u6e05\u9664')
 ```
 
 if not ts_token:
-st.info(”\U0001f448 \u8bf7\u5728\u5de6\u4fa7\u8f93\u5165 Tushare Token \u540e\u5f00\u59cb\u4f7f\u7528”)
+st.info(’\U0001f448 \u8bf7\u5728\u5de6\u4fa7\u8f93\u5165 Tushare Token \u540e\u5f00\u59cb\u4f7f\u7528’)
 st.stop()
 
 ts.set_token(ts_token)
 pro = ts.pro_api()
 
-tab1, tab2 = st.tabs([”\U0001f4e1 \u5b9e\u76d8\u9009\u80a1”, “\U0001f52c \u5386\u53f2\u56de\u6d4b”])
+tab1, tab2 = st.tabs([’\U0001f4e1 \u5b9e\u76d8\u9009\u80a1’, ‘\U0001f52c \u5386\u53f2\u56de\u6d4b’])
 
 with tab1:
-st.subheader(”\U0001f4e1 \u5b9e\u76d8\u9009\u80a1 | \u4eca\u65e5\u5019\u9009”)
-st.caption(”\u6536\u76d8\u540e\u8fd0\u884c,\u7b2c\u4e8c\u59299:25\u96c6\u5408\u7ade\u4ef7\u5224\u65ad\u9ad8\u5f00,9:30\u540e\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165”)
+st.subheader(’\U0001f4e1 \u5b9e\u76d8\u9009\u80a1 | \u4eca\u65e5\u5019\u9009’)
+st.caption(’\u6536\u76d8\u540e\u8fd0\u884c,\u7b2c\u4e8c\u59299:25\u96c6\u5408\u7ade\u4ef7\u5224\u65ad\u9ad8\u5f00,9:30\u540e\u51b2\u9ad81.5%\u89e6\u53d1\u4e70\u5165’)
 
 ```
 col1, col2 = st.columns([3, 1])
 with col1:
-    screen_date = st.date_input("\u9009\u80a1\u65e5\u671f(\u9009\u5f53\u5929\u6536\u76d8\u65e5)",
+    screen_date = st.date_input('\u9009\u80a1\u65e5\u671f(\u9009\u5f53\u5929\u6536\u76d8\u65e5)',
                                  value=datetime.now().date(), key='screen_date')
 with col2:
-    st.write("")
-    st.write("")
-    run_screen = st.button("\U0001f680 \u5f00\u59cb\u9009\u80a1", use_container_width=True)
+    st.write('')
+    st.write('')
+    run_screen = st.button('\U0001f680 \u5f00\u59cb\u9009\u80a1', use_container_width=True)
 
 if run_screen:
-    date_str = screen_date.strftime("%Y%m%d")
+    date_str = screen_date.strftime('%Y%m%d')
 
-    with st.spinner("\u52a0\u8f7d\u80a1\u7968\u57fa\u7840\u6570\u636e..."):
+    with st.spinner('\u52a0\u8f7d\u80a1\u7968\u57fa\u7840\u6570\u636e...'):
         stock_basic = load_stock_basic()
         industry_map = load_sw_industry()
 
     if stock_basic.empty:
-        st.error("\u65e0\u6cd5\u83b7\u53d6\u80a1\u7968\u5217\u8868,\u8bf7\u68c0\u67e5Token\u6743\u9650")
+        st.error('\u65e0\u6cd5\u83b7\u53d6\u80a1\u7968\u5217\u8868,\u8bf7\u68c0\u67e5Token\u6743\u9650')
         st.stop()
 
-    with st.spinner(f"\u6b63\u5728\u5206\u6790 {date_str} \u5168\u5e02\u573a\u6570\u636e,\u8bf7\u7a0d\u5019..."):
+    with st.spinner(f'\u6b63\u5728\u5206\u6790 {date_str} \u5168\u5e02\u573a\u6570\u636e,\u8bf7\u7a0d\u5019...'):
         result = screen_one_day(
             date_str, stock_basic, industry_map,
             min_price, min_mv, max_mv,
@@ -697,55 +697,55 @@ if run_screen:
         )
 
     if result.empty:
-        st.warning("\u4eca\u65e5\u672a\u627e\u5230\u7b26\u5408\u6761\u4ef6\u7684\u80a1\u7968,\u53ef\u9002\u5f53\u653e\u5bbd\u53c2\u6570")
+        st.warning('\u4eca\u65e5\u672a\u627e\u5230\u7b26\u5408\u6761\u4ef6\u7684\u80a1\u7968,\u53ef\u9002\u5f53\u653e\u5bbd\u53c2\u6570')
     else:
-        st.success(f"\u2705 \u7b5b\u9009\u5b8c\u6210,\u5171\u63a8\u8350 {len(result)} \u53ea\u5019\u9009\u80a1")
+        st.success(f'\u2705 \u7b5b\u9009\u5b8c\u6210,\u5171\u63a8\u8350 {len(result)} \u53ea\u5019\u9009\u80a1')
 
         market_state = get_market_state(date_str)
-        st.info(f"\U0001f4ca \u5f53\u524d\u5927\u76d8\u72b6\u6001\uff1a{'\U0001f7e2 \u5f3a\u52bf(\u6caa\u6df1300\u7ad9\u4e0aMA20)' if market_state else '\U0001f534 \u5f31\u52bf(\u6caa\u6df1300\u8dcc\u7834MA20)'}")
+        st.info(f'\U0001f4ca \u5f53\u524d\u5927\u76d8\u72b6\u6001\uff1a{'\U0001f7e2 \u5f3a\u52bf(\u6caa\u6df1300\u7ad9\u4e0aMA20)' if market_state else '\U0001f534 \u5f31\u52bf(\u6caa\u6df1300\u8dcc\u7834MA20)'}')
 
 
         for _, row in result.iterrows():
             with st.expander(
-                f"#{int(row['rank'])}  {row['name']} ({row['ts_code']})  "
-                f"CNY{row['close']:.2f}  {row['tag']}  \u7efc\u5408\u8bc4\u5206: {row['score']:.0f}\u5206",
+                f'#{int(row['rank'])}  {row['name']} ({row['ts_code']})  '
+                f'CNY{row['close']:.2f}  {row['tag']}  \u7efc\u5408\u8bc4\u5206: {row['score']:.0f}\u5206',
                 expanded=(row['rank'] <= 2)
             ):
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("\u4eca\u65e5\u6da8\u5e45", f"{row['pct_1d']:+.2f}%")
-                c2.metric("5\u65e5\u6da8\u5e45",  f"{row['pct_5d']:+.2f}%")
-                c3.metric("20\u65e5\u6da8\u5e45", f"{row['pct_20d']:+.2f}%")
-                c4.metric("\u672c\u8f6e\u6da8\u5e45", f"{row['from_bottom']:+.1f}%",
-                          help="\u4ece\u8fd160\u65e5\u4f4e\u70b9\u5230\u73b0\u5728\u7684\u6da8\u5e45,\u5224\u65ad\u9c7c\u8eab/\u9c7c\u5c3e\u4f4d\u7f6e")
+                c1.metric('\u4eca\u65e5\u6da8\u5e45', f'{row['pct_1d']:+.2f}%')
+                c2.metric('5\u65e5\u6da8\u5e45',  f'{row['pct_5d']:+.2f}%')
+                c3.metric('20\u65e5\u6da8\u5e45', f'{row['pct_20d']:+.2f}%')
+                c4.metric('\u672c\u8f6e\u6da8\u5e45', f'{row['from_bottom']:+.1f}%',
+                          help='\u4ece\u8fd160\u65e5\u4f4e\u70b9\u5230\u73b0\u5728\u7684\u6da8\u5e45,\u5224\u65ad\u9c7c\u8eab/\u9c7c\u5c3e\u4f4d\u7f6e')
 
                 c5, c6, c7, c8 = st.columns(4)
-                c5.metric("RSI(14)", f"{row['rsi']:.1f}")
-                c6.metric("\u7b79\u7801\u83b7\u5229\u6bd4", f"{row['winner_rate']:.1f}%")
-                c7.metric("\u91cf\u6bd4(5/20\u65e5)", f"{row['vol_ratio']:.2f}x")
-                c8.metric("\u5927\u76d8\u73af\u5883", row['market'])
+                c5.metric('RSI(14)', f'{row['rsi']:.1f}')
+                c6.metric('\u7b79\u7801\u83b7\u5229\u6bd4', f'{row['winner_rate']:.1f}%')
+                c7.metric('\u91cf\u6bd4(5/20\u65e5)', f'{row['vol_ratio']:.2f}x')
+                c8.metric('\u5927\u76d8\u73af\u5883', row['market'])
 
                 st.divider()
                 cc1, cc2, cc3, cc4 = st.columns(4)
-                cc1.metric("\U0001f4cc \u5efa\u8bae\u4e70\u5165\u4ef7\u533a\u95f4",
-                           f"CNY{row['buy_low']:.2f} ~ CNY{row['buy_high']:.2f}")
-                cc2.metric("\U0001f6e1\ufe0f \u6b62\u635f\u4ef7(-5%)", f"CNY{row['stop_loss']:.2f}")
-                cc3.metric("\U0001f3af \u76ee\u6807\u4ef7(+8%)", f"CNY{row['target']:.2f}")
-                cc4.metric("\u98ce\u9669\u6536\u76ca\u6bd4", "1 : 1.6")
+                cc1.metric('\U0001f4cc \u5efa\u8bae\u4e70\u5165\u4ef7\u533a\u95f4',
+                           f'CNY{row['buy_low']:.2f} ~ CNY{row['buy_high']:.2f}')
+                cc2.metric('\U0001f6e1\ufe0f \u6b62\u635f\u4ef7(-5%)', f'CNY{row['stop_loss']:.2f}')
+                cc3.metric('\U0001f3af \u76ee\u6807\u4ef7(+8%)', f'CNY{row['target']:.2f}')
+                cc4.metric('\u98ce\u9669\u6536\u76ca\u6bd4', '1 : 1.6')
 
                 st.divider()
-                st.write("**\u516d\u7ef4\u8bc4\u5206\u5206\u89e3\uff1a**")
+                st.write('**\u516d\u7ef4\u8bc4\u5206\u5206\u89e3\uff1a**')
                 score_cols = st.columns(6)
                 dims = ['\u6280\u672f\u9762','\u4e70\u5165\u65f6\u673a','\u91cf\u80fd\u5065\u5eb7','\u9c7c\u8eab\u5224\u65ad','\u677f\u5757\u70ed\u5ea6','\u5927\u76d8\u73af\u5883']
                 maxs = [25, 20, 15, 15, 15, 10]
                 for i, (dim, mx) in enumerate(zip(dims, maxs)):
                     val = row.get(dim, 0)
                     pct = val / mx * 100
-                    color = "\U0001f7e2" if pct >= 70 else "\U0001f7e1" if pct >= 40 else "\U0001f534"
-                    score_cols[i].metric(f"{color} {dim}", f"{val}/{mx}")
+                    color = '\U0001f7e2' if pct >= 70 else '\U0001f7e1' if pct >= 40 else '\U0001f534'
+                    score_cols[i].metric(f'{color} {dim}', f'{val}/{mx}')
 
 
         st.divider()
-        st.write("**\u6c47\u603b\u8868\u683c\uff1a**")
+        st.write('**\u6c47\u603b\u8868\u683c\uff1a**')
         show_df = result[['rank','name','ts_code','close','pct_1d','pct_5d',
                            'pct_20d','from_bottom','rsi','winner_rate',
                            'score','tag','buy_low','stop_loss','target']].copy()
@@ -754,26 +754,26 @@ if run_screen:
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
         csv = show_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("\U0001f4e5 \u5bfc\u51faCSV", csv,
-                           f"\u667a\u9009\u80a1_{date_str}.csv", "text/csv")
+        st.download_button('\U0001f4e5 \u5bfc\u51faCSV', csv,
+                           f'\u667a\u9009\u80a1_{date_str}.csv', 'text/csv')
 
     st.divider()
-    st.caption("\u26a0\ufe0f \u672c\u5de5\u5177\u4ec5\u4f9b\u5b66\u4e60\u7814\u7a76,\u4e0d\u6784\u6210\u6295\u8d44\u5efa\u8bae\u3002\u80a1\u5e02\u6709\u98ce\u9669,\u6295\u8d44\u9700\u8c28\u614e\u3002")
+    st.caption('\u26a0\ufe0f \u672c\u5de5\u5177\u4ec5\u4f9b\u5b66\u4e60\u7814\u7a76,\u4e0d\u6784\u6210\u6295\u8d44\u5efa\u8bae\u3002\u80a1\u5e02\u6709\u98ce\u9669,\u6295\u8d44\u9700\u8c28\u614e\u3002')
 ```
 
 with tab2:
-st.subheader(”\U0001f52c \u5386\u53f2\u56de\u6d4b | \u7b56\u7565\u9a8c\u8bc1”)
-st.caption(”\u6a21\u62df\uff1a\u6b21\u65e5\u9ad8\u5f00 + \u76d8\u4e2d\u51b2\u9ad81.5% \u89e6\u53d1\u4e70\u5165,\u6301\u6709N\u5929\u540e\u6536\u76d8\u4ef7\u5356\u51fa,\u6b62\u635f5%”)
+st.subheader(’\U0001f52c \u5386\u53f2\u56de\u6d4b | \u7b56\u7565\u9a8c\u8bc1’)
+st.caption(’\u6a21\u62df\uff1a\u6b21\u65e5\u9ad8\u5f00 + \u76d8\u4e2d\u51b2\u9ad81.5% \u89e6\u53d1\u4e70\u5165,\u6301\u6709N\u5929\u540e\u6536\u76d8\u4ef7\u5356\u51fa,\u6b62\u635f5%’)
 
 ```
-run_bt = st.button("\U0001f680 \u542f\u52a8\u56de\u6d4b", use_container_width=True)
+run_bt = st.button('\U0001f680 \u542f\u52a8\u56de\u6d4b', use_container_width=True)
 
 if run_bt:
-    end_str = bt_end.strftime("%Y%m%d")
+    end_str = bt_end.strftime('%Y%m%d')
     trade_days = get_recent_trade_days(end_str, int(bt_days))
 
     if not trade_days:
-        st.error("\u65e0\u6cd5\u83b7\u53d6\u4ea4\u6613\u65e5\u5386,\u8bf7\u68c0\u67e5Token")
+        st.error('\u65e0\u6cd5\u83b7\u53d6\u4ea4\u6613\u65e5\u5386,\u8bf7\u68c0\u67e5Token')
         st.stop()
 
 
@@ -786,7 +786,7 @@ if run_bt:
             ckpt['trade_date'] = ckpt['trade_date'].astype(str)
             processed = set(ckpt['trade_date'].unique())
             all_results.append(ckpt)
-            st.success(f"\u2705 \u8bfb\u53d6\u65ad\u70b9\u5b58\u6863,\u5df2\u8df3\u8fc7 {len(processed)} \u4e2a\u4ea4\u6613\u65e5")
+            st.success(f'\u2705 \u8bfb\u53d6\u65ad\u70b9\u5b58\u6863,\u5df2\u8df3\u8fc7 {len(processed)} \u4e2a\u4ea4\u6613\u65e5')
         except:
             if os.path.exists(CHECKPOINT_FILE):
                 os.remove(CHECKPOINT_FILE)
@@ -796,18 +796,18 @@ if run_bt:
     dates_to_run = [d for d in trade_days if d not in processed]
 
     if not dates_to_run:
-        st.success("\U0001f389 \u6240\u6709\u65e5\u671f\u5df2\u8ba1\u7b97\u5b8c\u6bd5\uff01")
+        st.success('\U0001f389 \u6240\u6709\u65e5\u671f\u5df2\u8ba1\u7b97\u5b8c\u6bd5\uff01')
     else:
-        with st.spinner("\u52a0\u8f7d\u80a1\u7968\u57fa\u7840\u6570\u636e..."):
+        with st.spinner('\u52a0\u8f7d\u80a1\u7968\u57fa\u7840\u6570\u636e...'):
             stock_basic = load_stock_basic()
             industry_map = load_sw_industry()
 
-        bar = st.progress(0, text="\u56de\u6d4b\u4e2d...")
+        bar = st.progress(0, text='\u56de\u6d4b\u4e2d...')
         err_placeholder = st.empty()
 
         for i, date in enumerate(dates_to_run):
             bar.progress((i + 1) / len(dates_to_run),
-                          text=f"\u56de\u6d4b\u4e2d: {date}  ({i+1}/{len(dates_to_run)})")
+                          text=f'\u56de\u6d4b\u4e2d: {date}  ({i+1}/{len(dates_to_run)})')
             try:
                 day_result = screen_one_day(
                     date, stock_basic, industry_map,
@@ -822,7 +822,7 @@ if run_bt:
                                       encoding='utf-8-sig')
                     all_results.append(day_result)
             except Exception as e:
-                err_placeholder.warning(f"{date} \u5904\u7406\u5f02\u5e38: {e}")
+                err_placeholder.warning(f'{date} \u5904\u7406\u5f02\u5e38: {e}')
 
         bar.empty()
 
@@ -833,19 +833,19 @@ if run_bt:
         final = final.sort_values(['trade_date', 'rank'], ascending=[False, True])
 
         st.divider()
-        st.header("\U0001f4ca \u56de\u6d4b\u7edf\u8ba1\u62a5\u544a")
+        st.header('\U0001f4ca \u56de\u6d4b\u7edf\u8ba1\u62a5\u544a')
 
 
         triggered = final[final['triggered'] == True] if 'triggered' in final.columns else pd.DataFrame()
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("\u603b\u9009\u80a1\u8bb0\u5f55", f"{len(final)} \u6761")
-        col1.metric("\u6d89\u53ca\u4ea4\u6613\u65e5", f"{final['trade_date'].nunique()} \u5929")
+        col1.metric('\u603b\u9009\u80a1\u8bb0\u5f55', f'{len(final)} \u6761')
+        col1.metric('\u6d89\u53ca\u4ea4\u6613\u65e5', f'{final['trade_date'].nunique()} \u5929')
 
         if not triggered.empty:
-            col2.metric("\u89e6\u53d1\u4e70\u5165\u6bd4\u4f8b",
-                        f"{len(triggered)/len(final)*100:.1f}%",
-                        help="\u6ee1\u8db3\u9ad8\u5f00+\u51b2\u9ad81.5%\u7684\u6bd4\u4f8b")
+            col2.metric('\u89e6\u53d1\u4e70\u5165\u6bd4\u4f8b',
+                        f'{len(triggered)/len(final)*100:.1f}%',
+                        help='\u6ee1\u8db3\u9ad8\u5f00+\u51b2\u9ad81.5%\u7684\u6bd4\u4f8b')
             for n, key in [(1,'R_D1'), (3,'R_D3'), (5,'R_D5')]:
                 valid = triggered.dropna(subset=[key])
                 if not valid.empty:
@@ -853,17 +853,17 @@ if run_bt:
                     wr   = (valid[key] > 0).mean() * 100
                     loss = (valid[key] < -5).mean() * 100
                     col3.metric(
-                        f"D+{n} \u5747\u6536\u76ca/\u80dc\u7387",
-                        f"{avg:+.2f}% / {wr:.1f}%",
-                        delta=f"\u4e8f\u635f>5%: {loss:.1f}%"
+                        f'D+{n} \u5747\u6536\u76ca/\u80dc\u7387',
+                        f'{avg:+.2f}% / {wr:.1f}%',
+                        delta=f'\u4e8f\u635f>5%: {loss:.1f}%'
                     )
         else:
-            col2.info("\u65e0\u89e6\u53d1\u4e70\u5165\u8bb0\u5f55(\u53ef\u80fd\u65e5\u671f\u8303\u56f4\u5185\u4fe1\u53f7\u8f83\u5c11)")
+            col2.info('\u65e0\u89e6\u53d1\u4e70\u5165\u8bb0\u5f55(\u53ef\u80fd\u65e5\u671f\u8303\u56f4\u5185\u4fe1\u53f7\u8f83\u5c11)')
 
 
         if not triggered.empty:
             st.divider()
-            st.subheader("\U0001f4c8 \u6309\u6392\u540d\u5206\u5c42\u5206\u6790(\u89e6\u53d1\u4e70\u5165)")
+            st.subheader('\U0001f4c8 \u6309\u6392\u540d\u5206\u5c42\u5206\u6790(\u89e6\u53d1\u4e70\u5165)')
             for n, key in [(1,'R_D1'), (3,'R_D3'), (5,'R_D5')]:
                 valid = triggered.dropna(subset=[key])
                 if valid.empty:
@@ -872,13 +872,13 @@ if run_bt:
                     avg='mean', win_rate=lambda x: (x > 0).mean() * 100, n_count='count'
                 ).round(2)
                 grp.columns = ['\u5747\u503c', '\u80dc\u7387%', '\u6837\u672c\u6570']
-                st.write(f"**D+{n} \u5206\u5c42\u8868\u73b0\uff1a**")
+                st.write(f'**D+{n} \u5206\u5c42\u8868\u73b0\uff1a**')
                 st.dataframe(grp, use_container_width=True)
 
 
         if not triggered.empty and 'tag' in triggered.columns:
             st.divider()
-            st.subheader("\U0001f3f7\ufe0f \u6309\u98ce\u9669\u6807\u7b7e\u5206\u6790(D+3\u6536\u76ca)")
+            st.subheader('\U0001f3f7\ufe0f \u6309\u98ce\u9669\u6807\u7b7e\u5206\u6790(D+3\u6536\u76ca)')
             valid = triggered.dropna(subset=['R_D3'])
             if not valid.empty:
                 grp = valid.groupby('tag')['R_D3'].agg(
@@ -889,7 +889,7 @@ if run_bt:
 
 
         st.divider()
-        st.subheader("\U0001f4cb \u56de\u6d4b\u660e\u7ec6")
+        st.subheader('\U0001f4cb \u56de\u6d4b\u660e\u7ec6')
         show_cols = ['trade_date','rank','name','ts_code','close','pct_1d',
                      'pct_20d','from_bottom','rsi','winner_rate','score','tag',
                      'triggered','buy_price','R_D1','R_D3','R_D5']
@@ -897,8 +897,8 @@ if run_bt:
         st.dataframe(final[show_cols], use_container_width=True, hide_index=True)
 
         csv = final[show_cols].to_csv(index=False).encode('utf-8-sig')
-        st.download_button("\U0001f4e5 \u4e0b\u8f7d\u56de\u6d4b\u7ed3\u679cCSV", csv,
-                           f"\u56de\u6d4b\u7ed3\u679c_{end_str}.csv", "text/csv")
+        st.download_button('\U0001f4e5 \u4e0b\u8f7d\u56de\u6d4b\u7ed3\u679cCSV', csv,
+                           f'\u56de\u6d4b\u7ed3\u679c_{end_str}.csv', 'text/csv')
     else:
-        st.warning("\u26a0\ufe0f \u56de\u6d4b\u672a\u4ea7\u751f\u7ed3\u679c,\u8bf7\u68c0\u67e5\u65e5\u671f\u8303\u56f4\u6216Token\u6743\u9650")
+        st.warning('\u26a0\ufe0f \u56de\u6d4b\u672a\u4ea7\u751f\u7ed3\u679c,\u8bf7\u68c0\u67e5\u65e5\u671f\u8303\u56f4\u6216Token\u6743\u9650')
 ```
