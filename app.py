@@ -9,12 +9,9 @@ import pandas as pd
 import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
-import warnings
 import time
 import os
 import pickle
-
-warnings.filterwarnings(‘ignore’)
 
 # —————————
 
