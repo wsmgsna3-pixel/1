@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 
+“””
+Smart Screener V1.0
+“””
 import streamlit as st
 import pandas as pd
 import numpy as np
