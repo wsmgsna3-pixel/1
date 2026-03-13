@@ -13,11 +13,15 @@ import warnings
 import time
 import os
 import pickle
+import concurrent.futures
 
 warnings.filterwarnings("ignore")
 
 pro = None
 CHECKPOINT_FILE = "bt_checkpoint.csv"
+CACHE_FILE = "market_cache.pkl"
+CACHE_DAILY = pd.DataFrame()
+CACHE_ADJ = pd.DataFrame()
 
 st.set_page_config(page_title="智选股 V1.0", layout="wide")
 st.title("智选股 V1.0 - 鱼身策略")
@@ -71,6 +75,100 @@ def load_industry_map():
     except:
         return {}
 
+def load_market_cache(trade_days_list):
+    global CACHE_DAILY, CACHE_ADJ
+    if os.path.exists(CACHE_FILE):
+        st.success("发现本地缓存，极速加载中...")
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                cached = pickle.load(f)
+            CACHE_DAILY = cached["daily"]
+            CACHE_ADJ = cached["adj"]
+            st.info("缓存加载成功！")
+            return True
+        except:
+            os.remove(CACHE_FILE)
+    earliest = min(trade_days_list)
+    latest = max(trade_days_list)
+    start = (datetime.strptime(earliest, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
+    end = (datetime.strptime(latest, "%Y%m%d") + timedelta(days=30)).strftime("%Y%m%d")
+    cal = safe_api("trade_cal", start_date=start, end_date=end, is_open="1")
+    if cal.empty:
+        return False
+    all_dates = cal["cal_date"].tolist()
+    st.info(f"首次运行，正在下载 {start} 至 {end} 的数据，完成后将缓存到本地...")
+    daily_list = []
+    adj_list = []
+    bar = st.progress(0, text="下载行情数据...")
+    total = len(all_dates)
+
+    def fetch_one(date):
+        d = safe_api("daily", trade_date=date)
+        a = safe_api("adj_factor", trade_date=date)
+        return d, a
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {executor.submit(fetch_one, date): date for date in all_dates}
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            try:
+                d, a = future.result()
+                if not d.empty:
+                    daily_list.append(d)
+                if not a.empty:
+                    adj_list.append(a)
+            except:
+                pass
+            if i % 5 == 0 or i == total - 1:
+                bar.progress((i+1)/total, text=f"下载中: {i+1}/{total} 天")
+    bar.empty()
+    if not daily_list:
+        st.error("下载失败，请检查网络或Token")
+        return False
+    with st.spinner("正在整理数据并保存缓存..."):
+        CACHE_DAILY = pd.concat(daily_list).drop_duplicates(subset=["ts_code","trade_date"])
+        CACHE_DAILY = CACHE_DAILY.set_index(["ts_code","trade_date"]).sort_index()
+        CACHE_ADJ = pd.concat(adj_list).drop_duplicates(subset=["ts_code","trade_date"])
+        CACHE_ADJ = CACHE_ADJ.set_index(["ts_code","trade_date"]).sort_index()
+        try:
+            with open(CACHE_FILE, "wb") as f:
+                pickle.dump({"daily": CACHE_DAILY, "adj": CACHE_ADJ}, f)
+            st.success("数据已缓存到本地，下次启动将秒开！")
+        except Exception as e:
+            st.warning(f"缓存写入失败: {e}")
+    return True
+
+def get_stock_history_fast(ts_code, end_date, lookback=90):
+    global CACHE_DAILY, CACHE_ADJ
+    start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=lookback*2)).strftime("%Y%m%d")
+    try:
+        daily = CACHE_DAILY.loc[ts_code].copy()
+        daily = daily[(daily.index >= start) & (daily.index <= end_date)]
+        daily = daily.reset_index().rename(columns={"level_0": "trade_date"})
+        daily.columns = [c if c != "index" else "trade_date" for c in daily.columns]
+        if "trade_date" not in daily.columns:
+            daily = daily.reset_index()
+            daily.columns = ["trade_date"] + list(daily.columns[1:])
+        daily = daily.sort_values("trade_date").reset_index(drop=True)
+    except KeyError:
+        return pd.DataFrame()
+    if daily.empty or len(daily) < 30:
+        return pd.DataFrame()
+    try:
+        adj = CACHE_ADJ.loc[ts_code]["adj_factor"].copy()
+        adj = adj[(adj.index >= start) & (adj.index <= end_date)]
+        adj_df = adj.reset_index()
+        adj_df.columns = ["trade_date", "adj_factor"]
+        daily = daily.merge(adj_df, on="trade_date", how="left")
+        daily["adj_factor"] = daily["adj_factor"].fillna(method="ffill").fillna(1.0)
+        latest_adj = daily["adj_factor"].iloc[-1]
+        for col in ["open", "high", "low", "close"]:
+            if col in daily.columns:
+                daily[col] = daily[col] * daily["adj_factor"] / latest_adj
+    except:
+        pass
+    daily["ts_code"] = ts_code
+    return daily
+
 @st.cache_data(ttl=3600*12)
 def get_stock_history(ts_code, end_date, lookback=90):
     start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=lookback*2)).strftime("%Y%m%d")
@@ -79,13 +177,13 @@ def get_stock_history(ts_code, end_date, lookback=90):
         return pd.DataFrame()
     adj = safe_api("adj_factor", ts_code=ts_code, start_date=start, end_date=end_date)
     daily = daily.sort_values("trade_date").reset_index(drop=True)
-    if adj.empty:
-        return daily
-    daily = daily.merge(adj[["trade_date", "adj_factor"]], on="trade_date", how="left")
-    daily["adj_factor"] = daily["adj_factor"].fillna(method="ffill").fillna(1.0)
-    latest_adj = daily["adj_factor"].iloc[-1]
-    for col in ["open", "high", "low", "close"]:
-        daily[col] = daily[col] * daily["adj_factor"] / latest_adj
+    if not adj.empty:
+        daily = daily.merge(adj[["trade_date", "adj_factor"]], on="trade_date", how="left")
+        daily["adj_factor"] = daily["adj_factor"].fillna(method="ffill").fillna(1.0)
+        latest_adj = daily["adj_factor"].iloc[-1]
+        for col in ["open", "high", "low", "close"]:
+            daily[col] = daily[col] * daily["adj_factor"] / latest_adj
+    daily["ts_code"] = ts_code
     return daily
 
 def calc_indicators(hist, trade_date, winner_rate_dict):
@@ -199,8 +297,7 @@ def calc_score(ind, sector_score, market_strong):
     detail["fish"] = fish
     detail["sector"] = min(sector_score, 15)
     detail["market"] = 10 if market_strong else 3
-    total = sum(detail.values())
-    return total, detail
+    return sum(detail.values()), detail
 
 def risk_tag(ind):
     if ind["from_bottom"] > 100 or ind["consec_limit"]:
@@ -223,9 +320,8 @@ def get_sector_scores(trade_date):
     global pro
     start = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=20)).strftime("%Y%m%d")
     hs300 = safe_api("index_daily", ts_code="000300.SH", start_date=start, end_date=trade_date)
-    if hs300.empty or len(hs300) < 5:
-        mkt_ret = 0
-    else:
+    mkt_ret = 0
+    if not hs300.empty and len(hs300) >= 5:
         hs300 = hs300.sort_values("trade_date")
         mkt_ret = (float(hs300.iloc[-1]["close"]) / float(hs300.iloc[-5]["close"]) - 1) * 100
     scores = {}
@@ -278,7 +374,10 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv, for_backtest=False)
     df = df.sort_values("pct_chg", ascending=False).head(200)
     records = []
     for row in df.itertuples():
-        hist = get_stock_history(row.ts_code, trade_date, lookback=90)
+        if for_backtest:
+            hist = get_stock_history_fast(row.ts_code, trade_date, lookback=90)
+        else:
+            hist = get_stock_history(row.ts_code, trade_date, lookback=90)
         if hist.empty:
             continue
         ind = calc_indicators(hist, trade_date, winner_rate_dict)
@@ -373,8 +472,9 @@ with st.sidebar:
     bt_top_n = st.number_input("每日推荐数", value=4, min_value=1, max_value=10)
     resume = st.checkbox("开启断点续传", value=True)
     if st.button("清除缓存"):
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
+        for f in [CHECKPOINT_FILE, CACHE_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
         st.success("缓存已清除")
 
 if not token:
@@ -449,6 +549,8 @@ with tab2:
             st.error("无法获取交易日历，请检查Token")
             st.stop()
         dates = cal[cal["is_open"]==1].sort_values("cal_date")["cal_date"].tail(int(bt_days)).tolist()
+        if not load_market_cache(dates):
+            st.stop()
         processed = set()
         results = []
         if resume and os.path.exists(CHECKPOINT_FILE):
