@@ -14,7 +14,7 @@ import time
 import os
 import pickle
 
-warnings.filterwarnings(“ignore”)
+warnings.filterwarnings(‘ignore’)
 
 # —————————
 
@@ -23,7 +23,7 @@ warnings.filterwarnings(“ignore”)
 # —————————
 
 pro = None
-CHECKPOINT_FILE = “bt_checkpoint.csv”
+CHECKPOINT_FILE = ‘bt_checkpoint.csv’
 
 # —————————
 
@@ -31,9 +31,9 @@ CHECKPOINT_FILE = “bt_checkpoint.csv”
 
 # —————————
 
-st.set_page_config(page_title=“智选股 V1.0”, layout=“wide”)
-st.title(“智选股 V1.0 - 鱼身策略”)
-st.caption(“收盘后运行，次日高开+冲高1.5%触发买入，止损5%”)
+st.set_page_config(page_title=‘智选股 V1.0’, layout=‘wide’)
+st.title(‘智选股 V1.0 - 鱼身策略’)
+st.caption(‘收盘后运行，次日高开+冲高1.5%触发买入，止损5%’)
 
 # —————————
 
@@ -97,7 +97,7 @@ return {}
 
 @st.cache_data(ttl=3600*12)
 def get_stock_history(ts_code, end_date, lookback=90):
-start = (datetime.strptime(end_date, “%Y%m%d”) - timedelta(days=lookback*2)).strftime(”%Y%m%d”)
+start = (datetime.strptime(end_date, ‘%Y%m%d’) - timedelta(days=lookback*2)).strftime(’%Y%m%d’)
 daily = safe_api(‘daily’, ts_code=ts_code, start_date=start, end_date=end_date)
 if daily is None or daily.empty or len(daily) < 30:
 return pd.DataFrame()
@@ -266,10 +266,10 @@ return total, detail
 
 def risk_tag(ind):
 if ind[‘from_bottom’] > 100 or ind[‘consec_limit’]:
-return “高风险”
+return ‘高风险’
 if ind[‘from_bottom’] > 60 or ind[‘pct_5d’] > 15 or ind[‘rsi’] > 80:
-return “谨慎”
-return “安全”
+return ‘谨慎’
+return ‘安全’
 
 # —————————
 
@@ -279,7 +279,7 @@ return “安全”
 
 @st.cache_data(ttl=3600*12)
 def get_market_strong(trade_date):
-start = (datetime.strptime(trade_date, “%Y%m%d”) - timedelta(days=60)).strftime(”%Y%m%d”)
+start = (datetime.strptime(trade_date, ‘%Y%m%d’) - timedelta(days=60)).strftime(’%Y%m%d’)
 df = safe_api(‘index_daily’, ts_code=‘000300.SH’, start_date=start, end_date=trade_date)
 if df.empty or len(df) < 20:
 return False
@@ -295,7 +295,7 @@ return float(df.iloc[-1][‘close’]) > df[‘close’].tail(20).mean()
 @st.cache_data(ttl=3600*12)
 def get_sector_scores(trade_date):
 global pro
-start = (datetime.strptime(trade_date, “%Y%m%d”) - timedelta(days=20)).strftime(”%Y%m%d”)
+start = (datetime.strptime(trade_date, ‘%Y%m%d’) - timedelta(days=20)).strftime(’%Y%m%d’)
 hs300 = safe_api(‘index_daily’, ts_code=‘000300.SH’, start_date=start, end_date=trade_date)
 if hs300.empty or len(hs300) < 5:
 mkt_ret = 0
@@ -404,7 +404,7 @@ for row in df.itertuples():
         'vol_ratio': round(ind['vol_ratio'], 2),
         'score': score,
         'tag': tag,
-        'market': "强势" if market_strong else "弱势",
+        'market': '强势' if market_strong else '弱势',
         'tech': detail['tech'],
         'timing': detail['timing'],
         'vol_score': detail['vol'],
@@ -419,9 +419,9 @@ for row in df.itertuples():
 
     if for_backtest:
         d0_close = ind['close']
-        d0 = datetime.strptime(trade_date, "%Y%m%d")
-        start_f = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-        end_f = (d0 + timedelta(days=20)).strftime("%Y%m%d")
+        d0 = datetime.strptime(trade_date, '%Y%m%d')
+        start_f = (d0 + timedelta(days=1)).strftime('%Y%m%d')
+        end_f = (d0 + timedelta(days=20)).strftime('%Y%m%d')
         fut = safe_api('daily', ts_code=row.ts_code, start_date=start_f, end_date=end_f)
         rec['R_D1'] = np.nan
         rec['R_D3'] = np.nan
@@ -459,24 +459,24 @@ return result
 # —————————
 
 with st.sidebar:
-st.header(“参数设置”)
-st.subheader(“Tushare Token”)
-token = st.text_input(“Token”, type=“password”)
-st.subheader(“股票池过滤”)
-min_price = st.number_input(“最低股价(元)”, value=10.0, min_value=1.0, step=1.0)
-min_mv = st.number_input(“最小流通市值(亿)”, value=50.0, min_value=10.0, step=10.0)
-max_mv = st.number_input(“最大流通市值(亿)”, value=1000.0, min_value=100.0, step=100.0)
-st.subheader(“实盘选股”)
-top_n = st.slider(“输出Top N候选股”, 3, 10, 5)
-st.subheader(“回测设置”)
-bt_end = st.date_input(“回测截止日期”, value=datetime.now().date())
-bt_days = st.number_input(“回测天数”, value=30, min_value=5, max_value=90, step=5)
-bt_top_n = st.number_input(“每日推荐数”, value=4, min_value=1, max_value=10)
-resume = st.checkbox(“开启断点续传”, value=True)
-if st.button(“清除缓存”):
+st.header(‘参数设置’)
+st.subheader(‘Tushare Token’)
+token = st.text_input(‘Token’, type=‘password’)
+st.subheader(‘股票池过滤’)
+min_price = st.number_input(‘最低股价(元)’, value=10.0, min_value=1.0, step=1.0)
+min_mv = st.number_input(‘最小流通市值(亿)’, value=50.0, min_value=10.0, step=10.0)
+max_mv = st.number_input(‘最大流通市值(亿)’, value=1000.0, min_value=100.0, step=100.0)
+st.subheader(‘实盘选股’)
+top_n = st.slider(‘输出Top N候选股’, 3, 10, 5)
+st.subheader(‘回测设置’)
+bt_end = st.date_input(‘回测截止日期’, value=datetime.now().date())
+bt_days = st.number_input(‘回测天数’, value=30, min_value=5, max_value=90, step=5)
+bt_top_n = st.number_input(‘每日推荐数’, value=4, min_value=1, max_value=10)
+resume = st.checkbox(‘开启断点续传’, value=True)
+if st.button(‘清除缓存’):
 if os.path.exists(CHECKPOINT_FILE):
 os.remove(CHECKPOINT_FILE)
-st.success(“缓存已清除”)
+st.success(‘缓存已清除’)
 
 # —————————
 
@@ -484,7 +484,7 @@ st.success(“缓存已清除”)
 
 # —————————
 
-TS_TOKEN = st.text_input(“Tushare Token”, type=“password”)
+TS_TOKEN = st.text_input(‘Tushare Token’, type=‘password’)
 if not TS_TOKEN:
 st.stop()
 ts.set_token(TS_TOKEN)
@@ -496,50 +496,50 @@ pro = ts.pro_api()
 
 # —————————
 
-tab1, tab2 = st.tabs([“实盘选股”, “历史回测”])
+tab1, tab2 = st.tabs([‘实盘选股’, ‘历史回测’])
 
 with tab1:
-st.subheader(“实盘选股 - 今日候选”)
-st.caption(“收盘后运行，第二天9:25判断高开，9:30后冲高1.5%触发买入”)
-screen_date = st.date_input(“选股日期”, value=datetime.now().date())
-if st.button(“开始选股”):
-date_str = screen_date.strftime(”%Y%m%d”)
+st.subheader(‘实盘选股 - 今日候选’)
+st.caption(‘收盘后运行，第二天9:25判断高开，9:30后冲高1.5%触发买入’)
+screen_date = st.date_input(‘选股日期’, value=datetime.now().date())
+if st.button(‘开始选股’):
+date_str = screen_date.strftime(’%Y%m%d’)
 basics = load_stock_basic()
 if basics.empty:
-st.error(“无法获取股票列表，请检查Token权限”)
+st.error(‘无法获取股票列表，请检查Token权限’)
 else:
-with st.spinner(“正在分析全市场数据，请稍候…”):
+with st.spinner(‘正在分析全市场数据，请稍候…’):
 result = run_screen(date_str, top_n, min_price, min_mv, max_mv, for_backtest=False)
 market_state = get_market_strong(date_str)
 if result.empty:
-st.warning(“今日未找到符合条件的股票，可适当放宽参数”)
+st.warning(‘今日未找到符合条件的股票，可适当放宽参数’)
 else:
-ms = “强势（沪深300站上MA20）” if market_state else “弱势（沪深300跌破MA20）”
-st.success(f”筛选完成，共推荐 {len(result)} 只候选股”)
-st.info(f”当前大盘状态：{ms}”)
+ms = ‘强势（沪深300站上MA20）’ if market_state else ‘弱势（沪深300跌破MA20）’
+st.success(f’筛选完成，共推荐 {len(result)} 只候选股’)
+st.info(f’当前大盘状态：{ms}’)
 for *, row in result.iterrows():
-with st.expander(f”No.{row[‘rank’]}  {row[‘name’]}（{row[‘ts_code’]}）  {row[‘tag’]}  评分:{round(row[‘score’],0)}”):
+with st.expander(f’No.{row[‘rank’]}  {row[‘name’]}（{row[‘ts_code’]}）  {row[‘tag’]}  评分:{round(row[‘score’],0)}’):
 c1,c2,c3,c4 = st.columns(4)
-c1.metric(“今日涨幅”, f”{row[‘pct_1d’]:+.2f}%”)
-c2.metric(“5日涨幅”, f”{row[‘pct_5d’]:+.2f}%”)
-c3.metric(“20日涨幅”, f”{row[‘pct_20d’]:+.2f}%”)
-c4.metric(“本轮涨幅”, f”{row[‘from_bottom’]:+.1f}%”)
+c1.metric(‘今日涨幅’, f’{row[‘pct_1d’]:+.2f}%’)
+c2.metric(‘5日涨幅’, f’{row[‘pct_5d’]:+.2f}%’)
+c3.metric(‘20日涨幅’, f’{row[‘pct_20d’]:+.2f}%’)
+c4.metric(‘本轮涨幅’, f’{row[‘from_bottom’]:+.1f}%’)
 c5,c6,c7,c8 = st.columns(4)
-c5.metric(“RSI”, row[‘rsi’])
-c6.metric(“筹码获利比”, f”{row[‘winner_rate’]:.1f}%”)
-c7.metric(“量比(5/20日)”, f”{row[‘vol_ratio’]:.2f}x”)
-c8.metric(“大盘环境”, row[‘market’])
+c5.metric(‘RSI’, row[‘rsi’])
+c6.metric(‘筹码获利比’, f’{row[‘winner_rate’]:.1f}%’)
+c7.metric(‘量比(5/20日)’, f’{row[‘vol_ratio’]:.2f}x’)
+c8.metric(‘大盘环境’, row[‘market’])
 cc1,cc2,cc3,cc4 = st.columns(4)
-cc1.metric(“建议买入区间”, f”{row[‘buy_low’]}~{row[‘buy_high’]}”)
-cc2.metric(“止损价(-5%)”, row[‘stop_loss’])
-cc3.metric(“目标价(+8%)”, row[‘target’])
-cc4.metric(“风险收益比”, “1:1.6”)
+cc1.metric(‘建议买入区间’, f’{row[‘buy_low’]}~{row[‘buy_high’]}’)
+cc2.metric(‘止损价(-5%)’, row[‘stop_loss’])
+cc3.metric(‘目标价(+8%)’, row[‘target’])
+cc4.metric(‘风险收益比’, ‘1:1.6’)
 dims  = [‘tech’,‘timing’,‘vol_score’,‘fish’,‘sector’,‘mkt_score’]
 labels = [‘技术面/25’,‘买入时机/20’,‘量能/15’,‘鱼身/15’,‘板块/15’,‘大盘/10’]
 maxes  = [25,20,15,15,15,10]
 dcols  = st.columns(6)
 for i,(d,lb,mx) in enumerate(zip(dims,labels,maxes)):
-dcols[i].metric(lb, f”{row[d]}/{mx}”)
+dcols[i].metric(lb, f’{row[d]}/{mx}’)
 show_df = result[[‘rank’,‘name’,‘ts_code’,‘close’,‘pct_1d’,‘pct_5d’,‘pct_20d’,
 ‘from_bottom’,‘rsi’,‘winner_rate’,‘score’,‘tag’,
 ‘buy_low’,‘stop_loss’,‘target’]].copy()
@@ -547,19 +547,19 @@ show_df.columns = [‘排名’,‘名称’,‘代码’,‘现价’,‘今日
 ‘本轮%’,‘RSI’,‘筹码%’,‘评分’,‘风险’,‘买入’,‘止损’,‘目标’]
 st.dataframe(show_df, use_container_width=True)
 csv = show_df.to_csv(index=False).encode(‘utf-8-sig’)
-st.download_button(“导出CSV”, csv, f”result*{date_str}.csv”, “text/csv”)
-st.caption(“本工具仅供学习研究，不构成投资建议。股市有风险，投资需谨慎。”)
+st.download_button(‘导出CSV’, csv, f’result*{date_str}.csv’, ‘text/csv’)
+st.caption(‘本工具仅供学习研究，不构成投资建议。股市有风险，投资需谨慎。’)
 
 with tab2:
-st.subheader(“历史回测 - 策略验证”)
-st.caption(“模拟：次日高开+盘中冲高1.5%触发买入，持有N天后收盘价卖出，止损5%”)
-if st.button(“启动回测”):
-end_str = bt_end.strftime(”%Y%m%d”)
+st.subheader(‘历史回测 - 策略验证’)
+st.caption(‘模拟：次日高开+盘中冲高1.5%触发买入，持有N天后收盘价卖出，止损5%’)
+if st.button(‘启动回测’):
+end_str = bt_end.strftime(’%Y%m%d’)
 cal = safe_api(‘trade_cal’,
-start_date=(bt_end - timedelta(days=int(bt_days)*3)).strftime(”%Y%m%d”),
+start_date=(bt_end - timedelta(days=int(bt_days)*3)).strftime(’%Y%m%d’),
 end_date=end_str)
 if cal.empty:
-st.error(“无法获取交易日历，请检查Token”)
+st.error(‘无法获取交易日历，请检查Token’)
 st.stop()
 dates = cal[cal[‘is_open’]==1].sort_values(‘cal_date’)[‘cal_date’].tail(int(bt_days)).tolist()
 processed = set()
@@ -569,14 +569,14 @@ try:
 ex = pd.read_csv(CHECKPOINT_FILE)
 processed = set(ex[‘trade_date’].astype(str).unique())
 results.append(ex)
-st.success(f”读取断点存档，已跳过 {len(processed)} 个交易日”)
+st.success(f’读取断点存档，已跳过 {len(processed)} 个交易日’)
 except:
 pass
 dates_to_run = [d for d in dates if d not in processed]
 if not dates_to_run:
-st.success(“所有日期已计算完毕！”)
+st.success(‘所有日期已计算完毕！’)
 else:
-bar = st.progress(0, text=“回测中…”)
+bar = st.progress(0, text=‘回测中…’)
 err_ph = st.empty()
 for i, date in enumerate(dates_to_run):
 try:
@@ -587,19 +587,19 @@ first = not os.path.exists(CHECKPOINT_FILE)
 res.to_csv(CHECKPOINT_FILE, mode=‘a’, index=False, header=first, encoding=‘utf-8-sig’)
 results.append(res)
 except Exception as e:
-err_ph.warning(f”{date} 处理异常: {e}”)
-bar.progress((i+1)/len(dates_to_run), text=f”回测中: {date} ({i+1}/{len(dates_to_run)})”)
+err_ph.warning(f’{date} 处理异常: {e}’)
+bar.progress((i+1)/len(dates_to_run), text=f’回测中: {date} ({i+1}/{len(dates_to_run)})’)
 bar.empty()
 if results:
 final = pd.concat(results).reset_index(drop=True)
 final = final.sort_values([‘trade_date’,‘rank’], ascending=[False,True])
-st.header(“回测统计报告”)
+st.header(‘回测统计报告’)
 col1, col2 = st.columns(2)
-col1.metric(“总选股记录”, f”{len(final)} 条”)
-col1.metric(“涉及交易日”, f”{final[‘trade_date’].nunique()} 天”)
+col1.metric(‘总选股记录’, f’{len(final)} 条’)
+col1.metric(‘涉及交易日’, f’{final[‘trade_date’].nunique()} 天’)
 triggered = final[final[‘triggered’]==True] if ‘triggered’ in final.columns else pd.DataFrame()
 if not triggered.empty:
-col2.metric(“触发买入比例”, f”{len(triggered)/len(final)*100:.1f}%”)
+col2.metric(‘触发买入比例’, f’{len(triggered)/len(final)*100:.1f}%’)
 cols3 = st.columns(3)
 for i, n in enumerate([1,3,5]):
 key = f’R_D{n}’
@@ -609,10 +609,10 @@ if not valid.empty:
 avg = valid[key].mean()
 win = (valid[key] > 0).mean() * 100
 loss = (valid[key] < -5).mean() * 100
-cols3[i].metric(f”D+{n} 均收益/胜率”,
-f”{avg:.2f}% / {win:.1f}%”,
-delta=f”亏损>5%: {loss:.1f}%”)
-st.subheader(“按排名分层分析（触发买入）”)
+cols3[i].metric(f’D+{n} 均收益/胜率’,
+f’{avg:.2f}% / {win:.1f}%’,
+delta=f’亏损>5%: {loss:.1f}%’)
+st.subheader(‘按排名分层分析（触发买入）’)
 for n in [1,3,5]:
 key = f’R_D{n}’
 if key not in triggered.columns:
@@ -626,15 +626,15 @@ win_rate=lambda x: (x > 0).mean() * 100,
 n=‘count’
 ).round(2)
 grp.columns = [‘均值%’, ‘胜率%’, ‘样本数’]
-st.write(f”D+{n} 分层表现：”)
+st.write(f’D+{n} 分层表现：’)
 st.dataframe(grp, use_container_width=True)
 else:
-col2.info(“无触发买入记录”)
-st.subheader(“回测明细”)
+col2.info(‘无触发买入记录’)
+st.subheader(‘回测明细’)
 show_cols = [‘trade_date’,‘rank’,‘name’,‘ts_code’,‘close’,‘score’,‘tag’,‘triggered’,‘R_D1’,‘R_D3’,‘R_D5’]
 show_cols = [c for c in show_cols if c in final.columns]
 st.dataframe(final[show_cols], use_container_width=True)
 csv = final.to_csv(index=False).encode(‘utf-8-sig’)
-st.download_button(“下载回测结果CSV”, csv, f”backtest_{end_str}.csv”, “text/csv”)
+st.download_button(‘下载回测结果CSV’, csv, f’backtest_{end_str}.csv’, ‘text/csv’)
 else:
-st.warning(“回测未产生结果，请检查日期范围或Token权限”)
+st.warning(‘回测未产生结果，请检查日期范围或Token权限’)
