@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V30.12.11 - 板块惯性版
-核心改动：在Gemini原版基础上，只加一个条件
-昨日申万板块涨幅前三名内的股票才能入选
-其他所有逻辑与V30.12.10完全一致
+选股王 V30.12.12 - 鱼身启动版
+新增：MA5在5天内刚上穿MA20，且偏离≤8%
+其他逻辑与V30.12.11完全一致
 """
 
 import streamlit as st
@@ -25,8 +24,8 @@ GLOBAL_DAILY_RAW = pd.DataFrame()
 GLOBAL_QFQ_BASE_FACTORS = {}
 GLOBAL_STOCK_INDUSTRY = {}
 
-st.set_page_config(page_title="选股王 V30.12.11", layout="wide")
-st.title("选股王 V30.12.11：板块惯性版")
+st.set_page_config(page_title="选股王 V30.12.12", layout="wide")
+st.title("选股王 V30.12.12：鱼身启动版")
 
 @st.cache_data(ttl=3600*12)
 def safe_get(func_name, **kwargs):
@@ -112,8 +111,7 @@ def get_top3_sectors(trade_date):
         if not records:
             return set()
         sdf = pd.DataFrame(records).sort_values("pct_chg", ascending=False)
-        top3 = set(sdf.head(3)["index_code"].tolist())
-        return top3
+        return set(sdf.head(3)["index_code"].tolist())
     except:
         return set()
 
@@ -126,7 +124,7 @@ def get_prev_trade_date(trade_date):
     prev_dates = cal[cal["is_open"] == 1].sort_values("cal_date")["cal_date"].tolist()
     return prev_dates[-2] if len(prev_dates) >= 2 else trade_date
 
-CACHE_FILE_NAME = "market_data_cache_v11.pkl"
+CACHE_FILE_NAME = "market_data_cache_v12.pkl"
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
@@ -137,7 +135,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
         GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
 
     if use_cache and os.path.exists(CACHE_FILE_NAME):
-        st.success(f"发现本地缓存，极速加载中...")
+        st.success("发现本地缓存，极速加载中...")
         try:
             with open(CACHE_FILE_NAME, "rb") as f:
                 cached_data = pickle.load(f)
@@ -304,6 +302,30 @@ def compute_indicators(ts_code, end_date):
     res["rsi_12"] = rsi_series.iloc[-1]
     hist_60 = df.tail(60)
     res["position_60d"] = (close.iloc[-1] - hist_60["low"].min()) / (hist_60["high"].max() - hist_60["low"].min() + 1e-9) * 100
+
+    # ===== 新增：MA5上穿MA20判断 =====
+    ma5_series = close.rolling(5).mean()
+    ma20_series = close.rolling(20).mean()
+
+    ma5_now = ma5_series.iloc[-1]
+    ma20_now = ma20_series.iloc[-1]
+
+    # MA5超过MA20的幅度
+    res["ma5_vs_ma20"] = (ma5_now - ma20_now) / ma20_now * 100
+
+    # 检查5天内是否有过MA5<=MA20（即最近才上穿）
+    # 看过去5天（不含今天）里MA5是否曾经<=MA20
+    recently_crossed = False
+    lookback = min(5, len(ma5_series) - 1)
+    for i in range(1, lookback + 1):
+        if len(ma5_series) > i and len(ma20_series) > i:
+            past_ma5 = ma5_series.iloc[-(i+1)]
+            past_ma20 = ma20_series.iloc[-(i+1)]
+            if past_ma5 <= past_ma20:
+                recently_crossed = True
+                break
+    res["ma5_recently_crossed"] = recently_crossed
+
     return res
 
 @st.cache_data(ttl=3600*12)
@@ -336,7 +358,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     except:
         pass
 
-    # ===== 核心新增：获取昨日板块前三名 =====
+    # 获取昨日板块前三名
     prev_date = get_prev_trade_date(last_trade)
     top3_sector_codes = get_top3_sectors(prev_date)
 
@@ -372,7 +394,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if len(df) == 0:
         return pd.DataFrame(), "过滤后无标的"
 
-    # ===== 核心新增：板块前三名过滤 =====
+    # 板块前三名过滤
     if top3_sector_codes and GLOBAL_STOCK_INDUSTRY:
         df["ind_code"] = df["ts_code"].map(GLOBAL_STOCK_INDUSTRY)
         df = df[df["ind_code"].isin(top3_sector_codes)]
@@ -380,7 +402,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if len(df) == 0:
         return pd.DataFrame(), "板块过滤后无标的"
 
-    # 取涨幅前100，完全沿用Gemini逻辑
+    # 取涨幅前100
     candidates = df.sort_values("pct_chg", ascending=False).head(FINAL_POOL)
     records = []
 
@@ -394,7 +416,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_close = ind["last_close"]
         d0_rsi = ind.get("rsi_12", 50)
 
-        # 完全沿用Gemini黄金版核心逻辑，一行不改
+        # Gemini黄金版核心逻辑，完全保留
         if row.ts_code.startswith("688") or row.ts_code.startswith("300"):
             if d0_rsi <= 90:
                 continue
@@ -422,6 +444,20 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         if win_rate < CHIP_MIN_WIN_RATE:
             continue
 
+        # ===== 新增：MA5鱼身启动过滤 =====
+        ma5_vs_ma20 = ind.get("ma5_vs_ma20", 999)
+        ma5_recently_crossed = ind.get("ma5_recently_crossed", False)
+
+        # MA5必须在MA20之上（趋势向上）
+        if ma5_vs_ma20 <= 0:
+            continue
+        # MA5超过MA20不能超过8%（没有涨太多）
+        if ma5_vs_ma20 > 8:
+            continue
+        # 5天内必须有过MA5<=MA20（刚刚突破，不是突破很久了）
+        if not ma5_recently_crossed:
+            continue
+
         future = get_future_prices(row.ts_code, last_trade, d0_close)
         records.append({
             "ts_code": row.ts_code,
@@ -432,6 +468,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             "winner_rate": win_rate,
             "macd": ind["macd_val"],
             "net_mf": row.net_mf,
+            "ma5_vs_ma20": round(ma5_vs_ma20, 2),
             "Return_D1 (%)": future.get("Return_D1", np.nan),
             "Return_D3 (%)": future.get("Return_D3", np.nan),
             "Return_D5 (%)": future.get("Return_D5", np.nan),
@@ -444,7 +481,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
     fdf = pd.DataFrame(records)
 
-    # 完全沿用Gemini评分逻辑，一行不改
+    # Gemini原版评分，完全保留
     def dynamic_score(r):
         base_score = r["macd"] * 1000 + (r["net_mf"] / 10000)
         if r["winner_rate"] > 90:
@@ -467,17 +504,17 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # 侧边栏
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.11 板块惯性版")
+    st.header("V30.12.12 鱼身启动版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1, 2")
+    BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-90天")
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="前四名都有机会")
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("开启断点续传", value=True)
     if st.button("清除行情缓存"):
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
-            st.success("缓存已清除")
-    CHECKPOINT_FILE = "backtest_checkpoint_v11.csv"
+        st.success("缓存已清除")
+    CHECKPOINT_FILE = "backtest_checkpoint_v12.csv"
     st.markdown("---")
     st.subheader("基础过滤")
     col1, col2 = st.columns(2)
@@ -487,11 +524,11 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("核心风控参数")
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0)
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0)
-    RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0)
+    MAX_PREV_PCT = st.number_input("最大涨幅限制 (%)", value=19.0)
+    RSI_LIMIT = st.number_input("RSI 拦截线", value=100.0)
     st.markdown("---")
     st.subheader("形态参数")
-    SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.5, help="仅用于显示，实际用前三名")
+    SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.5)
     MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=5.0)
     MIN_BODY_POS = st.number_input("实体位置", value=0.6)
     MAX_TURNOVER_RATE = st.number_input("换手率 (%)", value=20.0)
@@ -508,7 +545,7 @@ pro = ts.pro_api()
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button("启动 V30.12.11"):
+if st.button("启动 V30.12.12"):
     processed_dates = set()
     results = []
 
@@ -569,7 +606,7 @@ if st.button("启动 V30.12.11"):
         all_res["Trade_Date"] = all_res["Trade_Date"].astype(str)
         all_res = all_res.sort_values(["Trade_Date", "Rank"], ascending=[False, True])
 
-        st.header(f"V30.12.11 统计仪表盘 (Top {TOP_BACKTEST})")
+        st.header(f"V30.12.12 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f"Return_D{n} (%)"
@@ -599,12 +636,12 @@ if st.button("启动 V30.12.11"):
 
         st.subheader("回测明细")
         show_cols = ["Rank", "Trade_Date", "name", "ts_code", "Close", "Pct_Chg",
-                     "Return_D1 (%)", "Return_D3 (%)", "Return_D5 (%)",
+                     "ma5_vs_ma20", "Return_D1 (%)", "Return_D3 (%)", "Return_D5 (%)",
                      "rsi", "winner_rate", "Sector_Boost"]
         final_cols = [c for c in show_cols if c in all_res.columns]
         st.dataframe(all_res[final_cols], use_container_width=True)
 
         csv = all_res.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("下载结果 CSV", csv, f"export_v11.csv", "text/csv")
+        st.download_button("下载结果 CSV", csv, f"export_v12.csv", "text/csv")
     else:
         st.warning("没有结果，请检查Token或放宽参数")
