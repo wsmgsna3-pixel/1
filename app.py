@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-智选股 V2.0 - 鱼身策略
-收盘后运行，次日高开+冲高1.5%触发买入，止损5%
-新增：资金流向+筹码分析+换手率+板块热度+评分优化
+智选股 V3.0 - 板块惯性+主力试盘策略
+核心逻辑：强势板块前五+20天内涨停+技术过滤
 """
 
 import streamlit as st
@@ -19,8 +18,8 @@ import concurrent.futures
 warnings.filterwarnings("ignore")
 
 pro = None
-CHECKPOINT_FILE = "bt_checkpoint.csv"
-CACHE_FILE = "market_cache_v2.pkl"
+CHECKPOINT_FILE = "bt_checkpoint_v3.csv"
+CACHE_FILE = "market_cache_v3.pkl"
 
 CACHE_DAILY = pd.DataFrame()
 CACHE_ADJ = pd.DataFrame()
@@ -28,12 +27,11 @@ CACHE_BASIC = pd.DataFrame()
 CACHE_MONEYFLOW = pd.DataFrame()
 CACHE_CHIP = pd.DataFrame()
 
-st.set_page_config(page_title="智选股 V2.0", layout="wide")
-st.title("智选股 V2.0 - 鱼身策略")
-st.caption("收盘后运行，次日高开+冲高1.5%触发买入，止损5%")
+st.set_page_config(page_title="智选股 V3.0", layout="wide")
+st.title("智选股 V3.0 - 板块惯性+主力试盘")
+st.caption("强势板块前五+20天内涨停+次日高开冲高1.5%触发买入")
 
-@st.cache_data(ttl=3600*12)
-def safe_api(func_name, **kwargs):
+def safe_api_nocache(func_name, **kwargs):
     global pro
     if pro is None:
         return pd.DataFrame()
@@ -48,7 +46,8 @@ def safe_api(func_name, **kwargs):
             time.sleep(1)
     return pd.DataFrame()
 
-def safe_api_nocache(func_name, **kwargs):
+@st.cache_data(ttl=3600*12)
+def safe_api(func_name, **kwargs):
     global pro
     if pro is None:
         return pd.DataFrame()
@@ -95,6 +94,28 @@ def load_industry_map():
     except:
         return {}
 
+@st.cache_data(ttl=3600*12)
+def get_top_sectors(trade_date, top_n=5):
+    global pro
+    try:
+        sw = pro.index_classify(level="L1", src="SW2021")
+        if sw.empty:
+            return set()
+        records = []
+        for code in sw["index_code"].tolist():
+            idf = safe_api("sw_daily", index_code=code,
+                           start_date=trade_date, end_date=trade_date)
+            if idf.empty or "pct_chg" not in idf.columns:
+                continue
+            records.append({"index_code": code,
+                             "pct_chg": float(idf.iloc[0]["pct_chg"])})
+        if not records:
+            return set()
+        sdf = pd.DataFrame(records).sort_values("pct_chg", ascending=False)
+        return set(sdf.head(top_n)["index_code"].tolist())
+    except:
+        return set()
+
 def load_market_cache(trade_days_list):
     global CACHE_DAILY, CACHE_ADJ, CACHE_BASIC, CACHE_MONEYFLOW, CACHE_CHIP
 
@@ -108,7 +129,7 @@ def load_market_cache(trade_days_list):
             CACHE_BASIC = cached.get("basic", pd.DataFrame())
             CACHE_MONEYFLOW = cached.get("moneyflow", pd.DataFrame())
             CACHE_CHIP = cached.get("chip", pd.DataFrame())
-            st.info("缓存加载成功！包含行情+资金流+筹码数据")
+            st.info("缓存加载成功！")
             return True
         except:
             os.remove(CACHE_FILE)
@@ -124,13 +145,7 @@ def load_market_cache(trade_days_list):
     all_dates = cal["cal_date"].tolist()
 
     st.info(f"首次运行，下载 {start} 至 {end} 全量数据，请耐心等待...")
-
-    daily_list = []
-    adj_list = []
-    basic_list = []
-    mf_list = []
-    chip_list = []
-
+    daily_list, adj_list, basic_list, mf_list, chip_list = [], [], [], [], []
     bar = st.progress(0, text="下载行情数据...")
     total = len(all_dates)
 
@@ -138,19 +153,12 @@ def load_market_cache(trade_days_list):
         d = safe_api_nocache("daily", trade_date=date)
         a = safe_api_nocache("adj_factor", trade_date=date)
         b = safe_api_nocache("daily_basic", trade_date=date,
-                             fields="ts_code,trade_date,turnover_rate,circ_mv,pe,pb,volume_ratio")
+                             fields="ts_code,trade_date,turnover_rate,circ_mv,volume_ratio")
         mf = safe_api_nocache("moneyflow", trade_date=date)
         chip = safe_api_nocache("cyq_perf", trade_date=date)
-        if not d.empty and "trade_date" not in d.columns:
-            d["trade_date"] = date
-        if not a.empty and "trade_date" not in a.columns:
-            a["trade_date"] = date
-        if not b.empty and "trade_date" not in b.columns:
-            b["trade_date"] = date
-        if not mf.empty and "trade_date" not in mf.columns:
-            mf["trade_date"] = date
-        if not chip.empty and "trade_date" not in chip.columns:
-            chip["trade_date"] = date
+        for df_item in [d, a, b, mf, chip]:
+            if not df_item.empty and "trade_date" not in df_item.columns:
+                df_item["trade_date"] = date
         return d, a, b, mf, chip
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -158,16 +166,11 @@ def load_market_cache(trade_days_list):
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             try:
                 d, a, b, mf, chip = future.result()
-                if not d.empty:
-                    daily_list.append(d)
-                if not a.empty:
-                    adj_list.append(a)
-                if not b.empty:
-                    basic_list.append(b)
-                if not mf.empty:
-                    mf_list.append(mf)
-                if not chip.empty:
-                    chip_list.append(chip)
+                if not d.empty: daily_list.append(d)
+                if not a.empty: adj_list.append(a)
+                if not b.empty: basic_list.append(b)
+                if not mf.empty: mf_list.append(mf)
+                if not chip.empty: chip_list.append(chip)
             except:
                 pass
             if i % 5 == 0 or i == total - 1:
@@ -181,64 +184,39 @@ def load_market_cache(trade_days_list):
     with st.spinner("整理数据并保存缓存..."):
         CACHE_DAILY = pd.concat(daily_list).drop_duplicates(subset=["ts_code","trade_date"])
         CACHE_DAILY = CACHE_DAILY.set_index(["ts_code","trade_date"]).sort_index()
-
         CACHE_ADJ = pd.concat(adj_list).drop_duplicates(subset=["ts_code","trade_date"])
         CACHE_ADJ = CACHE_ADJ.set_index(["ts_code","trade_date"]).sort_index()
-
-        if basic_list:
-            tmp = pd.concat(basic_list)
-            if "trade_date" not in tmp.columns:
-                tmp["trade_date"] = None
-            CACHE_BASIC = tmp.drop_duplicates(subset=["ts_code","trade_date"])
-            CACHE_BASIC = CACHE_BASIC.set_index(["ts_code","trade_date"]).sort_index()
-
-        if mf_list:
-            tmp = pd.concat(mf_list)
-            if "trade_date" not in tmp.columns:
-                tmp["trade_date"] = None
-            CACHE_MONEYFLOW = tmp.drop_duplicates(subset=["ts_code","trade_date"])
-            CACHE_MONEYFLOW = CACHE_MONEYFLOW.set_index(["ts_code","trade_date"]).sort_index()
-
-        if chip_list:
-            tmp = pd.concat(chip_list)
-            if "trade_date" not in tmp.columns:
-                tmp["trade_date"] = None
-            CACHE_CHIP = tmp.drop_duplicates(subset=["ts_code","trade_date"])
-            CACHE_CHIP = CACHE_CHIP.set_index(["ts_code","trade_date"]).sort_index()
-
+        for lst, name in [(basic_list,"basic"),(mf_list,"moneyflow"),(chip_list,"chip")]:
+            if lst:
+                tmp = pd.concat(lst)
+                if "trade_date" not in tmp.columns:
+                    tmp["trade_date"] = None
+                tmp = tmp.drop_duplicates(subset=["ts_code","trade_date"])
+                tmp = tmp.set_index(["ts_code","trade_date"]).sort_index()
+                if name == "basic": CACHE_BASIC = tmp
+                elif name == "moneyflow": CACHE_MONEYFLOW = tmp
+                elif name == "chip": CACHE_CHIP = tmp
         try:
             with open(CACHE_FILE, "wb") as f:
-                pickle.dump({
-                    "daily": CACHE_DAILY,
-                    "adj": CACHE_ADJ,
-                    "basic": CACHE_BASIC,
-                    "moneyflow": CACHE_MONEYFLOW,
-                    "chip": CACHE_CHIP,
-                }, f)
+                pickle.dump({"daily": CACHE_DAILY, "adj": CACHE_ADJ,
+                             "basic": CACHE_BASIC, "moneyflow": CACHE_MONEYFLOW,
+                             "chip": CACHE_CHIP}, f)
             st.success("全量数据已缓存，下次启动将秒开！")
         except Exception as e:
             st.warning(f"缓存写入失败: {e}")
     return True
 
 def get_day_data(trade_date):
-    global CACHE_DAILY, CACHE_ADJ, CACHE_BASIC, CACHE_MONEYFLOW, CACHE_CHIP
-    try:
-        daily = CACHE_DAILY.xs(trade_date, level="trade_date").reset_index()
-    except:
-        daily = pd.DataFrame()
-    try:
-        basic = CACHE_BASIC.xs(trade_date, level="trade_date").reset_index()
-    except:
-        basic = pd.DataFrame()
-    try:
-        mf = CACHE_MONEYFLOW.xs(trade_date, level="trade_date").reset_index()
-    except:
-        mf = pd.DataFrame()
-    try:
-        chip = CACHE_CHIP.xs(trade_date, level="trade_date").reset_index()
-    except:
-        chip = pd.DataFrame()
-    return daily, basic, mf, chip
+    global CACHE_DAILY, CACHE_BASIC, CACHE_MONEYFLOW, CACHE_CHIP
+    def xs_safe(cache, date):
+        try:
+            return cache.xs(date, level="trade_date").reset_index()
+        except:
+            return pd.DataFrame()
+    return (xs_safe(CACHE_DAILY, trade_date),
+            xs_safe(CACHE_BASIC, trade_date),
+            xs_safe(CACHE_MONEYFLOW, trade_date),
+            xs_safe(CACHE_CHIP, trade_date))
 
 def get_stock_history_fast(ts_code, end_date, lookback=90):
     global CACHE_DAILY, CACHE_ADJ
@@ -251,7 +229,7 @@ def get_stock_history_fast(ts_code, end_date, lookback=90):
         daily = daily.sort_values("trade_date").reset_index(drop=True)
     except:
         return pd.DataFrame()
-    if daily.empty or len(daily) < 30:
+    if daily.empty or len(daily) < 20:
         return pd.DataFrame()
     try:
         adj = CACHE_ADJ.loc[ts_code]["adj_factor"].copy()
@@ -273,12 +251,12 @@ def get_stock_history_fast(ts_code, end_date, lookback=90):
 def get_stock_history_live(ts_code, end_date, lookback=90):
     start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=lookback*2)).strftime("%Y%m%d")
     daily = safe_api("daily", ts_code=ts_code, start_date=start, end_date=end_date)
-    if daily is None or daily.empty or len(daily) < 30:
+    if daily is None or daily.empty or len(daily) < 20:
         return pd.DataFrame()
     adj = safe_api("adj_factor", ts_code=ts_code, start_date=start, end_date=end_date)
     daily = daily.sort_values("trade_date").reset_index(drop=True)
     if not adj.empty:
-        daily = daily.merge(adj[["trade_date", "adj_factor"]], on="trade_date", how="left")
+        daily = daily.merge(adj[["trade_date","adj_factor"]], on="trade_date", how="left")
         daily["adj_factor"] = daily["adj_factor"].ffill().fillna(1.0)
         latest_adj = daily["adj_factor"].iloc[-1]
         for col in ["open", "high", "low", "close"]:
@@ -286,8 +264,25 @@ def get_stock_history_live(ts_code, end_date, lookback=90):
     daily["ts_code"] = ts_code
     return daily
 
+def check_limit_up_20d(hist, trade_date, ts_code):
+    if hist.empty:
+        return False
+    today = hist[hist["trade_date"] == trade_date]
+    if today.empty:
+        return False
+    idx = today.index[0]
+    start_idx = max(0, idx - 19)
+    recent = hist.iloc[start_idx:idx]
+    if recent.empty:
+        return False
+    is_kechuang = ts_code.startswith("688") or ts_code.startswith("300")
+    threshold = 9.5 if not is_kechuang else 19.5
+    if "pct_chg" in recent.columns:
+        return bool((recent["pct_chg"] >= threshold).any())
+    return False
+
 def calc_indicators(hist, trade_date, extra=None):
-    if hist.empty or len(hist) < 30:
+    if hist.empty or len(hist) < 20:
         return None
     close = hist["close"]
     today = hist[hist["trade_date"] == trade_date]
@@ -325,126 +320,104 @@ def calc_indicators(hist, trade_date, extra=None):
     vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
     consec_limit = False
     if idx >= 1 and "pct_chg" in hist.columns:
-        prev_pct = float(hist.iloc[idx-1]["pct_chg"])
-        if pct_1d >= 9.5 and prev_pct >= 9.5:
+        if pct_1d >= 9.5 and float(hist.iloc[idx-1]["pct_chg"]) >= 9.5:
             consec_limit = True
     winner_rate = 60
     net_mf = 0
     turnover_rate = 5
-    volume_ratio = 1
     if extra is not None:
         winner_rate = float(extra.get("winner_rate", 60))
         net_mf_val = extra.get("net_mf_amount", 0)
         net_mf = float(net_mf_val) if pd.notna(net_mf_val) else 0
         tr = extra.get("turnover_rate", 5)
         turnover_rate = float(tr) if pd.notna(tr) else 5
-        vr = extra.get("volume_ratio", 1)
-        volume_ratio = float(vr) if pd.notna(vr) else 1
     return {
         "close": c, "high": h, "low": l,
         "ma20": ma20, "ma60": ma60, "ma20_prev": ma20_prev,
         "macd_bar": macd_bar, "rsi": rsi,
         "upper_shadow": upper_shadow, "body_pos": body_pos,
         "pct_1d": pct_1d, "pct_5d": pct_5d, "pct_20d": pct_20d,
-        "from_bottom": from_bottom,
-        "vol_ratio": vol_ratio,
-        "consec_limit": consec_limit,
-        "winner_rate": winner_rate,
-        "net_mf": net_mf,
-        "turnover_rate": turnover_rate,
-        "volume_ratio": volume_ratio,
+        "from_bottom": from_bottom, "vol_ratio": vol_ratio,
+        "consec_limit": consec_limit, "winner_rate": winner_rate,
+        "net_mf": net_mf, "turnover_rate": turnover_rate,
     }
 
-def calc_score(ind, sector_score, market_strong):
+def calc_score(ind, market_strong):
     detail = {}
     tech = 0
     if ind["close"] > ind["ma20"] and ind["ma20"] > ind["ma20_prev"]:
-        tech += 8
+        tech += 10
     if ind["close"] > ind["ma60"]:
         tech += 5
     if ind["macd_bar"] > 0:
         tech += 7
     rsi = ind["rsi"]
-    if 50 <= rsi <= 65:
-        tech += 5
-    elif 65 < rsi <= 75:
-        tech += 3
-    elif rsi > 75:
+    if 50 <= rsi <= 70:
+        tech += 8
+    elif 70 < rsi <= 80:
+        tech += 4
+    elif rsi > 80:
         tech += 1
-    detail["tech"] = min(tech, 25)
+    detail["tech"] = min(tech, 30)
     timing = 0
     dev = (ind["close"] - ind["ma20"]) / ind["ma20"] * 100
-    if dev <= 2:
-        timing += 12
-    elif dev <= 5:
-        timing += 8
-    elif dev <= 10:
-        timing += 4
-    p5 = ind["pct_5d"]
-    if 2 <= p5 <= 8:
-        timing += 8
-    elif p5 < 2:
+    if dev <= 3:
+        timing += 15
+    elif dev <= 7:
+        timing += 10
+    elif dev <= 12:
         timing += 5
-    elif p5 <= 15:
-        timing += 2
-    detail["timing"] = min(timing, 20)
+    p5 = ind["pct_5d"]
+    if 2 <= p5 <= 10:
+        timing += 10
+    elif p5 < 2:
+        timing += 6
+    elif p5 <= 18:
+        timing += 3
+    detail["timing"] = min(timing, 25)
     vr = ind["vol_ratio"]
-    tr = ind["turnover_rate"]
-    vol = 0
-    if 1.2 <= vr <= 2.5:
-        vol += 10
-    elif 1.0 <= vr < 1.2:
-        vol += 6
-    elif 2.5 < vr <= 3.5:
-        vol += 5
+    if 1.3 <= vr <= 3.0:
+        vol = 15
+    elif 1.0 <= vr < 1.3:
+        vol = 8
+    elif 3.0 < vr <= 4.0:
+        vol = 6
     else:
-        vol += 2
-    if 3 <= tr <= 10:
-        vol += 5
-    elif tr <= 15:
-        vol += 2
+        vol = 2
     detail["vol"] = min(vol, 15)
-    fb = ind["from_bottom"]
-    if fb <= 20:
-        fish = 15
-    elif fb <= 40:
-        fish = 10
-    elif fb <= 70:
-        fish = 5
-    else:
-        fish = 0
-    detail["fish"] = fish
-    chip_mf = 0
     wr = ind["winner_rate"]
-    if 55 <= wr <= 75:
-        chip_mf += 8
-    elif 75 < wr <= 85:
-        chip_mf += 5
-    elif wr < 55:
-        chip_mf += 2
     net_mf = ind["net_mf"]
-    if net_mf > 10000:
+    chip_mf = 0
+    if 50 <= wr <= 72:
+        chip_mf += 10
+    elif 72 < wr <= 85:
+        chip_mf += 6
+    elif wr < 50:
+        chip_mf += 3
+    if net_mf > 5000:
+        chip_mf += 10
+    elif net_mf > 1000:
         chip_mf += 7
     elif net_mf > 0:
         chip_mf += 4
-    elif net_mf > -5000:
+    elif net_mf > -2000:
         chip_mf += 1
-    detail["chip_mf"] = min(chip_mf, 15)
-    detail["sector"] = min(sector_score, 10)
-    detail["market"] = 10 if market_strong else 3
-    return sum(detail.values()), detail
+    detail["chip_mf"] = min(chip_mf, 20)
+    detail["market"] = 10 if market_strong else 4
+    total = sum(detail.values())
+    return total, detail
 
 def risk_tag(ind):
     score = 0
-    if ind["from_bottom"] > 80:
-        score += 2
-    if ind["from_bottom"] > 120:
+    if ind["from_bottom"] > 60:
+        score += 1
+    if ind["from_bottom"] > 100:
         score += 2
     if ind["consec_limit"]:
         score += 3
-    if ind["pct_5d"] > 15:
+    if ind["pct_5d"] > 18:
         score += 1
-    if ind["rsi"] > 78:
+    if ind["rsi"] > 80:
         score += 1
     if ind["winner_rate"] > 85:
         score += 1
@@ -464,48 +437,30 @@ def get_market_strong(trade_date):
         return False
     df = df.sort_values("trade_date")
     return float(df.iloc[-1]["close"]) > df["close"].tail(20).mean()
-
-@st.cache_data(ttl=3600*12)
-def get_sector_scores(trade_date):
-    global pro
-    start = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d")
-    scores = {}
-    try:
-        sw = pro.index_classify(level="L1", src="SW2021")
-        for code in sw["index_code"].tolist():
-            idf = safe_api("sw_daily", index_code=code, start_date=start, end_date=trade_date)
-            if idf.empty or len(idf) < 3:
-                continue
-            idf = idf.sort_values("trade_date")
-            ret_1d = float(idf.iloc[-1]["pct_chg"]) if "pct_chg" in idf.columns else 0
-            ret_5d = (float(idf.iloc[-1]["close"]) / float(idf.iloc[0]["close"]) - 1) * 100
-            s = 0
-            if ret_1d >= 1.5:
-                s += 5
-            elif ret_1d >= 0.5:
-                s += 3
-            if ret_5d >= 3:
-                s += 5
-            elif ret_5d >= 1:
-                s += 3
-            scores[code] = min(s, 10)
-    except:
-        pass
-    return scores
 def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
-               max_turnover, for_backtest=False):
+               max_turnover, top_sectors_n, for_backtest=False):
     global pro
     market_strong = get_market_strong(trade_date)
-    sector_scores = get_sector_scores(trade_date)
     industry_map = load_industry_map()
     basics = load_stock_basic()
+
+    # 获取昨日强势板块
+    cal = safe_api("trade_cal",
+                   start_date=(datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d"),
+                   end_date=trade_date)
+    if not cal.empty:
+        prev_dates = cal[cal["is_open"]==1].sort_values("cal_date")["cal_date"].tolist()
+        prev_date = prev_dates[-2] if len(prev_dates) >= 2 else trade_date
+    else:
+        prev_date = trade_date
+    top_sector_codes = get_top_sectors(prev_date, top_n=top_sectors_n)
 
     if for_backtest:
         daily, basic, mf, chip = get_day_data(trade_date)
     else:
         daily = safe_api_nocache("daily", trade_date=trade_date)
         basic = safe_api_nocache("daily_basic", trade_date=trade_date,
-                                 fields="ts_code,trade_date,turnover_rate,circ_mv,pe,pb,volume_ratio")
+                                 fields="ts_code,trade_date,turnover_rate,circ_mv,volume_ratio")
         mf = safe_api_nocache("moneyflow", trade_date=trade_date)
         chip = safe_api_nocache("cyq_perf", trade_date=trade_date)
 
@@ -514,8 +469,8 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
 
     df = daily.copy()
     if not basic.empty:
-        basic_merge = basic[["ts_code","turnover_rate","circ_mv","volume_ratio"]].copy()
-        df = df.merge(basic_merge, on="ts_code", how="left")
+        bcols = [c for c in ["ts_code","turnover_rate","circ_mv","volume_ratio"] if c in basic.columns]
+        df = df.merge(basic[bcols], on="ts_code", how="left")
     else:
         df["circ_mv"] = 0
         df["turnover_rate"] = 5
@@ -534,8 +489,8 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     df["circ_mv_b"] = pd.to_numeric(df["circ_mv"], errors="coerce").fillna(0) / 10000
     df["net_mf_amount"] = pd.to_numeric(df["net_mf_amount"], errors="coerce").fillna(0)
     df["turnover_rate"] = pd.to_numeric(df["turnover_rate"], errors="coerce").fillna(5)
-    df["volume_ratio"] = pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(1)
 
+    # 基础过滤
     df = df[df["close"] >= min_price]
     df = df[df["circ_mv_b"] >= min_mv]
     df = df[df["circ_mv_b"] <= max_mv]
@@ -543,7 +498,17 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
 
     df["winner_rate"] = df["ts_code"].map(chip_dict).fillna(60)
     df = df[(df["winner_rate"] >= 45) & (df["winner_rate"] <= 88)]
-    df = df.sort_values("pct_chg", ascending=False).head(200)
+
+    # 板块过滤：只保留昨日强势板块前N名的股票
+    if top_sector_codes:
+        df["ind_code"] = df["ts_code"].map(industry_map)
+        df = df[df["ind_code"].isin(top_sector_codes)]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # 取涨幅前300
+    df = df.sort_values("pct_chg", ascending=False).head(300)
 
     records = []
     for row in df.itertuples():
@@ -552,6 +517,11 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
         else:
             hist = get_stock_history_live(row.ts_code, trade_date, lookback=90)
         if hist.empty:
+            continue
+
+        # 核心新条件：20天内有涨停
+        has_limit = check_limit_up_20d(hist, trade_date, row.ts_code)
+        if not has_limit:
             continue
 
         extra = {
@@ -568,20 +538,16 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
             continue
         if ind["ma20"] <= ind["ma20_prev"]:
             continue
-        if ind["upper_shadow"] > 5:
+        if ind["upper_shadow"] > 6:
             continue
-        if ind["body_pos"] < 0.6:
+        if ind["body_pos"] < 0.5:
             continue
         if ind["consec_limit"]:
             continue
-        if ind["pct_20d"] > 30:
-            continue
-        if ind["pct_5d"] > 20:
+        if ind["pct_20d"] > 35:
             continue
 
-        ind_code = industry_map.get(row.ts_code, "")
-        s_score = sector_scores.get(ind_code, 3)
-        score, detail = calc_score(ind, s_score, market_strong)
+        score, detail = calc_score(ind, market_strong)
         tag = risk_tag(ind)
 
         rec = {
@@ -591,9 +557,9 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
             "pct_1d": ind["pct_1d"],
             "pct_5d": ind["pct_5d"],
             "pct_20d": ind["pct_20d"],
-            "from_bottom": ind["from_bottom"],
+            "from_bottom": round(ind["from_bottom"], 1),
             "rsi": round(ind["rsi"], 1),
-            "winner_rate": ind["winner_rate"],
+            "winner_rate": round(ind["winner_rate"], 1),
             "net_mf": round(ind["net_mf"] / 10000, 1),
             "turnover_rate": round(ind["turnover_rate"], 1),
             "vol_ratio": round(ind["vol_ratio"], 2),
@@ -603,9 +569,7 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
             "tech": detail["tech"],
             "timing": detail["timing"],
             "vol_score": detail["vol"],
-            "fish": detail["fish"],
             "chip_mf": detail["chip_mf"],
-            "sector": detail["sector"],
             "mkt_score": detail["market"],
             "buy_low": round(ind["close"], 2),
             "buy_high": round(ind["close"] * 1.02, 2),
@@ -646,14 +610,18 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     result.insert(0, "rank", range(1, len(result)+1))
     return result
 
+# ---------------------------
+# 侧边栏
+# ---------------------------
 with st.sidebar:
-    st.header("参数设置")
+    st.header("V3.0 参数设置")
     token = st.text_input("Tushare Token", type="password")
     st.subheader("股票池过滤")
     min_price = st.number_input("最低股价(元)", value=10.0, min_value=1.0, step=1.0)
-    min_mv = st.number_input("最小流通市值(亿)", value=50.0, min_value=10.0, step=10.0)
-    max_mv = st.number_input("最大流通市值(亿)", value=1000.0, min_value=100.0, step=100.0)
-    max_turnover = st.number_input("最大换手率(%)", value=15.0, min_value=1.0, step=1.0)
+    min_mv = st.number_input("最小流通市值(亿)", value=30.0, min_value=10.0, step=10.0)
+    max_mv = st.number_input("最大流通市值(亿)", value=500.0, min_value=50.0, step=50.0)
+    max_turnover = st.number_input("最大换手率(%)", value=20.0, min_value=1.0, step=1.0)
+    top_sectors_n = st.slider("强势板块前N名", 3, 10, 5)
     st.subheader("实盘选股")
     top_n = st.slider("输出Top N候选股", 3, 10, 5)
     st.subheader("回测设置")
@@ -667,26 +635,32 @@ with st.sidebar:
                 os.remove(f)
         st.success("缓存已清除")
 
+# ---------------------------
+# Token初始化
+# ---------------------------
 if not token:
     st.info("请在左侧输入 Tushare Token 后开始使用")
     st.stop()
 ts.set_token(token)
 pro = ts.pro_api()
 
+# ---------------------------
+# 主界面
+# ---------------------------
 tab1, tab2 = st.tabs(["实盘选股", "历史回测"])
 
 with tab1:
     st.subheader("实盘选股 - 今日候选")
-    st.caption("收盘后运行，第二天9:25判断高开，9:30后冲高1.5%触发买入")
+    st.caption("强势板块+20天内涨停+次日高开冲高1.5%触发买入")
     screen_date = st.date_input("选股日期", value=datetime.now().date())
     if st.button("开始选股"):
         date_str = screen_date.strftime("%Y%m%d")
-        with st.spinner("正在分析全市场数据，请稍候..."):
+        with st.spinner("正在分析..."):
             result = run_screen(date_str, top_n, min_price, min_mv, max_mv,
-                                max_turnover, for_backtest=False)
+                                max_turnover, top_sectors_n, for_backtest=False)
             market_state = get_market_strong(date_str)
         if result.empty:
-            st.warning("今日未找到符合条件的股票，可适当放宽参数")
+            st.warning("今日未找到符合条件的股票，可放宽板块数量或换手率参数")
         else:
             ms = "强势（沪深300站上MA20）" if market_state else "弱势（沪深300跌破MA20）"
             st.success(f"筛选完成，共推荐 {len(result)} 只候选股")
@@ -708,10 +682,10 @@ with tab1:
                     cc2.metric("止损价(-5%)", row["stop_loss"])
                     cc3.metric("目标价(+8%)", row["target"])
                     cc4.metric("大盘环境", row["market"])
-                    dims   = ["tech","timing","vol_score","fish","chip_mf","sector","mkt_score"]
-                    labels = ["技术/25","时机/20","量能/15","鱼身/15","资金筹码/15","板块/10","大盘/10"]
-                    maxes  = [25,20,15,15,15,10,10]
-                    dcols  = st.columns(7)
+                    dims   = ["tech","timing","vol_score","chip_mf","mkt_score"]
+                    labels = ["技术/30","时机/25","量能/15","资金筹码/20","大盘/10"]
+                    maxes  = [30,25,15,20,10]
+                    dcols  = st.columns(5)
                     for i,(d,lb,mx) in enumerate(zip(dims,labels,maxes)):
                         dcols[i].metric(lb, f"{row[d]}/{mx}")
             show_df = result[["rank","name","ts_code","close","pct_1d","pct_5d",
@@ -727,7 +701,7 @@ with tab1:
 
 with tab2:
     st.subheader("历史回测 - 策略验证")
-    st.caption("模拟：次日高开+盘中冲高1.5%触发买入，持有N天后收盘价卖出")
+    st.caption("强势板块+20天内涨停+次日高开冲高1.5%触发买入")
     if st.button("启动回测"):
         end_str = bt_end.strftime("%Y%m%d")
         cal = safe_api_nocache("trade_cal",
@@ -739,16 +713,22 @@ with tab2:
         dates = cal[cal["is_open"]==1].sort_values("cal_date")["cal_date"].tail(int(bt_days)).tolist()
         if not load_market_cache(dates):
             st.stop()
+
+        # 修复重复数据：读取已有记录时去重
         processed = set()
         results = []
         if resume and os.path.exists(CHECKPOINT_FILE):
             try:
                 ex = pd.read_csv(CHECKPOINT_FILE)
-                processed = set(ex["trade_date"].astype(str).unique())
+                ex = ex.drop_duplicates(subset=["trade_date","ts_code"])
+                ex["trade_date"] = ex["trade_date"].astype(str)
+                processed = set(ex["trade_date"].unique())
                 results.append(ex)
                 st.success(f"读取断点存档，已跳过 {len(processed)} 个交易日")
             except:
-                pass
+                if os.path.exists(CHECKPOINT_FILE):
+                    os.remove(CHECKPOINT_FILE)
+
         dates_to_run = [d for d in dates if d not in processed]
         if not dates_to_run:
             st.success("所有日期已计算完毕！")
@@ -758,22 +738,30 @@ with tab2:
             for i, date in enumerate(dates_to_run):
                 try:
                     res = run_screen(date, int(bt_top_n), min_price, min_mv, max_mv,
-                                     max_turnover, for_backtest=True)
+                                     max_turnover, top_sectors_n, for_backtest=True)
                     if not res.empty:
                         res["trade_date"] = date
-                        first = not os.path.exists(CHECKPOINT_FILE)
-                        res.to_csv(CHECKPOINT_FILE, mode="a", index=False,
-                                   header=first, encoding="utf-8-sig")
+                        # 写入前先检查是否已存在该日期，避免重复
+                        if os.path.exists(CHECKPOINT_FILE):
+                            existing = pd.read_csv(CHECKPOINT_FILE)
+                            existing["trade_date"] = existing["trade_date"].astype(str)
+                            if date not in existing["trade_date"].values:
+                                res.to_csv(CHECKPOINT_FILE, mode="a", index=False,
+                                           header=False, encoding="utf-8-sig")
+                        else:
+                            res.to_csv(CHECKPOINT_FILE, mode="w", index=False,
+                                       header=True, encoding="utf-8-sig")
                         results.append(res)
                 except Exception as e:
                     err_ph.warning(f"{date} 处理异常: {e}")
                 bar.progress((i+1)/len(dates_to_run),
                              text=f"回测中: {date} ({i+1}/{len(dates_to_run)})")
             bar.empty()
+
         if results:
-            final = pd.concat(results).reset_index(drop=True)
+            final = pd.concat(results).drop_duplicates(subset=["trade_date","ts_code"]).reset_index(drop=True)
             final = final.sort_values(["trade_date","rank"], ascending=[False,True])
-            st.header("回测统计报告 V2.0")
+            st.header("回测统计报告 V3.0")
             col1, col2 = st.columns(2)
             col1.metric("总选股记录", f"{len(final)} 条")
             col1.metric("涉及交易日", f"{final['trade_date'].nunique()} 天")
