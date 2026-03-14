@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-智选股 V3.0 - 板块惯性+主力试盘策略
-核心逻辑：强势板块前五+20天内涨停+技术过滤
+智选股 V3.1 - 板块惯性+主力试盘+评分优选
+核心：强势板块前五+20天内涨停+评分排序（不依赖当日涨幅）
 """
 
 import streamlit as st
@@ -18,8 +18,8 @@ import concurrent.futures
 warnings.filterwarnings("ignore")
 
 pro = None
-CHECKPOINT_FILE = "bt_checkpoint_v3.csv"
-CACHE_FILE = "market_cache_v3.pkl"
+CHECKPOINT_FILE = "bt_checkpoint_v31.csv"
+CACHE_FILE = "market_cache_v31.pkl"
 
 CACHE_DAILY = pd.DataFrame()
 CACHE_ADJ = pd.DataFrame()
@@ -27,9 +27,9 @@ CACHE_BASIC = pd.DataFrame()
 CACHE_MONEYFLOW = pd.DataFrame()
 CACHE_CHIP = pd.DataFrame()
 
-st.set_page_config(page_title="智选股 V3.0", layout="wide")
-st.title("智选股 V3.0 - 板块惯性+主力试盘")
-st.caption("强势板块前五+20天内涨停+次日高开冲高1.5%触发买入")
+st.set_page_config(page_title="智选股 V3.1", layout="wide")
+st.title("智选股 V3.1 - 板块惯性+主力试盘")
+st.caption("强势板块前五+20天内涨停+评分优选，次日高开冲高1.5%触发买入")
 
 def safe_api_nocache(func_name, **kwargs):
     global pro
@@ -156,9 +156,9 @@ def load_market_cache(trade_days_list):
                              fields="ts_code,trade_date,turnover_rate,circ_mv,volume_ratio")
         mf = safe_api_nocache("moneyflow", trade_date=date)
         chip = safe_api_nocache("cyq_perf", trade_date=date)
-        for df_item in [d, a, b, mf, chip]:
-            if not df_item.empty and "trade_date" not in df_item.columns:
-                df_item["trade_date"] = date
+        for item in [d, a, b, mf, chip]:
+            if not item.empty and "trade_date" not in item.columns:
+                item["trade_date"] = date
         return d, a, b, mf, chip
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -186,16 +186,18 @@ def load_market_cache(trade_days_list):
         CACHE_DAILY = CACHE_DAILY.set_index(["ts_code","trade_date"]).sort_index()
         CACHE_ADJ = pd.concat(adj_list).drop_duplicates(subset=["ts_code","trade_date"])
         CACHE_ADJ = CACHE_ADJ.set_index(["ts_code","trade_date"]).sort_index()
-        for lst, name in [(basic_list,"basic"),(mf_list,"moneyflow"),(chip_list,"chip")]:
+        for lst, attr in [(basic_list,"CACHE_BASIC"),
+                          (mf_list,"CACHE_MONEYFLOW"),
+                          (chip_list,"CACHE_CHIP")]:
             if lst:
                 tmp = pd.concat(lst)
                 if "trade_date" not in tmp.columns:
                     tmp["trade_date"] = None
                 tmp = tmp.drop_duplicates(subset=["ts_code","trade_date"])
                 tmp = tmp.set_index(["ts_code","trade_date"]).sort_index()
-                if name == "basic": CACHE_BASIC = tmp
-                elif name == "moneyflow": CACHE_MONEYFLOW = tmp
-                elif name == "chip": CACHE_CHIP = tmp
+                if attr == "CACHE_BASIC": CACHE_BASIC = tmp
+                elif attr == "CACHE_MONEYFLOW": CACHE_MONEYFLOW = tmp
+                elif attr == "CACHE_CHIP": CACHE_CHIP = tmp
         try:
             with open(CACHE_FILE, "wb") as f:
                 pickle.dump({"daily": CACHE_DAILY, "adj": CACHE_ADJ,
@@ -207,7 +209,6 @@ def load_market_cache(trade_days_list):
     return True
 
 def get_day_data(trade_date):
-    global CACHE_DAILY, CACHE_BASIC, CACHE_MONEYFLOW, CACHE_CHIP
     def xs_safe(cache, date):
         try:
             return cache.xs(date, level="trade_date").reset_index()
@@ -271,12 +272,12 @@ def check_limit_up_20d(hist, trade_date, ts_code):
     if today.empty:
         return False
     idx = today.index[0]
-    start_idx = max(0, idx - 19)
+    start_idx = max(0, idx - 20)
     recent = hist.iloc[start_idx:idx]
     if recent.empty:
         return False
     is_kechuang = ts_code.startswith("688") or ts_code.startswith("300")
-    threshold = 9.5 if not is_kechuang else 19.5
+    threshold = 9.5 if not is_kechuang else 9.5
     if "pct_chg" in recent.columns:
         return bool((recent["pct_chg"] >= threshold).any())
     return False
@@ -350,12 +351,12 @@ def calc_score(ind, market_strong):
     if ind["close"] > ind["ma60"]:
         tech += 5
     if ind["macd_bar"] > 0:
-        tech += 7
+        tech += 8
     rsi = ind["rsi"]
     if 50 <= rsi <= 70:
-        tech += 8
+        tech += 7
     elif 70 < rsi <= 80:
-        tech += 4
+        tech += 3
     elif rsi > 80:
         tech += 1
     detail["tech"] = min(tech, 30)
@@ -371,7 +372,7 @@ def calc_score(ind, market_strong):
     if 2 <= p5 <= 10:
         timing += 10
     elif p5 < 2:
-        timing += 6
+        timing += 7
     elif p5 <= 18:
         timing += 3
     detail["timing"] = min(timing, 25)
@@ -381,19 +382,19 @@ def calc_score(ind, market_strong):
     elif 1.0 <= vr < 1.3:
         vol = 8
     elif 3.0 < vr <= 4.0:
-        vol = 6
+        vol = 5
     else:
         vol = 2
     detail["vol"] = min(vol, 15)
-    wr = ind["winner_rate"]
-    net_mf = ind["net_mf"]
     chip_mf = 0
+    wr = ind["winner_rate"]
     if 50 <= wr <= 72:
         chip_mf += 10
     elif 72 < wr <= 85:
         chip_mf += 6
     elif wr < 50:
         chip_mf += 3
+    net_mf = ind["net_mf"]
     if net_mf > 5000:
         chip_mf += 10
     elif net_mf > 1000:
@@ -404,8 +405,7 @@ def calc_score(ind, market_strong):
         chip_mf += 1
     detail["chip_mf"] = min(chip_mf, 20)
     detail["market"] = 10 if market_strong else 4
-    total = sum(detail.values())
-    return total, detail
+    return sum(detail.values()), detail
 
 def risk_tag(ind):
     score = 0
@@ -437,6 +437,15 @@ def get_market_strong(trade_date):
         return False
     df = df.sort_values("trade_date")
     return float(df.iloc[-1]["close"]) > df["close"].tail(20).mean()
+def get_prev_trade_date(trade_date):
+    cal = safe_api("trade_cal",
+                   start_date=(datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d"),
+                   end_date=trade_date)
+    if cal.empty:
+        return trade_date
+    prev_dates = cal[cal["is_open"]==1].sort_values("cal_date")["cal_date"].tolist()
+    return prev_dates[-2] if len(prev_dates) >= 2 else trade_date
+
 def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
                max_turnover, top_sectors_n, for_backtest=False):
     global pro
@@ -444,17 +453,11 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     industry_map = load_industry_map()
     basics = load_stock_basic()
 
-    # 获取昨日强势板块
-    cal = safe_api("trade_cal",
-                   start_date=(datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=10)).strftime("%Y%m%d"),
-                   end_date=trade_date)
-    if not cal.empty:
-        prev_dates = cal[cal["is_open"]==1].sort_values("cal_date")["cal_date"].tolist()
-        prev_date = prev_dates[-2] if len(prev_dates) >= 2 else trade_date
-    else:
-        prev_date = trade_date
+    # 第一步：获取昨日强势板块
+    prev_date = get_prev_trade_date(trade_date)
     top_sector_codes = get_top_sectors(prev_date, top_n=top_sectors_n)
 
+    # 第二步：获取当日全市场数据
     if for_backtest:
         daily, basic, mf, chip = get_day_data(trade_date)
     else:
@@ -467,9 +470,11 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     if daily.empty:
         return pd.DataFrame()
 
+    # 第三步：合并数据
     df = daily.copy()
     if not basic.empty:
-        bcols = [c for c in ["ts_code","turnover_rate","circ_mv","volume_ratio"] if c in basic.columns]
+        bcols = [c for c in ["ts_code","turnover_rate","circ_mv","volume_ratio"]
+                 if c in basic.columns]
         df = df.merge(basic[bcols], on="ts_code", how="left")
     else:
         df["circ_mv"] = 0
@@ -486,20 +491,22 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
         chip_dict = dict(zip(chip["ts_code"], chip["winner_rate"]))
 
     df = df.merge(basics[["ts_code","name"]], on="ts_code", how="inner")
+
+    # 数值清洗
     df["circ_mv_b"] = pd.to_numeric(df["circ_mv"], errors="coerce").fillna(0) / 10000
     df["net_mf_amount"] = pd.to_numeric(df["net_mf_amount"], errors="coerce").fillna(0)
     df["turnover_rate"] = pd.to_numeric(df["turnover_rate"], errors="coerce").fillna(5)
+    df["volume_ratio"] = pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(1)
+    df["winner_rate"] = df["ts_code"].map(chip_dict).fillna(60)
 
-    # 基础过滤
+    # 第四步：基础条件过滤
     df = df[df["close"] >= min_price]
     df = df[df["circ_mv_b"] >= min_mv]
     df = df[df["circ_mv_b"] <= max_mv]
     df = df[df["turnover_rate"] <= max_turnover]
-
-    df["winner_rate"] = df["ts_code"].map(chip_dict).fillna(60)
     df = df[(df["winner_rate"] >= 45) & (df["winner_rate"] <= 88)]
 
-    # 板块过滤：只保留昨日强势板块前N名的股票
+    # 第五步：板块前N名硬性过滤
     if top_sector_codes:
         df["ind_code"] = df["ts_code"].map(industry_map)
         df = df[df["ind_code"].isin(top_sector_codes)]
@@ -507,9 +514,7 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     if df.empty:
         return pd.DataFrame()
 
-    # 取涨幅前300
-    df = df.sort_values("pct_chg", ascending=False).head(300)
-
+    # 第六步：不按涨幅排序，全部进入技术分析
     records = []
     for row in df.itertuples():
         if for_backtest:
@@ -519,9 +524,8 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
         if hist.empty:
             continue
 
-        # 核心新条件：20天内有涨停
-        has_limit = check_limit_up_20d(hist, trade_date, row.ts_code)
-        if not has_limit:
+        # 核心条件：20天内有涨停
+        if not check_limit_up_20d(hist, trade_date, row.ts_code):
             continue
 
         extra = {
@@ -534,6 +538,8 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
         ind = calc_indicators(hist, trade_date, extra=extra)
         if ind is None:
             continue
+
+        # 技术过滤
         if ind["close"] <= ind["ma20"]:
             continue
         if ind["ma20"] <= ind["ma20_prev"]:
@@ -547,6 +553,7 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
         if ind["pct_20d"] > 35:
             continue
 
+        # 第七步：评分
         score, detail = calc_score(ind, market_strong)
         tag = risk_tag(ind)
 
@@ -554,9 +561,9 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
             "ts_code": row.ts_code,
             "name": row.name,
             "close": ind["close"],
-            "pct_1d": ind["pct_1d"],
-            "pct_5d": ind["pct_5d"],
-            "pct_20d": ind["pct_20d"],
+            "pct_1d": round(ind["pct_1d"], 2),
+            "pct_5d": round(ind["pct_5d"], 2),
+            "pct_20d": round(ind["pct_20d"], 2),
             "from_bottom": round(ind["from_bottom"], 1),
             "rsi": round(ind["rsi"], 1),
             "winner_rate": round(ind["winner_rate"], 1),
@@ -605,6 +612,8 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
 
     if not records:
         return pd.DataFrame()
+
+    # 第八步：按评分排序，不依赖当日涨幅
     result = pd.DataFrame(records)
     result = result.sort_values("score", ascending=False).head(top_n).reset_index(drop=True)
     result.insert(0, "rank", range(1, len(result)+1))
@@ -614,7 +623,7 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
 # 侧边栏
 # ---------------------------
 with st.sidebar:
-    st.header("V3.0 参数设置")
+    st.header("V3.1 参数设置")
     token = st.text_input("Tushare Token", type="password")
     st.subheader("股票池过滤")
     min_price = st.number_input("最低股价(元)", value=10.0, min_value=1.0, step=1.0)
@@ -651,16 +660,16 @@ tab1, tab2 = st.tabs(["实盘选股", "历史回测"])
 
 with tab1:
     st.subheader("实盘选股 - 今日候选")
-    st.caption("强势板块+20天内涨停+次日高开冲高1.5%触发买入")
+    st.caption("强势板块前五+20天内涨停+评分优选")
     screen_date = st.date_input("选股日期", value=datetime.now().date())
     if st.button("开始选股"):
         date_str = screen_date.strftime("%Y%m%d")
-        with st.spinner("正在分析..."):
+        with st.spinner("正在筛选，请稍候..."):
             result = run_screen(date_str, top_n, min_price, min_mv, max_mv,
                                 max_turnover, top_sectors_n, for_backtest=False)
             market_state = get_market_strong(date_str)
         if result.empty:
-            st.warning("今日未找到符合条件的股票，可放宽板块数量或换手率参数")
+            st.warning("今日未找到符合条件的股票，可尝试放宽板块数量或换手率")
         else:
             ms = "强势（沪深300站上MA20）" if market_state else "弱势（沪深300跌破MA20）"
             st.success(f"筛选完成，共推荐 {len(result)} 只候选股")
@@ -701,7 +710,7 @@ with tab1:
 
 with tab2:
     st.subheader("历史回测 - 策略验证")
-    st.caption("强势板块+20天内涨停+次日高开冲高1.5%触发买入")
+    st.caption("强势板块前五+20天内涨停+评分优选，次日高开冲高1.5%触发买入")
     if st.button("启动回测"):
         end_str = bt_end.strftime("%Y%m%d")
         cal = safe_api_nocache("trade_cal",
@@ -714,7 +723,6 @@ with tab2:
         if not load_market_cache(dates):
             st.stop()
 
-        # 修复重复数据：读取已有记录时去重
         processed = set()
         results = []
         if resume and os.path.exists(CHECKPOINT_FILE):
@@ -741,7 +749,6 @@ with tab2:
                                      max_turnover, top_sectors_n, for_backtest=True)
                     if not res.empty:
                         res["trade_date"] = date
-                        # 写入前先检查是否已存在该日期，避免重复
                         if os.path.exists(CHECKPOINT_FILE):
                             existing = pd.read_csv(CHECKPOINT_FILE)
                             existing["trade_date"] = existing["trade_date"].astype(str)
@@ -759,9 +766,10 @@ with tab2:
             bar.empty()
 
         if results:
-            final = pd.concat(results).drop_duplicates(subset=["trade_date","ts_code"]).reset_index(drop=True)
+            final = pd.concat(results).drop_duplicates(
+                subset=["trade_date","ts_code"]).reset_index(drop=True)
             final = final.sort_values(["trade_date","rank"], ascending=[False,True])
-            st.header("回测统计报告 V3.0")
+            st.header("回测统计报告 V3.1")
             col1, col2 = st.columns(2)
             col1.metric("总选股记录", f"{len(final)} 条")
             col1.metric("涉及交易日", f"{final['trade_date'].nunique()} 天")
@@ -815,12 +823,13 @@ with tab2:
             else:
                 col2.info("无触发买入记录")
             st.subheader("回测明细")
-            show_cols = ["trade_date","rank","name","ts_code","close","score",
-                         "tag","winner_rate","net_mf","turnover_rate",
+            show_cols = ["trade_date","rank","name","ts_code","close","pct_1d",
+                         "score","tag","winner_rate","net_mf","turnover_rate",
                          "triggered","R_D1","R_D3","R_D5"]
             show_cols = [c for c in show_cols if c in final.columns]
             st.dataframe(final[show_cols], use_container_width=True)
             csv = final.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("下载回测结果CSV", csv, f"backtest_{end_str}.csv", "text/csv")
+            st.download_button("下载回测结果CSV", csv,
+                               f"backtest_{end_str}.csv", "text/csv")
         else:
             st.warning("回测未产生结果，请检查日期范围或Token权限")
