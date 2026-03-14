@@ -123,7 +123,7 @@ def load_market_cache(trade_days_list):
         return False
     all_dates = cal["cal_date"].tolist()
 
-    st.info(f"首次运行，下载 {start} 至 {end} 全量数据（含资金流+筹码），请耐心等待...")
+    st.info(f"首次运行，下载 {start} 至 {end} 全量数据，请耐心等待...")
 
     daily_list = []
     adj_list = []
@@ -138,9 +138,19 @@ def load_market_cache(trade_days_list):
         d = safe_api_nocache("daily", trade_date=date)
         a = safe_api_nocache("adj_factor", trade_date=date)
         b = safe_api_nocache("daily_basic", trade_date=date,
-                             fields="ts_code,turnover_rate,circ_mv,pe,pb,volume_ratio")
+                             fields="ts_code,trade_date,turnover_rate,circ_mv,pe,pb,volume_ratio")
         mf = safe_api_nocache("moneyflow", trade_date=date)
         chip = safe_api_nocache("cyq_perf", trade_date=date)
+        if not d.empty and "trade_date" not in d.columns:
+            d["trade_date"] = date
+        if not a.empty and "trade_date" not in a.columns:
+            a["trade_date"] = date
+        if not b.empty and "trade_date" not in b.columns:
+            b["trade_date"] = date
+        if not mf.empty and "trade_date" not in mf.columns:
+            mf["trade_date"] = date
+        if not chip.empty and "trade_date" not in chip.columns:
+            chip["trade_date"] = date
         return d, a, b, mf, chip
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -176,15 +186,24 @@ def load_market_cache(trade_days_list):
         CACHE_ADJ = CACHE_ADJ.set_index(["ts_code","trade_date"]).sort_index()
 
         if basic_list:
-            CACHE_BASIC = pd.concat(basic_list).drop_duplicates(subset=["ts_code","trade_date"])
+            tmp = pd.concat(basic_list)
+            if "trade_date" not in tmp.columns:
+                tmp["trade_date"] = None
+            CACHE_BASIC = tmp.drop_duplicates(subset=["ts_code","trade_date"])
             CACHE_BASIC = CACHE_BASIC.set_index(["ts_code","trade_date"]).sort_index()
 
         if mf_list:
-            CACHE_MONEYFLOW = pd.concat(mf_list).drop_duplicates(subset=["ts_code","trade_date"])
+            tmp = pd.concat(mf_list)
+            if "trade_date" not in tmp.columns:
+                tmp["trade_date"] = None
+            CACHE_MONEYFLOW = tmp.drop_duplicates(subset=["ts_code","trade_date"])
             CACHE_MONEYFLOW = CACHE_MONEYFLOW.set_index(["ts_code","trade_date"]).sort_index()
 
         if chip_list:
-            CACHE_CHIP = pd.concat(chip_list).drop_duplicates(subset=["ts_code","trade_date"])
+            tmp = pd.concat(chip_list)
+            if "trade_date" not in tmp.columns:
+                tmp["trade_date"] = None
+            CACHE_CHIP = tmp.drop_duplicates(subset=["ts_code","trade_date"])
             CACHE_CHIP = CACHE_CHIP.set_index(["ts_code","trade_date"]).sort_index()
 
         try:
@@ -205,27 +224,20 @@ def get_day_data(trade_date):
     global CACHE_DAILY, CACHE_ADJ, CACHE_BASIC, CACHE_MONEYFLOW, CACHE_CHIP
     try:
         daily = CACHE_DAILY.xs(trade_date, level="trade_date").reset_index()
-        daily.rename(columns={"index": "ts_code"}, inplace=True)
-        if "ts_code" not in daily.columns:
-            daily = daily.reset_index()
     except:
         daily = pd.DataFrame()
-
     try:
         basic = CACHE_BASIC.xs(trade_date, level="trade_date").reset_index()
     except:
         basic = pd.DataFrame()
-
     try:
         mf = CACHE_MONEYFLOW.xs(trade_date, level="trade_date").reset_index()
     except:
         mf = pd.DataFrame()
-
     try:
         chip = CACHE_CHIP.xs(trade_date, level="trade_date").reset_index()
     except:
         chip = pd.DataFrame()
-
     return daily, basic, mf, chip
 
 def get_stock_history_fast(ts_code, end_date, lookback=90):
@@ -284,22 +296,18 @@ def calc_indicators(hist, trade_date, extra=None):
     idx = today.index[0]
     if idx < 19:
         return None
-
     ma20 = close.iloc[idx-19:idx+1].mean()
     ma20_prev = close.iloc[idx-20:idx].mean() if idx >= 20 else ma20
     ma60 = close.iloc[max(0,idx-59):idx+1].mean()
-
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     dif = ema12 - ema26
     dea = dif.ewm(span=9, adjust=False).mean()
     macd_bar = ((dif - dea) * 2).iloc[idx]
-
     delta = close.diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/12, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/12, adjust=False).mean()
     rsi = (100 - 100 / (1 + gain / (loss + 1e-9))).iloc[idx]
-
     row = hist.iloc[idx]
     c = float(row["close"])
     h = float(row["high"])
@@ -307,38 +315,31 @@ def calc_indicators(hist, trade_date, extra=None):
     upper_shadow = (h - c) / c * 100
     body_range = h - l
     body_pos = (c - l) / body_range if body_range > 0 else 0
-
     pct_1d = float(row["pct_chg"]) if "pct_chg" in row else 0
     pct_5d = (c / float(hist.iloc[idx-5]["close"]) - 1) * 100 if idx >= 5 else 0
     pct_20d = (c / float(hist.iloc[idx-20]["close"]) - 1) * 100 if idx >= 20 else 0
-
     low_60 = hist["low"].iloc[max(0,idx-59):idx+1].min()
     from_bottom = (c - low_60) / low_60 * 100 if low_60 > 0 else 0
-
     vol_5 = hist["vol"].iloc[max(0,idx-4):idx+1].mean()
     vol_20 = hist["vol"].iloc[max(0,idx-19):idx+1].mean()
     vol_ratio = vol_5 / vol_20 if vol_20 > 0 else 1
-
     consec_limit = False
     if idx >= 1 and "pct_chg" in hist.columns:
         prev_pct = float(hist.iloc[idx-1]["pct_chg"])
         if pct_1d >= 9.5 and prev_pct >= 9.5:
             consec_limit = True
-
     winner_rate = 60
     net_mf = 0
     turnover_rate = 5
     volume_ratio = 1
-
     if extra is not None:
         winner_rate = float(extra.get("winner_rate", 60))
-        net_mf_amount = extra.get("net_mf_amount", 0)
-        net_mf = float(net_mf_amount) if pd.notna(net_mf_amount) else 0
+        net_mf_val = extra.get("net_mf_amount", 0)
+        net_mf = float(net_mf_val) if pd.notna(net_mf_val) else 0
         tr = extra.get("turnover_rate", 5)
         turnover_rate = float(tr) if pd.notna(tr) else 5
         vr = extra.get("volume_ratio", 1)
         volume_ratio = float(vr) if pd.notna(vr) else 1
-
     return {
         "close": c, "high": h, "low": l,
         "ma20": ma20, "ma60": ma60, "ma20_prev": ma20_prev,
@@ -356,8 +357,6 @@ def calc_indicators(hist, trade_date, extra=None):
 
 def calc_score(ind, sector_score, market_strong):
     detail = {}
-
-    # 1. 技术面 0-25分
     tech = 0
     if ind["close"] > ind["ma20"] and ind["ma20"] > ind["ma20_prev"]:
         tech += 8
@@ -373,8 +372,6 @@ def calc_score(ind, sector_score, market_strong):
     elif rsi > 75:
         tech += 1
     detail["tech"] = min(tech, 25)
-
-    # 2. 买入时机 0-20分（偏离MA20越小越好）
     timing = 0
     dev = (ind["close"] - ind["ma20"]) / ind["ma20"] * 100
     if dev <= 2:
@@ -383,8 +380,6 @@ def calc_score(ind, sector_score, market_strong):
         timing += 8
     elif dev <= 10:
         timing += 4
-    else:
-        timing += 0
     p5 = ind["pct_5d"]
     if 2 <= p5 <= 8:
         timing += 8
@@ -392,11 +387,7 @@ def calc_score(ind, sector_score, market_strong):
         timing += 5
     elif p5 <= 15:
         timing += 2
-    else:
-        timing += 0
     detail["timing"] = min(timing, 20)
-
-    # 3. 量能健康 0-15分
     vr = ind["vol_ratio"]
     tr = ind["turnover_rate"]
     vol = 0
@@ -406,21 +397,13 @@ def calc_score(ind, sector_score, market_strong):
         vol += 6
     elif 2.5 < vr <= 3.5:
         vol += 5
-    elif vr > 3.5:
-        vol += 0
     else:
         vol += 2
     if 3 <= tr <= 10:
         vol += 5
-    elif tr < 3:
-        vol += 2
     elif tr <= 15:
         vol += 2
-    else:
-        vol += 0
     detail["vol"] = min(vol, 15)
-
-    # 4. 鱼身判断 0-15分（从底部涨幅越小越好）
     fb = ind["from_bottom"]
     if fb <= 20:
         fish = 15
@@ -431,8 +414,6 @@ def calc_score(ind, sector_score, market_strong):
     else:
         fish = 0
     detail["fish"] = fish
-
-    # 5. 资金+筹码 0-15分（新增）
     chip_mf = 0
     wr = ind["winner_rate"]
     if 55 <= wr <= 75:
@@ -441,8 +422,6 @@ def calc_score(ind, sector_score, market_strong):
         chip_mf += 5
     elif wr < 55:
         chip_mf += 2
-    else:
-        chip_mf += 0
     net_mf = ind["net_mf"]
     if net_mf > 10000:
         chip_mf += 7
@@ -450,18 +429,10 @@ def calc_score(ind, sector_score, market_strong):
         chip_mf += 4
     elif net_mf > -5000:
         chip_mf += 1
-    else:
-        chip_mf += 0
     detail["chip_mf"] = min(chip_mf, 15)
-
-    # 6. 板块热度 0-10分
     detail["sector"] = min(sector_score, 10)
-
-    # 7. 大盘环境 0-10分
     detail["market"] = 10 if market_strong else 3
-
-    total = sum(detail.values())
-    return total, detail
+    return sum(detail.values()), detail
 
 def risk_tag(ind):
     score = 0
@@ -534,7 +505,7 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     else:
         daily = safe_api_nocache("daily", trade_date=trade_date)
         basic = safe_api_nocache("daily_basic", trade_date=trade_date,
-                                 fields="ts_code,turnover_rate,circ_mv,pe,pb,volume_ratio")
+                                 fields="ts_code,trade_date,turnover_rate,circ_mv,pe,pb,volume_ratio")
         mf = safe_api_nocache("moneyflow", trade_date=trade_date)
         chip = safe_api_nocache("cyq_perf", trade_date=trade_date)
 
@@ -543,15 +514,15 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
 
     df = daily.copy()
     if not basic.empty:
-        df = df.merge(basic, on="ts_code", how="left")
+        basic_merge = basic[["ts_code","turnover_rate","circ_mv","volume_ratio"]].copy()
+        df = df.merge(basic_merge, on="ts_code", how="left")
     else:
         df["circ_mv"] = 0
         df["turnover_rate"] = 5
         df["volume_ratio"] = 1
 
-    if not mf.empty:
-        mf_cols = ["ts_code", "net_mf_amount"] if "net_mf_amount" in mf.columns else ["ts_code"]
-        df = df.merge(mf[mf_cols], on="ts_code", how="left")
+    if not mf.empty and "net_mf_amount" in mf.columns:
+        df = df.merge(mf[["ts_code","net_mf_amount"]], on="ts_code", how="left")
     else:
         df["net_mf_amount"] = 0
 
@@ -559,11 +530,11 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     if not chip.empty and "winner_rate" in chip.columns:
         chip_dict = dict(zip(chip["ts_code"], chip["winner_rate"]))
 
-    df = df.merge(basics[["ts_code", "name"]], on="ts_code", how="inner")
-    df["circ_mv_b"] = df["circ_mv"] / 10000
-    df["net_mf_amount"] = df["net_mf_amount"].fillna(0)
-    df["turnover_rate"] = df["turnover_rate"].fillna(5)
-    df["volume_ratio"] = df["volume_ratio"].fillna(1)
+    df = df.merge(basics[["ts_code","name"]], on="ts_code", how="inner")
+    df["circ_mv_b"] = pd.to_numeric(df["circ_mv"], errors="coerce").fillna(0) / 10000
+    df["net_mf_amount"] = pd.to_numeric(df["net_mf_amount"], errors="coerce").fillna(0)
+    df["turnover_rate"] = pd.to_numeric(df["turnover_rate"], errors="coerce").fillna(5)
+    df["volume_ratio"] = pd.to_numeric(df["volume_ratio"], errors="coerce").fillna(1)
 
     df = df[df["close"] >= min_price]
     df = df[df["circ_mv_b"] >= min_mv]
@@ -572,7 +543,6 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
 
     df["winner_rate"] = df["ts_code"].map(chip_dict).fillna(60)
     df = df[(df["winner_rate"] >= 45) & (df["winner_rate"] <= 88)]
-
     df = df.sort_values("pct_chg", ascending=False).head(200)
 
     records = []
@@ -676,9 +646,6 @@ def run_screen(trade_date, top_n, min_price, min_mv, max_mv,
     result.insert(0, "rank", range(1, len(result)+1))
     return result
 
-# ---------------------------
-# 侧边栏
-# ---------------------------
 with st.sidebar:
     st.header("参数设置")
     token = st.text_input("Tushare Token", type="password")
@@ -700,18 +667,12 @@ with st.sidebar:
                 os.remove(f)
         st.success("缓存已清除")
 
-# ---------------------------
-# Token初始化
-# ---------------------------
 if not token:
     st.info("请在左侧输入 Tushare Token 后开始使用")
     st.stop()
 ts.set_token(token)
 pro = ts.pro_api()
 
-# ---------------------------
-# 主界面
-# ---------------------------
 tab1, tab2 = st.tabs(["实盘选股", "历史回测"])
 
 with tab1:
@@ -844,10 +805,9 @@ with tab2:
                         win_rate=lambda x: (x > 0).mean() * 100,
                         n="count"
                     ).round(2)
-                    grp.columns = ["均值%", "胜率%", "样本数"]
+                    grp.columns = ["均值%","胜率%","样本数"]
                     st.write(f"D+{n} 分层表现：")
                     st.dataframe(grp, use_container_width=True)
-
                 st.subheader("按风险标签分析")
                 for n in [1,3,5]:
                     key = f"R_D{n}"
@@ -861,7 +821,7 @@ with tab2:
                         win_rate=lambda x: (x > 0).mean() * 100,
                         n="count"
                     ).round(2)
-                    grp.columns = ["均值%", "胜率%", "样本数"]
+                    grp.columns = ["均值%","胜率%","样本数"]
                     st.write(f"D+{n} 风险标签表现：")
                     st.dataframe(grp, use_container_width=True)
             else:
