@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V30.12.14 - 最终优化版
-核心改动：
-1. 取消涨幅前100限制，板块前三名全量入池
-2. RSI>=78硬性门槛
-3. 科创板/创业板不再要求RSI>90，统一标准
-4. 第三名界面标红警告
-其他逻辑与V30.12.11完全一致
+选股王 V30.12.15 - 双触发买入版
+新增：低开翻红买入法（低开<2%且最高价超昨收）
+取消第三名标红
+量比加入评分系统（权重适中）
 """
 
 import streamlit as st
@@ -28,8 +25,8 @@ GLOBAL_DAILY_RAW = pd.DataFrame()
 GLOBAL_QFQ_BASE_FACTORS = {}
 GLOBAL_STOCK_INDUSTRY = {}
 
-st.set_page_config(page_title="选股王 V30.12.14", layout="wide")
-st.title("选股王 V30.12.14：最终优化版")
+st.set_page_config(page_title="选股王 V30.12.15", layout="wide")
+st.title("选股王 V30.12.15：双触发买入版")
 
 @st.cache_data(ttl=3600*12)
 def safe_get(func_name, **kwargs):
@@ -128,7 +125,7 @@ def get_prev_trade_date(trade_date):
     prev_dates = cal[cal["is_open"] == 1].sort_values("cal_date")["cal_date"].tolist()
     return prev_dates[-2] if len(prev_dates) >= 2 else trade_date
 
-CACHE_FILE_NAME = "market_data_cache_v14.pkl"
+CACHE_FILE_NAME = "market_data_cache_v15.pkl"
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
@@ -250,11 +247,23 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     d1_data = hist.iloc[0]
     next_open = d1_data["open"]
     next_high = d1_data["high"]
-    if next_open <= d0_qfq_close:
+    target_buy_price = None
+    trigger_type = None
+    # 条件A：高开冲高1.5%
+    if next_open > d0_qfq_close:
+        trigger_a = next_open * 1.015
+        if next_high >= trigger_a:
+            target_buy_price = trigger_a
+            trigger_type = "高开冲高"
+    # 条件B：低开翻红（低开不超过2%，最高价超过昨收）
+    if target_buy_price is None:
+        if d0_qfq_close * 0.98 <= next_open < d0_qfq_close:
+            if next_high > d0_qfq_close:
+                target_buy_price = d0_qfq_close
+                trigger_type = "低开翻红"
+    if target_buy_price is None:
         return results
-    target_buy_price = next_open * 1.015
-    if next_high < target_buy_price:
-        return results
+    results["trigger_type"] = trigger_type
     for n in days_ahead:
         col = f"Return_D{n}"
         if len(hist) >= n:
@@ -307,18 +316,16 @@ def get_market_state(trade_date):
     latest_close = index_data.iloc[-1]["close"]
     ma20 = index_data["close"].tail(20).mean()
     return "Strong" if latest_close > ma20 else "Weak"
+
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
-
     market_state = get_market_state(last_trade)
     daily_all = safe_get("daily", trade_date=last_trade)
     if daily_all.empty:
         return pd.DataFrame(), f"数据缺失 {last_trade}"
-
     stock_basic = safe_get("stock_basic", list_status="L", fields="ts_code,name,list_date")
     if stock_basic.empty or "name" not in stock_basic.columns:
         stock_basic = safe_get("stock_basic", list_status="L")
-
     chip_dict = {}
     try:
         chip_df = safe_get("cyq_perf", trade_date=last_trade)
@@ -326,67 +333,50 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MAX_UPPER_SHADOW, MAX_TURNO
             chip_dict = dict(zip(chip_df["ts_code"], chip_df["winner_rate"]))
     except:
         pass
-
-    # 获取量比数据（只显示不评分）
     volume_ratio_dict = {}
     try:
         db = safe_get("daily_basic", trade_date=last_trade,
                       fields="ts_code,turnover_rate,circ_mv,volume_ratio")
-        if not db.empty:
-            if "volume_ratio" in db.columns:
-                volume_ratio_dict = dict(zip(db["ts_code"], db["volume_ratio"]))
+        if not db.empty and "volume_ratio" in db.columns:
+            volume_ratio_dict = dict(zip(db["ts_code"], db["volume_ratio"]))
     except:
         pass
-
     prev_date = get_prev_trade_date(last_trade)
     top3_sector_codes = get_top3_sectors(prev_date)
-
     df = daily_all.merge(stock_basic, on="ts_code", how="left")
     if "name" not in df.columns:
         df["name"] = ""
-
     daily_basic = safe_get("daily_basic", trade_date=last_trade)
     if not daily_basic.empty:
         needed_cols = ["ts_code", "turnover_rate", "circ_mv", "amount"]
         existing_cols = [c for c in needed_cols if c in daily_basic.columns]
         df = df.merge(daily_basic[existing_cols], on="ts_code", how="left")
-
     mf_raw = safe_get("moneyflow", trade_date=last_trade)
     if not mf_raw.empty:
         mf = mf_raw[["ts_code", "net_mf_amount"]].rename(columns={"net_mf_amount": "net_mf"})
         df = df.merge(mf, on="ts_code", how="left")
     else:
         df["net_mf"] = 0
-
     for col in ["net_mf", "turnover_rate", "circ_mv", "amount"]:
         if col not in df.columns:
             df[col] = 0
     df["net_mf"] = df["net_mf"].fillna(0)
     df["circ_mv_billion"] = df["circ_mv"] / 10000
-
     df = df[~df["name"].str.contains("ST|退", na=False)]
     df = df[~df["ts_code"].str.startswith("92")]
     df = df[(df["close"] >= MIN_PRICE) & (df["close"] <= 2000.0)]
     df = df[(df["circ_mv_billion"] >= MIN_MV) & (df["circ_mv_billion"] <= MAX_MV)]
     df = df[df["turnover_rate"] <= MAX_TURNOVER_RATE]
-
     if len(df) == 0:
         return pd.DataFrame(), "过滤后无标的"
-
-    # 板块前三名硬性过滤
     if top3_sector_codes and GLOBAL_STOCK_INDUSTRY:
         df["ind_code"] = df["ts_code"].map(GLOBAL_STOCK_INDUSTRY)
         df = df[df["ind_code"].isin(top3_sector_codes)]
-
     if len(df) == 0:
         return pd.DataFrame(), "板块过滤后无标的"
-
-    # 不限涨幅名次，全量进入技术分析
     candidates = df[df["pct_chg"] <= MAX_PREV_PCT].copy()
-
     if len(candidates) == 0:
         return pd.DataFrame(), "无符合条件标的"
-
     records = []
     for row in candidates.itertuples():
         ind = compute_indicators(row.ts_code, last_trade)
@@ -394,43 +384,42 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MAX_UPPER_SHADOW, MAX_TURNO
             continue
         d0_close = ind["last_close"]
         d0_rsi = ind.get("rsi_12", 50)
-
-        # RSI>=78 硬性门槛（统一标准，科创板创业板不再区别对待）
         if d0_rsi < 78:
             continue
-
         if market_state == "Weak":
             if d0_rsi > RSI_LIMIT:
                 continue
             if d0_close < ind["ma20"]:
                 continue
-
         if d0_close < ind["ma60"]:
             continue
-
         upper_shadow = (ind["last_high"] - d0_close) / d0_close * 100
         if upper_shadow > MAX_UPPER_SHADOW:
             continue
-
         range_len = ind["last_high"] - ind["last_low"]
         if range_len > 0:
             body_pos = (d0_close - ind["last_low"]) / range_len
             if body_pos < MIN_BODY_POS:
                 continue
-
         win_rate = chip_dict.get(row.ts_code, 50)
         if win_rate < CHIP_MIN_WIN_RATE:
             continue
-
-        # 量比（只记录不过滤）
         vol_ratio = volume_ratio_dict.get(row.ts_code, None)
         if vol_ratio is not None:
             try:
-                vol_ratio = round(float(vol_ratio), 2)
+                vol_ratio = float(vol_ratio)
             except:
                 vol_ratio = None
-
         future = get_future_prices(row.ts_code, last_trade, d0_close)
+        # 量比评分加成
+        vol_bonus = 0
+        if vol_ratio is not None:
+            if 1.0 <= vol_ratio <= 1.5:
+                vol_bonus = 10
+            elif 1.5 < vol_ratio <= 2.5:
+                vol_bonus = 6
+            elif vol_ratio > 2.5:
+                vol_bonus = 2
         records.append({
             "ts_code": row.ts_code,
             "name": row.name,
@@ -440,22 +429,20 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MAX_UPPER_SHADOW, MAX_TURNO
             "winner_rate": win_rate,
             "macd": ind["macd_val"],
             "net_mf": row.net_mf,
-            "vol_ratio": vol_ratio,
+            "vol_ratio": round(vol_ratio, 2) if vol_ratio else None,
+            "vol_bonus": vol_bonus,
+            "trigger_type": future.get("trigger_type", "未触发"),
             "Return_D1 (%)": future.get("Return_D1", np.nan),
             "Return_D3 (%)": future.get("Return_D3", np.nan),
             "Return_D5 (%)": future.get("Return_D5", np.nan),
             "market_state": market_state,
             "Sector_Boost": "Yes" if top3_sector_codes else "N/A",
         })
-
     if not records:
         return pd.DataFrame(), "深度筛选后无标的"
-
     fdf = pd.DataFrame(records)
-
-    # Gemini原版评分，完全保留
     def dynamic_score(r):
-        base_score = r["macd"] * 1000 + (r["net_mf"] / 10000)
+        base_score = r["macd"] * 1000 + (r["net_mf"] / 10000) + r["vol_bonus"]
         if r["winner_rate"] > 90:
             base_score += 1000
         if r["rsi"] > 90:
@@ -466,17 +453,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MAX_UPPER_SHADOW, MAX_TURNO
                 penalty += 500
             return base_score - penalty
         return base_score
-
     fdf["Score"] = fdf.apply(dynamic_score, axis=1)
     final_df = fdf.sort_values("Score", ascending=False).head(TOP_BACKTEST).copy()
     final_df.insert(0, "Rank", range(1, len(final_df) + 1))
     return final_df, None
 
-# ---------------------------
-# 侧边栏
-# ---------------------------
 with st.sidebar:
-    st.header("V30.12.14 最终优化版")
+    st.header("V30.12.15 双触发买入版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-90天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4)
@@ -486,7 +469,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
         st.success("缓存已清除")
-    CHECKPOINT_FILE = "backtest_checkpoint_v14.csv"
+    CHECKPOINT_FILE = "backtest_checkpoint_v15.csv"
     st.markdown("---")
     st.subheader("基础过滤")
     col1, col2 = st.columns(2)
@@ -505,22 +488,15 @@ with st.sidebar:
     MIN_BODY_POS = st.number_input("实体位置", value=0.6)
     MAX_TURNOVER_RATE = st.number_input("换手率 (%)", value=20.0)
 
-# ---------------------------
-# Token初始化
-# ---------------------------
 TS_TOKEN = st.text_input("Tushare Token", type="password")
 if not TS_TOKEN:
     st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-# ---------------------------
-# 主程序
-# ---------------------------
-if st.button("启动 V30.12.14"):
+if st.button("启动 V30.12.15"):
     processed_dates = set()
     results = []
-
     if RESUME_CHECKPOINT and os.path.exists(CHECKPOINT_FILE):
         try:
             existing_df = pd.read_csv(CHECKPOINT_FILE)
@@ -535,21 +511,16 @@ if st.button("启动 V30.12.14"):
     else:
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
-
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     if not trade_days_list:
         st.stop()
-
     dates_to_run = [d for d in trade_days_list if d not in processed_dates]
-
     if not dates_to_run:
         st.success("所有日期已计算完毕！")
     else:
         if not get_all_historical_data(trade_days_list, use_cache=True):
             st.stop()
-
         bar = st.progress(0, text="回测引擎启动...")
-
         for i, date in enumerate(dates_to_run):
             res, err = run_backtest_for_a_day(
                 date, int(TOP_BACKTEST),
@@ -570,15 +541,13 @@ if st.button("启动 V30.12.14"):
                 results.append(res)
             bar.progress((i+1)/len(dates_to_run), text=f"分析中: {date}")
         bar.empty()
-
     if results:
         all_res = pd.concat(results).drop_duplicates(
             subset=["Trade_Date", "ts_code"]).reset_index(drop=True)
         all_res = all_res[all_res["Rank"] <= int(TOP_BACKTEST)]
         all_res["Trade_Date"] = all_res["Trade_Date"].astype(str)
         all_res = all_res.sort_values(["Trade_Date", "Rank"], ascending=[False, True])
-
-        st.header(f"V30.12.14 统计仪表盘 (Top {TOP_BACKTEST})")
+        st.header(f"V30.12.15 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f"Return_D{n} (%)"
@@ -590,7 +559,6 @@ if st.button("启动 V30.12.14"):
                 cols[idx].metric(f"D+{n} 均益 / 胜率",
                                  f"{avg:.2f}% / {win:.1f}%",
                                  delta=f"亏损>5%: {loss:.1f}%")
-
         st.subheader("按排名分层分析")
         for n in [1, 3, 5]:
             col_name = f"Return_D{n} (%)"
@@ -605,23 +573,38 @@ if st.button("启动 V30.12.14"):
             grp.columns = ["均值%", "胜率%", "样本数"]
             st.write(f"D+{n} 分层表现：")
             st.dataframe(grp, use_container_width=True)
-
+        st.subheader("按触发类型分析")
+        triggered = all_res[all_res["trigger_type"].isin(["高开冲高", "低开翻红"])]
+        if not triggered.empty:
+            trig_count = triggered["trigger_type"].value_counts()
+            total_triggered = len(triggered)
+            total_records = len(all_res)
+            st.write(f"触发总数: {total_triggered} / {total_records} ({total_triggered/total_records*100:.1f}%)")
+            col_a, col_b = st.columns(2)
+            for tc, col_widget in zip(["高开冲高", "低开翻红"], [col_a, col_b]):
+                sub = triggered[triggered["trigger_type"] == tc]
+                col_widget.metric(f"{tc}触发数", f"{len(sub)}笔")
+            for n in [1, 3, 5]:
+                col_name = f"Return_D{n} (%)"
+                valid = triggered.dropna(subset=[col_name])
+                if valid.empty:
+                    continue
+                grp = valid.groupby("trigger_type")[col_name].agg(
+                    avg="mean",
+                    win_rate=lambda x: (x > 0).mean() * 100,
+                    n="count"
+                ).round(2)
+                grp.columns = ["均值%", "胜率%", "样本数"]
+                st.write(f"D+{n} 触发类型表现：")
+                st.dataframe(grp, use_container_width=True)
         st.subheader("回测明细")
-        # 第三名标红显示
-        def highlight_rank3(row):
-            if row["Rank"] == 3:
-                return ["background-color: #ffcccc"] * len(row)
-            return [""] * len(row)
-
         show_cols = ["Rank", "Trade_Date", "name", "ts_code", "Close", "Pct_Chg",
-                     "vol_ratio", "rsi", "winner_rate",
+                     "vol_ratio", "rsi", "winner_rate", "trigger_type",
                      "Return_D1 (%)", "Return_D3 (%)", "Return_D5 (%)",
                      "Sector_Boost"]
         final_cols = [c for c in show_cols if c in all_res.columns]
-        styled = all_res[final_cols].style.apply(highlight_rank3, axis=1)
-        st.dataframe(styled, use_container_width=True)
-
+        st.dataframe(all_res[final_cols], use_container_width=True)
         csv = all_res.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("下载结果 CSV", csv, f"export_v14.csv", "text/csv")
+        st.download_button("下载结果 CSV", csv, f"export_v15.csv", "text/csv")
     else:
         st.warning("没有结果，请检查Token或放宽参数")
