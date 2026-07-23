@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V37.0 中线共振狙击版 (轨迹追踪系统)
+选股王 · V37.0 中线共振狙击版 (轨迹追踪系统) - Pandas 最新兼容版
 ------------------------------------------------
 逻辑说明:
 1. [中线股票池] 流通市值 200亿-1000亿，股价 >= 20元。
@@ -295,7 +295,9 @@ def get_medium_term_future(ts_code, selection_date, buy_price, hold_weeks=8, sto
     hist['open'] = pd.to_numeric(hist['open'], errors='coerce')
     hist['low'] = pd.to_numeric(hist['low'], errors='coerce')
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
-    hist['ma20'] = hist['close'].rolling(20).mean().fillna(method='bfill')
+    
+    # 🌟 修复 Pandas 2.0+ 版本的 bfill 写法
+    hist['ma20'] = hist['close'].rolling(20).mean().bfill()
     
     stop_loss_price = buy_price * (1 - stop_loss_pct / 100.0)
     exit_triggered = False
