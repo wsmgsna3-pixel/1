@@ -8,10 +8,10 @@
 3. [三维打分取Top3] 公平起跑线，取消一切市值与板块偏见，纯粹考核当天攻击力！
    - 涨幅动能：突破日真实涨幅转换的分数。
    - 攻击量能：突破日成交量对比5日均量的放大倍数。
-4. [绞杀假突破] 
-   - MA20必须走平或向上。
-   - K线必须是饱满阳线（实体占振幅60%以上）。
-   - MACD必须为红柱（水上多头）。
+4. [绞杀假突破与回踩动能确认] 
+   - MA20必须走平或向上 (杜绝下跌趋势反抽)。
+   - K线必须是饱满阳线（实体占振幅60%以上，杜绝长上影线）。
+   - MACD大趋势在水上 (DIF > 0)，且动能拐头向上 (今日MACD > 昨日MACD，绿柱缩短或红柱放大)。
    - 突破日真实放量（>1.2倍五日均量）。
 5. [三级防守] 初始装死 -> 挂20日线 -> 偏离15%挂10日线。
 ------------------------------------------------
@@ -89,7 +89,6 @@ def load_industry_mapping():
     try:
         sw_indices = pro.index_classify(level='L1', src='SW2021')
         if sw_indices.empty: return {}
-        # ✅ 精简后的白名单
         white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
@@ -262,8 +261,8 @@ def compute_trend_indicators(ts_code, end_date):
     is_pulled_back = (prev2_row['close'] < prev2_row['ma20']) and (prev_row['close'] < prev_row['ma20'])
     is_breakout = row['close'] > row['ma20']
     
-    # --- 🚨 新增：绞杀假突破的四大金刚过滤 ---
-    # 1. 均线方向：今天的 MA20 必须不低于昨天 (走平或向上)
+    # --- 🚨 核心修正：绞杀假突破与回踩反转确认 ---
+    # 1. 均线方向：今天的 MA20 必须不低于昨天 (走平或向上)，过滤下跌趋势反抽
     is_ma20_healthy = row['ma20'] >= prev_row['ma20']
     
     # 2. 真实放量：今日成交量必须明显放大 (>1.2倍五日均量)
@@ -272,10 +271,12 @@ def compute_trend_indicators(ts_code, end_date):
     # 3. 饱满K线过滤长上影线：必须是红盘，且实体占全天振幅的60%以上
     candle_range = row['high'] - row['low']
     candle_body = row['close'] - row['open']
-    is_solid_yang = (row['close'] > row['open']) and (candle_body > candle_range * 0.6 if candle_range > 0 else True)
+    is_solid_yang = (row['close'] > row['open']) and (candle_body >= candle_range * 0.6 if candle_range > 0 else True)
     
-    # 4. MACD 必须在水上产生红柱动能
-    is_macd_healthy = row['macd'] > 0
+    # 4. MACD逻辑修正 (契合回踩反转)：
+    #    - 大趋势在水上 (dif > 0)
+    #    - 动能拐头向上 (今天的macd柱子大于昨天的，即绿柱缩短或红柱变长)
+    is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
     # 综合判定
     res['is_v38_buy_signal'] = (is_trend_up and is_pulled_back and is_breakout 
@@ -412,11 +413,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
             continue
             
         # ✅ V38.1 纯粹动能公平打分系统
-        # 1. 突破涨幅得分 (涨幅10%即得100分，涨幅5%即得50分，客观反映攻击力)
+        # 1. 突破涨幅得分 (涨幅10%即得100分，客观反映攻击力)
         pct_chg = (ind['last_close'] - ind['pre_close']) / ind['pre_close'] * 100
         score_breakout = pct_chg * 10 
         
-        # 2. 攻击量能得分 (突破日量比放大，反映资金参与坚决度)
+        # 2. 攻击量能得分 (突破日量比放大倍数)
         score_vol = ind['vol_ratio'] * 10
         
         # 总分：没有任何外在偏见，纯粹用K线实体涨幅与量能说话
@@ -450,7 +451,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
 with st.sidebar:
     st.header("V38.1 终极公平过滤版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    # ✅ 听取建议，默认调回 100 天，积累足够的验证样本
     BACKTEST_DAYS = st.number_input("分析天数", value=100, step=1)
     
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=3, help="只取公平动能打分最高的前三名")
