@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V38.0 中线共振狙击版 (三维打分优选版)
+选股王 · V38.1 中线共振狙击版 (终极公平打分 + 强过滤假突破)
 ------------------------------------------------
 逻辑说明:
-1. [中线股票池] 流通市值 200亿-1000亿，股价 >= 20元。
-2. [白名单赛道] 电子、计算机、通信、医药生物、国防军工、机械设备(含机器人硬件)。
-3. [三维打分取Top3] 
-   - 股性活跃度(40%)：近5日平均振幅。
-   - 动能共振(40%)：突破日实体阳线力度 + MACD多头。
-   - 20CM溢价(20%)：300/688双创板块加分。
-4. [日线降维] 周线趋势向上代理：日线 MA60 > MA120。
-5. [右侧发车] 买点：连续两日收盘在 20日线下，今日放量收盘站上 20日线。
-6. [三级防守] 初始装死 -> 挂20日线 -> 偏离15%挂10日线。
+1. [中线股票池] 严格锁定流通市值 200亿-1000亿，股价 >= 20元。
+2. [白名单赛道] 电子、计算机、通信、医药生物、国防军工、机械设备。
+3. [三维打分取Top3] 公平起跑线，取消一切市值与板块偏见，纯粹考核当天攻击力！
+   - 涨幅动能：突破日真实涨幅转换的分数。
+   - 攻击量能：突破日成交量对比5日均量的放大倍数。
+4. [绞杀假突破] 
+   - MA20必须走平或向上。
+   - K线必须是饱满阳线（实体占振幅60%以上）。
+   - MACD必须为红柱（水上多头）。
+   - 突破日真实放量（>1.2倍五日均量）。
+5. [三级防守] 初始装死 -> 挂20日线 -> 偏离15%挂10日线。
 ------------------------------------------------
 """
 
@@ -28,8 +30,8 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-# 更新缓存文件名以防止与旧版冲突
-CACHE_FILE_NAME = "market_data_cache_v38_scored.pkl" 
+# 更新缓存文件名以防止冲突
+CACHE_FILE_NAME = "market_data_cache_v38_1_final.pkl" 
 
 # ---------------------------
 # 全局变量
@@ -43,8 +45,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V38.0 爆发力优选", layout="wide")
-st.title("选股王 V38.0：三维打分优选与三级动态防御")
+st.set_page_config(page_title="选股王 V38.1 终极纯粹", layout="wide")
+st.title("选股王 V38.1：绞杀假突破与公平动能打分")
 
 # ---------------------------
 # 基础 API 与 辅助函数
@@ -87,7 +89,7 @@ def load_industry_mapping():
     try:
         sw_indices = pro.index_classify(level='L1', src='SW2021')
         if sw_indices.empty: return {}
-        # ✅ 精简并增加机械设备
+        # ✅ 精简后的白名单
         white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
@@ -225,7 +227,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'pre_close', 'vol']].copy() 
 
 # ---------------------------
-# 核心指标计算 (V38.0 爆发力增强版)
+# 核心指标计算 (V38.1 强过滤版)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date):
@@ -241,9 +243,7 @@ def compute_trend_indicators(ts_code, end_date):
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].rolling(5).mean()
     
-    # 爆发力计算依赖指标
-    df['amplitude'] = (df['high'] - df['low']) / df['pre_close'] # 振幅
-    # MACD
+    # MACD计算
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
     df['dif'] = df['ema12'] - df['ema26']
@@ -257,23 +257,35 @@ def compute_trend_indicators(ts_code, end_date):
     prev_row = df.iloc[-2]
     prev2_row = df.iloc[-3]
     
-    # 1. 判定大背景：周线趋势向上 (代理指标: 日线MA60 > MA120)
+    # --- 原有形态条件 ---
     is_trend_up = row['ma60'] > row['ma120']
-    
-    # 2. 判定回踩：前两日收盘在20日线下方
     is_pulled_back = (prev2_row['close'] < prev2_row['ma20']) and (prev_row['close'] < prev_row['ma20'])
-    
-    # 3. 确立买点：今日放量收盘站上MA20
     is_breakout = row['close'] > row['ma20']
-    is_vol_up = row['vol'] > row['ma5_vol']
     
-    res['is_v38_buy_signal'] = is_trend_up and is_pulled_back and is_breakout and is_vol_up
+    # --- 🚨 新增：绞杀假突破的四大金刚过滤 ---
+    # 1. 均线方向：今天的 MA20 必须不低于昨天 (走平或向上)
+    is_ma20_healthy = row['ma20'] >= prev_row['ma20']
+    
+    # 2. 真实放量：今日成交量必须明显放大 (>1.2倍五日均量)
+    is_vol_strong = row['vol'] > (1.2 * row['ma5_vol'])
+    
+    # 3. 饱满K线过滤长上影线：必须是红盘，且实体占全天振幅的60%以上
+    candle_range = row['high'] - row['low']
+    candle_body = row['close'] - row['open']
+    is_solid_yang = (row['close'] > row['open']) and (candle_body > candle_range * 0.6 if candle_range > 0 else True)
+    
+    # 4. MACD 必须在水上产生红柱动能
+    is_macd_healthy = row['macd'] > 0
+    
+    # 综合判定
+    res['is_v38_buy_signal'] = (is_trend_up and is_pulled_back and is_breakout 
+                                and is_ma20_healthy and is_vol_strong 
+                                and is_solid_yang and is_macd_healthy)
     
     if res['is_v38_buy_signal']:
-        # 记录打分所需数据
-        res['avg_amp_5d'] = df['amplitude'].tail(5).mean() # 活跃度
-        res['breakout_strength'] = (row['close'] - row['open']) / prev_row['close'] # 突破大阳线实体力度
-        res['macd'] = row['macd']
+        # 记录纯粹打分需要的数据
+        res['vol_ratio'] = row['vol'] / row['ma5_vol']  # 量比
+        res['pre_close'] = prev_row['close']            # 昨日收盘价用于计算涨幅
         
     res['last_close'] = row['close']
     res['bottom_line'] = row['low'] 
@@ -282,7 +294,7 @@ def compute_trend_indicators(ts_code, end_date):
     return res
 
 # ---------------------------
-# V38.0 核心大脑：三级动态防御系统
+# V38.1 核心大脑：三级动态防御系统
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -384,6 +396,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
     
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     
+    # 严格锁死物理护城河条件
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')] 
     df = df[(df['close'] >= MIN_PRICE)]
@@ -398,27 +411,25 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
         if not ind or not ind.get('is_v38_buy_signal'): 
             continue
             
-        # ✅ 三维打分逻辑
-        # 1. 活跃度得分 (40分上限)：近期日均振幅达到 10% 拿满 40分
-        score_active = min(max(ind['avg_amp_5d'] / 0.10, 0), 1.0) * 40 
+        # ✅ V38.1 纯粹动能公平打分系统
+        # 1. 突破涨幅得分 (涨幅10%即得100分，涨幅5%即得50分，客观反映攻击力)
+        pct_chg = (ind['last_close'] - ind['pre_close']) / ind['pre_close'] * 100
+        score_breakout = pct_chg * 10 
         
-        # 2. 动能得分 (40分上限)：阳线实体力度达10%拿30分 + MACD处于0轴上方拿10分
-        score_momentum = min(max(ind['breakout_strength'] / 0.10, 0), 1.0) * 30 + (10 if ind['macd'] > 0 else 0)
+        # 2. 攻击量能得分 (突破日量比放大，反映资金参与坚决度)
+        score_vol = ind['vol_ratio'] * 10
         
-        # 3. 20CM 溢价 (20分)
-        score_premium = 20 if (row.ts_code.startswith('300') or row.ts_code.startswith('688')) else 0
-        
-        total_score = score_active + score_momentum + score_premium
+        # 总分：没有任何外在偏见，纯粹用K线实体涨幅与量能说话
+        total_score = score_breakout + score_vol
         
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], 8)
         
         record_dict = {
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 
             'circ_mv': row.circ_mv_billion,
-            'Score': round(total_score, 2),
-            'Active_S': round(score_active, 1),
-            'Momentum_S': round(score_momentum, 1),
-            'Premium_S': score_premium
+            'Total_Score': round(total_score, 1),
+            'Breakout_S': round(score_breakout, 1),
+            'Volume_S': round(score_vol, 1)
         }
         record_dict.update(future_returns)
         records.append(record_dict)
@@ -427,8 +438,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
     
     fdf = pd.DataFrame(records)
     
-    # ✅ 严格按分数从高到低排序，只取优等生
-    final_df = fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST).copy()
+    # 按照公平竞技的总分排序，选取TopK
+    final_df = fdf.sort_values('Total_Score', ascending=False).head(TOP_BACKTEST).copy()
     final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
     
     return final_df, None
@@ -437,12 +448,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V38.0 爆发力优选")
+    st.header("V38.1 终极公平过滤版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析天数", value=60, step=1)
+    # ✅ 听取建议，默认调回 100 天，积累足够的验证样本
+    BACKTEST_DAYS = st.number_input("分析天数", value=100, step=1)
     
-    # ✅ 默认只取前三名
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3, help="只选全市场打分最高的前三名")
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3, help="只取公平动能打分最高的前三名")
     
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
@@ -450,7 +461,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v38_scored.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v38_1_final.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -460,6 +471,7 @@ with st.sidebar:
     st.subheader("💰 核心护城河门槛")
     MIN_PRICE = st.number_input("最低股价 (元)", value=20.0) 
     col1, col2 = st.columns(2)
+    # 严格贯彻：这里只作为准入通道，不再进行加减分干预
     MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
@@ -468,7 +480,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V38.0 智能打分引擎"):
+if st.button(f"🚀 启动 V38.1 极简动能追踪"):
     processed_dates = set()
     results = []
     
@@ -492,7 +504,7 @@ if st.button(f"🚀 启动 V38.0 智能打分引擎"):
     if not dates_to_run:
         st.success("🎉 回测已全部完毕！")
     else:
-        bar = st.progress(0, text="三维打分引擎运行中...")
+        bar = st.progress(0, text="强力过滤与公平打分引擎运行中...")
         for i, date in enumerate(dates_to_run):
             res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), MIN_MV, MAX_MV, MIN_PRICE)
             if not res.empty:
@@ -507,10 +519,9 @@ if st.button(f"🚀 启动 V38.0 智能打分引擎"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V38.0 爆发力优选 (Top 3)")
+        st.header(f"📊 V38.1 终极版 (严打假突破 + 公平竞技)")
         st.subheader("🗓️ 周度生存与收益切片")
         
-        # ✅ 重构的UI代码：确保分两行四列，左到右严格顺着排 W1-W8
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
         
@@ -518,7 +529,6 @@ if st.button(f"🚀 启动 V38.0 智能打分引擎"):
             col_name = f'Return_W{w} (%)'
             valid = all_res.dropna(subset=[col_name]) 
             
-            # W1-W4 放在第一行，W5-W8 放在第二行
             target_col = cols_row1[w-1] if w <= 4 else cols_row2[w-5]
             
             with target_col:
@@ -529,8 +539,8 @@ if st.button(f"🚀 启动 V38.0 智能打分引擎"):
                 else:
                     st.metric(f"W{w} 无持仓", "N/A")
  
-        st.subheader("📋 优等生清单 (附带得分细节与系统防守线)")
-        display_cols = ['Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'Score', 'Active_S', 'Momentum_S', 'Premium_S', 'circ_mv', 'Exit_Reason'] + [f'Return_W{w} (%)' for w in range(1, 9)]
+        st.subheader("📋 优等生清单")
+        display_cols = ['Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'] + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
     
         display_df = all_res[final_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]).reset_index(drop=True)
@@ -551,6 +561,6 @@ if st.button(f"🚀 启动 V38.0 智能打分引擎"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_0_scored.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_1_final.csv", "text/csv")
     else:
-        st.warning("⚠️ 深度筛选后未发现符合大资金共振的高分标的。请耐心等待。")
+        st.warning("⚠️ 强力过滤后未发现符合真实大资金共振的标的。请耐心等待确定性更高的机会。")
