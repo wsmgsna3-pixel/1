@@ -518,7 +518,16 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
                 elif '一档' in val: return 'color: green'
             return ''
         
-        st.dataframe(display_df.style.map(color_exit, subset=['Exit_Reason']), use_container_width=True)
+                # 增加安全判断：只有当存在 'Exit_Reason' 列时才渲染颜色，否则正常显示
+        if 'Exit_Reason' in display_df.columns:
+            # 兼容 Pandas 较新版本用 map，如果你的环境提示 map 报错，可以改用 applymap
+            try:
+                st.dataframe(display_df.style.map(color_exit, subset=['Exit_Reason']), use_container_width=True)
+            except AttributeError:
+                st.dataframe(display_df.style.applymap(color_exit, subset=['Exit_Reason']), use_container_width=True)
+        else:
+            st.dataframe(display_df, use_container_width=True)
+
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_0.csv", "text/csv")
