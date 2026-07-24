@@ -3,7 +3,7 @@
 选股王 · V38.0 中线共振狙击版 (三级动态防御系统) - 完整融合版
 ------------------------------------------------
 逻辑说明:
-1. [中线股票池] 流通市值 30亿-500亿，股价 >= 10元。
+1. [中线股票池] 流通市值 200亿-1000亿，股价 >= 20元 (有效规避恶庄画线干扰)。
 2. [白名单赛道] 仅保留核心科技、医药与高端制造。
 3. [日线降维] 周线趋势向上代理：日线 MA60 > MA120。
 4. [右侧发车] 买点：连续两日收盘在 20日线下(回踩)，今日放量(Vol>MA5_Vol)收盘站上 20日线。
@@ -436,10 +436,11 @@ with st.sidebar:
             
     st.markdown("---")
     st.subheader("💰 核心护城河门槛")
-    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, help="拒绝仙股") 
+    # ✅ 修改为你要求的默认值：股价20，市值200-1000
+    MIN_PRICE = st.number_input("最低股价 (元)", value=20.0, help="规避低价恶庄") 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=30.0) 
-    MAX_MV = col2.number_input("最大市值(亿)", value=500.0)
+    MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
+    MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
     st.info("🛡️ V38 风控：自动运行最低价死守、10%激活20日线、15%乖离挂10日线逻辑。")
@@ -509,7 +510,9 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
         display_cols = ['Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'circ_mv', 'Exit_Reason'] + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
     
-        display_df = all_res[final_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
+        # ✅ 这里加了 .reset_index(drop=True) 解决了由于合并 DataFrame 导致的索引重复报错问题
+        display_df = all_res[final_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]).reset_index(drop=True)
+        
         # 增加高亮显示离场原因，便于复盘
         def color_exit(val):
             if isinstance(val, str):
@@ -518,16 +521,14 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
                 elif '一档' in val: return 'color: green'
             return ''
         
-                # 增加安全判断：只有当存在 'Exit_Reason' 列时才渲染颜色，否则正常显示
+        # 增加安全判断：只有当存在 'Exit_Reason' 列时才渲染颜色，否则正常显示
         if 'Exit_Reason' in display_df.columns:
-            # 兼容 Pandas 较新版本用 map，如果你的环境提示 map 报错，可以改用 applymap
             try:
                 st.dataframe(display_df.style.map(color_exit, subset=['Exit_Reason']), use_container_width=True)
             except AttributeError:
                 st.dataframe(display_df.style.applymap(color_exit, subset=['Exit_Reason']), use_container_width=True)
         else:
             st.dataframe(display_df, use_container_width=True)
-
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_0.csv", "text/csv")
