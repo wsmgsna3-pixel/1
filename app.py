@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V38.0 中线共振狙击版 (三级动态防御系统) - 完整融合版
+选股王 · V38.0 中线共振狙击版 (三维打分优选版)
 ------------------------------------------------
 逻辑说明:
-1. [中线股票池] 流通市值 200亿-1000亿，股价 >= 20元 (有效规避恶庄画线干扰)。
-2. [白名单赛道] 仅保留核心科技、医药与高端制造。
-3. [日线降维] 周线趋势向上代理：日线 MA60 > MA120。
-4. [右侧发车] 买点：连续两日收盘在 20日线下(回踩)，今日放量(Vol>MA5_Vol)收盘站上 20日线。
-5. [三级防守] 
-   - 初始装死：只认突破日大阳线最低价，不破不走。
-   - 一档激活：利润达 10% 或 MA20 越过买入价，激活 20 日线作为防守。
-   - 二档飙车：股价偏离 MA20 达 15%，升档 10 日线逃顶。
-6. [持仓轨迹] 引入时间胶囊机制，切片记录 W1 - W8 周度收益及最终离场原因。
+1. [中线股票池] 流通市值 200亿-1000亿，股价 >= 20元。
+2. [白名单赛道] 电子、计算机、通信、医药生物、国防军工、机械设备(含机器人硬件)。
+3. [三维打分取Top3] 
+   - 股性活跃度(40%)：近5日平均振幅。
+   - 动能共振(40%)：突破日实体阳线力度 + MACD多头。
+   - 20CM溢价(20%)：300/688双创板块加分。
+4. [日线降维] 周线趋势向上代理：日线 MA60 > MA120。
+5. [右侧发车] 买点：连续两日收盘在 20日线下，今日放量收盘站上 20日线。
+6. [三级防守] 初始装死 -> 挂20日线 -> 偏离15%挂10日线。
 ------------------------------------------------
 """
 
@@ -29,7 +29,7 @@ import pickle
 warnings.filterwarnings("ignore")
 
 # 更新缓存文件名以防止与旧版冲突
-CACHE_FILE_NAME = "market_data_cache_v38.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v38_scored.pkl" 
 
 # ---------------------------
 # 全局变量
@@ -43,8 +43,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V38.0 动态防御", layout="wide")
-st.title("选股王 V38.0：中线狙击与三级动态防御系统")
+st.set_page_config(page_title="选股王 V38.0 爆发力优选", layout="wide")
+st.title("选股王 V38.0：三维打分优选与三级动态防御")
 
 # ---------------------------
 # 基础 API 与 辅助函数
@@ -87,12 +87,13 @@ def load_industry_mapping():
     try:
         sw_indices = pro.index_classify(level='L1', src='SW2021')
         if sw_indices.empty: return {}
-        white_list_names = ['电子', '计算机', '通信', '电力设备', '医药生物', '汽车', '国防军工']
+        # ✅ 精简并增加机械设备
+        white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
         
         all_members = []
-        load_bar = st.progress(0, text="正在加载白名单赛道数据...")
+        load_bar = st.progress(0, text="正在加载硬科技白名单赛道数据...")
         for i, idx_code in enumerate(index_codes):
             df = pro.index_member(index_code=idx_code, is_new='Y')
             if not df.empty: 
@@ -152,7 +153,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
         
     all_dates = all_trade_dates_df['cal_date'].tolist()
     
-    st.info(f"📡 [首次运行] 正在下载复权行情数据: {start_date} 至 {end_date} (下载后将自动缓存)...")
+    st.info(f"📡 [首次运行] 正在下载复权行情数据: {start_date} 至 {end_date}...")
     adj_factor_data_list, daily_data_list = [], []
 
     my_bar = st.progress(0, text="Tushare 数据下载中...")
@@ -221,10 +222,10 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     for col in ['open', 'high', 'low', 'close']:
         df[col] = df[col + '_qfq']
         
-    return df[['open', 'high', 'low', 'close', 'vol']].copy() 
+    return df[['open', 'high', 'low', 'close', 'pre_close', 'vol']].copy() 
 
 # ---------------------------
-# 核心指标计算 (V38.0 逻辑)
+# 核心指标计算 (V38.0 爆发力增强版)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date):
@@ -233,17 +234,25 @@ def compute_trend_indicators(ts_code, end_date):
     res = {}
     if df.empty or len(df) < 120: return res 
     
-    # 计算日线级别的均线
+    # 均线
     df['ma10'] = df['close'].rolling(10).mean()
     df['ma20'] = df['close'].rolling(20).mean()
     df['ma60'] = df['close'].rolling(60).mean()
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].rolling(5).mean()
     
+    # 爆发力计算依赖指标
+    df['amplitude'] = (df['high'] - df['low']) / df['pre_close'] # 振幅
+    # MACD
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['dif'] = df['ema12'] - df['ema26']
+    df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
+    df['macd'] = (df['dif'] - df['dea']) * 2
+    
     df = df.dropna().reset_index()
     if len(df) < 4: return res
     
-    # 提取今日与近期数据
     row = df.iloc[-1]
     prev_row = df.iloc[-2]
     prev2_row = df.iloc[-3]
@@ -260,8 +269,14 @@ def compute_trend_indicators(ts_code, end_date):
     
     res['is_v38_buy_signal'] = is_trend_up and is_pulled_back and is_breakout and is_vol_up
     
+    if res['is_v38_buy_signal']:
+        # 记录打分所需数据
+        res['avg_amp_5d'] = df['amplitude'].tail(5).mean() # 活跃度
+        res['breakout_strength'] = (row['close'] - row['open']) / prev_row['close'] # 突破大阳线实体力度
+        res['macd'] = row['macd']
+        
     res['last_close'] = row['close']
-    res['bottom_line'] = row['low'] # 锁定大阳线最低价
+    res['bottom_line'] = row['low'] 
     res['ma20'] = row['ma20']
     
     return res
@@ -271,7 +286,6 @@ def compute_trend_indicators(ts_code, end_date):
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
-    # 向前推60天获取历史，以保证计算突破后的第一天就能拥有真实的MA20/MA10
     start_fetch = (d0 - timedelta(days=60)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=150)).strftime("%Y%m%d") 
     
@@ -286,11 +300,9 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
     hist_full['low'] = pd.to_numeric(hist_full['low'], errors='coerce')
     hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
     
-    # 真实计算均线，杜绝未来函数
     hist_full['ma10'] = hist_full['close'].rolling(10).mean()
     hist_full['ma20'] = hist_full['close'].rolling(20).mean()
     
-    # 截取买入日之后的未来走势图进行模拟
     hist_future = hist_full[hist_full.index > selection_date]
     
     ma20_active = False
@@ -309,19 +321,17 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
         curr_ma10 = row['ma10']
         curr_ma20 = row['ma20']
         
-        # --- 第一步：状态解锁判定 ---
         if not ma10_active:
             current_bias = (curr_high - curr_ma20) / curr_ma20
             if current_bias >= 0.15:
                 ma10_active = True
-                ma20_active = True # 挂入二档
+                ma20_active = True 
                 
         if not ma20_active and not ma10_active:
             profit_pct = (curr_close - buy_price) / buy_price
             if profit_pct >= 0.10 or curr_ma20 > buy_price:
-                ma20_active = True # 挂入一档
+                ma20_active = True 
                 
-        # --- 第二步：降级防守判定 ---
         final_return = np.nan
         if ma10_active:
             if curr_close < curr_ma10:
@@ -334,22 +344,18 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
                 exit_triggered = True
                 results['Exit_Reason'] = "一档防守(破20日线)"
         else:
-            # 初始装死期，死守发车底价
             if curr_close < bottom_line:
                 final_return = (curr_close - buy_price) / buy_price * 100.0
                 exit_triggered = True
                 results['Exit_Reason'] = "假突破(破底线)"
                 
-        # --- 第三步：结算处理 ---
         if exit_triggered:
             results[f'Return_W{current_week} (%)'] = final_return
             break 
             
-        # 正常切片记录
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = (curr_close - buy_price) / buy_price * 100.0
             
-    # 若到回测结束仍未离场
     if not exit_triggered and len(hist_future) >= hold_weeks * 5:
         last_price = hist_future.iloc[hold_weeks * 5 - 1]['close']
         results[f'Return_W{hold_weeks} (%)'] = (last_price - buy_price) / buy_price * 100.0
@@ -378,7 +384,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
     
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     
-    # 🌟 护城河过滤
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')] 
     df = df[(df['close'] >= MIN_PRICE)]
@@ -386,29 +391,44 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
     
     records = []
     for row in df.itertuples():
-        # 白名单过滤
         if GLOBAL_STOCK_INDUSTRY and row.ts_code not in GLOBAL_STOCK_INDUSTRY: 
             continue
             
         ind = compute_trend_indicators(row.ts_code, last_trade)
         if not ind or not ind.get('is_v38_buy_signal'): 
             continue
+            
+        # ✅ 三维打分逻辑
+        # 1. 活跃度得分 (40分上限)：近期日均振幅达到 10% 拿满 40分
+        score_active = min(max(ind['avg_amp_5d'] / 0.10, 0), 1.0) * 40 
         
-        # 记录未来 8 周轨迹及动态防守结果
+        # 2. 动能得分 (40分上限)：阳线实体力度达10%拿30分 + MACD处于0轴上方拿10分
+        score_momentum = min(max(ind['breakout_strength'] / 0.10, 0), 1.0) * 30 + (10 if ind['macd'] > 0 else 0)
+        
+        # 3. 20CM 溢价 (20分)
+        score_premium = 20 if (row.ts_code.startswith('300') or row.ts_code.startswith('688')) else 0
+        
+        total_score = score_active + score_momentum + score_premium
+        
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], 8)
         
         record_dict = {
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 
-            'circ_mv': row.circ_mv_billion
+            'circ_mv': row.circ_mv_billion,
+            'Score': round(total_score, 2),
+            'Active_S': round(score_active, 1),
+            'Momentum_S': round(score_momentum, 1),
+            'Premium_S': score_premium
         }
         record_dict.update(future_returns)
         records.append(record_dict)
             
     if not records: return pd.DataFrame(), "无标的"
+    
     fdf = pd.DataFrame(records)
     
-    # 无需刻意打分，符合V38形态的都是好标的，简单用市值由小到大排序展现弹性
-    final_df = fdf.sort_values('circ_mv', ascending=True).head(TOP_BACKTEST).copy()
+    # ✅ 严格按分数从高到低排序，只取优等生
+    final_df = fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST).copy()
     final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
     
     return final_df, None
@@ -417,10 +437,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V38.0 动态防御系统")
+    st.header("V38.0 爆发力优选")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析天数", value=100, step=1, help="建议测试完整牛熊波段")
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="符合新逻辑的标的适量放宽")
+    BACKTEST_DAYS = st.number_input("分析天数", value=60, step=1)
+    
+    # ✅ 默认只取前三名
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3, help="只选全市场打分最高的前三名")
     
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
@@ -428,7 +450,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v38.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v38_scored.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -436,21 +458,17 @@ with st.sidebar:
             
     st.markdown("---")
     st.subheader("💰 核心护城河门槛")
-    # ✅ 修改为你要求的默认值：股价20，市值200-1000
-    MIN_PRICE = st.number_input("最低股价 (元)", value=20.0, help="规避低价恶庄") 
+    MIN_PRICE = st.number_input("最低股价 (元)", value=20.0) 
     col1, col2 = st.columns(2)
     MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
-    
-    st.markdown("---")
-    st.info("🛡️ V38 风控：自动运行最低价死守、10%激活20日线、15%乖离挂10日线逻辑。")
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
 if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V38.0 轨迹追踪"):
+if st.button(f"🚀 启动 V38.0 智能打分引擎"):
     processed_dates = set()
     results = []
     
@@ -460,7 +478,6 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
             existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
             processed_dates = set(existing_df['Trade_Date'].unique())
             results.append(existing_df)
-            st.success(f"✅ 断点续传，跳过 {len(processed_dates)} 个交易日...")
         except:
             if os.path.exists(CHECKPOINT_FILE): os.remove(CHECKPOINT_FILE)
     else:
@@ -475,7 +492,7 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
     if not dates_to_run:
         st.success("🎉 回测已全部完毕！")
     else:
-        bar = st.progress(0, text="三级防御引擎启动...")
+        bar = st.progress(0, text="三维打分引擎运行中...")
         for i, date in enumerate(dates_to_run):
             res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), MIN_MV, MAX_MV, MIN_PRICE)
             if not res.empty:
@@ -490,30 +507,34 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V38.0 中线狙击 (白名单+三级动态防御)")
+        st.header(f"📊 V38.0 爆发力优选 (Top 3)")
         st.subheader("🗓️ 周度生存与收益切片")
         
-        cols = st.columns(4)
+        # ✅ 重构的UI代码：确保分两行四列，左到右严格顺着排 W1-W8
+        cols_row1 = st.columns(4)
+        cols_row2 = st.columns(4)
+        
         for w in range(1, 9):
             col_name = f'Return_W{w} (%)'
             valid = all_res.dropna(subset=[col_name]) 
-            with cols[(w-1) % 4]:
+            
+            # W1-W4 放在第一行，W5-W8 放在第二行
+            target_col = cols_row1[w-1] if w <= 4 else cols_row2[w-5]
+            
+            with target_col:
                 if not valid.empty:
                     avg = valid[col_name].mean()
                     win = (valid[col_name] > 0).mean() * 100
                     st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
                 else:
                     st.metric(f"W{w} 无持仓", "N/A")
-            if w == 4: st.write("")
  
-        st.subheader("📋 回测清单 (附带系统离场原因)")
-        display_cols = ['Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'circ_mv', 'Exit_Reason'] + [f'Return_W{w} (%)' for w in range(1, 9)]
+        st.subheader("📋 优等生清单 (附带得分细节与系统防守线)")
+        display_cols = ['Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'Score', 'Active_S', 'Momentum_S', 'Premium_S', 'circ_mv', 'Exit_Reason'] + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
     
-        # ✅ 这里加了 .reset_index(drop=True) 解决了由于合并 DataFrame 导致的索引重复报错问题
         display_df = all_res[final_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]).reset_index(drop=True)
         
-        # 增加高亮显示离场原因，便于复盘
         def color_exit(val):
             if isinstance(val, str):
                 if '假突破' in val: return 'color: red'
@@ -521,7 +542,6 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
                 elif '一档' in val: return 'color: green'
             return ''
         
-        # 增加安全判断：只有当存在 'Exit_Reason' 列时才渲染颜色，否则正常显示
         if 'Exit_Reason' in display_df.columns:
             try:
                 st.dataframe(display_df.style.map(color_exit, subset=['Exit_Reason']), use_container_width=True)
@@ -531,6 +551,6 @@ if st.button(f"🚀 启动 V38.0 轨迹追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_0.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_0_scored.csv", "text/csv")
     else:
-        st.warning("⚠️ 深度筛选后未发现符合大资金共振的标的。请耐心等待。")
+        st.warning("⚠️ 深度筛选后未发现符合大资金共振的高分标的。请耐心等待。")
