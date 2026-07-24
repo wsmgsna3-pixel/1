@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V38.2 中线共振狙击版 (铁桶防御版)
+选股王 · V38.3 中线共振狙击版 (刚柔并济弹性版)
 ------------------------------------------------
 逻辑说明:
 1. [中线股票池] 严格锁定流通市值 200亿-1000亿，股价 >= 20元。
-2. [白名单赛道] 电子、计算机、通信、医药生物、国防军工、机械设备。
-3. [三维打分取Top3] 取消市值板块偏见，纯粹考核当天攻击力（涨幅+量比）。
-4. [绞杀假突破] MA20必须向上、K线必须饱满、MACD大趋势在水上且动能拐头向上、真实放量。
-5. [四大动态防守体系] (防弹衣升级)
-   - 铁闸门：盘中最低价触及买入价 -8%，强制止损 (最高优先级)！
+2. [白名单赛道] 电子、计算机、通信、医药生物、国防军工、机械设备 (排除汽车)。
+3. [绞杀假突破] MA20向上、K线饱满、MACD在水上拐头、放量1.2倍。
+4. [双轨布林带过滤 (防超买)] 
+   - 主板(000/600)：不限制布林带上轨。
+   - 双创板(300/688)：突破当天的收盘价绝对不能越过布林带上轨，拒绝情绪高潮接盘。
+5. [弹性动态防御系统] 
+   - 弹性铁闸门 (最高优先级)：主板盘中破 -8% 强制斩仓；双创板盘中破 -12% 强制斩仓！
    - 初始装死：跌破大阳线最低价止损。
    - 挂 20 日线：利润达 10% 或脱离成本区后，依托 20日线防守。
-   - 真实二档锁：账面真实利润 >= 15% 且偏离均线，挂入 10 日线逃顶，绝不提前挂挡！
+   - 真实二档锁：账面真实浮盈 >= 15% 且偏离均线，挂入 10 日线逃顶。
 ------------------------------------------------
 """
 
@@ -28,7 +30,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v38_2_iron.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v38_3_elastic.pkl" 
 
 # ---------------------------
 # 全局变量
@@ -42,8 +44,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V38.2 铁桶防御", layout="wide")
-st.title("选股王 V38.2：终极打分与铁桶防御阵")
+st.set_page_config(page_title="选股王 V38.3 刚柔并济", layout="wide")
+st.title("选股王 V38.3：双轨布林带过滤 + 弹性防线")
 
 # ---------------------------
 # 基础 API 与 辅助函数
@@ -86,6 +88,7 @@ def load_industry_mapping():
     try:
         sw_indices = pro.index_classify(level='L1', src='SW2021')
         if sw_indices.empty: return {}
+        # 确保包含机械设备，剔除汽车
         white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
@@ -238,6 +241,11 @@ def compute_trend_indicators(ts_code, end_date):
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].rolling(5).mean()
     
+    # 布林带计算
+    df['boll_std'] = df['close'].rolling(20).std()
+    df['boll_upper'] = df['ma20'] + 2 * df['boll_std']
+    
+    # MACD计算
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
     df['dif'] = df['ema12'] - df['ema26']
@@ -264,9 +272,19 @@ def compute_trend_indicators(ts_code, end_date):
     
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
+    # --- 🚨 双轨制布林带过滤 ---
+    is_20cm = ts_code.startswith('300') or ts_code.startswith('688')
+    if is_20cm:
+        # 双创板严格不许超买
+        is_boll_valid = row['close'] <= row['boll_upper']
+    else:
+        # 主板豁免
+        is_boll_valid = True
+        
     res['is_v38_buy_signal'] = (is_trend_up and is_pulled_back and is_breakout 
                                 and is_ma20_healthy and is_vol_strong 
-                                and is_solid_yang and is_macd_healthy)
+                                and is_solid_yang and is_macd_healthy
+                                and is_boll_valid)
     
     if res['is_v38_buy_signal']:
         res['vol_ratio'] = row['vol'] / row['ma5_vol']  
@@ -279,7 +297,7 @@ def compute_trend_indicators(ts_code, end_date):
     return res
 
 # ---------------------------
-# V38.2 核心大脑：铁桶动态防御系统
+# V38.3 核心大脑：双轨弹性防御系统
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -306,6 +324,10 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
     ma10_active = False
     exit_triggered = False
     
+    # --- 判定板块归属，分配弹性止损额度 ---
+    is_20cm = ts_code.startswith('300') or ts_code.startswith('688')
+    hard_stop_limit = -0.12 if is_20cm else -0.08
+    
     for i in range(len(hist_future)):
         if i >= hold_weeks * 5: break 
             
@@ -320,16 +342,16 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
         curr_ma10 = row['ma10']
         curr_ma20 = row['ma20']
         
-        # --- 防弹衣1：铁闸门 8% 强制止损 (盘中最高优先级) ---
-        if (curr_low - buy_price) / buy_price <= -0.08:
-            # 如果跳空低开直接低于-8%，以开盘价算，否则严格按-8%斩仓
-            actual_loss = min(-8.0, (curr_open - buy_price) / buy_price * 100)
+        # --- 弹性铁闸门 (最高优先级) ---
+        if (curr_low - buy_price) / buy_price <= hard_stop_limit:
+            # 记录实际亏损，不超过阈值太多(防跳空)
+            actual_loss = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
             results[f'Return_W{current_week} (%)'] = actual_loss
             exit_triggered = True
-            results['Exit_Reason'] = "强制止损(破-8%)"
+            results['Exit_Reason'] = f"强制止损(破{int(hard_stop_limit*100)}%)"
             break 
             
-        # --- 防弹衣2：二档利润锁 (必须有 15% 真实账面浮盈，才允许挂挡) ---
+        # --- 真实利润二档锁 ---
         if not ma10_active:
             profit_bias = (curr_high - buy_price) / buy_price
             if profit_bias >= 0.15:
@@ -439,7 +461,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V38.2 铁桶防御版")
+    st.header("V38.3 刚柔并济版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=100, step=1)
     
@@ -451,7 +473,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v38_2_iron.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v38_3_elastic.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -469,7 +491,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V38.2 铁桶矩阵追踪"):
+if st.button(f"🚀 启动 V38.3 双轨防线追踪"):
     processed_dates = set()
     results = []
     
@@ -493,7 +515,7 @@ if st.button(f"🚀 启动 V38.2 铁桶矩阵追踪"):
     if not dates_to_run:
         st.success("🎉 回测已全部完毕！")
     else:
-        bar = st.progress(0, text="强力过滤与铁桶防线构建中...")
+        bar = st.progress(0, text="双轨布林带过滤与弹性防线构建中...")
         for i, date in enumerate(dates_to_run):
             res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), MIN_MV, MAX_MV, MIN_PRICE)
             if not res.empty:
@@ -508,7 +530,7 @@ if st.button(f"🚀 启动 V38.2 铁桶矩阵追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V38.2 铁桶防御版 (强过滤 + 8%强制止损)")
+        st.header(f"📊 V38.3 刚柔并济版 (弹性止损 + 双轨防超买)")
         st.subheader("🗓️ 周度生存与收益切片")
         
         cols_row1 = st.columns(4)
@@ -551,6 +573,6 @@ if st.button(f"🚀 启动 V38.2 铁桶矩阵追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_2_iron.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_3_elastic.csv", "text/csv")
     else:
-        st.warning("⚠️ 强力过滤后未发现标的，请耐心等待。")
+        st.warning("⚠️ 过滤过于严苛未发现标的，请耐心等待。")
