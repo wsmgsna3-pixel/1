@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V38.4 终极双轨弹性版 (融合新浪盘中实时引擎版)
+选股王 · V38.4 终极双轨弹性版 (融合新浪盘中实时引擎版 - 修复报错)
 ------------------------------------------------
 逻辑说明:
 1. [中线股票池] 严格锁定流通市值 200亿-1000亿，股价 >= 20元。
@@ -483,8 +483,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
         
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], 8, use_sina=use_sina)
         
+        # ⚠️ 此处已彻底修复 row.last_close 为 ind['last_close']
         record_dict = {
-            'ts_code': row.ts_code, 'name': row.name, 'Close': row.last_close, # 修正为实时最新价格
+            'ts_code': row.ts_code, 'name': row.name, 'Close': ind['last_close'], 
             'circ_mv': row.circ_mv_billion,
             'Total_Score': round(total_score, 1),
             'Breakout_S': round(score_breakout, 1),
