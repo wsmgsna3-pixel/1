@@ -4,7 +4,6 @@ import requests
 import datetime
 import time
 import sys
-import os
 
 # ==========================================
 # 通用基础模块：指标计算与实时数据抓取
@@ -44,7 +43,7 @@ def calc_indicators(df):
     df['MA10'] = df['close'].rolling(window=10).mean()
     df['MA5_Vol'] = df['vol'].rolling(window=5).mean()
     
-    # MACD
+    # MACD计算
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['DIF'] = exp1 - exp2
@@ -53,18 +52,17 @@ def calc_indicators(df):
     return df
 
 def get_core_stock_pool(pro):
-    """获取严格过滤后的股票池 (板块 + 200亿-1000亿市值)"""
+    """获取严格过滤后的股票池"""
     stock_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
-    # 剔除汽车，锁定高弹性板块
+    # 坚决剔除汽车，锁定电子、计算机、通信、医药生物、国防军工、机械设备
     target_industries = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
     filtered_stocks = stock_basic[stock_basic['industry'].isin(target_industries)]
 
-    # 获取最近一个交易日的日期来查市值
     trade_cal = pro.trade_cal(exchange='', is_open='1', start_date='20260701', end_date=datetime.datetime.now().strftime('%Y%m%d'))
     last_trade_date = trade_cal.iloc[-1]['cal_date']
 
     daily_basic = pro.daily_basic(ts_code='', trade_date=last_trade_date, fields='ts_code,circ_mv')
-    # 200亿 到 1000亿 流通市值
+    # 流通市值锁定 200亿 到 1000亿
     daily_basic = daily_basic[(daily_basic['circ_mv'] >= 2000000) & (daily_basic['circ_mv'] <= 10000000)]
     
     return pd.merge(filtered_stocks, daily_basic, on='ts_code')
@@ -77,7 +75,6 @@ def run_realtime_radar(pro):
     print("🛡️  启动 [实盘雷达模式] - 每日 14:45 运行")
     print("="*60)
     
-    # 网络连通性测试
     sys.stdout.write("📡 正在测试实时数据源连通性... ")
     sys.stdout.flush()
     test_data = get_sina_realtime_kline('000001.SZ')
@@ -104,7 +101,8 @@ def run_realtime_radar(pro):
             if df_hist.empty: continue
             
             today_data = get_sina_realtime_kline(ts_code)
-            if today_data is None or today_data['close'] < 20: continue # 价格铁闸门 >= 20元
+            # 价格铁闸门：现价必须大于等于 20 元
+            if today_data is None or today_data['close'] < 20: continue 
 
             df_today = pd.DataFrame([today_data])
             df = pd.concat([df_today, df_hist], ignore_index=True)
@@ -113,7 +111,7 @@ def run_realtime_radar(pro):
             latest = df.iloc[-1]
             prev = df.iloc[-2]
             
-            # 条件判定
+            # 实战四项铁律判定
             cond_ma20 = latest['close'] > latest['MA20']
             total_range = latest['high'] - latest['low']
             if total_range == 0: continue
@@ -172,13 +170,16 @@ def run_backtest_engine(pro):
             
             df = calc_indicators(df)
             
+            # 双创板12%止损，主板8%止损
             hard_sl_rate = 0.88 if ts_code.startswith('300') or ts_code.startswith('688') else 0.92
             
             for j in range(30, len(df) - 15):
                 current = df.iloc[j]
                 prev = df.iloc[j-1]
                 
+                # 价格铁闸门：必须大于等于20元
                 if current['close'] < 20: continue
+                
                 total_range = current['high'] - current['low']
                 if total_range == 0: continue
                 body_range = current['close'] - current['open']
@@ -264,25 +265,28 @@ def run_backtest_engine(pro):
         print("⚠️ 选定周期内未触发任何符合所有条件的交易信号。")
 
 # ==========================================
-# 终极控制台菜单 (修复空白假死版)
+# 交互式启动入口 (回归经典手动输入)
 # ==========================================
 if __name__ == "__main__":
+    sys.stdout.flush() 
     print("="*60)
     print("🚀 欢迎使用 V38.4 终极双轨弹性量化系统")
     print("="*60)
     
-    # ⚠️ 【重要：请将下方引号内的文字替换为你的 Tushare Token】
-    user_token = 'YOUR_TOKEN_HERE' 
+    # 交互 1：手动输入 Token
+    user_token = input("\n🔑 请直接粘贴您的 Tushare Token 并按回车: ").strip()
+    if not user_token:
+        print("⚠️ Token 不能为空，程序已退出。")
+        sys.exit()
+        
     ts.set_token(user_token)
     pro = ts.pro_api()
     
+    # 交互 2：手动选择模式
     print("\n请选择您要运行的模式：")
     print("  [1] ⚡ 实盘雷达模式 (每日 14:45 运行)")
     print("  [2] 📊 历史回测模式 (验证策略胜率)")
     print("  [0] ❌ 退出系统")
-    
-    # 强制刷新缓冲区，确保所有文字立刻在界面显示
-    sys.stdout.flush() 
     
     choice = input("\n👉 请输入对应数字 (1/2/0) 并按回车: ").strip()
     
@@ -291,7 +295,7 @@ if __name__ == "__main__":
     elif choice == '2':
         run_backtest_engine(pro)
     elif choice == '0':
-        print("\n系统已安全退出，祝实盘顺利。")
+        print("\n系统已退出。")
         sys.exit()
     else:
-        print("⚠️ 输入无效，请重新运行代码并选择。")
+        print("\n⚠️ 输入无效，请重新运行代码。")
