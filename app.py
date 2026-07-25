@@ -1,17 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V38.4 终极双轨弹性版 (实盘无缝融合 + 完美复刻版)
+选股王 · V38.4 终极双轨弹性版 (内置 T+1 形态监控模块)
 ------------------------------------------------
-逻辑说明:
-1. [中线股票池] 严格锁定流通市值 200亿-1000亿，股价 >= 20元。
-2. [白名单赛道] 电子、计算机、通信、医药生物、国防军工、机械设备。
-3. [三维打分取Top3] 公平起跑线，纯粹考核当天攻击力（涨幅+量比）。
-4. [保留强爆发买入] 彻底放弃布林带限制，保留“MA20向上 + 实体大阳线 + MACD水上动能反转 + 1.2倍放量”。
-5. [双轨弹性防守系统]
-   - 弹性铁闸门 (最高优先级)：主板 (000/600) 盘中破 -8% 强制斩仓；双创板 (300/688) 盘中破 -12% 强制斩仓！
-   - 初始装死：跌破大阳线最低价止损。
-   - 挂 20 日线：利润达 10% 或脱离成本区后，依托 20日线防守。
-   - 真实二档锁：账面真实浮盈 >= 15% 且偏离均线，挂入 10 日线逃顶。
+新增功能:
+1. [T+1 形态X光片] 自动抓取买入次日的阴阳、实体、影线、量能特征，用于分析短线胜率。
 ------------------------------------------------
 """
 
@@ -44,7 +36,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V38.4 终极双轨弹性", layout="wide")
-st.title("选股王 V38.4：强爆发力 + 弹性防弹衣 (实盘融合版)")
+st.title("选股王 V38.4：强爆发力 + 弹性防弹衣 (内置T+1形态监控)")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -118,7 +110,7 @@ def load_industry_mapping():
     try:
         sw_indices = pro.index_classify(level='L1', src='SW2021')
         if sw_indices.empty: return {}
-        # 严格遵守历史原版设定，拒绝一切污染
+        # 核心赛道：已剔除汽车，融合机械设备
         white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
@@ -255,14 +247,12 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
         
     final_df = df[['open', 'high', 'low', 'close', 'pre_close', 'vol']].copy() 
 
-    # --- 新浪实盘数据无缝缝合 ---
     if use_sina:
         today_str = datetime.now().strftime('%Y%m%d')
         if end_date == today_str:
             sina_data = get_sina_realtime_kline(ts_code)
             if sina_data and sina_data['close'] > 0:
                 sina_row = pd.DataFrame([sina_data]).set_index('trade_date_str')
-                # 用最新时刻的真实价格覆盖/追加到历史 K 线中
                 if today_str in final_df.index:
                     final_df.loc[today_str] = sina_row.iloc[0]
                 else:
@@ -286,7 +276,6 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].rolling(5).mean()
     
-    # MACD计算
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
     df['dif'] = df['ema12'] - df['ema26']
@@ -324,13 +313,14 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     res['last_close'] = row['close']
     res['bottom_line'] = row['low'] 
     res['ma20'] = row['ma20']
+    res['vol'] = row['vol'] # 抓取 T0 的成交量，用于给 T+1 计算量能比
     
     return res
 
 # ---------------------------
-# V38.4 核心大脑：双轨弹性防御系统
+# V38.4 核心大脑：双轨弹性防御系统 & T+1 形态监控模块
 # ---------------------------
-def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8, use_sina=False):
+def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, t0_vol, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_fetch = (d0 - timedelta(days=60)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=150)).strftime("%Y%m%d") 
@@ -339,23 +329,49 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
     results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
     results['Exit_Reason'] = "持仓中"
     
+    # 初始化 T+1 形态监控字段
+    results['T1_是否阳线'] = np.nan
+    results['T1_实体大小(%)'] = np.nan
+    results['T1_上影线(%)'] = np.nan
+    results['T1_下影线(%)'] = np.nan
+    results['T1_量能比(T1/T0)'] = np.nan
+    results['T1_破昨日底线'] = np.nan
+    
     if hist_full.empty or len(hist_full) < 30: return results
     
     hist_full['open'] = pd.to_numeric(hist_full['open'], errors='coerce')
     hist_full['high'] = pd.to_numeric(hist_full['high'], errors='coerce')
     hist_full['low'] = pd.to_numeric(hist_full['low'], errors='coerce')
     hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
+    hist_full['vol'] = pd.to_numeric(hist_full['vol'], errors='coerce')
     
     hist_full['ma10'] = hist_full['close'].rolling(10).mean()
     hist_full['ma20'] = hist_full['close'].rolling(20).mean()
     
     hist_future = hist_full[hist_full.index > selection_date]
     
+    # ---------------------------
+    # T+1 K线形态X光片提取
+    # ---------------------------
+    if not hist_future.empty:
+        t1_row = hist_future.iloc[0]
+        t1_open = t1_row['open']
+        t1_close = t1_row['close']
+        t1_high = t1_row['high']
+        t1_low = t1_row['low']
+        t1_vol = t1_row['vol']
+        
+        results['T1_是否阳线'] = 1 if t1_close > t1_open else 0
+        results['T1_实体大小(%)'] = round(abs(t1_close - t1_open) / buy_price * 100, 2)
+        results['T1_上影线(%)'] = round((t1_high - max(t1_open, t1_close)) / buy_price * 100, 2)
+        results['T1_下影线(%)'] = round((min(t1_open, t1_close) - t1_low) / buy_price * 100, 2)
+        results['T1_量能比(T1/T0)'] = round(t1_vol / t0_vol, 2) if t0_vol > 0 else np.nan
+        results['T1_破昨日底线'] = 1 if t1_low < bottom_line else 0
+
     ma20_active = False
     ma10_active = False
     exit_triggered = False
     
-    # 板块弹性风控：双创板 -12%，主板 -8%
     is_20cm = ts_code.startswith('300') or ts_code.startswith('688')
     hard_stop_limit = -0.12 if is_20cm else -0.08
     
@@ -373,7 +389,6 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
         curr_ma10 = row['ma10']
         curr_ma20 = row['ma20']
         
-        # 弹性铁闸门 (最高优先级)
         if (curr_low - buy_price) / buy_price <= hard_stop_limit:
             actual_loss = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
             results[f'Return_W{current_week} (%)'] = actual_loss
@@ -381,7 +396,6 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
             results['Exit_Reason'] = f"强制止损(破{int(hard_stop_limit*100)}%)"
             break 
             
-        # 真实利润二档锁 (必须有 15% 真实账面浮盈，才允许挂挡)
         if not ma10_active:
             profit_bias = (curr_high - buy_price) / buy_price
             if profit_bias >= 0.15:
@@ -430,11 +444,9 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False, run_timestamp=None):
     global GLOBAL_STOCK_INDUSTRY
     
-    # 彻底还原 V38.4 原版逻辑，拒绝一切会触发限流的冗余 API 调用
     query_date = last_trade
     daily_all = safe_get('daily', trade_date=query_date) 
     
-    # --- 仅在实盘雷达遇到数据真空期时，触发轻量级回溯 (绝对安全) ---
     if use_sina and daily_all.empty:
         for i in range(1, 10):
             temp_date = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=i)).strftime("%Y%m%d")
@@ -461,7 +473,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')] 
     
-    # 完美还原原版价格和市值的初筛位置
     df = df[(df['close'] >= MIN_PRICE)]
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     
@@ -474,7 +485,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
         if not ind or not ind.get('is_v38_buy_signal'): 
             continue
             
-        # 针对实盘模式，用新浪最新价进行双重精确校验
         if use_sina and ind['last_close'] < MIN_PRICE:
             continue
             
@@ -485,7 +495,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
         
         total_score = score_breakout + score_vol
         
-        future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], 8, use_sina=use_sina)
+        # 传递 t0_vol 供 T+1 量能比计算使用
+        future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], ind['vol'], hold_weeks=8, use_sina=use_sina)
         
         record_dict = {
             'ts_code': row.ts_code, 'name': row.name, 'Close': ind['last_close'], 
@@ -565,7 +576,6 @@ if st.button(f"🚀 启动 V38.4 终极双轨追踪"):
         bar = st.progress(0, text="强攻击力买入与弹性防线构建中...")
         for i, date in enumerate(dates_to_run):
             
-            # --- 雷达模式判定：天数为1且处理今日数据时，开启新浪实盘对接并击穿缓存 ---
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
             run_timestamp = time.time() if is_realtime_radar else None
             
@@ -586,7 +596,7 @@ if st.button(f"🚀 启动 V38.4 终极双轨追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V38.4 终极双轨弹性版")
+        st.header(f"📊 V38.4 终极双轨弹性版 (含 T+1 形态特征)")
         st.subheader("🗓️ 周度生存与收益切片")
         
         cols_row1 = st.columns(4)
@@ -606,8 +616,11 @@ if st.button(f"🚀 启动 V38.4 终极双轨追踪"):
                 else:
                     st.metric(f"W{w} 无持仓", "N/A")
  
-        st.subheader("📋 优等生清单 (附防线触发监控)")
-        display_cols = ['Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'] + [f'Return_W{w} (%)' for w in range(1, 9)]
+        st.subheader("📋 优等生清单 (附 T+1 监控与防线触发)")
+        display_cols = [
+            'Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason',
+            'T1_是否阳线', 'T1_实体大小(%)', 'T1_上影线(%)', 'T1_下影线(%)', 'T1_量能比(T1/T0)', 'T1_破昨日底线'
+        ] + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
     
         display_df = all_res[final_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]).reset_index(drop=True)
@@ -629,6 +642,6 @@ if st.button(f"🚀 启动 V38.4 终极双轨追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_4_final.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_4_final_with_T1.csv", "text/csv")
     else:
         st.warning("⚠️ 未发现标的，请耐心等待。")
