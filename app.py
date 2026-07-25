@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 选股王 · V38.4 终极双轨弹性版 (融合新浪盘中实时引擎版 - 修复报错)
+【第一部分：基础配置与数据获取】
 ------------------------------------------------
 逻辑说明:
 1. [中线股票池] 严格锁定流通市值 200亿-1000亿，股价 >= 20元。
@@ -223,7 +224,6 @@ def get_all_historical_data(trade_days_list, use_cache=True):
         except Exception: pass
             
     return True
-
 # 新增 use_sina 参数
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=False):
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
