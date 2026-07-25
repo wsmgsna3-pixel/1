@@ -55,7 +55,7 @@ def calc_indicators(df):
 def get_core_stock_pool(pro):
     """获取严格过滤后的股票池 (板块 + 200亿-1000亿市值)"""
     stock_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
-    # 剔除汽车，加入机械设备
+    # 剔除汽车，锁定高弹性板块
     target_industries = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
     filtered_stocks = stock_basic[stock_basic['industry'].isin(target_industries)]
 
@@ -79,6 +79,7 @@ def run_realtime_radar(pro):
     
     # 网络连通性测试
     sys.stdout.write("📡 正在测试实时数据源连通性... ")
+    sys.stdout.flush()
     test_data = get_sina_realtime_kline('000001.SZ')
     if test_data and test_data['close'] > 0:
         print(f"✅ 成功 (平安银行现价: {test_data['close']} 元)\n")
@@ -128,7 +129,7 @@ def run_realtime_radar(pro):
                 })
                 print(f"\n🔥 [捕获信号] {stock_name} ({ts_code}) | 现价: {round(latest['close'], 2)} 突破！")
             
-            time.sleep(0.06) # Tushare 接口防封限制
+            time.sleep(0.06) 
         except Exception:
             continue
 
@@ -151,7 +152,7 @@ def run_backtest_engine(pro):
     print("📊 启动 [历史回测模式] - 验证 V38.4 市场适应性")
     print("="*60)
     
-    start_date = '20250101' # 可在此处修改回测起点
+    start_date = '20250101'
     print(f"⏳ 正在拉取数据，回测区间起点：{start_date} ...\n")
     
     candidate_pool = get_core_stock_pool(pro)
@@ -171,14 +172,12 @@ def run_backtest_engine(pro):
             
             df = calc_indicators(df)
             
-            # 判断标的属性设置强制止损比例
             hard_sl_rate = 0.88 if ts_code.startswith('300') or ts_code.startswith('688') else 0.92
             
-            for j in range(30, len(df) - 15): # 预留15天用于走势推演
+            for j in range(30, len(df) - 15):
                 current = df.iloc[j]
                 prev = df.iloc[j-1]
                 
-                # 买入条件判断
                 if current['close'] < 20: continue
                 total_range = current['high'] - current['low']
                 if total_range == 0: continue
@@ -190,12 +189,10 @@ def run_backtest_engine(pro):
                 cond_vol = current['vol'] > (current['MA5_Vol'] * 1.2)
                 
                 if cond_ma20 and cond_body and cond_macd and cond_vol:
-                    # 记录买入信息 (假设 14:50 买入，买入价即收盘价)
                     buy_price = current['close']
                     buy_date = current['trade_date']
-                    buy_low = current['low'] # 大阳线最低价用于假突破防守
+                    buy_low = current['low']
                     
-                    # 模拟持仓推演 (未来 15 个交易日)
                     sell_price = 0
                     sell_reason = ""
                     hold_days = 0
@@ -206,35 +203,29 @@ def run_backtest_engine(pro):
                         future_k = df.iloc[k]
                         hold_days += 1
                         
-                        # 记录期间最高浮盈
                         curr_profit = (future_k['high'] - buy_price) / buy_price
                         if curr_profit > max_profit: max_profit = curr_profit
                         
-                        # 1. 灾难防线：盘中强制止损 (-8% / -12%)
                         if future_k['low'] <= buy_price * hard_sl_rate:
                             sell_price = buy_price * hard_sl_rate
                             sell_reason = "触及强制止损"
                             break
                             
-                        # 2. 逻辑防线：收盘假突破止损
                         if future_k['close'] < buy_low:
                             sell_price = future_k['close']
                             sell_reason = "跌破大阳最低价"
                             break
                             
-                        # 3. 动态止盈：二档防守 (盈利>15%，破MA10卖出)
                         if max_profit >= 0.15 and future_k['close'] < future_k['MA10']:
                             sell_price = future_k['close']
                             sell_reason = "15%二档止盈(破MA10)"
                             break
                             
-                        # 4. 动态防守：一档防守 (盈利>10%，破MA20卖出)
                         if max_profit >= 0.10 and max_profit < 0.15 and future_k['close'] < future_k['MA20']:
                             sell_price = future_k['close']
                             sell_reason = "10%一档保本(破MA20)"
                             break
                             
-                        # 若熬过 15 天未触发任何卖出条件，按期末收盘价结算
                         if hold_days == 15:
                             sell_price = future_k['close']
                             sell_reason = "完成3周推演持仓"
@@ -259,7 +250,6 @@ def run_backtest_engine(pro):
         win_rate = round(len(res_df[res_df['盈亏幅度(%)'] > 0]) / len(res_df) * 100, 2)
         total_trades = len(res_df)
         
-        # 导出 Excel 报表
         file_name = f"V38_4_回测报告_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         res_df.to_excel(file_name, index=False)
         
@@ -274,31 +264,34 @@ def run_backtest_engine(pro):
         print("⚠️ 选定周期内未触发任何符合所有条件的交易信号。")
 
 # ==========================================
-# 终端控制台菜单
+# 终极控制台菜单 (修复空白假死版)
 # ==========================================
 if __name__ == "__main__":
     print("="*60)
     print("🚀 欢迎使用 V38.4 终极双轨弹性量化系统")
     print("="*60)
     
-    user_token = input("🔑 请输入您的 Tushare Token (输入后按回车): ").strip()
+    # ⚠️ 【重要：请将下方引号内的文字替换为你的 Tushare Token】
+    user_token = 'YOUR_TOKEN_HERE' 
     ts.set_token(user_token)
     pro = ts.pro_api()
     
-    while True:
-        print("\n请选择您要运行的模式：")
-        print("  [1] ⚡ 实盘雷达模式 (每日 14:45 运行，输出今日买入信号)")
-        print("  [2] 📊 历史回测模式 (盘后运行，验证策略在近期行情的胜率)")
-        print("  [0] ❌ 退出系统")
-        
-        choice = input("\n👉 请输入对应数字 (1/2/0): ").strip()
-        
-        if choice == '1':
-            run_realtime_radar(pro)
-        elif choice == '2':
-            run_backtest_engine(pro)
-        elif choice == '0':
-            print("\n系统已安全退出，祝实盘顺利。")
-            sys.exit()
-        else:
-            print("⚠️ 输入无效，请重新选择。")
+    print("\n请选择您要运行的模式：")
+    print("  [1] ⚡ 实盘雷达模式 (每日 14:45 运行)")
+    print("  [2] 📊 历史回测模式 (验证策略胜率)")
+    print("  [0] ❌ 退出系统")
+    
+    # 强制刷新缓冲区，确保所有文字立刻在界面显示
+    sys.stdout.flush() 
+    
+    choice = input("\n👉 请输入对应数字 (1/2/0) 并按回车: ").strip()
+    
+    if choice == '1':
+        run_realtime_radar(pro)
+    elif choice == '2':
+        run_backtest_engine(pro)
+    elif choice == '0':
+        print("\n系统已安全退出，祝实盘顺利。")
+        sys.exit()
+    else:
+        print("⚠️ 输入无效，请重新运行代码并选择。")
