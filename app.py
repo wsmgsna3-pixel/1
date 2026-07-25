@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V38.5 终极实战版 (内置大盘风控 + 实时行情监控)
+选股王 · V38.5 终极实战版 (内置大盘风控 + 实时行情监控 + UI修复)
 ------------------------------------------------
-新增功能:
-1. [大盘风控总闸] 监控上证指数，破20日线自动空仓过滤系统性风险。
-2. [Sina探针] 实时雷达模式下，明确提示新浪盘中数据是否抓取成功。
-3. [清理冗余] 移除了已完成历史使命的 T+1 探测模块。
+修复与新增:
+1. [参数修复] 严格恢复流通市值 200亿 - 1000亿 的核心圈层门槛。
+2. [UI修复] 补齐周度生存与收益切片 (W1-W8) 的界面渲染代码。
+3. [大盘风控] 监控上证指数，破20日线自动空仓过滤系统性风险。
+4. [Sina探针] 实时雷达模式下，明确提示新浪盘中数据是否抓取成功。
 ------------------------------------------------
 """
 
@@ -33,7 +34,7 @@ GLOBAL_ADJ_FACTOR = pd.DataFrame()
 GLOBAL_DAILY_RAW = pd.DataFrame() 
 GLOBAL_QFQ_BASE_FACTORS = {} 
 GLOBAL_STOCK_INDUSTRY = {} 
-SINA_STATUS = {'success': 0, 'fail': 0} # 新浪接口探针
+SINA_STATUS = {'success': 0, 'fail': 0} 
 
 # ---------------------------
 # 页面设置
@@ -45,7 +46,6 @@ st.title("选股王 V38.5：大盘风控过滤 + 实时探针")
 # 新浪实时行情引擎 (带状态监控)
 # ---------------------------
 def get_sina_realtime_kline(ts_code):
-    """获取新浪实时行情，用于盘中14:45分接管"""
     global SINA_STATUS
     code_split = ts_code.split('.')
     if len(code_split) != 2: return None
@@ -71,7 +71,7 @@ def get_sina_realtime_kline(ts_code):
             'close': float(data_list[3]),
             'high': float(data_list[4]),
             'low': float(data_list[5]),
-            'vol': (float(data_list[8]) / 100) * (240 / 225) # 尾盘预估全天量
+            'vol': (float(data_list[8]) / 100) * (240 / 225) 
         }
     except Exception:
         SINA_STATUS['fail'] += 1
@@ -88,7 +88,6 @@ def safe_get(func_name, **kwargs):
     try:
         for _ in range(3):
             try:
-                # 兼容大盘指数API
                 if func_name == 'index_daily': 
                     df = pro.index_daily(**kwargs)
                 else: 
@@ -110,14 +109,11 @@ def get_trade_days(end_date_str, num_days):
 
 @st.cache_data(ttl=3600*2)
 def check_market_environment(trade_date):
-    """
-    大盘风控系统：判断上证指数是否站上 20 日均线
-    """
     start_date = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
     df = safe_get('index_daily', ts_code='000001.SH', start_date=start_date, end_date=trade_date)
     
     if df.empty or len(df) < 20: 
-        return True # 数据缺失时默认放行，避免误阻断
+        return True 
         
     df = df.sort_values('trade_date').reset_index(drop=True)
     df['ma20'] = df['close'].rolling(20).mean()
@@ -139,7 +135,7 @@ def load_industry_mapping():
     try:
         sw_indices = pro.index_classify(level='L1', src='SW2021')
         if sw_indices.empty: return {}
-        # 核心赛道：剔除汽车，融合机械设备
+        # 核心赛道：已剔除汽车，融合机械设备
         white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
@@ -439,7 +435,6 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, apply_market_filter, use_sina=False, run_timestamp=None):
     global GLOBAL_STOCK_INDUSTRY
     
-    # 【大盘风控阻断逻辑】
     if apply_market_filter:
         is_market_safe = check_market_environment(last_trade)
         if not is_market_safe:
@@ -543,8 +538,9 @@ with st.sidebar:
     st.subheader("💰 核心护城河门槛")
     MIN_PRICE = st.number_input("最低股价 (元)", value=20.0) 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=20.0) 
-    MAX_MV = col2.number_input("最大市值(亿)", value=100.0)
+    # 彻底修复：严格还原 200亿 到 1000亿 的底线
+    MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
+    MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
 if not TS_TOKEN: st.stop()
@@ -552,7 +548,6 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 if st.button(f"🚀 启动 V38.5 终极双轨追踪"):
-    # 重置新浪接口探针状态
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -589,7 +584,6 @@ if st.button(f"🚀 启动 V38.5 终极双轨追踪"):
                 use_sina=is_realtime_radar, run_timestamp=run_timestamp
             )
             
-            # 若触发大盘风控，可以在终端打印，但不写入持仓
             if err and "大盘风控未通过" in err:
                 st.warning(f"⚠️ {date}：大盘风控未通过，系统主动空仓过滤风险。")
             
@@ -601,7 +595,6 @@ if st.button(f"🚀 启动 V38.5 终极双轨追踪"):
             bar.progress((i+1)/len(dates_to_run), text=f"分析中: {date}")
         bar.empty()
     
-    # 实盘模式下，展示新浪接口抓取状态
     if int(BACKTEST_DAYS) == 1:
         st.markdown("---")
         if SINA_STATUS['success'] > 0:
@@ -617,6 +610,25 @@ if st.button(f"🚀 启动 V38.5 终极双轨追踪"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
         st.header(f"📊 V38.5 终极实战版")
+        
+        # 彻底修复：重新加回 W1-W8 的统计看板卡片
+        st.subheader("🗓️ 周度生存与收益切片")
+        cols_row1 = st.columns(4)
+        cols_row2 = st.columns(4)
+        
+        for w in range(1, 9):
+            col_name = f'Return_W{w} (%)'
+            if col_name in all_res.columns:
+                valid = all_res.dropna(subset=[col_name]) 
+                target_col = cols_row1[w-1] if w <= 4 else cols_row2[w-5]
+                with target_col:
+                    if not valid.empty:
+                        avg = valid[col_name].mean()
+                        win = (valid[col_name] > 0).mean() * 100
+                        st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
+                    else:
+                        st.metric(f"W{w} 无持仓", "N/A")
+                        
         st.subheader("📋 优等生清单")
         display_cols = [
             'Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
@@ -642,6 +654,6 @@ if st.button(f"🚀 启动 V38.5 终极双轨追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_5_final.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v38_5_final_fixed.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
