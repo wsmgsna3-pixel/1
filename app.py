@@ -3,12 +3,13 @@ import pandas as pd
 import requests
 import datetime
 import time
-import streamlit as st # 必须引入网页 UI 库
+import streamlit as st 
 
 # ==========================================
 # 通用基础模块：指标计算与实时数据抓取
 # ==========================================
 def get_sina_realtime_kline(ts_code):
+    """获取新浪实时行情，用于盘中缝合"""
     code_split = ts_code.split('.')
     if len(code_split) != 2: return None
     sina_code = code_split[1].lower() + code_split[0]
@@ -30,17 +31,19 @@ def get_sina_realtime_kline(ts_code):
             'high': float(data_list[4]),
             'low': float(data_list[5]),
             'close': float(data_list[3]),
-            'vol': (float(data_list[8]) / 100) * (240 / 225) 
+            'vol': (float(data_list[8]) / 100) * (240 / 225) # 14:45预估全天量
         }
     except Exception:
         return None
 
 def calc_indicators(df):
+    """统一的指标计算引擎"""
     df = df.sort_values('trade_date', ascending=True).reset_index(drop=True)
     df['MA20'] = df['close'].rolling(window=20).mean()
     df['MA10'] = df['close'].rolling(window=10).mean()
     df['MA5_Vol'] = df['vol'].rolling(window=5).mean()
     
+    # MACD计算
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['DIF'] = exp1 - exp2
@@ -49,14 +52,19 @@ def calc_indicators(df):
     return df
 
 def get_core_stock_pool(pro):
+    """获取严格过滤后的股票池 (修复行业匹配Bug版)"""
     stock_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry')
-    target_industries = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
-    filtered_stocks = stock_basic[stock_basic['industry'].isin(target_industries)]
+    
+    # 核心修复：使用反向剔除逻辑。只要行业里带有“汽车”，一律剔除。保留机械设备等所有核心资产。
+    filtered_stocks = stock_basic[~stock_basic['industry'].str.contains('汽车', na=False)]
 
+    # 获取最近一个交易日的日期来查市值
     trade_cal = pro.trade_cal(exchange='', is_open='1', start_date='20260701', end_date=datetime.datetime.now().strftime('%Y%m%d'))
     last_trade_date = trade_cal.iloc[-1]['cal_date']
 
     daily_basic = pro.daily_basic(ts_code='', trade_date=last_trade_date, fields='ts_code,circ_mv')
+    
+    # 严格锁定 200亿 到 1000亿 流通市值
     daily_basic = daily_basic[(daily_basic['circ_mv'] >= 2000000) & (daily_basic['circ_mv'] <= 10000000)]
     
     return pd.merge(filtered_stocks, daily_basic, on='ts_code')
@@ -68,7 +76,7 @@ def run_realtime_radar_web(pro):
     st.markdown("### 📡 正在测试实时数据源连通性...")
     test_data = get_sina_realtime_kline('000001.SZ')
     if test_data and test_data['close'] > 0:
-        st.success(f"✅ 网络通信正常 (平安银行现价: {test_data['close']} 元)")
+        st.success(f"✅ 网络通信正常 (平安银行实时数据测试成功)")
     else:
         st.error("❌ 失败，请检查网络！")
         return
@@ -78,7 +86,7 @@ def run_realtime_radar_web(pro):
     total_count = len(stock_list)
     final_signals = []
 
-    st.info(f"🚀 锁定 {total_count} 只核心赛道资产，开始实时扫描...")
+    st.info(f"🚀 成功锁定 {total_count} 只核心资产，雷达开始扫描...")
     
     # 网页进度条组件
     progress_bar = st.progress(0)
@@ -87,7 +95,7 @@ def run_realtime_radar_web(pro):
     for i, ts_code in enumerate(stock_list):
         try:
             stock_name = candidate_pool[candidate_pool['ts_code'] == ts_code]['name'].values[0]
-            # 更新进度条和文本
+            # 实时更新进度条
             progress_bar.progress((i + 1) / total_count)
             status_text.text(f"🔍 正在扫描 [{i+1}/{total_count}]: {stock_name} ({ts_code})")
 
@@ -95,6 +103,8 @@ def run_realtime_radar_web(pro):
             if df_hist.empty: continue
             
             today_data = get_sina_realtime_kline(ts_code)
+            
+            # 价格铁闸门：>= 20元
             if today_data is None or today_data['close'] < 20: continue 
 
             df_today = pd.DataFrame([today_data])
@@ -122,16 +132,16 @@ def run_realtime_radar_web(pro):
         except Exception:
             continue
 
-    status_text.text("✅ 扫描完成！")
+    status_text.text("✅ 雷达全盘扫描完成！")
     st.markdown("---")
     st.markdown("### 🎯 V38.4 尾盘终极狙击名单")
     
     if final_signals:
-        st.warning("【免死金牌提示】：重点关注现价 > 40元 的标的！")
+        st.warning("【免死金牌复核提示】：重点关注现价 > 40元 的标的！")
         for s in final_signals:
             st.success(f"🔥 **{s['名称']} ({s['代码']})** | 现价: **{s['现价']}** 元 | 防守线: {s['MA20防守']} 元")
     else:
-        st.info("⚠️ 今日无标的满足饱满实体大阳线，严格空仓。")
+        st.info("⚠️ 经受住全盘抛压的个股为零，今日无标的满足饱满实体大阳线条件，严格执行空仓纪律。")
 
 # ==========================================
 # 核心功能二：历史回测引擎 (网页渲染版)
@@ -164,7 +174,9 @@ def run_backtest_engine_web(pro):
                 current = df.iloc[j]
                 prev = df.iloc[j-1]
                 
+                # 价格铁闸门：>= 20元
                 if current['close'] < 20: continue
+                
                 total_range = current['high'] - current['low']
                 if total_range == 0: continue
                 body_range = current['close'] - current['open']
@@ -215,14 +227,16 @@ def run_backtest_engine_web(pro):
                     if sell_price > 0:
                         profit_rate = round((sell_price - buy_price) / buy_price * 100, 2)
                         backtest_results.append({
-                            '名称': stock_name, '买入日': buy_date, '盈亏(%)': profit_rate, '出局原因': sell_reason
+                            '代码': ts_code, '名称': stock_name, '买入日': buy_date, 
+                            '买入价': round(buy_price, 2), '卖出价': round(sell_price, 2),
+                            '盈亏(%)': profit_rate, '出局原因': sell_reason
                         })
                         
             time.sleep(0.06)
         except Exception:
             continue
             
-    status_text.text("✅ 回测推演完成！")
+    status_text.text("✅ 回测动态推演完成！")
     
     if backtest_results:
         res_df = pd.DataFrame(backtest_results)
@@ -230,37 +244,41 @@ def run_backtest_engine_web(pro):
         
         st.markdown("---")
         st.markdown("### 📊 回测总结报表")
-        st.metric(label="整体胜率 (>0收益)", value=f"{win_rate}%")
-        st.metric(label="总计触发交易", value=f"{len(res_df)} 次")
-        st.dataframe(res_df) # 在网页直接展示表格
+        
+        # 网页排版展示数据面板
+        col1, col2 = st.columns(2)
+        col1.metric(label="总体胜率 (>0收益)", value=f"{win_rate}%")
+        col2.metric(label="触发总交易次数", value=f"{len(res_df)} 次")
+        
+        st.markdown("#### 📜 详细交易清单")
+        st.dataframe(res_df) 
     else:
-        st.warning("⚠️ 选定周期内未触发任何交易信号。")
+        st.warning("⚠️ 选定周期内，未触发任何一笔符合全维度铁律的交易。")
 
 # ==========================================
 # 网页界面搭建 (Streamlit UI)
 # ==========================================
-st.set_page_config(page_title="V38.4 量化系统", page_icon="🚀")
+st.set_page_config(page_title="V38.4 量化系统", page_icon="🚀", layout="wide")
 st.title("🚀 V38.4 终极双轨弹性量化系统")
 st.markdown("---")
 
-# 密码输入框：输入内容会自动变成星号，不会泄露，也不会保存在代码里
-user_token = st.text_input("🔑 请粘贴您的 Tushare Token:", type="password")
+# 密码输入框：输入内容会自动变成星号隐藏
+user_token = st.text_input("🔑 请粘贴您的 Tushare 10000 积分账户 Token:", type="password")
 
 if user_token:
     ts.set_token(user_token)
     try:
         pro = ts.pro_api()
-        st.success("Token 验证通过，系统就绪。")
+        st.success("✅ 万分权限 Token 验证通过，系统就绪。")
         
-        # 网页单选按钮
-        run_mode = st.radio("请选择运行模式：", ["⚡ 实盘雷达模式 (每日 14:45 运行)", "📊 历史回测模式 (验证策略胜率)"])
+        st.markdown("### ⚙️ 引擎控制台")
+        run_mode = st.radio("请选择本次启动的运行模式：", ["⚡ 实盘雷达模式 (每日 14:45 运行，抓取右侧突破点)", "📊 历史回测模式 (评估近期市场胜率)"])
         
-        # 网页触发按钮
-        if st.button("▶️ 立即运行"):
+        if st.button("▶️ 立即启动系统"):
             if "雷达" in run_mode:
                 run_realtime_radar_web(pro)
             else:
                 run_backtest_engine_web(pro)
                 
     except Exception as e:
-        st.error(f"Token 无效或网络异常，请核对。")
+        st.error(f"❌ Token 验证失败或网络异常，请重新核对密钥输入。")
