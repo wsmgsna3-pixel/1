@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V39.2 周线温和降维版 (解封底部黑马 + 防高位派发)
+选股王 · V39.2修正版 周线温和降维版 (解封底部黑马 + 防高位派发)
 ------------------------------------------------
 核心改进:
 1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
@@ -23,7 +23,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v39_2.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v39_2_fix.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -38,8 +38,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.2 周线温和降维", layout="wide")
-st.title("选股王 V39.2：周线温和过滤 + 日线爆量共振")
+st.set_page_config(page_title="选股王 V39.2修正版 周线温和降维", layout="wide")
+st.title("选股王 V39.2修正版：周线温和过滤 + 日线爆量共振")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -222,7 +222,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
     if GLOBAL_DAILY_RAW.empty: return pd.DataFrame()
     
-    # V39.2 修正：使用回测截止日复权因子，避免使用未来日期基准
+    # V39.2修正版：优先使用回测截止日复权因子
     try:
         latest_adj_factor = GLOBAL_ADJ_FACTOR.loc[(ts_code, end_date), 'adj_factor']
     except Exception:
@@ -328,9 +328,10 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     if w_prev_range > 0 and (w_prev_upper_shadow / w_prev_range) >= 0.60:
         w_shadow_safe = False
 
+    # V39.2修正版：周线不明显下降即可，避免错杀启动阶段
     is_weekly_trend_up = (
         not pd.isna(w_curr.get('w_ma20_slope', np.nan))
-        and w_curr['w_ma20_slope'] > 0.02
+        and w_curr['w_ma20_slope'] > -0.01
     )
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
@@ -344,19 +345,19 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_daily_pulled_back = (prev2_row['close'] < prev2_row['ma20']) and (prev_row['close'] < prev_row['ma20'])
     is_daily_breakout = row['close'] > row['ma20']
 
-    # V39.2 新增：20日均线斜率过滤
     try:
         ma20_slope = row['ma20'] / df_calc.iloc[-6]['ma20'] - 1
     except Exception:
         ma20_slope = -1
 
-    is_daily_ma20_healthy = ma20_slope > 0.02
+    # 修正版：回踩后重新走强，不要求强趋势加速
+    is_daily_ma20_healthy = ma20_slope > 0
 
-    # V39.2 新增：避免深跌反弹
     try:
         high60 = df_calc['high'].rolling(60).max().iloc[-1]
         price_position = row['close'] / high60
-        is_near_high = price_position > 0.85
+        # 过滤深跌反弹，但保留二次启动
+        is_near_high = price_position > 0.70
     except Exception:
         is_near_high = False
 
@@ -368,10 +369,18 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
     # 【综合决策】：温和周线风控 + 日线强攻击信号
-    res['is_v38_buy_signal'] = (is_weekly_safe and 
-                                is_daily_trend_up and is_daily_pulled_back and 
-                                is_daily_breakout and is_daily_ma20_healthy and 
-                                is_daily_vol_strong and is_solid_yang and is_macd_healthy)
+    res['is_v39_2_buy_signal'] = (
+        is_weekly_safe and
+        is_weekly_trend_up and
+        is_daily_trend_up and
+        is_daily_pulled_back and
+        is_daily_breakout and
+        is_daily_ma20_healthy and
+        is_near_high and
+        is_daily_vol_strong and
+        is_solid_yang and
+        is_macd_healthy
+    )
     
     if res['is_v38_buy_signal']:
         res['vol_ratio'] = row['vol'] / row['ma5_vol']  
@@ -384,7 +393,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# V39.2 核心大脑：双轨弹性防御系统
+# V39.2修正版 核心大脑：双轨弹性防御系统
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -556,7 +565,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.2 周线温和降维版")
+    st.header("V39.2修正版 周线温和降维版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -568,7 +577,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_2.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_2_fix.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -586,7 +595,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.2 温和降维追踪"):
+if st.button(f"🚀 启动 V39.2修正版 温和降维追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -644,7 +653,7 @@ if st.button(f"🚀 启动 V39.2 温和降维追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.2 周线温和降维版")
+        st.header(f"📊 V39.2修正版 周线温和降维版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -687,6 +696,6 @@ if st.button(f"🚀 启动 V39.2 温和降维追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_2_mild_filter.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_2_fix_mild_filter.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
