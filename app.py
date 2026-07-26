@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V39.0 周日双周期共振版 (真实周线合成 + 日线爆量点火)
+选股王 · V39.1 周线温和降维版 (解封底部黑马 + 防高位派发)
 ------------------------------------------------
-核心重构:
-1. [真实周线引擎] 动态聚合每日数据为周K线，计算周线 MA10/MA20 及周线 MACD。
-2. [周线趋势+回踩] 锁定周线上升趋势中的深度缩量回踩，彻底过滤日线高位诱多。
-3. [日线爆量共振] 在周线安全底座之上，捕捉日线 20 日线放量反包的极致买点。
+核心改进:
+1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
+2. [防高位陷阱] 增加周线乖离率与高位上影线风控，专门绞杀高位 B 浪诱多派发。
+3. [日线爆量点火] 保持日线 20 日线爆量反包的极致灵敏度。
 ------------------------------------------------
 """
 
@@ -23,7 +23,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v39_0.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v39_1.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -38,11 +38,11 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.0 周日双周期共振", layout="wide")
-st.title("选股王 V39.0：周线趋势回踩 + 日线爆量共振")
+st.set_page_config(page_title="选股王 V39.1 周线温和降维", layout="wide")
+st.title("选股王 V39.1：周线温和过滤 + 日线爆量共振")
 
 # ---------------------------
-# 新浪实时行情引擎 (带状态监控)
+# 新浪实时行情引擎
 # ---------------------------
 def get_sina_realtime_kline(ts_code):
     global SINA_STATUS
@@ -119,7 +119,6 @@ def load_industry_mapping():
     try:
         sw_indices = pro.index_classify(level='L1', src='SW2021')
         if sw_indices.empty: return {}
-        # 核心赛道：已剔除汽车，精准聚焦硬科技与机械设备
         white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
@@ -172,7 +171,6 @@ def get_all_historical_data(trade_days_list, use_cache=True):
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     
-    # 扩展数据调取窗口至 365 天，确保周线合成拥有足够的样本长度
     start_date = (datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
     end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=150)).strftime("%Y%m%d")
     
@@ -265,7 +263,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
     return final_df
 
 # ---------------------------
-# 核心指标计算 (引入周线重采样引擎)
+# 核心指标计算 (温和周线过滤)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -274,7 +272,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     res = {}
     if df.empty or len(df) < 120: return res 
     
-    # 1. 计算日线基础技术指标
+    # 1. 日线指标计算
     df['ma10'] = df['close'].rolling(10).mean()
     df['ma20'] = df['close'].rolling(20).mean()
     df['ma60'] = df['close'].rolling(60).mean()
@@ -290,7 +288,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df_calc = df.dropna().copy().reset_index()
     if len(df_calc) < 20: return res
 
-    # 2. 真实周线合成重采样引擎 (Weekly Resampling)
+    # 2. 周线重采样合成
     df_calc['dt'] = pd.to_datetime(df_calc['trade_date_str'])
     iso_cal = df_calc['dt'].dt.isocalendar()
     df_calc['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
@@ -304,29 +302,30 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
         'vol': 'sum'
     }).sort_values('trade_date_str').reset_index(drop=True)
     
-    if len(weekly_df) < 12: return res
+    if len(weekly_df) < 10: return res
     
-    # 在合成的周K线上计算周线指标
-    weekly_df['w_ma5'] = weekly_df['close'].rolling(5).mean()
-    weekly_df['w_ma10'] = weekly_df['close'].rolling(10).mean()
     weekly_df['w_ma20'] = weekly_df['close'].rolling(20).mean()
-    weekly_df['w_ema12'] = weekly_df['close'].ewm(span=12, adjust=False).mean()
-    weekly_df['w_ema26'] = weekly_df['close'].ewm(span=26, adjust=False).mean()
-    weekly_df['w_dif'] = weekly_df['w_ema12'] - weekly_df['w_ema26']
-    weekly_df['w_dea'] = weekly_df['w_dif'].ewm(span=9, adjust=False).mean()
-    weekly_df['w_macd'] = (weekly_df['w_dif'] - weekly_df['w_dea']) * 2
     
-    # 提取周线形态
-    w_curr = weekly_df.iloc[-1]   # 当前周（截至当天的动态周线）
-    w_prev = weekly_df.iloc[-2]   # 上一周完整周线
+    w_curr = weekly_df.iloc[-1]
+    w_prev = weekly_df.iloc[-2] if len(weekly_df) >= 2 else w_curr
     
-    # 【周线硬核条件 1】：周线多头向上 (周线 MA10 > MA20，且周线 DIF > 0，确认中长期资金主导)
-    is_weekly_trend_up = (w_curr['w_ma10'] > w_curr['w_ma20']) and (w_curr['w_dif'] > 0)
-    
-    # 【周线硬核条件 2】：周线深度回踩确认 (近期周线低点或收盘回踩周线 MA10/MA20，但周线收盘稳守 MA20)
-    is_weekly_support = (w_curr['close'] >= w_curr['w_ma20']) and (w_prev['low'] <= w_prev['w_ma10'] or w_prev['close'] <= w_prev['w_ma10'])
-    
-    # 3. 提取日线最终共振信号
+    # 【温和周线过滤 1】：防高位过度偏离（股价不能高于 20周线 45% 以上，防止高位派发接盘）
+    w_bias_safe = True
+    if not pd.isna(w_curr['w_ma20']) and w_curr['w_ma20'] > 0:
+        w_bias = (w_curr['close'] - w_curr['w_ma20']) / w_curr['w_ma20']
+        if w_bias > 0.45:
+            w_bias_safe = False
+            
+    # 【温和周线过滤 2】：防高位长上影线（上一周上影线不能占总振幅 60% 以上，防止墓碑线陷阱）
+    w_shadow_safe = True
+    w_prev_range = w_prev['high'] - w_prev['low']
+    w_prev_upper_shadow = w_prev['high'] - max(w_prev['open'], w_prev['close'])
+    if w_prev_range > 0 and (w_prev_upper_shadow / w_prev_range) >= 0.60:
+        w_shadow_safe = False
+
+    is_weekly_safe = w_bias_safe and w_shadow_safe
+
+    # 3. 日线突破点火信号
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     prev2_row = df_calc.iloc[-3]
@@ -342,8 +341,8 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_solid_yang = (row['close'] > row['open']) and (candle_body >= candle_range * 0.6 if candle_range > 0 else True)
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
-    # 【周日双周期终极共振】
-    res['is_v38_buy_signal'] = (is_weekly_trend_up and is_weekly_support and 
+    # 【综合决策】：温和周线风控 + 日线强攻击信号
+    res['is_v38_buy_signal'] = (is_weekly_safe and 
                                 is_daily_trend_up and is_daily_pulled_back and 
                                 is_daily_breakout and is_daily_ma20_healthy and 
                                 is_daily_vol_strong and is_solid_yang and is_macd_healthy)
@@ -359,7 +358,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# V39.0 核心大脑：双轨弹性防御系统
+# V39.1 核心大脑：双轨弹性防御系统
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -531,7 +530,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.0 周日双周期共振版")
+    st.header("V39.1 周线温和降维版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -543,7 +542,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_0.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_1.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -561,7 +560,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.0 周日双周期追踪"):
+if st.button(f"🚀 启动 V39.1 温和降维追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -586,7 +585,7 @@ if st.button(f"🚀 启动 V39.0 周日双周期追踪"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="双周期趋势锚定与爆量点火计算中...")
+        bar = st.progress(0, text="温和周线风控与爆量点火计算中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -619,7 +618,7 @@ if st.button(f"🚀 启动 V39.0 周日双周期追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.0 周日双周期共振版")
+        st.header(f"📊 V39.1 周线温和降维版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -662,6 +661,6 @@ if st.button(f"🚀 启动 V39.0 周日双周期追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_0_weekly_resonant.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_1_mild_filter.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
