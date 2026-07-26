@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V39.1 周线温和降维版 (解封底部黑马 + 防高位派发)
+选股王 · V39.2 周线温和降维版 (去未来函数·T+1开盘买入)
 ------------------------------------------------
-核心改进:
+核心改进 (基于V39.1):
 1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
 2. [防高位陷阱] 增加周线乖离率与高位上影线风控，专门绞杀高位 B 浪诱多派发。
 3. [日线爆量点火] 保持日线 20 日线爆量反包的极致灵敏度。
+4. [★V39.2新增·去未来函数] 买入价改为信号日次日(T+1)开盘价，而非信号当天收盘价。
+   原版逻辑用信号当天收盘价作为买入价，但选股指标本身也是用当天收盘后数据算出的，
+   相当于"收盘后才知道今天是突破日，却假设收盘价就能成交"，属于未来函数，会虚增胜率。
+   修改后止损/止盈的距离、周收益率都改为相对T+1开盘价计算，更贴近真实可执行结果。
+   新增 Buy_Price 和 Gap_pct(%) 两列，可以直接看到每只票次日实际是高开还是低开、
+   高开/低开幅度对最终存活率的影响。
 ------------------------------------------------
 """
 
@@ -23,7 +29,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v39_1.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v39_1.pkl"  # 原始行情数据缓存，未变更，可复用
 
 # ---------------------------
 # 全局变量与探针
@@ -38,8 +44,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.1 周线温和降维", layout="wide")
-st.title("选股王 V39.1：周线温和过滤 + 日线爆量共振")
+st.set_page_config(page_title="选股王 V39.2 去未来函数版", layout="wide")
+st.title("选股王 V39.2：周线温和过滤 + 日线爆量共振（T+1开盘买入·去未来函数）")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -358,9 +364,11 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# V39.1 核心大脑：双轨弹性防御系统
+# V39.2 核心大脑：双轨弹性防御系统 (T+1开盘买入，去未来函数)
 # ---------------------------
-def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8, use_sina=False):
+def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, hold_weeks=8, use_sina=False):
+    # 注意：signal_close 是信号当天的收盘价，仅作为参考(计算Gap_pct用)，
+    # 不再作为买入价——买入价改为下面从 hist_future 里取的 T+1 开盘价。
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_fetch = (d0 - timedelta(days=60)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=150)).strftime("%Y%m%d") 
@@ -368,6 +376,8 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
     hist_full = get_qfq_data_v4_optimized_final(ts_code, start_date=start_fetch, end_date=end_future, use_sina=use_sina)
     results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
     results['Exit_Reason'] = "持仓中"
+    results['Buy_Price'] = np.nan
+    results['Gap_pct (%)'] = np.nan
     
     if hist_full.empty or len(hist_full) < 30: return results
     
@@ -380,6 +390,18 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
     hist_full['ma20'] = hist_full['close'].rolling(20).mean()
     
     hist_future = hist_full[hist_full.index > selection_date]
+
+    # 【★V39.2核心修改】没有次日数据（比如信号刚好是数据里最后一天）就无法确定买入价，直接返回
+    if hist_future.empty:
+        return results
+
+    buy_price = hist_future.iloc[0]['open']
+    if pd.isna(buy_price) or buy_price <= 0:
+        return results
+
+    results['Buy_Price'] = round(buy_price, 2)
+    if signal_close and signal_close > 0:
+        results['Gap_pct (%)'] = round((buy_price - signal_close) / signal_close * 100, 2)
 
     ma20_active = False
     ma10_active = False
@@ -507,10 +529,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
         score_vol = ind['vol_ratio'] * 10
         total_score = score_breakout + score_vol
         
+        # 注意：ind['last_close'] 是信号日收盘价，现在只作为 Gap_pct 的参考基准传入，
+        # 真正的买入价在 get_medium_term_future 内部用 T+1 开盘价重新确定。
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], hold_weeks=8, use_sina=use_sina)
         
         record_dict = {
-            'ts_code': row.ts_code, 'name': row.name, 'Close': ind['last_close'], 
+            'ts_code': row.ts_code, 'name': row.name, 'Signal_Close': ind['last_close'], 
             'circ_mv': row.circ_mv_billion,
             'Total_Score': round(total_score, 1),
             'Breakout_S': round(score_breakout, 1),
@@ -530,7 +554,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.1 周线温和降维版")
+    st.header("V39.2 周线温和降维版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -542,7 +566,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_1.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_2_openbuy.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -560,7 +584,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.1 温和降维追踪"):
+if st.button(f"🚀 启动 V39.2 温和降维追踪(去未来函数)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -618,7 +642,7 @@ if st.button(f"🚀 启动 V39.1 温和降维追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.1 周线温和降维版")
+        st.header(f"📊 V39.2 周线温和降维版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -638,7 +662,8 @@ if st.button(f"🚀 启动 V39.1 温和降维追踪"):
                         
         st.subheader("📋 优等生清单")
         display_cols = [
-            'Rank', 'Trade_Date', 'name', 'ts_code', 'Close', 'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
+            'Rank', 'Trade_Date', 'name', 'ts_code', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
+            'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
         ] + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
     
@@ -661,6 +686,6 @@ if st.button(f"🚀 启动 V39.1 温和降维追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_1_mild_filter.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_2_openbuy.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
