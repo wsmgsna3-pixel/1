@@ -1,27 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V39.5 修复五处漏洞版
+选股王 · V39.6 主板一字板过滤版
 ------------------------------------------------
-核心改进 (基于V39.4):
+核心改进 (基于V39.5):
 1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
 2. [防高位陷阱] 增加周线乖离率与高位上影线风控，专门绞杀高位 B 浪诱多派发。
 3. [日线爆量点火] 保持日线 20 日线爆量反包的极致灵敏度。
 4. [去未来函数] 买入价为信号日次日(T+1)开盘价，而非信号当天收盘价。
 5. [入场信号收紧] 突破幅度：收盘价需高出MA20至少2%。
-6. [止损止盈-三层简化] 固定止损-8%/-12% → 浮盈满10%保本 → 浮盈满20%后回撤15%移动止盈。
+6. [止损止盈-三层简化] 固定止损-8%/-12% → 浮盈满10%保本 → 浮盈满20%后回撤15%移动止盈，
+   全程用最高价追踪浮盈峰值，固定止损全程兜底生效，保本/移动止盈延迟到次日开盘结算。
+7. [301止损档位/量比基准] 已修复。
 
-【★V39.5修复的5处漏洞】
-① 固定止损兜底失效：原来升级到保本层/移动止盈层之后，-8%/-12%硬止损就不再检查，
-   极端情况下亏损可以远超预期。现在改成不管处于哪一档，固定止损全程生效。
-② 301开头(创业板注册制新股)股票同样是20%涨跌停板，原代码只认300/688，漏判了301，
-   导致这类票错误地按-8%止损（该用-12%）。
-③ "放量"判断的5日均量基准包含了当天自己的成交量，相当于自己拉高自己的及格线，
-   放量信号比预期更难触发。改成用前5天(不含当天)的均量做基准。
-④ 保本层/移动止盈层原来"看到收盘价跌破线，就假设能在那个收盘价卖出"，属于未来函数——
-   收盘后已经无法在当天收盘价成交。改成：收盘价触发条件后，用次日开盘价结算离场
-   （固定止损维持原样，因为它是盘中止损单，当天低点触发、当天结算是合理的）。
-⑤ 浮盈的峰值追踪原来用的是每天收盘价(peak_close = max(peak_close, curr_close))，
-   和注释里写的"按最高价"不符，会低估真实触及过的浮盈。改成用当天最高价追踪峰值。
+【★V39.6新增：主板一字涨停过滤】
+   主板股票(非创业板300/301、非科创板688/689)信号次日如果开盘=最高=最低(全天封在
+   同一价位、没有任何成交空间)，说明是一字板，实盘根本买不进去。原来的回测把这种情况
+   当成"能以开盘价成交"，会虚增存活率/胜率。现在检测到这种情况会把这笔交易整个从统计
+   中剔除(Return_W1~W8全部留空，不计入存活/胜率)，Exit_Reason标注"一字板无法买入(剔除)"，
+   方便你直接看出信号里有多少比例是实盘根本没法执行的。
+   双创板(创业板/科创板)按实盘经验不会出现一字板，不做此项检查。
+   顺带修复了表格颜色标注函数(color_exit)——它里面匹配的还是V39.2之前"一档/二档/假突破"
+   这些早就废弃的旧名称，一直没起作用，现在改成匹配现有的固定止损/保本止盈/移动止盈/
+   一字板/周期结束平仓这几个真实存在的分类。
 ------------------------------------------------
 """
 
@@ -54,8 +54,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.5 修复五处漏洞版", layout="wide")
-st.title("选股王 V39.5：周线温和过滤 + 日线爆量共振（修复5处漏洞：兜底止损+301止损档位+量比基准+延迟结算+峰值追踪）")
+st.set_page_config(page_title="选股王 V39.6 主板一字板过滤版", layout="wide")
+st.title("选股王 V39.6：周线温和过滤 + 日线爆量共振（新增主板一字板过滤）")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -416,7 +416,22 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     if hist_future.empty:
         return results
 
-    buy_price = hist_future.iloc[0]['open']
+    next_row = hist_future.iloc[0]
+
+    # 【V39.6新增】主板一字涨停过滤：主板(非创业板301/300、非科创板688/689)信号次日
+    # 如果开盘=最高=最低(全天封在同一价位、没有任何成交空间)，说明是一字板，实际根本买不进去。
+    # 双创板(创业板/科创板)按用户实盘经验不会出现这种情况，不做这项检查。
+    is_main_board = not (ts_code.startswith('300') or ts_code.startswith('301') 
+                          or ts_code.startswith('688') or ts_code.startswith('689'))
+    is_one_word_limit = (is_main_board and pd.notna(next_row['open']) and pd.notna(next_row['high']) 
+                          and pd.notna(next_row['low']) and next_row['open'] == next_row['high'] == next_row['low'])
+    if is_one_word_limit:
+        results['Exit_Reason'] = "一字板无法买入(剔除)"
+        results['Buy_Price'] = round(next_row['open'], 2)  # 仅作参考，实际没有成交机会
+        # Return_W1~W8 全部保持NaN，不计入存活/胜率统计——因为这笔交易实盘根本成交不了
+        return results
+
+    buy_price = next_row['open']
     if pd.isna(buy_price) or buy_price <= 0:
         return results
 
@@ -580,7 +595,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.5 修复五处漏洞版")
+    st.header("V39.6 主板一字板过滤版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -592,7 +607,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_5_bugfix.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_6_oneword.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -610,7 +625,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.5 追踪(5处漏洞修复)"):
+if st.button(f"🚀 启动 V39.6 追踪(一字板过滤)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -668,7 +683,7 @@ if st.button(f"🚀 启动 V39.5 追踪(5处漏洞修复)"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.5 修复五处漏洞版")
+        st.header(f"📊 V39.6 主板一字板过滤版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -697,10 +712,11 @@ if st.button(f"🚀 启动 V39.5 追踪(5处漏洞修复)"):
         
         def color_exit(val):
             if isinstance(val, str):
-                if '强制止损' in val: return 'color: white; background-color: darkred'
-                elif '假突破' in val: return 'color: red'
-                elif '二档' in val: return 'color: magenta'
-                elif '一档' in val: return 'color: green'
+                if '固定止损' in val: return 'color: white; background-color: darkred'
+                elif '一字板' in val: return 'color: white; background-color: gray'
+                elif '保本止盈' in val: return 'color: orange'
+                elif '移动止盈' in val: return 'color: green'
+                elif '周期结束平仓' in val: return 'color: blue'
             return ''
         
         if 'Exit_Reason' in display_df.columns:
@@ -712,6 +728,6 @@ if st.button(f"🚀 启动 V39.5 追踪(5处漏洞修复)"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_5_bugfix.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_6_oneword.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
