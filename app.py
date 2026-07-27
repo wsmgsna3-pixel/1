@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V39.2修正版 周线温和降维版 (解封底部黑马 + 防高位派发)
+选股王 · V39.2 极简风控版 (主板8/双创12硬止损 + 10日线止盈)
 ------------------------------------------------
 核心改进:
-1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
-2. [防高位陷阱] 增加周线乖离率与高位上影线风控，专门绞杀高位 B 浪诱多派发。
-3. [日线爆量点火] 保持日线 20 日线爆量反包的极致灵敏度。
+1. [极简防守] 废除繁琐的多级止损止盈，统一为主板-8%/双创-12%硬止损，收盘破10日线出局。
+2. [动能锁定] 严格要求买入当天必须高开，且盘中最大涨幅超过开盘价 1.5%。
+3. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
 ------------------------------------------------
 """
 
@@ -23,7 +23,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v39_2_fix.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v39_2.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -38,8 +38,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.2修正版 周线温和降维", layout="wide")
-st.title("选股王 V39.2修正版：周线温和过滤 + 日线爆量共振")
+st.set_page_config(page_title="选股王 V39.2 极简风控版", layout="wide")
+st.title("选股王 V39.2：周线温和过滤 + 极简趋势风控")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -222,13 +222,8 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
     if GLOBAL_DAILY_RAW.empty: return pd.DataFrame()
     
-    # V39.2修正版：优先使用回测截止日复权因子
-    try:
-        latest_adj_factor = GLOBAL_ADJ_FACTOR.loc[(ts_code, end_date), 'adj_factor']
-    except Exception:
-        latest_adj_factor = GLOBAL_QFQ_BASE_FACTORS.get(ts_code, np.nan)
-
-    if pd.isna(latest_adj_factor): return pd.DataFrame()
+    latest_adj_factor = GLOBAL_QFQ_BASE_FACTORS.get(ts_code, np.nan)
+    if pd.isna(latest_adj_factor): return pd.DataFrame() 
 
     try:
         daily_df = GLOBAL_DAILY_RAW.loc[ts_code]
@@ -268,7 +263,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
     return final_df
 
 # ---------------------------
-# 核心指标计算 (温和周线过滤)
+# 核心指标计算 (温和周线过滤 + 动能确认)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -314,25 +309,19 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     w_curr = weekly_df.iloc[-1]
     w_prev = weekly_df.iloc[-2] if len(weekly_df) >= 2 else w_curr
     
-    # 【温和周线过滤 1】：防高位过度偏离（股价不能高于 20周线 45% 以上，防止高位派发接盘）
+    # 【温和周线过滤 1】：防高位过度偏离
     w_bias_safe = True
     if not pd.isna(w_curr['w_ma20']) and w_curr['w_ma20'] > 0:
         w_bias = (w_curr['close'] - w_curr['w_ma20']) / w_curr['w_ma20']
         if w_bias > 0.45:
             w_bias_safe = False
             
-    # 【温和周线过滤 2】：防高位长上影线（上一周上影线不能占总振幅 60% 以上，防止墓碑线陷阱）
+    # 【温和周线过滤 2】：防高位长上影线
     w_shadow_safe = True
     w_prev_range = w_prev['high'] - w_prev['low']
     w_prev_upper_shadow = w_prev['high'] - max(w_prev['open'], w_prev['close'])
     if w_prev_range > 0 and (w_prev_upper_shadow / w_prev_range) >= 0.60:
         w_shadow_safe = False
-
-    # V39.2修正版：周线不明显下降即可，避免错杀启动阶段
-    is_weekly_trend_up = (
-        not pd.isna(w_curr.get('w_ma20_slope', np.nan))
-        and w_curr['w_ma20_slope'] > -0.01
-    )
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
@@ -344,23 +333,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_daily_trend_up = row['ma60'] > row['ma120']
     is_daily_pulled_back = (prev2_row['close'] < prev2_row['ma20']) and (prev_row['close'] < prev_row['ma20'])
     is_daily_breakout = row['close'] > row['ma20']
-
-    try:
-        ma20_slope = row['ma20'] / df_calc.iloc[-6]['ma20'] - 1
-    except Exception:
-        ma20_slope = -1
-
-    # 修正版：回踩后重新走强，不要求强趋势加速
-    is_daily_ma20_healthy = ma20_slope > 0
-
-    try:
-        high60 = df_calc['high'].rolling(60).max().iloc[-1]
-        price_position = row['close'] / high60
-        # 过滤深跌反弹，但保留二次启动
-        is_near_high = price_position > 0.70
-    except Exception:
-        is_near_high = False
-
+    is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
     is_daily_vol_strong = row['vol'] > (1.2 * row['ma5_vol'])
     
     candle_range = row['high'] - row['low']
@@ -368,19 +341,15 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_solid_yang = (row['close'] > row['open']) and (candle_body >= candle_range * 0.6 if candle_range > 0 else True)
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
-    # 【综合决策】：温和周线风控 + 日线强攻击信号
-    res['is_v39_2_buy_signal'] = (
-        is_weekly_safe and
-        is_weekly_trend_up and
-        is_daily_trend_up and
-        is_daily_pulled_back and
-        is_daily_breakout and
-        is_daily_ma20_healthy and
-        is_near_high and
-        is_daily_vol_strong and
-        is_solid_yang and
-        is_macd_healthy
-    )
+    # 【买点动能确认】：要求高开，并且盘中拉升幅度高于开盘价1.5%
+    is_momentum_confirmed = (row['open'] > prev_row['close']) and (row['high'] >= row['open'] * 1.015)
+    
+    # 【综合决策】
+    res['is_v38_buy_signal'] = (is_weekly_safe and 
+                                is_daily_trend_up and is_daily_pulled_back and 
+                                is_daily_breakout and is_daily_ma20_healthy and 
+                                is_daily_vol_strong and is_solid_yang and is_macd_healthy and
+                                is_momentum_confirmed)
     
     if res['is_v38_buy_signal']:
         res['vol_ratio'] = row['vol'] / row['ma5_vol']  
@@ -393,7 +362,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# V39.2修正版 核心大脑：双轨弹性防御系统
+# V39.2 核心大脑：极简防守系统 (硬止损 + 10日线止盈)
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -411,15 +380,14 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
     hist_full['low'] = pd.to_numeric(hist_full['low'], errors='coerce')
     hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
     
+    # 只需要计算10日线
     hist_full['ma10'] = hist_full['close'].rolling(10).mean()
-    hist_full['ma20'] = hist_full['close'].rolling(20).mean()
     
     hist_future = hist_full[hist_full.index > selection_date]
 
-    ma20_active = False
-    ma10_active = False
     exit_triggered = False
     
+    # 动态识别板块赋予硬止损额度 (主板8%，双创12%)
     is_20cm = ts_code.startswith('300') or ts_code.startswith('688')
     hard_stop_limit = -0.12 if is_20cm else -0.08
     
@@ -432,50 +400,30 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
         
         curr_open = row['open']
         curr_close = row['close']
-        curr_high = row['high']
         curr_low = row['low']
         curr_ma10 = row['ma10']
-        curr_ma20 = row['ma20']
         
+        # 1. 强制硬止损：盘中最低价触碰止损线
         if (curr_low - buy_price) / buy_price <= hard_stop_limit:
+            # 取开盘跳空和硬止损限度中更真实的一个作为实际亏损
             actual_loss = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
             results[f'Return_W{current_week} (%)'] = actual_loss
             exit_triggered = True
-            results['Exit_Reason'] = f"强制止损(破{int(hard_stop_limit*100)}%)"
+            results['Exit_Reason'] = f"强制止损({int(hard_stop_limit*100)}%)"
             break 
             
-        if not ma10_active:
-            profit_bias = (curr_high - buy_price) / buy_price
-            if profit_bias >= 0.15:
-                ma10_active = True
-                ma20_active = True 
-                
-        if not ma20_active and not ma10_active:
-            profit_pct = (curr_close - buy_price) / buy_price
-            if profit_pct >= 0.10 or curr_ma20 > buy_price:
-                ma20_active = True 
-                
-        final_return = np.nan
-        if ma10_active:
-            if curr_close < curr_ma10:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "二档止盈(破10日线)"
-        elif ma20_active:
-            if curr_close < curr_ma20:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "一档防守(破20日线)"
-        else:
-            if curr_close < bottom_line:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "假突破(破底线)"
-                
-        if exit_triggered:
+        # 2. 10日线动态防守：收盘价跌破10日均线
+        if curr_close < curr_ma10:
+            final_return = (curr_close - buy_price) / buy_price * 100.0
+            exit_triggered = True
+            if final_return > 0:
+                results['Exit_Reason'] = "10日线止盈离场"
+            else:
+                results['Exit_Reason'] = "10日线止损离场"
             results[f'Return_W{current_week} (%)'] = final_return
             break 
             
+        # 记录每周末的持仓浮动盈亏
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = (curr_close - buy_price) / buy_price * 100.0
             
@@ -530,7 +478,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
             continue
             
         ind = compute_trend_indicators(row.ts_code, last_trade, use_sina=use_sina, _run_id=run_timestamp)
-        if not ind or not ind.get('is_v39_2_buy_signal'): 
+        if not ind or not ind.get('is_v38_buy_signal'): 
             continue
             
         if use_sina and ind['last_close'] < MIN_PRICE:
@@ -557,7 +505,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
     if not records: return pd.DataFrame(), "无标的"
     
     fdf = pd.DataFrame(records)
-    final_df = fdf.sort_values('Total_Score', ascending=False).head(TOP_BACKTEST).copy()
+    # 严格按照给定的 TopK 数量进行截断切片，防止界面显示冗余
+    final_df = fdf.sort_values('Total_Score', ascending=False).head(int(TOP_BACKTEST)).copy()
     final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
     return final_df, None
 
@@ -565,11 +514,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.2修正版 周线温和降维版")
+    st.header("V39.2 极简风控版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3)
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3, step=1, min_value=1)
     
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
@@ -577,7 +526,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_2_fix.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_2.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -587,7 +536,7 @@ with st.sidebar:
     st.subheader("💰 核心护城河门槛")
     MIN_PRICE = st.number_input("最低股价 (元)", value=20.0) 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
+    MIN_MV = col1.number_input("最小市值(亿)", value=300.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -595,7 +544,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.2修正版 温和降维追踪"):
+if st.button(f"🚀 启动 V39.2 极简雷达"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -620,7 +569,7 @@ if st.button(f"🚀 启动 V39.2修正版 温和降维追踪"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="温和周线风控与爆量点火计算中...")
+        bar = st.progress(0, text="执行核心运算中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -653,7 +602,7 @@ if st.button(f"🚀 启动 V39.2修正版 温和降维追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.2修正版 周线温和降维版")
+        st.header(f"📊 V39.2 极简风控版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -682,9 +631,8 @@ if st.button(f"🚀 启动 V39.2修正版 温和降维追踪"):
         def color_exit(val):
             if isinstance(val, str):
                 if '强制止损' in val: return 'color: white; background-color: darkred'
-                elif '假突破' in val: return 'color: red'
-                elif '二档' in val: return 'color: magenta'
-                elif '一档' in val: return 'color: green'
+                elif '10日线止盈' in val: return 'color: green'
+                elif '10日线止损' in val: return 'color: red'
             return ''
         
         if 'Exit_Reason' in display_df.columns:
@@ -696,6 +644,6 @@ if st.button(f"🚀 启动 V39.2修正版 温和降维追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_2_fix_mild_filter.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_2_minimal_risk.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
