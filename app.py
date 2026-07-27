@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V39.1 周线温和降维版 (解封底部黑马 + 防高位派发)
+选股王 · V39.3 T+1 速砍与宽严切换防守版
 ------------------------------------------------
-核心改进:
-1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
-2. [防高位陷阱] 增加周线乖离率与高位上影线风控，专门绞杀高位 B 浪诱多派发。
-3. [日线爆量点火] 保持日线 20 日线爆量反包的极致灵敏度。
+核心逻辑:
+1. [买点回归] 恢复 V39.1 原始爆量突破买点，保证标的数量。
+2. [T+1 速砍] 买入次日若实体收阴（收盘价 < 开盘价），判定突破衰竭，直接平仓。
+3. [时间分段防守] 
+   - 第一周 (Day 1-5)：死扛洗盘，无视均线，仅执行主板8% / 双创12% 硬止损。
+   - 第二周起 (Day 6+)：脱离底部，全面激活 10 日均线动态止盈/止损。
 ------------------------------------------------
 """
 
@@ -23,7 +25,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v39_1.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v39_3.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -38,8 +40,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.1 周线温和降维", layout="wide")
-st.title("选股王 V39.1：周线温和过滤 + 日线爆量共振")
+st.set_page_config(page_title="选股王 V39.3 宽严切换版", layout="wide")
+st.title("选股王 V39.3：T+1 速砍 + 宽严防守切换")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -263,7 +265,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
     return final_df
 
 # ---------------------------
-# 核心指标计算 (温和周线过滤)
+# 核心指标计算 (回归 V39.1 原始买点)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -309,14 +311,14 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     w_curr = weekly_df.iloc[-1]
     w_prev = weekly_df.iloc[-2] if len(weekly_df) >= 2 else w_curr
     
-    # 【温和周线过滤 1】：防高位过度偏离（股价不能高于 20周线 45% 以上，防止高位派发接盘）
+    # 【温和周线过滤 1】：防高位过度偏离
     w_bias_safe = True
     if not pd.isna(w_curr['w_ma20']) and w_curr['w_ma20'] > 0:
         w_bias = (w_curr['close'] - w_curr['w_ma20']) / w_curr['w_ma20']
         if w_bias > 0.45:
             w_bias_safe = False
             
-    # 【温和周线过滤 2】：防高位长上影线（上一周上影线不能占总振幅 60% 以上，防止墓碑线陷阱）
+    # 【温和周线过滤 2】：防高位长上影线
     w_shadow_safe = True
     w_prev_range = w_prev['high'] - w_prev['low']
     w_prev_upper_shadow = w_prev['high'] - max(w_prev['open'], w_prev['close'])
@@ -325,7 +327,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
-    # 3. 日线突破点火信号
+    # 3. 日线突破点火信号 (回归 V39.1 设定)
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     prev2_row = df_calc.iloc[-3]
@@ -338,10 +340,11 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     
     candle_range = row['high'] - row['low']
     candle_body = row['close'] - row['open']
+    # 仅要求收红盘及实体达标，废除高开门槛
     is_solid_yang = (row['close'] > row['open']) and (candle_body >= candle_range * 0.6 if candle_range > 0 else True)
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
-    # 【综合决策】：温和周线风控 + 日线强攻击信号
+    # 【综合决策】
     res['is_v38_buy_signal'] = (is_weekly_safe and 
                                 is_daily_trend_up and is_daily_pulled_back and 
                                 is_daily_breakout and is_daily_ma20_healthy and 
@@ -358,7 +361,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# V39.1 核心大脑：双轨弹性防御系统
+# V39.3 核心大脑：T+1速砍 + 宽严切换防守
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -377,14 +380,12 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
     hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
     
     hist_full['ma10'] = hist_full['close'].rolling(10).mean()
-    hist_full['ma20'] = hist_full['close'].rolling(20).mean()
     
     hist_future = hist_full[hist_full.index > selection_date]
 
-    ma20_active = False
-    ma10_active = False
     exit_triggered = False
     
+    # 动态识别板块赋予硬止损额度 (主板8%，双创12%)
     is_20cm = ts_code.startswith('300') or ts_code.startswith('688')
     hard_stop_limit = -0.12 if is_20cm else -0.08
     
@@ -397,50 +398,39 @@ def get_medium_term_future(ts_code, selection_date, buy_price, bottom_line, hold
         
         curr_open = row['open']
         curr_close = row['close']
-        curr_high = row['high']
         curr_low = row['low']
         curr_ma10 = row['ma10']
-        curr_ma20 = row['ma20']
         
+        # 1. 强制硬止损：盘中最低价触碰止损线 (全周期生效)
         if (curr_low - buy_price) / buy_price <= hard_stop_limit:
             actual_loss = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
             results[f'Return_W{current_week} (%)'] = actual_loss
             exit_triggered = True
-            results['Exit_Reason'] = f"强制止损(破{int(hard_stop_limit*100)}%)"
+            results['Exit_Reason'] = f"强制止损({int(hard_stop_limit*100)}%)"
             break 
             
-        if not ma10_active:
-            profit_bias = (curr_high - buy_price) / buy_price
-            if profit_bias >= 0.15:
-                ma10_active = True
-                ma20_active = True 
-                
-        if not ma20_active and not ma10_active:
-            profit_pct = (curr_close - buy_price) / buy_price
-            if profit_pct >= 0.10 or curr_ma20 > buy_price:
-                ma20_active = True 
-                
-        final_return = np.nan
-        if ma10_active:
-            if curr_close < curr_ma10:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "二档止盈(破10日线)"
-        elif ma20_active:
-            if curr_close < curr_ma20:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "一档防守(破20日线)"
-        else:
-            if curr_close < bottom_line:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "假突破(破底线)"
-                
-        if exit_triggered:
+        # 2. T+1 弱势速砍：仅在第二天生效 (day_count == 1)
+        # 如果第二天收盘价低于开盘价 (K线实体为阴线)，直接斩仓离场
+        if day_count == 1 and curr_close < curr_open:
+            final_return = (curr_close - buy_price) / buy_price * 100.0
+            exit_triggered = True
+            results['Exit_Reason'] = "T+1实体收阴速砍"
+            results[f'Return_W{current_week} (%)'] = final_return
+            break
+            
+        # 3. 10日线动态防守：仅在存活到第二周起生效 (day_count > 5)
+        # 第一周内彻底无视 10日线破位，给足震荡洗盘空间
+        if day_count > 5 and curr_close < curr_ma10:
+            final_return = (curr_close - buy_price) / buy_price * 100.0
+            exit_triggered = True
+            if final_return > 0:
+                results['Exit_Reason'] = "10日线止盈离场"
+            else:
+                results['Exit_Reason'] = "10日线止损离场"
             results[f'Return_W{current_week} (%)'] = final_return
             break 
             
+        # 记录每周末的持仓浮动盈亏
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = (curr_close - buy_price) / buy_price * 100.0
             
@@ -522,7 +512,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
     if not records: return pd.DataFrame(), "无标的"
     
     fdf = pd.DataFrame(records)
-    final_df = fdf.sort_values('Total_Score', ascending=False).head(TOP_BACKTEST).copy()
+    final_df = fdf.sort_values('Total_Score', ascending=False).head(int(TOP_BACKTEST)).copy()
     final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
     return final_df, None
 
@@ -530,11 +520,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.1 周线温和降维版")
+    st.header("V39.3 宽严切换版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3)
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3, step=1, min_value=1)
     
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
@@ -542,7 +532,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_1.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_3.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -552,6 +542,7 @@ with st.sidebar:
     st.subheader("💰 核心护城河门槛")
     MIN_PRICE = st.number_input("最低股价 (元)", value=20.0) 
     col1, col2 = st.columns(2)
+    # 严格按照实盘要求，将默认市值底线恢复并锁定为 200 亿
     MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
@@ -560,7 +551,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.1 温和降维追踪"):
+if st.button(f"🚀 启动 V39.3 T+1 速砍雷达"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -585,7 +576,7 @@ if st.button(f"🚀 启动 V39.1 温和降维追踪"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="温和周线风控与爆量点火计算中...")
+        bar = st.progress(0, text="执行核心运算中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -618,7 +609,7 @@ if st.button(f"🚀 启动 V39.1 温和降维追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.1 周线温和降维版")
+        st.header(f"📊 V39.3 宽严切换版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -647,9 +638,9 @@ if st.button(f"🚀 启动 V39.1 温和降维追踪"):
         def color_exit(val):
             if isinstance(val, str):
                 if '强制止损' in val: return 'color: white; background-color: darkred'
-                elif '假突破' in val: return 'color: red'
-                elif '二档' in val: return 'color: magenta'
-                elif '一档' in val: return 'color: green'
+                elif 'T+1实体收阴速砍' in val: return 'color: white; background-color: orange'
+                elif '10日线止盈' in val: return 'color: green'
+                elif '10日线止损' in val: return 'color: red'
             return ''
         
         if 'Exit_Reason' in display_df.columns:
@@ -661,6 +652,6 @@ if st.button(f"🚀 启动 V39.1 温和降维追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_1_mild_filter.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_3_t1_exit.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
