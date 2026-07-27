@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V39.4 修复入场信号冲突版
+选股王 · V39.5 修复五处漏洞版
 ------------------------------------------------
-核心改进 (基于V39.3):
+核心改进 (基于V39.4):
 1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
 2. [防高位陷阱] 增加周线乖离率与高位上影线风控，专门绞杀高位 B 浪诱多派发。
 3. [日线爆量点火] 保持日线 20 日线爆量反包的极致灵敏度。
 4. [去未来函数] 买入价为信号日次日(T+1)开盘价，而非信号当天收盘价。
-5. [入场信号收紧-保留] 突破幅度：收盘价需高出MA20至少2%，排除贴线蹭一下的弱突破
-6. [★V39.4·去掉冲突条件] V39.3新加的"近期新高确认"(收盘价需接近/创近20日新高)
-   与已有的"is_daily_pulled_back(先回调过)"逻辑天然矛盾：像样的回调(从高点跌
-   8%~10%再企稳反包，典型主升浪走法)会让20日最高点明显高于当前价，导致这条件
-   把真正的主升浪票也一起误杀，是V39.3信号数量骤减(100个交易日仅18次、间隔41
-   天不出信号)、光迅科技消失的主因。V39.4去掉此条件，只保留突破幅度收紧。
-7. [止损止盈-三层简化，沿用V39.3] 固定止损-8%/-12% → 浮盈满10%保本 → 浮盈满
-   20%后回撤15%移动止盈。
-   注意：V39.3测试中发现"保本层"阶段固定止损会被跳过、导致保本止盈实际亏损可以
-   远超预期(比如-6%/-10%)，这个bug在V39.4里【尚未修复】，留待下一版单独验证。
+5. [入场信号收紧] 突破幅度：收盘价需高出MA20至少2%。
+6. [止损止盈-三层简化] 固定止损-8%/-12% → 浮盈满10%保本 → 浮盈满20%后回撤15%移动止盈。
+
+【★V39.5修复的5处漏洞】
+① 固定止损兜底失效：原来升级到保本层/移动止盈层之后，-8%/-12%硬止损就不再检查，
+   极端情况下亏损可以远超预期。现在改成不管处于哪一档，固定止损全程生效。
+② 301开头(创业板注册制新股)股票同样是20%涨跌停板，原代码只认300/688，漏判了301，
+   导致这类票错误地按-8%止损（该用-12%）。
+③ "放量"判断的5日均量基准包含了当天自己的成交量，相当于自己拉高自己的及格线，
+   放量信号比预期更难触发。改成用前5天(不含当天)的均量做基准。
+④ 保本层/移动止盈层原来"看到收盘价跌破线，就假设能在那个收盘价卖出"，属于未来函数——
+   收盘后已经无法在当天收盘价成交。改成：收盘价触发条件后，用次日开盘价结算离场
+   （固定止损维持原样，因为它是盘中止损单，当天低点触发、当天结算是合理的）。
+⑤ 浮盈的峰值追踪原来用的是每天收盘价(peak_close = max(peak_close, curr_close))，
+   和注释里写的"按最高价"不符，会低估真实触及过的浮盈。改成用当天最高价追踪峰值。
 ------------------------------------------------
 """
 
@@ -49,8 +54,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.4 修复入场冲突版", layout="wide")
-st.title("选股王 V39.4：周线温和过滤 + 日线爆量共振（去掉冲突条件+三层简化止盈止损）")
+st.set_page_config(page_title="选股王 V39.5 修复五处漏洞版", layout="wide")
+st.title("选股王 V39.5：周线温和过滤 + 日线爆量共振（修复5处漏洞：兜底止损+301止损档位+量比基准+延迟结算+峰值追踪）")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -288,7 +293,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df['ma20'] = df['close'].rolling(20).mean()
     df['ma60'] = df['close'].rolling(60).mean()
     df['ma120'] = df['close'].rolling(120).mean()
-    df['ma5_vol'] = df['vol'].rolling(5).mean()
+    df['ma5_vol'] = df['vol'].shift(1).rolling(5).mean()  # 【V39.5修复漏洞③】前5天均量(不含当天)，避免自己拉高自己的基准线
     
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
@@ -419,15 +424,19 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     if signal_close and signal_close > 0:
         results['Gap_pct (%)'] = round((buy_price - signal_close) / signal_close * 100, 2)
 
-    # 【V39.3核心修改】止损止盈简化为三层，全程只看价格与买入价/最高价的关系，不再依赖均线：
-    #   第0层：固定止损 -8%/-12%（创业板/科创板放宽），浮盈不到10%之前唯一的防线
-    #   第1层：浮盈达到10% → 止损线上移到买入价（保本，留0.5%缓冲避免手续费磨损）
-    #   第2层：浮盈(按最高价计)达到20% → 切换为"从最高价回撤15%止盈"，此后止盈线只会跟最高价上移，不再回落
+    # 【V39.3设计，V39.5修复①④⑤】止损止盈三层，全程只看价格与买入价/最高价的关系，不再依赖均线：
+    #   第0层：固定止损 -8%/-12%（创业板/科创板/301新股放宽），全程生效的兜底防线，不因升档而失效
+    #   第1层：浮盈(按盘中最高价计)达到10% → 止损线上移到买入价（保本，留0.5%缓冲）
+    #   第2层：浮盈(按盘中最高价计)达到20% → 切换为"从最高价回撤15%止盈"
+    #   保本/移动止盈的退出条件基于收盘价判断，但成交价延迟到次日开盘价结算(去未来函数)；
+    #   固定止损是盘中触发的止损单，当天用低点判断、以开盘价与止损价的较差者结算，维持原有处理方式。
     exit_triggered = False
     tier = 0  # 0=固定止损期, 1=保本期, 2=移动止盈期
     peak_close = buy_price
+    pending_exit_reason = None  # 【V39.5修复④】昨日收盘触发的保本/止盈，今日开盘执行
     
-    is_20cm = ts_code.startswith('300') or ts_code.startswith('688')
+    # 【V39.5修复漏洞②】301开头(创业板注册制新股)同样是20%涨跌停板，之前只认300/688漏判了301
+    is_20cm = ts_code.startswith('300') or ts_code.startswith('301') or ts_code.startswith('688')
     hard_stop_limit = -0.12 if is_20cm else -0.08
     
     for i in range(len(hist_future)):
@@ -439,42 +448,46 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
         
         curr_open = row['open']
         curr_close = row['close']
+        curr_high = row['high']
         curr_low = row['low']
-        
-        peak_close = max(peak_close, curr_close)
-        peak_profit_pct = (peak_close - buy_price) / buy_price
         
         final_return = np.nan
         
-        if tier == 0:
-            # 固定止损：跌破买入价 -8%/-12%
-            if (curr_low - buy_price) / buy_price <= hard_stop_limit:
-                final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
-                exit_triggered = True
-                results['Exit_Reason'] = f"固定止损(破{int(hard_stop_limit*100)}%)"
-            elif peak_profit_pct >= 0.10:
-                tier = 1
+        # 【V39.5修复④】昨天收盘已经触发保本/移动止盈，今天用开盘价结算离场
+        if pending_exit_reason is not None:
+            final_return = (curr_open - buy_price) / buy_price * 100.0
+            exit_triggered = True
+            results['Exit_Reason'] = pending_exit_reason
+            results[f'Return_W{current_week} (%)'] = final_return
+            break
+        
+        # 【V39.5修复⑤】峰值用盘中最高价追踪，不再用收盘价（避免低估真实触及过的浮盈）
+        peak_close = max(peak_close, curr_high)
+        peak_profit_pct = (peak_close - buy_price) / buy_price
+        
+        # 【V39.5修复①】固定止损兜底：不管当前处于哪一档，跌破-8%/-12%都立刻离场
+        if (curr_low - buy_price) / buy_price <= hard_stop_limit:
+            final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
+            exit_triggered = True
+            results['Exit_Reason'] = f"固定止损(破{int(hard_stop_limit*100)}%)"
+            results[f'Return_W{current_week} (%)'] = final_return
+            break
+        
+        if tier == 0 and peak_profit_pct >= 0.10:
+            tier = 1
                 
-        if tier == 1 and not exit_triggered:
-            # 保本层：浮盈到过10%后，跌破买入价*0.995就走（留0.5%缓冲）
+        if tier == 1:
+            # 保本层：浮盈到过10%后，跌破买入价*0.995就走（留0.5%缓冲）——次日开盘结算
             if curr_close < buy_price * 0.995:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "保本止盈"
+                pending_exit_reason = "保本止盈"
             elif peak_profit_pct >= 0.20:
                 tier = 2
                 
-        if tier == 2 and not exit_triggered:
-            # 移动止盈层：浮盈(按最高价)到过20%后，从最高价回撤15%就走
+        if tier == 2:
+            # 移动止盈层：浮盈(按最高价)到过20%后，从最高价回撤15%就走——次日开盘结算
             giveback = (peak_close - curr_close) / peak_close
             if giveback >= 0.15:
-                final_return = (curr_close - buy_price) / buy_price * 100.0
-                exit_triggered = True
-                results['Exit_Reason'] = "移动止盈(回撤15%)"
-                
-        if exit_triggered:
-            results[f'Return_W{current_week} (%)'] = final_return
-            break 
+                pending_exit_reason = "移动止盈(回撤15%)"
             
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = (curr_close - buy_price) / buy_price * 100.0
@@ -567,7 +580,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.4 修复入场冲突版")
+    st.header("V39.5 修复五处漏洞版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -579,7 +592,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_4_fixed.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_5_bugfix.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -597,7 +610,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.4 追踪(去掉冲突条件)"):
+if st.button(f"🚀 启动 V39.5 追踪(5处漏洞修复)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -655,7 +668,7 @@ if st.button(f"🚀 启动 V39.4 追踪(去掉冲突条件)"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.4 修复入场冲突版")
+        st.header(f"📊 V39.5 修复五处漏洞版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -699,6 +712,6 @@ if st.button(f"🚀 启动 V39.4 追踪(去掉冲突条件)"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_4_fixed.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_5_bugfix.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
