@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-翻倍黑马归类统计器 · 双重确认版 (带洗盘深度测算)
+翻倍黑马归类统计器 · MACD波浪动能版 (带洗盘深度测算)
 ------------------------------------------------
-采用“绝对空间(≥18%) + 结构破坏(≥12%且破10周线)”的双保险机制来识别真实波浪
+采用“周线 MACD 红绿柱交替（由红转绿）”作为客观识别波浪的硬核工具
 """
 
 import streamlit as st
@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 1. 页面配置与侧边栏 UI
 # ---------------------------
-st.set_page_config(page_title="50周翻倍股票深度测算器 (双重确认版)", layout="wide")
+st.set_page_config(page_title="50周翻倍股票深度测算器 (MACD波浪版)", layout="wide")
 
 with st.sidebar:
     st.header("⚙️ 参数设置")
@@ -27,7 +27,7 @@ with st.sidebar:
     MIN_MV = st.number_input("最小市值 (亿元)", value=100.0) 
     MAX_MV = st.number_input("最大市值 (亿元)", value=1000.0)
 
-st.title("📊 近50周翻倍股票测算 (波浪双重确认版)")
+st.title("📊 近50周翻倍股票测算 (MACD动能波浪版)")
 
 if not TS_TOKEN:
     st.info("👈 请先在左侧边栏输入您的 Tushare Token 以启动程序。")
@@ -64,29 +64,32 @@ def get_stock_weekly_data(_pro, ts_code, start_date, end_date):
     for col in ['open', 'high', 'low', 'close']:
         df[col] = df[col] * df['adj_factor'] / latest_factor
         
+    # 日线 MACD 计算，用于后续合成周线 MACD 或直接计算
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['dif'] = df['ema12'] - df['ema26']
+    df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
+    df['macd'] = (df['dif'] - df['dea']) * 2
+    
     df['dt'] = pd.to_datetime(df['trade_date'])
     iso_cal = df['dt'].dt.isocalendar()
     df['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
     
+    # 周线合成：取每周最后一天的数据作为周收盘/MACD状态
     weekly = df.groupby('year_week', as_index=False).agg({
         'trade_date': 'last',
         'open': 'first',
         'high': 'max',
         'low': 'min',
         'close': 'last',
-        'vol': 'sum'
+        'vol': 'sum',
+        'macd': 'last'  # 采用周末最后一天的 MACD 柱子状态
     }).sort_values('trade_date').reset_index(drop=True)
     
-    # 【新增】：为双重确认机制计算 10 周均线
-    if len(weekly) >= 10:
-        weekly['w_ma10'] = weekly['close'].rolling(10).mean()
-    else:
-        weekly['w_ma10'] = np.nan
-        
     return weekly
 
 # ---------------------------
-# 3. 形态判断核心算法 (带双重确认机制)
+# 3. 形态判断核心算法 (MACD 动能交替识别法)
 # ---------------------------
 def classify_double_pattern(weekly_df):
     if len(weekly_df) < 10: return None
@@ -111,11 +114,12 @@ def classify_double_pattern(weekly_df):
     drawdowns = []
     current_max_drawdown = 0.0
     
+    # 【核心逻辑升级】：利用周线 MACD 的正负切换来界定洗盘周期
+    # 当 MACD < 0（绿柱）时，程序正式判定该股票进入洗盘/调整浪
     for i in range(1, len(ascent_df)):
         curr_high = ascent_df.loc[i, 'high']
         curr_low = ascent_df.loc[i, 'low']
-        curr_close = ascent_df.loc[i, 'close']
-        curr_ma10 = ascent_df.loc[i, 'w_ma10']
+        curr_macd = ascent_df.loc[i, 'macd']
         
         if curr_high > running_max:
             running_max = curr_high
@@ -126,16 +130,8 @@ def classify_double_pattern(weekly_df):
         else:
             drawdown = (running_max - curr_low) / running_max
             
-            # 【核心修改】：波浪双重确认机制
-            # 条件1：绝对空间跌幅 >= 18%
-            # 条件2：跌幅 >= 12% 且 当周收盘价向下跌破 10 周均线
-            is_valid_pullback = False
-            if drawdown >= 0.18:
-                is_valid_pullback = True
-            elif drawdown >= 0.12 and pd.notna(curr_ma10) and curr_close < curr_ma10:
-                is_valid_pullback = True
-
-            if is_valid_pullback:
+            # 只要周线 MACD 翻绿（< 0），且确实发生了空间回撤（比如大于5%），就确认为一次有效洗盘
+            if curr_macd < 0 and drawdown >= 0.05:
                 in_pullback = True
                 if drawdown > current_max_drawdown:
                     current_max_drawdown = drawdown 
@@ -143,6 +139,7 @@ def classify_double_pattern(weekly_df):
     if in_pullback and current_max_drawdown > 0:
         drawdowns.append(current_max_drawdown)
         
+    # 如果没有检测到清晰的 MACD 绿柱交替，或者耗时太短，归为爆破型
     if weeks_taken <= 6 or len(drawdowns) <= 1:
         pattern = "⚡ 潜伏爆破型 (形态一)"
     else:
@@ -165,7 +162,7 @@ def classify_double_pattern(weekly_df):
 # ---------------------------
 # 4. 主干回测与展示逻辑
 # ---------------------------
-if st.button("🚀 开始测算 (采用最新双重确认机制)"):
+if st.button("🚀 开始 MACD 动能波浪测算"):
     today_str = datetime.now().strftime("%Y%m%d")
     start_date_str = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
     
@@ -192,7 +189,7 @@ if st.button("🚀 开始测算 (采用最新双重确认机制)"):
         (df_merged['circ_mv_billion'] <= MAX_MV)
     ]
     
-    st.write(f"🔍 符合过滤条件（股价≥{MIN_PRICE}元，市值{MIN_MV}-{MAX_MV}亿）的股票共 **{len(filtered_stocks)}** 只，开始执行结构扫描...")
+    st.write(f"🔍 符合过滤条件（股价≥{MIN_PRICE}元，市值{MIN_MV}-{MAX_MV}亿）的股票共 **{len(filtered_stocks)}** 只，开始 MACD 动能波浪扫描...")
     
     results = []
     progress_bar = st.progress(0)
@@ -217,24 +214,24 @@ if st.button("🚀 开始测算 (采用最新双重确认机制)"):
         total = len(res_df)
         
         st.markdown("---")
-        st.header("📈 统计结果汇总 (双重确认机制)")
+        st.header("📈 统计结果汇总 (MACD 动能波浪版)")
         
         c1, c2, c3 = st.columns(3)
         c1.metric("近50周翻倍股票总数", f"{total} 只")
         c2.metric("⚡ 潜伏爆破型 (形态一)", f"{p1_count} 只", f"{p1_count/total*100:.1f}%")
         c3.metric("🌊 波浪推进型 (形态二)", f"{p2_count} 只", f"{p2_count/total*100:.1f}%")
         
-        st.subheader("📋 详细翻倍股票轨迹清单 (含洗盘深度与次数精准测算)")
+        st.subheader("📋 详细翻倍股票轨迹清单 (含 MACD 洗盘测算)")
         
         display_df = res_df[['ts_code', 'name', 'Pattern', 'Weeks_Taken', 'Pullback_Count', 
                              'Avg_Drop (%)', 'Max_Drop (%)', 'Max_Gain (%)', 'Min_Price', 'Max_Price']]
         
-        display_df.columns = ['代码', '名称', '归类形态', '翻倍耗时(周)', '严选期间洗盘次数', 
+        display_df.columns = ['代码', '名称', '归类形态', '翻倍耗时(周)', 'MACD洗盘次数', 
                               '平均每次洗盘跌幅(%)', '极限单次洗盘跌幅(%)', '最大总涨幅(%)', '区间最低价', '区间最高价']
         
         st.dataframe(display_df.sort_values('翻倍耗时(周)').reset_index(drop=True), use_container_width=True)
         
         csv = display_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载深度分析明细 (CSV)", csv, "double_stocks_dual_confirm_analysis.csv", "text/csv")
+        st.download_button("📥 下载 MACD 波浪分析明细 (CSV)", csv, "double_stocks_macd_wave_analysis.csv", "text/csv")
     else:
-        st.warning("⚠️ 在当前筛选条件下，近 50 周内没有扫描到翻倍的股票。")
+        st.warning("⚠️ 在当前筛选条件下，近 50 周内没有扫描到符合条件的股票。")
