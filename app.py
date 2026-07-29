@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.1 伪突破绞杀版 (高胜率降噪版)
+选股王 · V40.2 纯净绞杀版 (弹性爆发 & 冷却过滤)
 ------------------------------------------------
-核心改进 (基于V40.0):
-1. [量能区间锁死] 突破日成交量严格限制在 5日均量的 1.5 倍至 5.0 倍之间 (剔除弱鸡假放量与天量派发陷阱)。
-2. [极致地量沉淀] 突破前的 5 个交易日内，必须出现过至少 1 天的极致缩量 (当日成交量 < 5日均量的0.7倍)，确保筹码洗净。
-3. [形态箱体突破] 废除“前2天必须在20日线下”的死板规则，改为：今日收盘价必须创下近 10 个交易日以来的最高价 (过滤均线无序震荡的假突破)。
+核心改进 (基于V40.1的“坦诚局”优化):
+1. [量比弹性优化] 突破量比放宽为 1.3倍 ~ 5.0倍，拥抱真实市场的高换手核心资产。
+2. [砍掉地量要求] 删除“突破前必须极度缩量<0.7”的死板规定，防止误杀强势洗盘龙头。
+3. [箱体突破与冷却机制] 要求：今天收盘 > 过去10天最高价，且昨天收盘未突破。
+   - 彻底过滤均线横盘缠绕的伪信号。
+   - 实现“信号首发控制”，同一股票爆发后不再重复刷屏，只抓爆破第一天！
 ------------------------------------------------
 """
 
@@ -23,7 +25,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v40_1.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v40_2.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -38,8 +40,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.1 伪突破绞杀版", layout="wide")
-st.title("选股王 V40.1：主升浪波浪动能 + 伪突破强力绞杀")
+st.set_page_config(page_title="选股王 V40.2 纯净绞杀版", layout="wide")
+st.title("选股王 V40.2：箱体首发爆破 + 弹性量能绞杀")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -315,7 +317,7 @@ def count_macd_wave_pullbacks(df_calc):
     return pullback_count
 
 # ---------------------------
-# V40.1 核心指标计算 (伪突破强力绞杀)
+# V40.2 核心指标计算 (纯净绞杀版)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -330,6 +332,10 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df['ma60'] = df['close'].rolling(60).mean()
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].shift(1).rolling(5).mean()  
+    
+    # 【V40.2 新增】：计算“过去 10 个交易日（不含今日）的最高价”
+    # rolling(10).max().shift(1) 代表 T-10 到 T-1 这 10 天内的最高价
+    df['box_high_10'] = df['high'].rolling(window=10).max().shift(1)
     
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
@@ -377,32 +383,23 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
-    # 4. 日线突破点火信号 (V40.1 强力绞杀改动)
-    if len(df_calc) < 15: return res
-    
+    # 4. 日线突破点火信号 (V40.2 纯净绞杀)
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     
     is_daily_trend_up = row['ma60'] > row['ma120']
     
-    # 【改动1】10日箱体突破 (取代前两天必在20日线下的死板规则)
-    recent_10_days = df_calc.iloc[-11:-1] # 过去10天，不包含今天
-    box_high_10 = recent_10_days['high'].max()
-    is_box_breakout = row['close'] > box_high_10
+    # 【V40.2 改动1：箱体首发爆破】
+    # 1. 今日收盘价 > 过去10日最高价 (突破确认)
+    # 2. 昨天收盘价 <= 昨天的过去10日最高价 (首发控制，过滤连阳刷屏)
+    is_box_breakout = (row['close'] > row['box_high_10']) and (prev_row['close'] <= prev_row['box_high_10'])
     
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
     
-    # 【改动2 & 3】成交量控制：量比1.5-5.0倍，且前5天内必有地量洗盘(<0.7倍)
+    # 【V40.2 改动2：弹性量比】1.3倍至5.0倍之间
     vol_ratio = row['vol'] / row['ma5_vol'] if row['ma5_vol'] > 0 else 0
-    is_daily_vol_strong = (1.5 <= vol_ratio <= 5.0)
-    
-    recent_5_days = df_calc.iloc[-6:-1]
-    has_extreme_low_vol = False
-    for _, r in recent_5_days.iterrows():
-        if r['ma5_vol'] > 0 and (r['vol'] / r['ma5_vol']) < 0.7:
-            has_extreme_low_vol = True
-            break
+    is_daily_vol_strong = (1.3 <= vol_ratio <= 5.0)
     
     candle_range = row['high'] - row['low']
     candle_body = row['close'] - row['open']
@@ -415,7 +412,6 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
                                 is_daily_breakout and 
                                 is_daily_ma20_healthy and 
                                 is_daily_vol_strong and 
-                                has_extreme_low_vol and 
                                 is_solid_yang and 
                                 is_macd_healthy)
     
@@ -618,7 +614,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.1 伪突破绞杀版")
+    st.header("V40.2 纯净绞杀版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -630,7 +626,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_1_filter.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v40_2_pure.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -648,7 +644,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.1 伪突破绞杀追踪"):
+if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -673,7 +669,7 @@ if st.button(f"🚀 启动 V40.1 伪突破绞杀追踪"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="地量洗盘验证与伪突破阻击中...")
+        bar = st.progress(0, text="箱体首发与弹性放量点火计算中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -706,7 +702,7 @@ if st.button(f"🚀 启动 V40.1 伪突破绞杀追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.1 伪突破绞杀版")
+        st.header(f"📊 V40.2 纯净绞杀版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -724,7 +720,7 @@ if st.button(f"🚀 启动 V40.1 伪突破绞杀追踪"):
                     else:
                         st.metric(f"W{w} 无持仓", "N/A")
                         
-        st.subheader("📋 优等生清单 (剔除伪突破)")
+        st.subheader("📋 优等生首发清单 (无连续重复信号)")
         display_cols = [
             'Rank', 'Trade_Date', 'name', 'ts_code', 'Wave_Count', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
             'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
@@ -751,6 +747,6 @@ if st.button(f"🚀 启动 V40.1 伪突破绞杀追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_1_filter.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_2_pure.csv", "text/csv")
     else:
-        st.warning("⚠️ 暂无符合条件的标的，伪突破已全被绞杀。")
+        st.warning("⚠️ 暂无符合条件的标的。")
