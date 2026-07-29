@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.2 波浪转折点对齐版
+选股王 · V40.3 修复转折点重复触发版
 ------------------------------------------------
-核心改进 (基于V40.1 + 深度讨论成果):
+核心改进 (基于V40.2 + 深度讨论成果):
 1. [MACD周线波浪识别] 引入周线 MACD 红绿柱交替（由红转绿）作为客观界定波浪洗盘的裁判。
 2. [渐进式加分，非硬门槛] 洗盘次数不做筛选门槛，只按可靠程度分级加分（详见V40.1改动）。
-3. [★V40.2新增·买入时机与周线转折点对齐] 原来日线层面的"最近2天收盘价低于MA20"这条
-   回调判断，是在还没有周线波浪概念时设计的，跟周线是否真的经历过一次有意义的洗盘没有
-   必然关系——一次很小的日线波动就能凑出"2天回调"，跟真正的周线级别转折是两回事。
-   现在改成：截至当天，本周(可能还没走完)的周线MACD相比上一周由绿柱转为红柱，即"刚刚
-   转折"——这是确认后进场（不是预判绿柱快变红这种更冒险的赌法，后者虽然能更早、更便宜
-   进场，但有可能判断错方向），更符合资金安全优先的取向。日线层面仍然保留"突破20日线×
-   1.02 + 放量 + 阳线实体 + 日线MACD向好"这几条，负责在转折确认之后精确定位当天要不要买。
-4. [T+1开盘买入 & 一字板过滤 & 三层止盈止损] 完美继承 V39.6 的所有风控与实盘防错机制。
+3. [买入时机与周线转折点对齐] 用波浪转折点替代原来偏日线噪音的"回调2天"判断（详见V40.2改动）。
+4. [★V40.3修复] V40.2的转折判断(w_curr['macd']>=0 and w_prev['macd']<0)会在"本周"这几天里
+   天天成立——"本周"是用截至当天的数据滚动算出来的，只要本周还没走完、macd保持红柱，从周一
+   到周五每天单独检查都符合条件，导致同一次转折被重复触发好几天(实测中江丰电子、北京君正、
+   飞凯材料都在相邻日期各触发了2~4次，稀释了整体质量，也让原本表现最好的那一次触发被淹没，
+   光迅科技这次只抓到转折后第9个交易日的次优信号，没能复现之前扛住172%涨幅的表现)。
+   现在改成：用日线macd自己"今天由负转正"这个更精确的边界(只会在唯一的那一天成立)，配合
+   "上一个完整周确实是绿柱"这个周线背景确认，两者结合，既贴合周线波浪转折的大方向，又不会
+   把同一次转折重复计数。
+5. [T+1开盘买入 & 一字板过滤 & 三层止盈止损] 完美继承 V39.6 的所有风控与实盘防错机制。
 ------------------------------------------------
 """
 
@@ -30,7 +32,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v40_2.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v40_3.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -45,8 +47,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.2 波浪转折点对齐版", layout="wide")
-st.title("选股王 V40.2：买入时机与周线波浪转折点对齐")
+st.set_page_config(page_title="选股王 V40.3 修复重复触发版", layout="wide")
+st.title("选股王 V40.3：修复波浪转折点重复触发漏洞")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -401,19 +403,21 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
-    # 【V40.2新增】波浪转折点判断：截至今天，本周(可能还没走完)的周线MACD已经由上一周的
-    # 绿柱(<0)转为红柱(>=0)，即"刚刚转折"，属于确认后进场，不是预判绿柱即将变红这种更冒险的赌法
-    is_weekly_wave_turn = bool(w_curr['macd'] >= 0 and w_prev['macd'] < 0)
-
     # 3. 日线突破点火信号
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     prev2_row = df_calc.iloc[-3]
-    
+
+    # 【V40.3修复】V40.2原来的写法(w_curr['macd']>=0 and w_prev['macd']<0)会在"本周"这几天
+    # 里天天成立——因为"本周"是用截至当天的数据滚动算出来的，只要本周还没走完、macd保持红柱，
+    # 从周一到周五每天单独检查都符合条件，导致同一次转折被重复触发好几天(江丰电子、北京君正、
+    # 飞凯材料这几只票都在相邻日期各触发了2~4次，就是这个bug)。
+    # 现在改成：用日线macd自己"今天由负转正"这个更精确的边界(只会在唯一的那一天成立)，
+    # 配合"上一个完整周确实是绿柱"这个周线背景确认，两者结合，既贴合周线波浪转折的大方向，
+    # 又不会把同一次转折重复计数。
+    is_weekly_wave_turn = bool(row['macd'] >= 0 and prev_row['macd'] < 0 and w_prev['macd'] < 0)
+
     is_daily_trend_up = row['ma60'] > row['ma120']
-    # 【V40.2修改】原来的"最近2天日线收盘价低于MA20"太容易被日线小波动触发，
-    # 跟周线级别是否真的经历过一次洗盘没有必然关系。改成直接用上面算出的
-    # is_weekly_wave_turn(本周周线MACD刚由绿转红)，把买入时机和真正的波浪转折点对齐。
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
     is_daily_vol_strong = row['vol'] > (1.2 * row['ma5_vol'])
@@ -639,7 +643,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.2 波浪转折点对齐版")
+    st.header("V40.3 修复重复触发版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -651,7 +655,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_2_waveturn.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v40_3_fixdup.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -669,7 +673,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.2 追踪(波浪转折点对齐)"):
+if st.button(f"🚀 启动 V40.3 追踪(修复重复触发)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -727,7 +731,7 @@ if st.button(f"🚀 启动 V40.2 追踪(波浪转折点对齐)"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.2 波浪转折点对齐版")
+        st.header(f"📊 V40.3 修复重复触发版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -772,6 +776,6 @@ if st.button(f"🚀 启动 V40.2 追踪(波浪转折点对齐)"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_2_waveturn.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_3_fixdup.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
