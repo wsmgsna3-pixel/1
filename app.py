@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.1 主升浪波浪动能版 (加分制修正版)
+选股王 · V40.2 波浪转折点对齐版
 ------------------------------------------------
-核心改进 (基于V39.6 + 深度讨论成果):
+核心改进 (基于V40.1 + 深度讨论成果):
 1. [MACD周线波浪识别] 引入周线 MACD 红绿柱交替（由红转绿）作为客观界定波浪洗盘的裁判。
-2. [★V40.1修正] 洗盘次数不再作为硬性筛选门槛，改为渐进式加分项：
-   翻倍股回溯研究是"事后已知结局"统计出来的，实盘选股时无法提前知道一只票会不会走完全程，
-   用回溯规律做硬性排除条件，会把大量本该合格的信号误杀（V39.3"近期新高确认"那次硬性条件
-   误杀光迅科技就是同类教训）。现在改成：洗盘0~1次不加分，洗盘2~5次(对应第3~6浪)按翻倍股
-   统计里样本量与平均涨幅的可靠程度分级加分(洗盘4次/第5浪加分最高)，洗盘6次以上样本量断崖
-   下降、规律不可信，不加分但也不排除——所有候选票依然有资格入选，只是排序会受影响。
-   同时不再断言"第3浪最具爆发力"：完整数据显示涨幅最大的浪并不集中在固定的某个浪序号，
-   而是相对位置上更常出现在"这轮上涨接近尾声的最后1~2浪"，且第5浪(洗盘4次)是样本量充分
-   前提下平均涨幅最高的一浪，不是第3浪。
-3. [T+1开盘买入 & 一字板过滤 & 三层止盈止损] 完美继承 V39.6 的所有风控与实盘防错机制。
+2. [渐进式加分，非硬门槛] 洗盘次数不做筛选门槛，只按可靠程度分级加分（详见V40.1改动）。
+3. [★V40.2新增·买入时机与周线转折点对齐] 原来日线层面的"最近2天收盘价低于MA20"这条
+   回调判断，是在还没有周线波浪概念时设计的，跟周线是否真的经历过一次有意义的洗盘没有
+   必然关系——一次很小的日线波动就能凑出"2天回调"，跟真正的周线级别转折是两回事。
+   现在改成：截至当天，本周(可能还没走完)的周线MACD相比上一周由绿柱转为红柱，即"刚刚
+   转折"——这是确认后进场（不是预判绿柱快变红这种更冒险的赌法，后者虽然能更早、更便宜
+   进场，但有可能判断错方向），更符合资金安全优先的取向。日线层面仍然保留"突破20日线×
+   1.02 + 放量 + 阳线实体 + 日线MACD向好"这几条，负责在转折确认之后精确定位当天要不要买。
+4. [T+1开盘买入 & 一字板过滤 & 三层止盈止损] 完美继承 V39.6 的所有风控与实盘防错机制。
 ------------------------------------------------
 """
 
@@ -31,7 +30,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v40_1.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v40_2.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -46,8 +45,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.1 加分制修正版", layout="wide")
-st.title("选股王 V40.1：周线MACD波浪动能识别 + 渐进式加分(非硬门槛)")
+st.set_page_config(page_title="选股王 V40.2 波浪转折点对齐版", layout="wide")
+st.title("选股王 V40.2：买入时机与周线波浪转折点对齐")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -363,7 +362,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     # 交给下面打分环节做"加分项"处理。
     wave_count = count_macd_wave_pullbacks(df_calc)
 
-    # 2. 周线重采样合成（用于风控）
+    # 2. 周线重采样合成（用于风控 + V40.2新增的波浪转折点判断）
     df_calc['dt'] = pd.to_datetime(df_calc['trade_date_str'])
     iso_cal = df_calc['dt'].dt.isocalendar()
     df_calc['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
@@ -374,7 +373,9 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
         'high': 'max',
         'low': 'min',
         'close': 'last',
-        'vol': 'sum'
+        'vol': 'sum',
+        'macd': 'last'  # 【V40.2新增】取当周最后一个交易日的日线macd值，作为该周(含未走完的本周)的MACD状态，
+                         # 口径和 count_macd_wave_pullbacks、翻倍股统计工具保持一致，不引入第三种算法
     }).sort_values('trade_date_str').reset_index(drop=True)
     
     if len(weekly_df) < 10: return res
@@ -400,13 +401,19 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
+    # 【V40.2新增】波浪转折点判断：截至今天，本周(可能还没走完)的周线MACD已经由上一周的
+    # 绿柱(<0)转为红柱(>=0)，即"刚刚转折"，属于确认后进场，不是预判绿柱即将变红这种更冒险的赌法
+    is_weekly_wave_turn = bool(w_curr['macd'] >= 0 and w_prev['macd'] < 0)
+
     # 3. 日线突破点火信号
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     prev2_row = df_calc.iloc[-3]
     
     is_daily_trend_up = row['ma60'] > row['ma120']
-    is_daily_pulled_back = (prev2_row['close'] < prev2_row['ma20']) and (prev_row['close'] < prev_row['ma20'])
+    # 【V40.2修改】原来的"最近2天日线收盘价低于MA20"太容易被日线小波动触发，
+    # 跟周线级别是否真的经历过一次洗盘没有必然关系。改成直接用上面算出的
+    # is_weekly_wave_turn(本周周线MACD刚由绿转红)，把买入时机和真正的波浪转折点对齐。
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
     is_daily_vol_strong = row['vol'] > (1.2 * row['ma5_vol'])
@@ -417,7 +424,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
     res['is_v38_buy_signal'] = (is_weekly_safe and 
-                                is_daily_trend_up and is_daily_pulled_back and 
+                                is_daily_trend_up and is_weekly_wave_turn and 
                                 is_daily_breakout and is_daily_ma20_healthy and 
                                 is_daily_vol_strong and is_solid_yang and is_macd_healthy)
     
@@ -632,7 +639,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.1 加分制修正版")
+    st.header("V40.2 波浪转折点对齐版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -644,7 +651,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_1_scorebonus.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v40_2_waveturn.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -662,7 +669,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.1 追踪(加分制修正)"):
+if st.button(f"🚀 启动 V40.2 追踪(波浪转折点对齐)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -720,7 +727,7 @@ if st.button(f"🚀 启动 V40.1 追踪(加分制修正)"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.1 加分制修正版")
+        st.header(f"📊 V40.2 波浪转折点对齐版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -765,6 +772,6 @@ if st.button(f"🚀 启动 V40.1 追踪(加分制修正)"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_1_scorebonus.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_2_waveturn.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
