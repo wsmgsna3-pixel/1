@@ -1,20 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.3 修复转折点重复触发版
+选股王 · V40.1 伪突破绞杀版 (高胜率降噪版)
 ------------------------------------------------
-核心改进 (基于V40.2 + 深度讨论成果):
-1. [MACD周线波浪识别] 引入周线 MACD 红绿柱交替（由红转绿）作为客观界定波浪洗盘的裁判。
-2. [渐进式加分，非硬门槛] 洗盘次数不做筛选门槛，只按可靠程度分级加分（详见V40.1改动）。
-3. [买入时机与周线转折点对齐] 用波浪转折点替代原来偏日线噪音的"回调2天"判断（详见V40.2改动）。
-4. [★V40.3修复] V40.2的转折判断(w_curr['macd']>=0 and w_prev['macd']<0)会在"本周"这几天里
-   天天成立——"本周"是用截至当天的数据滚动算出来的，只要本周还没走完、macd保持红柱，从周一
-   到周五每天单独检查都符合条件，导致同一次转折被重复触发好几天(实测中江丰电子、北京君正、
-   飞凯材料都在相邻日期各触发了2~4次，稀释了整体质量，也让原本表现最好的那一次触发被淹没，
-   光迅科技这次只抓到转折后第9个交易日的次优信号，没能复现之前扛住172%涨幅的表现)。
-   现在改成：用日线macd自己"今天由负转正"这个更精确的边界(只会在唯一的那一天成立)，配合
-   "上一个完整周确实是绿柱"这个周线背景确认，两者结合，既贴合周线波浪转折的大方向，又不会
-   把同一次转折重复计数。
-5. [T+1开盘买入 & 一字板过滤 & 三层止盈止损] 完美继承 V39.6 的所有风控与实盘防错机制。
+核心改进 (基于V40.0):
+1. [量能区间锁死] 突破日成交量严格限制在 5日均量的 1.5 倍至 5.0 倍之间 (剔除弱鸡假放量与天量派发陷阱)。
+2. [极致地量沉淀] 突破前的 5 个交易日内，必须出现过至少 1 天的极致缩量 (当日成交量 < 5日均量的0.7倍)，确保筹码洗净。
+3. [形态箱体突破] 废除“前2天必须在20日线下”的死板规则，改为：今日收盘价必须创下近 10 个交易日以来的最高价 (过滤均线无序震荡的假突破)。
 ------------------------------------------------
 """
 
@@ -32,7 +23,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v40_3.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v40_1.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -47,8 +38,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.3 修复重复触发版", layout="wide")
-st.title("选股王 V40.3：修复波浪转折点重复触发漏洞")
+st.set_page_config(page_title="选股王 V40.1 伪突破绞杀版", layout="wide")
+st.title("选股王 V40.1：主升浪波浪动能 + 伪突破强力绞杀")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -272,17 +263,11 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
     return final_df
 
 # ---------------------------
-# 【V40新增】周线 MACD 波浪洗盘次数统计函数
+# 周线 MACD 波浪洗盘次数统计函数
 # ---------------------------
 def count_macd_wave_pullbacks(df_calc):
-    """
-    通过周线重采样并计算 MACD，统计从绝对低点到当前信号日之间，
-    经历了多少次周线 MACD 由红转绿（洗盘结束/调整期）。
-    返回洗盘次数 (int)
-    """
-    if len(df_calc) < 60: return -1 # 数据不够
+    if len(df_calc) < 60: return -1 
     
-    # 计算日线 MACD 基础指标
     df = df_calc.copy()
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
@@ -303,7 +288,6 @@ def count_macd_wave_pullbacks(df_calc):
     
     if len(weekly_df) < 10: return -1
     
-    # 寻找过去周期内的最低点作为波浪起点
     min_idx = weekly_df['low'].idxmin()
     sub_df = weekly_df.loc[min_idx:].reset_index(drop=True)
     if len(sub_df) < 5: return -1
@@ -323,7 +307,6 @@ def count_macd_wave_pullbacks(df_calc):
                 in_pullback = False
         else:
             drawdown = (running_max - curr_low) / running_max
-            # 满足 MACD 翻绿(<0) 且空间跌幅超过 5% 即确认为一次有效洗盘
             if curr_macd < 0 and drawdown >= 0.05:
                 if not in_pullback:
                     in_pullback = True
@@ -332,7 +315,7 @@ def count_macd_wave_pullbacks(df_calc):
     return pullback_count
 
 # ---------------------------
-# 核心指标计算 (温和周线过滤 + V40波浪动能机制)
+# V40.1 核心指标计算 (伪突破强力绞杀)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -341,7 +324,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     res = {}
     if df.empty or len(df) < 120: return res 
     
-    # 1. 日线指标计算
+    # 1. 日线基础指标
     df['ma10'] = df['close'].rolling(10).mean()
     df['ma20'] = df['close'].rolling(20).mean()
     df['ma60'] = df['close'].rolling(60).mean()
@@ -357,14 +340,12 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df_calc = df.dropna().copy().reset_index()
     if len(df_calc) < 20: return res
 
-    # 【V40.1修正】：不再用洗盘次数做硬性筛选门槛——翻倍股回溯研究是"事后已知结局"算出来的，
-    # 用它排除当下还不知道结局的候选票，等于假设"这只票一定会走完全程"，这是我们讨论中明确
-    # 排除掉的做法（也是V39.3"近期新高确认"那次硬性条件误杀光迅科技的同类错误）。
-    # 现在改成：始终计算 wave_count 并保留下来，不因为它不在某个区间就直接剔除信号，
-    # 交给下面打分环节做"加分项"处理。
+    # 2. 周线波浪过滤
     wave_count = count_macd_wave_pullbacks(df_calc)
+    if wave_count < 2 or wave_count > 5:
+        return res  
 
-    # 2. 周线重采样合成（用于风控 + V40.2新增的波浪转折点判断）
+    # 3. 周线风控
     df_calc['dt'] = pd.to_datetime(df_calc['trade_date_str'])
     iso_cal = df_calc['dt'].dt.isocalendar()
     df_calc['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
@@ -375,26 +356,19 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
         'high': 'max',
         'low': 'min',
         'close': 'last',
-        'vol': 'sum',
-        'macd': 'last'  # 【V40.2新增】取当周最后一个交易日的日线macd值，作为该周(含未走完的本周)的MACD状态，
-                         # 口径和 count_macd_wave_pullbacks、翻倍股统计工具保持一致，不引入第三种算法
     }).sort_values('trade_date_str').reset_index(drop=True)
     
     if len(weekly_df) < 10: return res
-    
     weekly_df['w_ma20'] = weekly_df['close'].rolling(20).mean()
     
     w_curr = weekly_df.iloc[-1]
     w_prev = weekly_df.iloc[-2] if len(weekly_df) >= 2 else w_curr
     
-    # 周线风控 1：防高位过度偏离
     w_bias_safe = True
     if not pd.isna(w_curr['w_ma20']) and w_curr['w_ma20'] > 0:
         w_bias = (w_curr['close'] - w_curr['w_ma20']) / w_curr['w_ma20']
-        if w_bias > 0.45:
-            w_bias_safe = False
+        if w_bias > 0.45: w_bias_safe = False
             
-    # 周线风控 2：防高位长上影线
     w_shadow_safe = True
     w_prev_range = w_prev['high'] - w_prev['low']
     w_prev_upper_shadow = w_prev['high'] - max(w_prev['open'], w_prev['close'])
@@ -403,24 +377,32 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
-    # 3. 日线突破点火信号
+    # 4. 日线突破点火信号 (V40.1 强力绞杀改动)
+    if len(df_calc) < 15: return res
+    
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
-    prev2_row = df_calc.iloc[-3]
-
-    # 【V40.3修复】V40.2原来的写法(w_curr['macd']>=0 and w_prev['macd']<0)会在"本周"这几天
-    # 里天天成立——因为"本周"是用截至当天的数据滚动算出来的，只要本周还没走完、macd保持红柱，
-    # 从周一到周五每天单独检查都符合条件，导致同一次转折被重复触发好几天(江丰电子、北京君正、
-    # 飞凯材料这几只票都在相邻日期各触发了2~4次，就是这个bug)。
-    # 现在改成：用日线macd自己"今天由负转正"这个更精确的边界(只会在唯一的那一天成立)，
-    # 配合"上一个完整周确实是绿柱"这个周线背景确认，两者结合，既贴合周线波浪转折的大方向，
-    # 又不会把同一次转折重复计数。
-    is_weekly_wave_turn = bool(row['macd'] >= 0 and prev_row['macd'] < 0 and w_prev['macd'] < 0)
-
+    
     is_daily_trend_up = row['ma60'] > row['ma120']
+    
+    # 【改动1】10日箱体突破 (取代前两天必在20日线下的死板规则)
+    recent_10_days = df_calc.iloc[-11:-1] # 过去10天，不包含今天
+    box_high_10 = recent_10_days['high'].max()
+    is_box_breakout = row['close'] > box_high_10
+    
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
-    is_daily_vol_strong = row['vol'] > (1.2 * row['ma5_vol'])
+    
+    # 【改动2 & 3】成交量控制：量比1.5-5.0倍，且前5天内必有地量洗盘(<0.7倍)
+    vol_ratio = row['vol'] / row['ma5_vol'] if row['ma5_vol'] > 0 else 0
+    is_daily_vol_strong = (1.5 <= vol_ratio <= 5.0)
+    
+    recent_5_days = df_calc.iloc[-6:-1]
+    has_extreme_low_vol = False
+    for _, r in recent_5_days.iterrows():
+        if r['ma5_vol'] > 0 and (r['vol'] / r['ma5_vol']) < 0.7:
+            has_extreme_low_vol = True
+            break
     
     candle_range = row['high'] - row['low']
     candle_body = row['close'] - row['open']
@@ -428,15 +410,20 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
     res['is_v38_buy_signal'] = (is_weekly_safe and 
-                                is_daily_trend_up and is_weekly_wave_turn and 
-                                is_daily_breakout and is_daily_ma20_healthy and 
-                                is_daily_vol_strong and is_solid_yang and is_macd_healthy)
+                                is_daily_trend_up and 
+                                is_box_breakout and 
+                                is_daily_breakout and 
+                                is_daily_ma20_healthy and 
+                                is_daily_vol_strong and 
+                                has_extreme_low_vol and 
+                                is_solid_yang and 
+                                is_macd_healthy)
     
     if res['is_v38_buy_signal']:
-        res['vol_ratio'] = row['vol'] / row['ma5_vol']  
+        res['vol_ratio'] = vol_ratio
         res['pre_close'] = prev_row['close']            
+        res['wave_count'] = wave_count  
         
-    res['wave_count'] = wave_count  # 【V40.1修正】始终记录，不管信号是否成立，且不再用默认值3掩盖"数据不足"的情况
     res['last_close'] = row['close']
     res['bottom_line'] = row['low'] 
     res['ma20'] = row['ma20']
@@ -464,17 +451,11 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     hist_full['low'] = pd.to_numeric(hist_full['low'], errors='coerce')
     hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
     
-    hist_full['ma10'] = hist_full['close'].rolling(10).mean()
-    hist_full['ma20'] = hist_full['close'].rolling(20).mean()
-    
     hist_future = hist_full[hist_full.index > selection_date]
-
-    if hist_future.empty:
-        return results
+    if hist_future.empty: return results
 
     next_row = hist_future.iloc[0]
 
-    # 主板一字板过滤
     is_main_board = not (ts_code.startswith('300') or ts_code.startswith('301') 
                           or ts_code.startswith('688') or ts_code.startswith('689'))
     is_one_word_limit = (is_main_board and pd.notna(next_row['open']) and pd.notna(next_row['high']) 
@@ -511,8 +492,6 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
         curr_close = row['close']
         curr_high = row['high']
         curr_low = row['low']
-        
-        final_return = np.nan
         
         if pending_exit_reason is not None:
             final_return = (curr_open - buy_price) / buy_price * 100.0
@@ -610,14 +589,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
         score_vol = ind['vol_ratio'] * 10
         total_score = score_breakout + score_vol
         
-        # 【V40.1修正】洗盘次数改为渐进式加分曲线，只加分不做硬门槛：
-        # 洗盘0~1次(尚未形成有效浪型，对应"潜伏爆破型")不加分；
-        # 洗盘2~5次(对应第3~6浪)是翻倍股回溯统计里样本量和平均涨幅都相对扎实的区间，给予加分，
-        # 其中洗盘4次(第5浪)在统计里平均涨幅最高(84%，179个样本)，加分也最高；
-        # 洗盘6次以上样本量断崖下降(第7浪47个、第8浪18个、第9/10浪仅4个和1个)，规律不可信，不加分但也不排除。
-        wave_cnt = ind.get('wave_count', -1)
-        wave_bonus_map = {2: 10.0, 3: 20.0, 4: 20.0, 5: 10.0}
-        total_score += wave_bonus_map.get(wave_cnt, 0.0)
+        # 阶梯加权：洗盘 2-3 次（主升段前夜）加 30 分
+        wave_cnt = ind.get('wave_count', 3)
+        if wave_cnt in [2, 3]:
+            total_score += 30.0  
             
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], hold_weeks=8, use_sina=use_sina)
         
@@ -643,7 +618,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.3 修复重复触发版")
+    st.header("V40.1 伪突破绞杀版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -655,7 +630,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_3_fixdup.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v40_1_filter.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -663,9 +638,9 @@ with st.sidebar:
             
     st.markdown("---")
     st.subheader("💰 核心护城河门槛")
-    MIN_PRICE = st.number_input("最低股价 (元)", value=20.0) 
+    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
+    MIN_MV = col1.number_input("最小市值(亿)", value=100.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -673,7 +648,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.3 追踪(修复重复触发)"):
+if st.button(f"🚀 启动 V40.1 伪突破绞杀追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -698,7 +673,7 @@ if st.button(f"🚀 启动 V40.3 追踪(修复重复触发)"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="MACD波浪动能与爆量点火计算中...")
+        bar = st.progress(0, text="地量洗盘验证与伪突破阻击中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -731,7 +706,7 @@ if st.button(f"🚀 启动 V40.3 追踪(修复重复触发)"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.3 修复重复触发版")
+        st.header(f"📊 V40.1 伪突破绞杀版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -749,7 +724,7 @@ if st.button(f"🚀 启动 V40.3 追踪(修复重复触发)"):
                     else:
                         st.metric(f"W{w} 无持仓", "N/A")
                         
-        st.subheader("📋 优等生清单 (含波浪洗盘次数)")
+        st.subheader("📋 优等生清单 (剔除伪突破)")
         display_cols = [
             'Rank', 'Trade_Date', 'name', 'ts_code', 'Wave_Count', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
             'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
@@ -776,6 +751,6 @@ if st.button(f"🚀 启动 V40.3 追踪(修复重复触发)"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_3_fixdup.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_1_filter.csv", "text/csv")
     else:
-        st.warning("⚠️ 暂无符合条件的标的。")
+        st.warning("⚠️ 暂无符合条件的标的，伪突破已全被绞杀。")
