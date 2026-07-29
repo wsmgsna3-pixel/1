@@ -121,11 +121,13 @@ def classify_double_pattern(weekly_df):
     weeks_taken = max_idx - min_idx + 1
     ascent_df = weekly_df.loc[min_idx:max_idx].copy().reset_index(drop=True)
 
-    # 【新增】判断"窗口内最高点"是不是恰好就是全部数据的最后一根，且最新MACD仍是红柱——
-    # 如果是，说明这轮上涨可能还没走完，最后这一浪应标记为"进行中"，而不是已经见顶的完整浪。
-    is_last_bar_of_data = (max_idx == weekly_df.index[-1])
-    last_macd = weekly_df.loc[max_idx, 'macd']
-    is_final_wave_ongoing = bool(is_last_bar_of_data and last_macd >= 0)
+    # 【修复】原来要求"最新一周必须恰好是整个窗口的历史最高点"才算"进行中"，
+    # 这个条件太苛刻——只要历史最高点不是精确落在最新一周（哪怕只差一点点，或者
+    # 当前周K线还没走完），就永远判断为False，导致"进行中"几乎不可能被触发。
+    # 现在改成：不要求创新高，只看最新一根周K线的MACD是否仍是红柱——只要还是红柱，
+    # 就说明这段行情(不管有没有突破前高)还没走完，值得纳入"进行中"观察池。
+    last_macd = weekly_df['macd'].iloc[-1]
+    is_final_wave_ongoing = bool(last_macd >= 0)
 
     running_max = ascent_df['high'].iloc[0]
     in_pullback = False
@@ -191,6 +193,13 @@ def classify_double_pattern(weekly_df):
     avg_drop = (sum(drawdowns) / len(drawdowns) * 100) if drawdowns else 0.0
     max_drop = (max(drawdowns) * 100) if drawdowns else 0.0
 
+    # 【新增】"进行中"只代表最新一周仍是红柱，不代表已经创了新高——
+    # 补充"最新收盘价距历史最高点还差多少"，让你能分清两种情况：
+    # 距离≤0(甚至为负)＝已经站上前高、正在创新高的强势票；距离>0＝还没突破前高，
+    # 可能是刚从洗盘里爬升、正在挑战前高的途中，两种都值得关注，但含义不同。
+    last_close = weekly_df['close'].iloc[-1]
+    dist_from_peak_pct = (max_price - last_close) / max_price * 100 if max_price > 0 else np.nan
+
     summary = {
         'Min_Price': round(min_price, 2),
         'Max_Price': round(max_price, 2),
@@ -201,7 +210,9 @@ def classify_double_pattern(weekly_df):
         'Max_Drop (%)': round(max_drop, 2),
         'Pattern': pattern,
         'Total_Waves': len(waves),
-        'Final_Wave_Ongoing': is_final_wave_ongoing
+        'Final_Wave_Ongoing': is_final_wave_ongoing,
+        'Last_Close': round(last_close, 2),
+        'Dist_From_Peak (%)': round(dist_from_peak_pct, 2)
     }
 
     return summary, waves
@@ -284,10 +295,10 @@ if st.button("🚀 开始 MACD 动能·逐浪拆解测算"):
         st.subheader("📋 汇总统计明细")
         display_df = res_df[['ts_code', 'name', 'Pattern', 'Weeks_Taken', 'Pullback_Count',
                              'Avg_Drop (%)', 'Max_Drop (%)', 'Max_Gain (%)', 'Min_Price', 'Max_Price',
-                             'Total_Waves', 'Final_Wave_Ongoing']]
+                             'Total_Waves', 'Final_Wave_Ongoing', 'Last_Close', 'Dist_From_Peak (%)']]
         display_df.columns = ['代码', '名称', '归类形态', '翻倍耗时(周)', 'MACD洗盘次数',
                               '平均每次洗盘跌幅(%)', '极限单次洗盘跌幅(%)', '最大总涨幅(%)', '区间最低价',
-                              '区间最高价', '总浪数', '最后一浪是否进行中']
+                              '区间最高价', '总浪数', '最后一浪是否进行中', '最新收盘价', '距历史高点距离(%)']
         st.dataframe(display_df.sort_values('翻倍耗时(周)').reset_index(drop=True), use_container_width=True)
 
         csv_summary = display_df.to_csv(index=False).encode('utf-8-sig')
@@ -338,10 +349,12 @@ if st.button("🚀 开始 MACD 动能·逐浪拆解测算"):
             st.markdown("---")
             st.subheader("🚀 当前正处于「进行中」最后一浪的股票（候选观察池）")
             st.caption("这些票最新一根周K线仍是红柱，说明当前这一浪还没走完/还没见顶。"
-                       "结合上面「主升浪常见于第几浪」的统计，如果这些票正处在容易成为主升浪的浪序号位置，"
-                       "可以重点关注。")
+                       "注意「距历史高点距离(%)」这一列：≤0表示已经站上前高、正在创新高，属于强势延续；"
+                       ">0表示还没突破前高，可能是刚从洗盘里爬升、正在挑战前高的半路上——这一浪的涨幅数字"
+                       "在后一种情况下还没算完整，仅供参考。结合上面「主升浪常见于第几浪」的统计，"
+                       "如果这些票正处在容易成为主升浪的浪序号位置，可以重点关注。")
             ongoing_display = ongoing_stocks.merge(
-                res_df[['ts_code', 'Total_Waves']], on='ts_code', how='left'
+                res_df[['ts_code', 'Total_Waves', 'Dist_From_Peak (%)']], on='ts_code', how='left'
             )
             st.dataframe(ongoing_display.sort_values('本浪涨幅(%)', ascending=False).reset_index(drop=True),
                         use_container_width=True)
