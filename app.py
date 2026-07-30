@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.2 纯净绞杀版 (弹性爆发 & 冷却过滤)
+选股王 · V40.6 实战定型版 (四大神盾)
 ------------------------------------------------
-核心改进 (基于V40.1的“坦诚局”优化):
-1. [量比弹性优化] 突破量比放宽为 1.3倍 ~ 5.0倍，拥抱真实市场的高换手核心资产。
-2. [砍掉地量要求] 删除“突破前必须极度缩量<0.7”的死板规定，防止误杀强势洗盘龙头。
-3. [箱体突破与冷却机制] 要求：今天收盘 > 过去10天最高价，且昨天收盘未突破。
-   - 彻底过滤均线横盘缠绕的伪信号。
-   - 实现“信号首发控制”，同一股票爆发后不再重复刷屏，只抓爆破第一天！
+核心改进 (基于数据复盘后的终极定型):
+1. [硬门槛 1：盘子基座] 侧边栏默认流通市值提高至 250 亿，彻底隔绝微盘股的画线诱多陷阱。
+2. [硬门槛 2：温和爆破] 突破量比上限严格锁定在 3.0倍 (1.3 <= vol <= 3.0)，绞杀“天量见天价”的分歧坑。
+3. [硬门槛 3：开盘定生死] 在 T+1 买入引擎中加入集合竞价拦截器。若高开>5%或低开<-3%，直接放弃买入，剔除该标的！
+4. [废除主观加分] 尊重客观数据，剔除原有的“洗盘2-3次加分”逻辑，所有分数纯靠量价真实动能。
 ------------------------------------------------
 """
 
@@ -25,7 +24,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v40_2.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v40_6.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -40,8 +39,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.2 纯净绞杀版", layout="wide")
-st.title("选股王 V40.2：箱体首发爆破 + 弹性量能绞杀")
+st.set_page_config(page_title="选股王 V40.6 实战定型版", layout="wide")
+st.title("选股王 V40.6：箱体首发 + 四大神盾")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -317,7 +316,7 @@ def count_macd_wave_pullbacks(df_calc):
     return pullback_count
 
 # ---------------------------
-# V40.2 核心指标计算 (纯净绞杀版)
+# 核心指标计算 (加入四大神盾)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -333,8 +332,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].shift(1).rolling(5).mean()  
     
-    # 【V40.2 新增】：计算“过去 10 个交易日（不含今日）的最高价”
-    # rolling(10).max().shift(1) 代表 T-10 到 T-1 这 10 天内的最高价
+    # 10 日箱体
     df['box_high_10'] = df['high'].rolling(window=10).max().shift(1)
     
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
@@ -383,23 +381,19 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
-    # 4. 日线突破点火信号 (V40.2 纯净绞杀)
+    # 4. 日线突破点火信号 
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     
     is_daily_trend_up = row['ma60'] > row['ma120']
     
-    # 【V40.2 改动1：箱体首发爆破】
-    # 1. 今日收盘价 > 过去10日最高价 (突破确认)
-    # 2. 昨天收盘价 <= 昨天的过去10日最高价 (首发控制，过滤连阳刷屏)
     is_box_breakout = (row['close'] > row['box_high_10']) and (prev_row['close'] <= prev_row['box_high_10'])
-    
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
     
-    # 【V40.2 改动2：弹性量比】1.3倍至5.0倍之间
+    # 【改动2：突破量比 ≤ 3.0倍】
     vol_ratio = row['vol'] / row['ma5_vol'] if row['ma5_vol'] > 0 else 0
-    is_daily_vol_strong = (1.3 <= vol_ratio <= 5.0)
+    is_daily_vol_strong = (1.3 <= vol_ratio <= 3.0)
     
     candle_range = row['high'] - row['low']
     candle_body = row['close'] - row['open']
@@ -427,7 +421,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# 三层简化止盈止损系统 (T+1开盘买入)
+# 三层简化止盈止损系统 (加入集合竞价拦截器)
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -465,9 +459,17 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     if pd.isna(buy_price) or buy_price <= 0:
         return results
 
-    results['Buy_Price'] = round(buy_price, 2)
+    # 【改动3：T+1 集合竞价拦截器】防核按钮与高开诱多
     if signal_close and signal_close > 0:
-        results['Gap_pct (%)'] = round((buy_price - signal_close) / signal_close * 100, 2)
+        gap_pct = (buy_price - signal_close) / signal_close * 100
+        results['Gap_pct (%)'] = round(gap_pct, 2)
+        if gap_pct < -3.0 or gap_pct > 5.0:
+            results['Exit_Reason'] = f"开盘幅度不符(剔除: {round(gap_pct, 2)}%)"
+            results['Buy_Price'] = round(buy_price, 2)
+            # 直接返回，不再执行后续持仓运算
+            return results
+
+    results['Buy_Price'] = round(buy_price, 2)
 
     exit_triggered = False
     tier = 0  
@@ -585,10 +587,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
         score_vol = ind['vol_ratio'] * 10
         total_score = score_breakout + score_vol
         
-        # 阶梯加权：洗盘 2-3 次（主升段前夜）加 30 分
+        # 【改动4：废除主观加分】去掉了 wave_cnt 的 30 分加成，让排序回归真实的量价爆发力度。
         wave_cnt = ind.get('wave_count', 3)
-        if wave_cnt in [2, 3]:
-            total_score += 30.0  
             
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], hold_weeks=8, use_sina=use_sina)
         
@@ -614,7 +614,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.2 纯净绞杀版")
+    st.header("V40.6 实战定型版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -626,7 +626,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_2_pure.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v40_6_final.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -636,7 +636,8 @@ with st.sidebar:
     st.subheader("💰 核心护城河门槛")
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=100.0) 
+    # 【改动1：市值基准提升】默认过滤掉 250亿以下的微盘股
+    MIN_MV = col1.number_input("最小市值(亿)", value=250.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -644,7 +645,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
+if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -669,7 +670,7 @@ if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="箱体首发与弹性放量点火计算中...")
+        bar = st.progress(0, text="箱体首发与四大神盾过滤中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -702,15 +703,18 @@ if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.2 纯净绞杀版")
-        st.subheader("🗓️ 周度生存与收益切片")
+        st.header(f"📊 V40.6 实战定型版")
+        st.subheader("🗓️ 周度生存与收益切片 (剔除不符合开盘要求的无效标的)")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
         
+        # 排除掉那些开盘直接被剔除的标的进行胜率统计
+        valid_trades_only = all_res[~all_res['Exit_Reason'].str.contains('剔除', na=False)]
+        
         for w in range(1, 9):
             col_name = f'Return_W{w} (%)'
-            if col_name in all_res.columns:
-                valid = all_res.dropna(subset=[col_name]) 
+            if col_name in valid_trades_only.columns:
+                valid = valid_trades_only.dropna(subset=[col_name]) 
                 target_col = cols_row1[w-1] if w <= 4 else cols_row2[w-5]
                 with target_col:
                     if not valid.empty:
@@ -720,7 +724,7 @@ if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
                     else:
                         st.metric(f"W{w} 无持仓", "N/A")
                         
-        st.subheader("📋 优等生首发清单 (无连续重复信号)")
+        st.subheader("📋 实战定型榜单")
         display_cols = [
             'Rank', 'Trade_Date', 'name', 'ts_code', 'Wave_Count', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
             'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
@@ -731,8 +735,8 @@ if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
         
         def color_exit(val):
             if isinstance(val, str):
-                if '固定止损' in val: return 'color: white; background-color: darkred'
-                elif '一字板' in val: return 'color: white; background-color: gray'
+                if '剔除' in val: return 'color: white; background-color: darkgray'
+                elif '固定止损' in val: return 'color: white; background-color: darkred'
                 elif '保本止盈' in val: return 'color: orange'
                 elif '移动止盈' in val: return 'color: green'
                 elif '周期结束平仓' in val: return 'color: blue'
@@ -747,6 +751,6 @@ if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_2_pure.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_6_final.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
