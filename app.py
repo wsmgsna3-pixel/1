@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.5 大盘风控绞杀版 (完美底座 + 顺势而为)
+选股王 · V40.2 纯净绞杀版 (弹性爆发 & 冷却过滤)
 ------------------------------------------------
-核心改进 (基于V40.2的完美个股底座):
-1. [重回完美底座] 撤销 V40.4/40.3 的严苛条件，退回 V40.2 (10日首发箱体 + 1.3~5.0量比) 以确保不错杀真龙。
-2. [必杀技一：双核大盘风控] 引入上证指数(000001.SH)与创业板指(399006.SZ)风控。
-   - 规则：如果两大指数全部跌破20日均线，判定为系统性主跌浪，强制空仓熔断。
-   - 只要有一个指数站上20日线(存在结构性行情)，即允许个股开仓。
+核心改进 (基于V40.1的“坦诚局”优化):
+1. [量比弹性优化] 突破量比放宽为 1.3倍 ~ 5.0倍，拥抱真实市场的高换手核心资产。
+2. [砍掉地量要求] 删除“突破前必须极度缩量<0.7”的死板规定，防止误杀强势洗盘龙头。
+3. [箱体突破与冷却机制] 要求：今天收盘 > 过去10天最高价，且昨天收盘未突破。
+   - 彻底过滤均线横盘缠绕的伪信号。
+   - 实现“信号首发控制”，同一股票爆发后不再重复刷屏，只抓爆破第一天！
 ------------------------------------------------
 """
 
@@ -24,7 +25,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v40_5.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v40_2.pkl" 
 
 # ---------------------------
 # 全局变量与探针
@@ -39,8 +40,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.5 大盘风控绞杀版", layout="wide")
-st.title("选股王 V40.5：大盘环境熔断 + 完美首发爆破")
+st.set_page_config(page_title="选股王 V40.2 纯净绞杀版", layout="wide")
+st.title("选股王 V40.2：箱体首发爆破 + 弹性量能绞杀")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -140,54 +141,6 @@ def load_industry_mapping():
         return dict(zip(full_df['con_code'], full_df['industry_code']))
     except Exception:
         return {}
-
-# ---------------------------
-# 【V40.5 新增】大盘健康状态引擎
-# ---------------------------
-@st.cache_data(ttl=3600*24)
-def get_market_health_dict(start_date, end_date):
-    """
-    获取分析区间内，每天的大盘健康状态。
-    只要 上证指数 或 创业板指 收盘价大于 20日均线，即判定为 True (可交易)。
-    两大指数全破 20 日线，判定为 False (强制空仓)。
-    """
-    global pro
-    if pro is None: return {}
-    
-    # 往前多取60天以便计算 MA20
-    start_fetch = (datetime.strptime(start_date, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
-    
-    with st.spinner("正在加载大盘指数风控数据..."):
-        sh_df = safe_get('index_daily', ts_code='000001.SH', start_date=start_fetch, end_date=end_date)
-        cy_df = safe_get('index_daily', ts_code='399006.SZ', start_date=start_fetch, end_date=end_date)
-        
-    health_dict = {}
-    
-    if not sh_df.empty:
-        sh_df = sh_df.sort_values('trade_date').reset_index(drop=True)
-        sh_df['ma20'] = sh_df['close'].rolling(20).mean()
-        sh_df = sh_df.set_index('trade_date')
-        
-    if not cy_df.empty:
-        cy_df = cy_df.sort_values('trade_date').reset_index(drop=True)
-        cy_df['ma20'] = cy_df['close'].rolling(20).mean()
-        cy_df = cy_df.set_index('trade_date')
-        
-    all_dates = set()
-    if not sh_df.empty: all_dates.update(sh_df.index)
-    if not cy_df.empty: all_dates.update(cy_df.index)
-    
-    for d in all_dates:
-        sh_ok = False
-        cy_ok = False
-        if not sh_df.empty and d in sh_df.index and pd.notna(sh_df.loc[d, 'ma20']):
-            sh_ok = sh_df.loc[d, 'close'] > sh_df.loc[d, 'ma20']
-        if not cy_df.empty and d in cy_df.index and pd.notna(cy_df.loc[d, 'ma20']):
-            cy_ok = cy_df.loc[d, 'close'] > cy_df.loc[d, 'ma20']
-            
-        health_dict[d] = sh_ok or cy_ok
-        
-    return health_dict
 
 # ---------------------------
 # 数据获取与复权引擎
@@ -364,7 +317,7 @@ def count_macd_wave_pullbacks(df_calc):
     return pullback_count
 
 # ---------------------------
-# 核心指标计算 (恢复至 V40.2 完美底座)
+# V40.2 核心指标计算 (纯净绞杀版)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -380,7 +333,8 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].shift(1).rolling(5).mean()  
     
-    # 恢复 V40.2 的 10 日箱体
+    # 【V40.2 新增】：计算“过去 10 个交易日（不含今日）的最高价”
+    # rolling(10).max().shift(1) 代表 T-10 到 T-1 这 10 天内的最高价
     df['box_high_10'] = df['high'].rolling(window=10).max().shift(1)
     
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
@@ -429,17 +383,21 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
-    # 4. 日线突破点火信号 (恢复至 V40.2 的完美形态)
+    # 4. 日线突破点火信号 (V40.2 纯净绞杀)
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     
     is_daily_trend_up = row['ma60'] > row['ma120']
     
+    # 【V40.2 改动1：箱体首发爆破】
+    # 1. 今日收盘价 > 过去10日最高价 (突破确认)
+    # 2. 昨天收盘价 <= 昨天的过去10日最高价 (首发控制，过滤连阳刷屏)
     is_box_breakout = (row['close'] > row['box_high_10']) and (prev_row['close'] <= prev_row['box_high_10'])
+    
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
     
-    # 恢复 V40.2 弹性量比 1.3 ~ 5.0
+    # 【V40.2 改动2：弹性量比】1.3倍至5.0倍之间
     vol_ratio = row['vol'] / row['ma5_vol'] if row['ma5_vol'] > 0 else 0
     is_daily_vol_strong = (1.3 <= vol_ratio <= 5.0)
     
@@ -575,11 +533,7 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
 # ---------------------------
 # 核心回测循环
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, is_market_healthy, use_sina=False, run_timestamp=None):
-    # 【大盘熔断机制】：如果大盘不健康，直接跳过选股，节省算力并规避风险
-    if not is_market_healthy:
-        return pd.DataFrame(), "大盘风控熔断"
-        
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False, run_timestamp=None):
     global GLOBAL_STOCK_INDUSTRY
 
     query_date = last_trade
@@ -660,7 +614,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.5 大盘风控绞杀版")
+    st.header("V40.2 纯净绞杀版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -672,7 +626,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_5_market.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v40_2_pure.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -690,7 +644,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.5 大盘风控追踪"):
+if st.button(f"🚀 启动 V40.2 纯净绞杀追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -710,59 +664,45 @@ if st.button(f"🚀 启动 V40.5 大盘风控追踪"):
     if not trade_days_list: st.stop()
     
     if not get_all_historical_data(trade_days_list, use_cache=True): st.stop()
-    
-    # 提前获取大盘风控字典 (大幅提升运行效率)
-    market_health_dict = get_market_health_dict(min(trade_days_list), max(trade_days_list))
             
     dates_to_run = [d for d in trade_days_list if d not in processed_dates]
-    
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="执行大盘环境风控与选股...")
-        blocked_days = 0
-        
+        bar = st.progress(0, text="箱体首发与弹性放量点火计算中...")
         for i, date in enumerate(dates_to_run):
+            
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
             run_timestamp = time.time() if is_realtime_radar else None
             
-            # 读取当天的环境健康状态 (缺省为True防止数据缺失导致死锁)
-            is_healthy = market_health_dict.get(date, True)
-            
             res, err = run_backtest_for_a_day(
-                date, int(TOP_BACKTEST), MIN_MV, MAX_MV, MIN_PRICE, is_healthy,
+                date, int(TOP_BACKTEST), MIN_MV, MAX_MV, MIN_PRICE,
                 use_sina=is_realtime_radar, run_timestamp=run_timestamp
             )
             
-            if err == "大盘风控熔断":
-                blocked_days += 1
-                
             if not res.empty:
                 res['Trade_Date'] = date
                 is_first = not os.path.exists(CHECKPOINT_FILE)
                 res.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
                 results.append(res)
-                
-            bar.progress((i+1)/len(dates_to_run), text=f"分析中: {date} | 熔断天数: {blocked_days}")
+            bar.progress((i+1)/len(dates_to_run), text=f"分析中: {date}")
         bar.empty()
-        st.info(f"🛡️ 总结：本次回测共有 {blocked_days} 天因大盘全线跌破20日均线，触发系统熔断空仓。")
     
     if int(BACKTEST_DAYS) == 1:
         st.markdown("---")
-        is_today_healthy = market_health_dict.get(trade_days_list[0], True)
-        if not is_today_healthy:
-            st.error("🚨 **今日大盘(上证&创业板)均跌破20日线，系统已强制熔断，全天禁止开仓！**")
-        elif SINA_STATUS['success'] > 0:
-            st.success(f"✅ **盘中实时探针响应正常**：大盘环境安全，接入新浪数据 {SINA_STATUS['success']} 次。")
+        if SINA_STATUS['success'] > 0:
+            st.success(f"✅ **盘中实时探针响应正常**：成功接入新浪底层数据 {SINA_STATUS['success']} 次，行情已接管。")
         elif SINA_STATUS['fail'] > 0:
-            st.error(f"❌ **探针警告**：新浪数据抓取失败 {SINA_STATUS['fail']} 次。")
+            st.error(f"❌ **盘中实时探针警告**：新浪数据抓取失败 {SINA_STATUS['fail']} 次。请确认当前是否在交易时间。")
+        else:
+            st.info("ℹ️ 实时探针未触发（可能由于基础选股条件未通过）。")
         st.markdown("---")
     
     if results:
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.5 大盘风控绞杀版")
+        st.header(f"📊 V40.2 纯净绞杀版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -780,7 +720,7 @@ if st.button(f"🚀 启动 V40.5 大盘风控追踪"):
                     else:
                         st.metric(f"W{w} 无持仓", "N/A")
                         
-        st.subheader("📋 优等生安全首发清单")
+        st.subheader("📋 优等生首发清单 (无连续重复信号)")
         display_cols = [
             'Rank', 'Trade_Date', 'name', 'ts_code', 'Wave_Count', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
             'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
@@ -807,6 +747,6 @@ if st.button(f"🚀 启动 V40.5 大盘风控追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_5_market.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_2_pure.csv", "text/csv")
     else:
-        st.warning("⚠️ 暂无符合条件的标的，或大盘环境极度恶劣导致系统长时间熔断。")
+        st.warning("⚠️ 暂无符合条件的标的。")
