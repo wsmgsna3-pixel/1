@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.6 实战定型版 (四大神盾)
+选股王 · V40.6 实战定型版 (四大神盾 + MAE/MFE 轨迹侦测)
 ------------------------------------------------
 核心改进 (基于数据复盘后的终极定型):
 1. [硬门槛 1：盘子基座] 侧边栏默认流通市值提高至 250 亿，彻底隔绝微盘股的画线诱多陷阱。
 2. [硬门槛 2：温和爆破] 突破量比上限严格锁定在 3.0倍 (1.3 <= vol <= 3.0)，绞杀“天量见天价”的分歧坑。
 3. [硬门槛 3：开盘定生死] 在 T+1 买入引擎中加入集合竞价拦截器。若高开>5%或低开<-3%，直接放弃买入，剔除该标的！
 4. [废除主观加分] 尊重客观数据，剔除原有的“洗盘2-3次加分”逻辑，所有分数纯靠量价真实动能。
+5. [新增：5日轨迹侦测] 自动输出 T+1 至 T+5 的全部 OHLCV 数据及 T5_MA5，用于动态止损策略的机器学习。
 ------------------------------------------------
 """
 
@@ -39,8 +40,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.6 实战定型版", layout="wide")
-st.title("选股王 V40.6：箱体首发 + 四大神盾")
+st.set_page_config(page_title="选股王 V40.6 轨迹分析版", layout="wide")
+st.title("选股王 V40.6：箱体首发 + 轨迹侦测")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -325,14 +326,12 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     res = {}
     if df.empty or len(df) < 120: return res 
     
-    # 1. 日线基础指标
     df['ma10'] = df['close'].rolling(10).mean()
     df['ma20'] = df['close'].rolling(20).mean()
     df['ma60'] = df['close'].rolling(60).mean()
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].shift(1).rolling(5).mean()  
     
-    # 10 日箱体
     df['box_high_10'] = df['high'].rolling(window=10).max().shift(1)
     
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
@@ -344,12 +343,10 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df_calc = df.dropna().copy().reset_index()
     if len(df_calc) < 20: return res
 
-    # 2. 周线波浪过滤
     wave_count = count_macd_wave_pullbacks(df_calc)
     if wave_count < 2 or wave_count > 5:
         return res  
 
-    # 3. 周线风控
     df_calc['dt'] = pd.to_datetime(df_calc['trade_date_str'])
     iso_cal = df_calc['dt'].dt.isocalendar()
     df_calc['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
@@ -381,7 +378,6 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
-    # 4. 日线突破点火信号 
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
     
@@ -391,7 +387,6 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
     
-    # 【改动2：突破量比 ≤ 3.0倍】
     vol_ratio = row['vol'] / row['ma5_vol'] if row['ma5_vol'] > 0 else 0
     is_daily_vol_strong = (1.3 <= vol_ratio <= 3.0)
     
@@ -421,7 +416,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# 三层简化止盈止损系统 (加入集合竞价拦截器)
+# 三层简化止盈止损系统 (加入 T1-T5 轨迹特征输出)
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -429,7 +424,19 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     end_future = (d0 + timedelta(days=150)).strftime("%Y%m%d") 
     
     hist_full = get_qfq_data_v4_optimized_final(ts_code, start_date=start_fetch, end_date=end_future, use_sina=use_sina)
+    
+    # 初始化周度返回字段
     results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
+    
+    # 初始化 T1 到 T5 的轨迹特征字段
+    for d in range(1, 6):
+        results[f'T{d}_O'] = np.nan
+        results[f'T{d}_H'] = np.nan
+        results[f'T{d}_L'] = np.nan
+        results[f'T{d}_C'] = np.nan
+        results[f'T{d}_V'] = np.nan
+    results['T5_MA5'] = np.nan
+    
     results['Exit_Reason'] = "持仓中"
     results['Buy_Price'] = np.nan
     results['Gap_pct (%)'] = np.nan
@@ -440,9 +447,24 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     hist_full['high'] = pd.to_numeric(hist_full['high'], errors='coerce')
     hist_full['low'] = pd.to_numeric(hist_full['low'], errors='coerce')
     hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
+    hist_full['ma5'] = hist_full['close'].rolling(5).mean() # 为 T5_MA5 提前计算全局均线
     
     hist_future = hist_full[hist_full.index > selection_date]
     if hist_future.empty: return results
+
+    # ======= 新增：前5个交易日的 MAE/MFE 轨迹特征数据抓取 =======
+    for d in range(1, 6):
+        if d - 1 < len(hist_future):
+            row_d = hist_future.iloc[d - 1]
+            results[f'T{d}_O'] = round(row_d['open'], 2)
+            results[f'T{d}_H'] = round(row_d['high'], 2)
+            results[f'T{d}_L'] = round(row_d['low'], 2)
+            results[f'T{d}_C'] = round(row_d['close'], 2)
+            results[f'T{d}_V'] = round(row_d['vol'], 2)
+            
+    if len(hist_future) >= 5:
+        results['T5_MA5'] = round(hist_future.iloc[4]['ma5'], 2)
+    # ==========================================================
 
     next_row = hist_future.iloc[0]
 
@@ -459,14 +481,12 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     if pd.isna(buy_price) or buy_price <= 0:
         return results
 
-    # 【改动3：T+1 集合竞价拦截器】防核按钮与高开诱多
     if signal_close and signal_close > 0:
         gap_pct = (buy_price - signal_close) / signal_close * 100
         results['Gap_pct (%)'] = round(gap_pct, 2)
         if gap_pct < -3.0 or gap_pct > 5.0:
             results['Exit_Reason'] = f"开盘幅度不符(剔除: {round(gap_pct, 2)}%)"
             results['Buy_Price'] = round(buy_price, 2)
-            # 直接返回，不再执行后续持仓运算
             return results
 
     results['Buy_Price'] = round(buy_price, 2)
@@ -587,7 +607,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
         score_vol = ind['vol_ratio'] * 10
         total_score = score_breakout + score_vol
         
-        # 【改动4：废除主观加分】去掉了 wave_cnt 的 30 分加成，让排序回归真实的量价爆发力度。
         wave_cnt = ind.get('wave_count', 3)
             
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], hold_weeks=8, use_sina=use_sina)
@@ -636,7 +655,6 @@ with st.sidebar:
     st.subheader("💰 核心护城河门槛")
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
     col1, col2 = st.columns(2)
-    # 【改动1：市值基准提升】默认过滤掉 250亿以下的微盘股
     MIN_MV = col1.number_input("最小市值(亿)", value=250.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
@@ -645,7 +663,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
+if st.button(f"🚀 启动 V40.6 轨迹分析追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -670,7 +688,7 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="箱体首发与四大神盾过滤中...")
+        bar = st.progress(0, text="箱体首发与轨迹特征过滤中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -703,12 +721,11 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.6 实战定型版")
+        st.header(f"📊 V40.6 实战定型版 (轨迹分析版)")
         st.subheader("🗓️ 周度生存与收益切片 (剔除不符合开盘要求的无效标的)")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
         
-        # 排除掉那些开盘直接被剔除的标的进行胜率统计
         valid_trades_only = all_res[~all_res['Exit_Reason'].str.contains('剔除', na=False)]
         
         for w in range(1, 9):
@@ -725,10 +742,17 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
                         st.metric(f"W{w} 无持仓", "N/A")
                         
         st.subheader("📋 实战定型榜单")
+        
+        # 将新增的 T1-T5 字段加入显示和导出列表
+        t_cols = []
+        for d in range(1, 6):
+            t_cols.extend([f'T{d}_O', f'T{d}_H', f'T{d}_L', f'T{d}_C', f'T{d}_V'])
+        t_cols.append('T5_MA5')
+
         display_cols = [
             'Rank', 'Trade_Date', 'name', 'ts_code', 'Wave_Count', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
             'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
-        ] + [f'Return_W{w} (%)' for w in range(1, 9)]
+        ] + t_cols + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
     
         display_df = all_res[final_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]).reset_index(drop=True)
@@ -751,6 +775,6 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v40_6_final.csv", "text/csv")
+        st.download_button("📥 下载带轨迹的完整数据 (CSV)", csv, f"export_v40_6_track.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
