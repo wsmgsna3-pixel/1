@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.6 实战定型版 (四大神盾 + MAE/MFE 轨迹侦测)
+选股王 · V39.6 主板一字板过滤版 (含 T1-T5 轨迹侦测)
 ------------------------------------------------
-核心改进 (基于数据复盘后的终极定型):
-1. [硬门槛 1：盘子基座] 侧边栏默认流通市值提高至 250 亿，彻底隔绝微盘股的画线诱多陷阱。
-2. [硬门槛 2：温和爆破] 突破量比上限严格锁定在 3.0倍 (1.3 <= vol <= 3.0)，绞杀“天量见天价”的分歧坑。
-3. [硬门槛 3：开盘定生死] 在 T+1 买入引擎中加入集合竞价拦截器。若高开>5%或低开<-3%，直接放弃买入，剔除该标的！
-4. [废除主观加分] 尊重客观数据，剔除原有的“洗盘2-3次加分”逻辑，所有分数纯靠量价真实动能。
-5. [新增：5日轨迹侦测] 自动输出 T+1 至 T+5 的全部 OHLCV 数据及 T5_MA5，用于动态止损策略的机器学习。
+核心改进 (基于V39.5):
+1. [周线松绑] 移除周线 MA10 > MA20 的硬性限制，允许底部爆量反转的大牛股进场。
+2. [防高位陷阱] 增加周线乖离率与高位上影线风控，专门绞杀高位 B 浪诱多派发。
+3. [日线爆量点火] 保持日线 20 日线爆量反包的极致灵敏度。
+4. [去未来函数] 买入价为信号日次日(T+1)开盘价，而非信号当天收盘价。
+5. [入场信号收紧] 突破幅度：收盘价需高出MA20至少2%。
+6. [止损止盈-三层简化] 固定止损-8%/-12% → 浮盈满10%保本 → 浮盈满20%后回撤15%移动止盈，
+   全程用最高价追踪浮盈峰值，固定止损全程兜底生效，保本/移动止盈延迟到次日开盘结算。
+7. [301止损档位/量比基准] 已修复。
+8. [新增：主板一字涨停过滤] 剔除无法买入的一字板，标为"一字板无法买入(剔除)"。
+9. [新增：5日轨迹侦测] 自动输出 T+1 至 T+5 的 OHLCV 数据及 T5_MA5，用于提前止损分析。
 ------------------------------------------------
 """
 
@@ -25,7 +30,7 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "market_data_cache_v40_6.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v39_1.pkl"  # 原始行情数据缓存，未变更，可复用
 
 # ---------------------------
 # 全局变量与探针
@@ -40,8 +45,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.6 轨迹分析版", layout="wide")
-st.title("选股王 V40.6：箱体首发 + 轨迹侦测")
+st.set_page_config(page_title="选股王 V39.6 轨迹侦测版", layout="wide")
+st.title("选股王 V39.6：周线温和过滤 + 轨迹侦测引擎")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -265,59 +270,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=Fals
     return final_df
 
 # ---------------------------
-# 周线 MACD 波浪洗盘次数统计函数
-# ---------------------------
-def count_macd_wave_pullbacks(df_calc):
-    if len(df_calc) < 60: return -1 
-    
-    df = df_calc.copy()
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['dif'] = df['ema12'] - df['ema26']
-    df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
-    df['macd'] = (df['dif'] - df['dea']) * 2
-    
-    df['dt'] = pd.to_datetime(df['trade_date_str'])
-    iso_cal = df['dt'].dt.isocalendar()
-    df['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
-    
-    weekly_df = df.groupby('year_week', as_index=False).agg({
-        'trade_date_str': 'last',
-        'low': 'min',
-        'high': 'max',
-        'macd': 'last'
-    }).sort_values('trade_date_str').reset_index(drop=True)
-    
-    if len(weekly_df) < 10: return -1
-    
-    min_idx = weekly_df['low'].idxmin()
-    sub_df = weekly_df.loc[min_idx:].reset_index(drop=True)
-    if len(sub_df) < 5: return -1
-    
-    running_max = sub_df['high'].iloc[0]
-    in_pullback = False
-    pullback_count = 0
-    
-    for i in range(1, len(sub_df)):
-        curr_high = sub_df.loc[i, 'high']
-        curr_low = sub_df.loc[i, 'low']
-        curr_macd = sub_df.loc[i, 'macd']
-        
-        if curr_high > running_max:
-            running_max = curr_high
-            if in_pullback:
-                in_pullback = False
-        else:
-            drawdown = (running_max - curr_low) / running_max
-            if curr_macd < 0 and drawdown >= 0.05:
-                if not in_pullback:
-                    in_pullback = True
-                    pullback_count += 1
-                    
-    return pullback_count
-
-# ---------------------------
-# 核心指标计算 (加入四大神盾)
+# 核心指标计算 (温和周线过滤)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
@@ -326,13 +279,12 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     res = {}
     if df.empty or len(df) < 120: return res 
     
+    # 1. 日线指标计算
     df['ma10'] = df['close'].rolling(10).mean()
     df['ma20'] = df['close'].rolling(20).mean()
     df['ma60'] = df['close'].rolling(60).mean()
     df['ma120'] = df['close'].rolling(120).mean()
     df['ma5_vol'] = df['vol'].shift(1).rolling(5).mean()  
-    
-    df['box_high_10'] = df['high'].rolling(window=10).max().shift(1)
     
     df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
     df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
@@ -343,10 +295,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     df_calc = df.dropna().copy().reset_index()
     if len(df_calc) < 20: return res
 
-    wave_count = count_macd_wave_pullbacks(df_calc)
-    if wave_count < 2 or wave_count > 5:
-        return res  
-
+    # 2. 周线重采样合成
     df_calc['dt'] = pd.to_datetime(df_calc['trade_date_str'])
     iso_cal = df_calc['dt'].dt.isocalendar()
     df_calc['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
@@ -357,9 +306,11 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
         'high': 'max',
         'low': 'min',
         'close': 'last',
+        'vol': 'sum'
     }).sort_values('trade_date_str').reset_index(drop=True)
     
     if len(weekly_df) < 10: return res
+    
     weekly_df['w_ma20'] = weekly_df['close'].rolling(20).mean()
     
     w_curr = weekly_df.iloc[-1]
@@ -368,7 +319,8 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     w_bias_safe = True
     if not pd.isna(w_curr['w_ma20']) and w_curr['w_ma20'] > 0:
         w_bias = (w_curr['close'] - w_curr['w_ma20']) / w_curr['w_ma20']
-        if w_bias > 0.45: w_bias_safe = False
+        if w_bias > 0.45:
+            w_bias_safe = False
             
     w_shadow_safe = True
     w_prev_range = w_prev['high'] - w_prev['low']
@@ -378,17 +330,18 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
 
     is_weekly_safe = w_bias_safe and w_shadow_safe
 
+    # 3. 日线突破点火信号
     row = df_calc.iloc[-1]
     prev_row = df_calc.iloc[-2]
+    prev2_row = df_calc.iloc[-3]
     
     is_daily_trend_up = row['ma60'] > row['ma120']
-    
-    is_box_breakout = (row['close'] > row['box_high_10']) and (prev_row['close'] <= prev_row['box_high_10'])
+    is_daily_pulled_back = (prev2_row['close'] < prev2_row['ma20']) and (prev_row['close'] < prev_row['ma20'])
+
     is_daily_breakout = row['close'] > row['ma20'] * 1.02
+
     is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
-    
-    vol_ratio = row['vol'] / row['ma5_vol'] if row['ma5_vol'] > 0 else 0
-    is_daily_vol_strong = (1.3 <= vol_ratio <= 3.0)
+    is_daily_vol_strong = row['vol'] > (1.2 * row['ma5_vol'])
     
     candle_range = row['high'] - row['low']
     candle_body = row['close'] - row['open']
@@ -396,18 +349,13 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
     
     res['is_v38_buy_signal'] = (is_weekly_safe and 
-                                is_daily_trend_up and 
-                                is_box_breakout and 
-                                is_daily_breakout and 
-                                is_daily_ma20_healthy and 
-                                is_daily_vol_strong and 
-                                is_solid_yang and 
-                                is_macd_healthy)
+                                is_daily_trend_up and is_daily_pulled_back and 
+                                is_daily_breakout and is_daily_ma20_healthy and 
+                                is_daily_vol_strong and is_solid_yang and is_macd_healthy)
     
     if res['is_v38_buy_signal']:
-        res['vol_ratio'] = vol_ratio
+        res['vol_ratio'] = row['vol'] / row['ma5_vol']  
         res['pre_close'] = prev_row['close']            
-        res['wave_count'] = wave_count  
         
     res['last_close'] = row['close']
     res['bottom_line'] = row['low'] 
@@ -416,7 +364,7 @@ def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
     return res
 
 # ---------------------------
-# 三层简化止盈止损系统 (加入 T1-T5 轨迹特征输出)
+# V39.3 核心大脑：三层简化止盈止损系统 (加入 T1-T5 轨迹特征输出)
 # ---------------------------
 def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, hold_weeks=8, use_sina=False):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -447,11 +395,16 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     hist_full['high'] = pd.to_numeric(hist_full['high'], errors='coerce')
     hist_full['low'] = pd.to_numeric(hist_full['low'], errors='coerce')
     hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
-    hist_full['ma5'] = hist_full['close'].rolling(5).mean() # 为 T5_MA5 提前计算全局均线
+    
+    hist_full['ma10'] = hist_full['close'].rolling(10).mean()
+    hist_full['ma20'] = hist_full['close'].rolling(20).mean()
+    hist_full['ma5'] = hist_full['close'].rolling(5).mean()  # 提前计算 5 日均线供 T+5 读取
     
     hist_future = hist_full[hist_full.index > selection_date]
-    if hist_future.empty: return results
 
+    if hist_future.empty:
+        return results
+        
     # ======= 新增：前5个交易日的 MAE/MFE 轨迹特征数据抓取 =======
     for d in range(1, 6):
         if d - 1 < len(hist_future):
@@ -481,15 +434,9 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
     if pd.isna(buy_price) or buy_price <= 0:
         return results
 
-    if signal_close and signal_close > 0:
-        gap_pct = (buy_price - signal_close) / signal_close * 100
-        results['Gap_pct (%)'] = round(gap_pct, 2)
-        if gap_pct < -3.0 or gap_pct > 5.0:
-            results['Exit_Reason'] = f"开盘幅度不符(剔除: {round(gap_pct, 2)}%)"
-            results['Buy_Price'] = round(buy_price, 2)
-            return results
-
     results['Buy_Price'] = round(buy_price, 2)
+    if signal_close and signal_close > 0:
+        results['Gap_pct (%)'] = round((buy_price - signal_close) / signal_close * 100, 2)
 
     exit_triggered = False
     tier = 0  
@@ -510,6 +457,8 @@ def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, h
         curr_close = row['close']
         curr_high = row['high']
         curr_low = row['low']
+        
+        final_return = np.nan
         
         if pending_exit_reason is not None:
             final_return = (curr_open - buy_price) / buy_price * 100.0
@@ -604,16 +553,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
             
         pct_chg = (ind['last_close'] - ind['pre_close']) / ind['pre_close'] * 100
         score_breakout = pct_chg * 10 
+        
         score_vol = ind['vol_ratio'] * 10
         total_score = score_breakout + score_vol
         
-        wave_cnt = ind.get('wave_count', 3)
-            
         future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], hold_weeks=8, use_sina=use_sina)
         
         record_dict = {
             'ts_code': row.ts_code, 'name': row.name, 'Signal_Close': ind['last_close'], 
-            'Wave_Count': wave_cnt,
             'circ_mv': row.circ_mv_billion,
             'Total_Score': round(total_score, 1),
             'Breakout_S': round(score_breakout, 1),
@@ -633,7 +580,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.6 实战定型版")
+    st.header("V39.6 轨迹侦测版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -645,7 +592,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_6_final.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_6_track.csv" 
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -653,9 +600,9 @@ with st.sidebar:
             
     st.markdown("---")
     st.subheader("💰 核心护城河门槛")
-    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
+    MIN_PRICE = st.number_input("最低股价 (元)", value=20.0) 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=250.0) 
+    MIN_MV = col1.number_input("最小市值(亿)", value=200.0) 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -663,7 +610,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V40.6 轨迹分析追踪"):
+if st.button(f"🚀 启动 V39.6 追踪 (含轨迹侦测)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -688,7 +635,7 @@ if st.button(f"🚀 启动 V40.6 轨迹分析追踪"):
     if not dates_to_run:
         st.success("🎉 扫描已全部完毕！")
     else:
-        bar = st.progress(0, text="箱体首发与轨迹特征过滤中...")
+        bar = st.progress(0, text="温和周线风控与轨迹特征提取中...")
         for i, date in enumerate(dates_to_run):
             
             is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
@@ -721,17 +668,15 @@ if st.button(f"🚀 启动 V40.6 轨迹分析追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.6 实战定型版 (轨迹分析版)")
-        st.subheader("🗓️ 周度生存与收益切片 (剔除不符合开盘要求的无效标的)")
+        st.header(f"📊 V39.6 主板一字板过滤版 (含轨迹分析)")
+        st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
         
-        valid_trades_only = all_res[~all_res['Exit_Reason'].str.contains('剔除', na=False)]
-        
         for w in range(1, 9):
             col_name = f'Return_W{w} (%)'
-            if col_name in valid_trades_only.columns:
-                valid = valid_trades_only.dropna(subset=[col_name]) 
+            if col_name in all_res.columns:
+                valid = all_res.dropna(subset=[col_name]) 
                 target_col = cols_row1[w-1] if w <= 4 else cols_row2[w-5]
                 with target_col:
                     if not valid.empty:
@@ -741,16 +686,16 @@ if st.button(f"🚀 启动 V40.6 轨迹分析追踪"):
                     else:
                         st.metric(f"W{w} 无持仓", "N/A")
                         
-        st.subheader("📋 实战定型榜单")
+        st.subheader("📋 优等生清单 (附带 T1-T5 轨迹特征)")
         
         # 将新增的 T1-T5 字段加入显示和导出列表
         t_cols = []
         for d in range(1, 6):
             t_cols.extend([f'T{d}_O', f'T{d}_H', f'T{d}_L', f'T{d}_C', f'T{d}_V'])
         t_cols.append('T5_MA5')
-
+        
         display_cols = [
-            'Rank', 'Trade_Date', 'name', 'ts_code', 'Wave_Count', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
+            'Rank', 'Trade_Date', 'name', 'ts_code', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
             'Total_Score', 'Breakout_S', 'Volume_S', 'circ_mv', 'Exit_Reason'
         ] + t_cols + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
@@ -759,8 +704,8 @@ if st.button(f"🚀 启动 V40.6 轨迹分析追踪"):
         
         def color_exit(val):
             if isinstance(val, str):
-                if '剔除' in val: return 'color: white; background-color: darkgray'
-                elif '固定止损' in val: return 'color: white; background-color: darkred'
+                if '固定止损' in val: return 'color: white; background-color: darkred'
+                elif '一字板' in val: return 'color: white; background-color: gray'
                 elif '保本止盈' in val: return 'color: orange'
                 elif '移动止盈' in val: return 'color: green'
                 elif '周期结束平仓' in val: return 'color: blue'
@@ -775,6 +720,6 @@ if st.button(f"🚀 启动 V40.6 轨迹分析追踪"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载带轨迹的完整数据 (CSV)", csv, f"export_v40_6_track.csv", "text/csv")
+        st.download_button("📥 下载带轨迹的完整数据 (CSV)", csv, f"export_v39_6_track.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
