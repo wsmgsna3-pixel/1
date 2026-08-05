@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.6 同口径三仓回测版
+选股王 · V40.6 可靠缓存三仓回测版
 ------------------------------------------------
 核心改进 (基于数据复盘后的终极定型):
 1. [硬门槛 1：盘子基座] 侧边栏默认流通市值下限为 200 亿，隔绝微盘股的画线诱多陷阱。
@@ -9,6 +9,7 @@
 4. [废除主观加分] 尊重客观数据，剔除原有的“洗盘2-3次加分”逻辑，所有分数纯靠量价真实动能。
 5. [回测口径统一] 股票池改为V40.4历史申万科技池，股价>=20元、流通市值200~1000亿元。
 6. [真实组合] 30万元初始资金、最多3只持仓、单只目标约10万元，并计入滑点、佣金和卖出税费。
+7. [可靠续传] 行情/复权/市值按交易日立即落盘；有标的与无标的日均记录完成状态。
 ------------------------------------------------
 """
 
@@ -20,13 +21,18 @@ import tushare as ts
 from datetime import datetime, timedelta
 import warnings
 import time
-import concurrent.futures 
 import os
 import pickle
+import json
+import hashlib
+import tempfile
+import shutil
 
 warnings.filterwarnings("ignore")
 
 CACHE_FILE_NAME = "market_data_cache_v40_6.pkl" 
+CACHE_DIR_NAME = "market_data_cache_v40_6_days"
+CACHE_VERSION = 3
 
 INITIAL_CAPITAL = 300_000.0
 MAX_PORTFOLIO_POSITIONS = 3
@@ -53,6 +59,7 @@ TECH_INDUSTRY_KEYWORDS = {
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
+GLOBAL_DAILY_BASIC = pd.DataFrame()
 GLOBAL_QFQ_BASE_FACTORS = {} 
 GLOBAL_STOCK_BASIC = pd.DataFrame()
 GLOBAL_TECH_PERIODS = {}
@@ -61,8 +68,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.6 实战定型版", layout="wide")
-st.title("选股王 V40.6：箱体首发 + V40.4同口径三仓")
+st.set_page_config(page_title="选股王 V40.6 可靠缓存版", layout="wide")
+st.title("选股王 V40.6：箱体首发 + 可靠续传三仓")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -129,11 +136,93 @@ def get_trade_days(end_date_str, num_days):
     trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
     return trade_days_df['cal_date'].head(num_days).tolist()
 
-@st.cache_data(ttl=3600*24)
-def fetch_and_cache_daily_data(date):
-    adj_df = safe_get('adj_factor', trade_date=date)
-    daily_df = safe_get('daily', trade_date=date)
-    return {'adj': adj_df, 'daily': daily_df}
+def direct_get_with_retry(func_name, attempts=4, **kwargs):
+    """下载阶段不缓存失败结果，网络恢复后可立即续传。"""
+    global pro
+    if pro is None:
+        return pd.DataFrame(columns=['ts_code'])
+    func = getattr(pro, func_name)
+    for attempt in range(attempts):
+        try:
+            df = func(**kwargs)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+        time.sleep(min(1.0 + attempt, 3.0))
+    return pd.DataFrame(columns=['ts_code'])
+
+
+def fetch_daily_components(date, existing=None, need_daily_basic=True):
+    """只下载该交易日仍缺失的组件。"""
+    data = dict(existing or {})
+    requests_map = {
+        'adj': ('adj_factor', {'trade_date': date}),
+        'daily': ('daily', {'trade_date': date}),
+    }
+    if need_daily_basic:
+        requests_map['daily_basic'] = ('daily_basic', {'trade_date': date})
+    for key, (func_name, kwargs) in requests_map.items():
+        current = data.get(key)
+        if isinstance(current, pd.DataFrame) and not current.empty:
+            continue
+        data[key] = direct_get_with_retry(func_name, **kwargs)
+    return data
+
+
+def atomic_pickle_dump(value, target_path):
+    target_path = os.path.abspath(target_path)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix='.tmp_v40_6_', dir=os.path.dirname(target_path))
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, target_path)
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+def atomic_csv_save(df, target_path):
+    target_path = os.path.abspath(target_path)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix='.tmp_v40_6_', suffix='.csv', dir=os.path.dirname(target_path))
+    os.close(fd)
+    try:
+        df.to_csv(temp_path, index=False, encoding='utf-8-sig')
+        os.replace(temp_path, target_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+def cache_day_path(date):
+    return os.path.join(CACHE_DIR_NAME, f'{date}.pkl')
+
+
+def load_day_cache(date):
+    path = cache_day_path(date)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def day_components_complete(data, need_daily_basic=True):
+    required = ['adj', 'daily'] + (['daily_basic'] if need_daily_basic else [])
+    return all(isinstance(data.get(key), pd.DataFrame) and not data[key].empty for key in required)
 
 def normalize_date(value, default=''):
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -243,8 +332,51 @@ def stock_active_on_date(row, trade_date):
 # ---------------------------
 # 数据获取与复权引擎
 # ---------------------------
+def split_cached_frame_by_date(frame):
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {}
+    work = frame.reset_index() if 'trade_date' in list(frame.index.names) else frame.copy()
+    if 'trade_date' not in work.columns:
+        return {}
+    work['trade_date'] = work['trade_date'].astype(str)
+    return {str(date): group.copy() for date, group in work.groupby('trade_date')}
+
+
+def set_global_market_frames(adj_frames, daily_frames, basic_frames):
+    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_DAILY_BASIC, GLOBAL_QFQ_BASE_FACTORS
+
+    adj = pd.concat(adj_frames, ignore_index=True)
+    adj['trade_date'] = adj['trade_date'].astype(str)
+    adj['adj_factor'] = pd.to_numeric(adj['adj_factor'], errors='coerce').fillna(0)
+    GLOBAL_ADJ_FACTOR = (
+        adj.drop_duplicates(['ts_code', 'trade_date'])
+        .set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
+    )
+
+    daily = pd.concat(daily_frames, ignore_index=True)
+    daily['trade_date'] = daily['trade_date'].astype(str)
+    GLOBAL_DAILY_RAW = (
+        daily.drop_duplicates(['ts_code', 'trade_date'])
+        .set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
+    )
+
+    basic = pd.concat(basic_frames, ignore_index=True)
+    basic['trade_date'] = basic['trade_date'].astype(str)
+    GLOBAL_DAILY_BASIC = (
+        basic.drop_duplicates(['ts_code', 'trade_date'])
+        .set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
+    )
+
+    latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
+    try:
+        latest_adj_df = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_global_date), 'adj_factor']
+        GLOBAL_QFQ_BASE_FACTORS = latest_adj_df.droplevel(1).to_dict()
+    except Exception:
+        GLOBAL_QFQ_BASE_FACTORS = {}
+
+
 def get_all_historical_data(trade_days_list, use_cache=True):
-    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
+    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_DAILY_BASIC, GLOBAL_QFQ_BASE_FACTORS
     global GLOBAL_STOCK_BASIC, GLOBAL_TECH_PERIODS
     if not trade_days_list: return False
     
@@ -256,72 +388,120 @@ def get_all_historical_data(trade_days_list, use_cache=True):
         st.error('历史股票池或申万历史行业成分加载失败，无法保证与V40.4样本一致。')
         return False
 
-    if use_cache and os.path.exists(CACHE_FILE_NAME):
-        st.success(f"⚡ 发现本地行情缓存，极速加载中...")
-        try:
-            with open(CACHE_FILE_NAME, 'rb') as f:
-                cached_data = pickle.load(f)
-                GLOBAL_ADJ_FACTOR = cached_data['adj']
-                GLOBAL_DAILY_RAW = cached_data['daily']
-                
-            latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
-            if latest_global_date:
-                try:
-                    latest_adj_df = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_global_date), 'adj_factor']
-                    GLOBAL_QFQ_BASE_FACTORS = latest_adj_df.droplevel(1).to_dict()
-                except: GLOBAL_QFQ_BASE_FACTORS = {}
-            return True
-        except Exception:
-            os.remove(CACHE_FILE_NAME)
-
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     
     start_date = (datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
-    end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=150)).strftime("%Y%m%d")
+    requested_end = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=150)
+    end_date = min(requested_end, datetime.now()).strftime("%Y%m%d")
     
     all_trade_dates_df = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')
     if all_trade_dates_df.empty: return False
-    all_dates = all_trade_dates_df['cal_date'].tolist()
-    
-    st.info(f"📡 [首次运行] 正在下载复权行情数据...")
-    adj_factor_data_list, daily_data_list = [], []
+    all_dates = sorted(all_trade_dates_df['cal_date'].astype(str).unique().tolist())
+    required_dates = set(all_dates)
+    analysis_dates = set(map(str, trade_days_list))
+    os.makedirs(CACHE_DIR_NAME, exist_ok=True)
 
-    my_bar = st.progress(0, text="Tushare 数据下载中...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future_to_date = {executor.submit(fetch_and_cache_daily_data, date): date for date in all_dates}
-        for i, future in enumerate(concurrent.futures.as_completed(future_to_date)):
-            try:
-                data = future.result()
-                if not data['adj'].empty: adj_factor_data_list.append(data['adj'])
-                if not data['daily'].empty: daily_data_list.append(data['daily'])
-            except Exception: pass
-            if i % 5 == 0 or i == len(all_dates) - 1:
-                my_bar.progress((i + 1) / len(all_dates), text=f"下载中: {i+1}/{len(all_dates)}")
-    my_bar.empty()
-    
-    if not daily_data_list: return False
-   
-    with st.spinner("正在构建索引并保存缓存..."):
-        adj_factor_data = pd.concat(adj_factor_data_list)
-        adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
-        GLOBAL_ADJ_FACTOR = adj_factor_data.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
-        
-        daily_raw_data = pd.concat(daily_data_list)
-        GLOBAL_DAILY_RAW = daily_raw_data.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
-
-        latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
-        if latest_global_date:
-            try:
-                latest_adj_df = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_global_date), 'adj_factor']
-                GLOBAL_QFQ_BASE_FACTORS = latest_adj_df.droplevel(1).to_dict()
-            except: GLOBAL_QFQ_BASE_FACTORS = {}
-        
+    legacy_seed = {'adj': {}, 'daily': {}, 'daily_basic': {}}
+    if use_cache and os.path.exists(CACHE_FILE_NAME):
         try:
-            with open(CACHE_FILE_NAME, 'wb') as f:
-                pickle.dump({'adj': GLOBAL_ADJ_FACTOR, 'daily': GLOBAL_DAILY_RAW}, f)
-        except Exception: pass
-            
+            with open(CACHE_FILE_NAME, 'rb') as f:
+                cached_data = pickle.load(f)
+            cached_market_coverage = set(map(str, cached_data.get('covered_market_dates', [])))
+            cached_basic_coverage = set(map(str, cached_data.get('covered_basic_dates', [])))
+            if (
+                cached_data.get('cache_version') == CACHE_VERSION
+                and required_dates.issubset(cached_market_coverage)
+                and analysis_dates.issubset(cached_basic_coverage)
+                and all(isinstance(cached_data.get(k), pd.DataFrame) and not cached_data[k].empty
+                        for k in ['adj', 'daily', 'daily_basic'])
+            ):
+                GLOBAL_ADJ_FACTOR = cached_data['adj']
+                GLOBAL_DAILY_RAW = cached_data['daily']
+                GLOBAL_DAILY_BASIC = cached_data['daily_basic']
+                latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
+                try:
+                    latest_adj_df = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_global_date), 'adj_factor']
+                    GLOBAL_QFQ_BASE_FACTORS = latest_adj_df.droplevel(1).to_dict()
+                except Exception:
+                    GLOBAL_QFQ_BASE_FACTORS = {}
+                st.success(f"⚡ 行情、复权和市值缓存已完整覆盖 {len(all_dates)} 个交易日。")
+                return True
+            for key in legacy_seed:
+                legacy_seed[key] = split_cached_frame_by_date(cached_data.get(key, pd.DataFrame()))
+        except Exception:
+            legacy_seed = {'adj': {}, 'daily': {}, 'daily_basic': {}}
+
+    adj_frames, daily_frames, basic_frames = [], [], []
+    failed_dates = []
+    consecutive_failures = 0
+    downloaded_now = 0
+    reused_days = 0
+    my_bar = st.progress(0, text="检查逐日持久化缓存...")
+
+    for i, date in enumerate(all_dates):
+        need_daily_basic = date in analysis_dates
+        data = load_day_cache(date) if use_cache else {}
+        for key in ['adj', 'daily', 'daily_basic']:
+            current = data.get(key)
+            if not isinstance(current, pd.DataFrame) or current.empty:
+                seeded = legacy_seed[key].get(date)
+                if isinstance(seeded, pd.DataFrame) and not seeded.empty:
+                    data[key] = seeded
+
+        was_complete = day_components_complete(data, need_daily_basic=need_daily_basic)
+        if not was_complete:
+            data = fetch_daily_components(date, data, need_daily_basic=need_daily_basic)
+            if any(isinstance(data.get(k), pd.DataFrame) and not data[k].empty
+                   for k in ['adj', 'daily', 'daily_basic']):
+                atomic_pickle_dump(data, cache_day_path(date))
+
+        if day_components_complete(data, need_daily_basic=need_daily_basic):
+            adj_frames.append(data['adj'])
+            daily_frames.append(data['daily'])
+            if need_daily_basic:
+                basic_frames.append(data['daily_basic'])
+            consecutive_failures = 0
+            if was_complete:
+                reused_days += 1
+            else:
+                downloaded_now += 1
+        else:
+            failed_dates.append(date)
+            consecutive_failures += 1
+
+        my_bar.progress(
+            (i + 1) / len(all_dates),
+            text=f"缓存核验 {i+1}/{len(all_dates)}｜本次新增 {downloaded_now}｜已复用 {reused_days}",
+        )
+        if consecutive_failures >= 3:
+            break
+    my_bar.empty()
+
+    if (
+        failed_dates
+        or len(adj_frames) != len(all_dates)
+        or len(basic_frames) != len(analysis_dates)
+    ):
+        st.warning(
+            f"网络中断或数据缺失：已成功持久化 {len(adj_frames)}/{len(all_dates)} 个交易日。"
+            "请在网络恢复后重新启动，程序只会补下载缺失项。"
+        )
+        return False
+
+    with st.spinner("正在构建内存索引和快速总缓存..."):
+        set_global_market_frames(adj_frames, daily_frames, basic_frames)
+        atomic_pickle_dump({
+            'cache_version': CACHE_VERSION,
+            'covered_market_dates': all_dates,
+            'covered_basic_dates': sorted(analysis_dates),
+            'start_date': all_dates[0],
+            'end_date': all_dates[-1],
+            'adj': GLOBAL_ADJ_FACTOR,
+            'daily': GLOBAL_DAILY_RAW,
+            'daily_basic': GLOBAL_DAILY_BASIC,
+        }, CACHE_FILE_NAME)
+    st.success(f"✅ {len(all_dates)} 个交易日已全部持久化，后续逐日分析不再依赖行情网络请求。")
     return True
 
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=False):
@@ -679,15 +859,28 @@ def get_medium_term_future(
 # ---------------------------
 # 核心回测循环
 # ---------------------------
+def cached_frame_for_date(frame, trade_date):
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    try:
+        result = frame.xs(str(trade_date), level='trade_date').reset_index()
+        return result
+    except (KeyError, ValueError):
+        return pd.DataFrame()
+
+
 def run_backtest_for_a_day(
     last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE,
     buy_slippage_pct, sell_slippage_pct, commission_pct, sell_tax_pct,
     use_sina=False, run_timestamp=None,
 ):
-    global GLOBAL_STOCK_BASIC, GLOBAL_TECH_PERIODS
+    global GLOBAL_STOCK_BASIC, GLOBAL_TECH_PERIODS, GLOBAL_DAILY_RAW, GLOBAL_DAILY_BASIC
 
     query_date = last_trade
-    daily_all = safe_get('daily', trade_date=query_date) 
+    daily_all = (
+        safe_get('daily', trade_date=query_date)
+        if use_sina else cached_frame_for_date(GLOBAL_DAILY_RAW, query_date)
+    )
     
     if use_sina and daily_all.empty:
         for i in range(1, 10):
@@ -703,7 +896,10 @@ def run_backtest_for_a_day(
         return pd.DataFrame(), "历史股票基础信息缺失"
     df = daily_all.merge(GLOBAL_STOCK_BASIC, on='ts_code', how='inner')
     
-    daily_basic = safe_get('daily_basic', trade_date=query_date)
+    daily_basic = (
+        safe_get('daily_basic', trade_date=query_date)
+        if use_sina else cached_frame_for_date(GLOBAL_DAILY_BASIC, query_date)
+    )
     if not daily_basic.empty:
         df = df.merge(daily_basic[['ts_code','circ_mv']], on='ts_code', how='left')
     else: 
@@ -991,11 +1187,16 @@ def build_portfolio_backtest(
     }
     return curve, ledger, orders_df, summary
 
+
+def build_run_fingerprint(config):
+    payload = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:12]
+
 # ---------------------------
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.6 同口径三仓回测版")
+    st.header("V40.6 可靠缓存三仓回测版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -1006,12 +1207,14 @@ with st.sidebar:
     if st.button("🗑️ 清除行情缓存"):
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
-            st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v40_6_same_pool_portfolio.csv" 
+        if os.path.isdir(CACHE_DIR_NAME):
+            shutil.rmtree(CACHE_DIR_NAME)
+        st.success("行情、复权和市值逐日缓存已清除。")
+    CHECKPOINT_DIR = "backtest_checkpoint_v40_6_reliable"
     if st.button("🗑️ 清除断点记录 (重新回测)"):
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-            st.success("旧进度已清理！")
+        if os.path.isdir(CHECKPOINT_DIR):
+            shutil.rmtree(CHECKPOINT_DIR)
+        st.success("所有V40.6可靠续传进度已清理！")
             
     st.markdown("---")
     st.subheader("💰 核心护城河门槛")
@@ -1035,28 +1238,58 @@ pro = ts.pro_api()
 
 if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
     SINA_STATUS = {'success': 0, 'fail': 0}
-    processed_dates = set()
-    results = []
-    
-    if RESUME_CHECKPOINT and os.path.exists(CHECKPOINT_FILE):
-        try:
-            existing_df = pd.read_csv(CHECKPOINT_FILE)
-            existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
-            processed_dates = set(existing_df['Trade_Date'].unique())
-            results.append(existing_df)
-        except:
-            if os.path.exists(CHECKPOINT_FILE): os.remove(CHECKPOINT_FILE)
-    else:
-        if os.path.exists(CHECKPOINT_FILE): os.remove(CHECKPOINT_FILE)
-        
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     if not trade_days_list: st.stop()
+
+    run_config = {
+        'version': 'v40.6_reliable_cache_1',
+        'end_date': backtest_date_end.strftime('%Y%m%d'),
+        'backtest_days': int(BACKTEST_DAYS),
+        'top_k': int(TOP_BACKTEST),
+        'min_price': float(MIN_PRICE),
+        'min_mv': float(MIN_MV),
+        'max_mv': float(MAX_MV),
+        'buy_slippage': float(BUY_SLIPPAGE),
+        'sell_slippage': float(SELL_SLIPPAGE),
+        'commission': float(COMMISSION),
+        'sell_tax': float(SELL_TAX),
+    }
+    run_key = build_run_fingerprint(run_config)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, f'signals_{run_key}.csv')
+    STATUS_FILE = os.path.join(CHECKPOINT_DIR, f'status_{run_key}.csv')
+
+    checkpoint_signals = pd.DataFrame()
+    status_df = pd.DataFrame(columns=['Trade_Date', 'Status', 'Detail'])
+    if not RESUME_CHECKPOINT:
+        for path in [CHECKPOINT_FILE, STATUS_FILE]:
+            if os.path.exists(path):
+                os.remove(path)
+    else:
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                checkpoint_signals = pd.read_csv(CHECKPOINT_FILE)
+                checkpoint_signals['Trade_Date'] = checkpoint_signals['Trade_Date'].map(normalize_date)
+            except Exception:
+                st.error('信号断点文件损坏，请点击“清除断点记录”后重新回测。')
+                st.stop()
+        if os.path.exists(STATUS_FILE):
+            try:
+                status_df = pd.read_csv(STATUS_FILE)
+                status_df['Trade_Date'] = status_df['Trade_Date'].map(normalize_date)
+            except Exception:
+                st.error('完成日期断点文件损坏，请点击“清除断点记录”后重新回测。')
+                st.stop()
+
+    processed_dates = set(
+        status_df.loc[status_df['Status'].eq('completed'), 'Trade_Date'].astype(str)
+    )
     
     if not get_all_historical_data(trade_days_list, use_cache=True): st.stop()
             
     dates_to_run = [d for d in trade_days_list if d not in processed_dates]
     if not dates_to_run:
-        st.success("🎉 扫描已全部完毕！")
+        st.success(f"🎉 扫描已全部完毕！可靠断点已覆盖 {len(processed_dates)}/{len(trade_days_list)} 天。")
     else:
         bar = st.progress(0, text="箱体首发与四大神盾过滤中...")
         for i, date in enumerate(dates_to_run):
@@ -1072,11 +1305,34 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
             
             if not res.empty:
                 res['Trade_Date'] = date
-                is_first = not os.path.exists(CHECKPOINT_FILE)
-                res.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
-                results.append(res)
-            bar.progress((i+1)/len(dates_to_run), text=f"分析中: {date}")
+                checkpoint_signals = pd.concat([checkpoint_signals, res], ignore_index=True)
+                checkpoint_signals['Trade_Date'] = checkpoint_signals['Trade_Date'].map(normalize_date)
+                checkpoint_signals = checkpoint_signals.drop_duplicates(
+                    ['Trade_Date', 'ts_code'], keep='last'
+                )
+                atomic_csv_save(checkpoint_signals, CHECKPOINT_FILE)
+
+            analysis_completed = (not res.empty) or (err == '无标的')
+            if analysis_completed:
+                status_row = pd.DataFrame([{
+                    'Trade_Date': date,
+                    'Status': 'completed',
+                    'Detail': f'信号{len(res)}只' if not res.empty else '无标的',
+                }])
+                status_df = pd.concat([status_df, status_row], ignore_index=True)
+                status_df = status_df.drop_duplicates('Trade_Date', keep='last')
+                atomic_csv_save(status_df, STATUS_FILE)
+                processed_dates.add(date)
+            else:
+                st.warning(f'{date} 未完成：{err or "未知数据错误"}，未写入完成断点，下次会自动重试。')
+
+            bar.progress(
+                (i+1)/len(dates_to_run),
+                text=f"分析中: {date}｜已持久化 {len(processed_dates)}/{len(trade_days_list)} 天",
+            )
         bar.empty()
+
+    results = [checkpoint_signals] if not checkpoint_signals.empty else []
     
     if int(BACKTEST_DAYS) == 1:
         st.markdown("---")
@@ -1092,7 +1348,7 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V40.6 同口径三仓回测版")
+        st.header(f"📊 V40.6 可靠缓存三仓回测版")
 
         portfolio_curve, portfolio_ledger, portfolio_orders, portfolio_summary = build_portfolio_backtest(
             all_res,
