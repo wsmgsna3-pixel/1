@@ -360,12 +360,15 @@ def set_global_market_frames(adj_frames, daily_frames, basic_frames):
         .set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
     )
 
-    basic = pd.concat(basic_frames, ignore_index=True)
-    basic['trade_date'] = basic['trade_date'].astype(str)
-    GLOBAL_DAILY_BASIC = (
-        basic.drop_duplicates(['ts_code', 'trade_date'])
-        .set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
-    )
+    if basic_frames:
+        basic = pd.concat(basic_frames, ignore_index=True)
+        basic['trade_date'] = basic['trade_date'].astype(str)
+        GLOBAL_DAILY_BASIC = (
+            basic.drop_duplicates(['ts_code', 'trade_date'])
+            .set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
+        )
+    else:
+        GLOBAL_DAILY_BASIC = pd.DataFrame()
 
     latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
     try:
@@ -433,13 +436,17 @@ def get_all_historical_data(trade_days_list, use_cache=True):
             legacy_seed = {'adj': {}, 'daily': {}, 'daily_basic': {}}
 
     adj_frames, daily_frames, basic_frames = [], [], []
+    successful_market_dates, successful_basic_dates = [], []
     failed_dates = []
+    failed_details = {}
+    scanned_dates = []
     consecutive_failures = 0
     downloaded_now = 0
     reused_days = 0
     my_bar = st.progress(0, text="检查逐日持久化缓存...")
 
     for i, date in enumerate(all_dates):
+        scanned_dates.append(date)
         need_daily_basic = date in analysis_dates
         data = load_day_cache(date) if use_cache else {}
         for key in ['adj', 'daily', 'daily_basic']:
@@ -456,11 +463,20 @@ def get_all_historical_data(trade_days_list, use_cache=True):
                    for k in ['adj', 'daily', 'daily_basic']):
                 atomic_pickle_dump(data, cache_day_path(date))
 
-        if day_components_complete(data, need_daily_basic=need_daily_basic):
+        market_complete = day_components_complete(data, need_daily_basic=False)
+        basic_complete = (
+            isinstance(data.get('daily_basic'), pd.DataFrame)
+            and not data['daily_basic'].empty
+        )
+        if market_complete:
             adj_frames.append(data['adj'])
             daily_frames.append(data['daily'])
-            if need_daily_basic:
-                basic_frames.append(data['daily_basic'])
+            successful_market_dates.append(date)
+        if need_daily_basic and basic_complete:
+            basic_frames.append(data['daily_basic'])
+            successful_basic_dates.append(date)
+
+        if market_complete and (not need_daily_basic or basic_complete):
             consecutive_failures = 0
             if was_complete:
                 reused_days += 1
@@ -468,6 +484,12 @@ def get_all_historical_data(trade_days_list, use_cache=True):
                 downloaded_now += 1
         else:
             failed_dates.append(date)
+            missing_parts = []
+            if not market_complete:
+                missing_parts.extend(['daily/adj_factor'])
+            if need_daily_basic and not basic_complete:
+                missing_parts.append('daily_basic')
+            failed_details[date] = '+'.join(missing_parts) or '未知组件'
             consecutive_failures += 1
 
         my_bar.progress(
@@ -478,30 +500,57 @@ def get_all_historical_data(trade_days_list, use_cache=True):
             break
     my_bar.empty()
 
-    if (
-        failed_dates
-        or len(adj_frames) != len(all_dates)
-        or len(basic_frames) != len(analysis_dates)
-    ):
+    failed_set = set(failed_dates)
+    trailing_failed_dates = []
+    for date in reversed(all_dates):
+        if date in failed_set:
+            trailing_failed_dates.append(date)
+        else:
+            break
+    trailing_failed_set = set(trailing_failed_dates)
+    allow_unpublished_tail = bool(failed_set) and (
+        len(scanned_dates) == len(all_dates)
+        and failed_set == trailing_failed_set
+        and all(date >= latest_trade_date for date in trailing_failed_set)
+    )
+    hard_failure = (
+        len(scanned_dates) != len(all_dates)
+        or bool(failed_set - trailing_failed_set)
+        or (bool(failed_set) and not allow_unpublished_tail)
+    )
+
+    if hard_failure:
+        examples = [f'{date}({failed_details.get(date, "未扫描")})' for date in failed_dates[:5]]
         st.warning(
-            f"网络中断或数据缺失：已成功持久化 {len(adj_frames)}/{len(all_dates)} 个交易日。"
-            "请在网络恢复后重新启动，程序只会补下载缺失项。"
+            f"网络中断或历史区间内部数据缺失：已扫描 {len(scanned_dates)}/{len(all_dates)} 日，"
+            f"完整行情 {len(successful_market_dates)} 日。缺失示例：{examples}。"
+            "请在网络恢复后重启，程序只补缺失项。"
         )
         return False
+
+    if allow_unpublished_tail:
+        details = [f'{date}({failed_details[date]})' for date in sorted(trailing_failed_set)]
+        st.warning(
+            f"与V40.4口径一致：末端计划交易日尚未产生完整数据 {details}，"
+            "保留在250日计划样本中，但该日不产生选股信号。"
+        )
 
     with st.spinner("正在构建内存索引和快速总缓存..."):
         set_global_market_frames(adj_frames, daily_frames, basic_frames)
         atomic_pickle_dump({
             'cache_version': CACHE_VERSION,
-            'covered_market_dates': all_dates,
-            'covered_basic_dates': sorted(analysis_dates),
+            'covered_market_dates': sorted(set(successful_market_dates)),
+            'covered_basic_dates': sorted(set(successful_basic_dates)),
             'start_date': all_dates[0],
             'end_date': all_dates[-1],
             'adj': GLOBAL_ADJ_FACTOR,
             'daily': GLOBAL_DAILY_RAW,
             'daily_basic': GLOBAL_DAILY_BASIC,
         }, CACHE_FILE_NAME)
-    st.success(f"✅ {len(all_dates)} 个交易日已全部持久化，后续逐日分析不再依赖行情网络请求。")
+    st.success(
+        f"✅ 计划数据日 {len(all_dates)}，已持久化完整行情 {len(successful_market_dates)} 日；"
+        "后续逐日分析直接读取本地数据。"
+    )
     return True
 
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=False):
@@ -1312,12 +1361,21 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
                 )
                 atomic_csv_save(checkpoint_signals, CHECKPOINT_FILE)
 
-            analysis_completed = (not res.empty) or (err == '无标的')
+            # 与V40.4一致：交易日历中已列入、但尚未发布daily/daily_basic的
+            # 末端日期仍记为已处理，该日不产生信号，不改变250日计划样本起点。
+            completed_without_signal = {'无标的', '数据缺失', '市值数据缺失'}
+            analysis_completed = (not res.empty) or (err in completed_without_signal)
             if analysis_completed:
+                if not res.empty:
+                    detail = f'信号{len(res)}只'
+                elif err == '无标的':
+                    detail = '无标的'
+                else:
+                    detail = f'数据缺失({err})'
                 status_row = pd.DataFrame([{
                     'Trade_Date': date,
                     'Status': 'completed',
-                    'Detail': f'信号{len(res)}只' if not res.empty else '无标的',
+                    'Detail': detail,
                 }])
                 status_df = pd.concat([status_df, status_row], ignore_index=True)
                 status_df = status_df.drop_duplicates('Trade_Date', keep='last')
@@ -1333,6 +1391,17 @@ if st.button(f"🚀 启动 V40.6 四大神盾追踪"):
         bar.empty()
 
     results = [checkpoint_signals] if not checkpoint_signals.empty else []
+    window_status = status_df[status_df['Trade_Date'].isin(set(trade_days_list))].copy()
+    missing_signal_days = int(
+        window_status['Detail'].astype(str).str.startswith('数据缺失').sum()
+    ) if not window_status.empty else 0
+    processed_window_days = len(set(window_status['Trade_Date']))
+    st.info(
+        f"回测起跑线：计划交易日 {len(trade_days_list)} 天｜"
+        f"已处理 {processed_window_days} 天｜"
+        f"有完整选股数据 {processed_window_days - missing_signal_days} 天｜"
+        f"末端数据未发布 {missing_signal_days} 天。"
+    )
     
     if int(BACKTEST_DAYS) == 1:
         st.markdown("---")
