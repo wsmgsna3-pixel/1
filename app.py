@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线 MACD 假设验证器 V1.0
+周线 MACD 假设验证器 V2.0
 ========================================
 
 研究目的（纯统计，不是选股实盘版）：
@@ -10,6 +10,9 @@
 4. 第一根红柱后一周立即翻绿的比例。
 5. DIF、DEA 位于零轴上方/下方的差异。
 6. 第一根红柱前回调深度对未来八周表现的影响。
+7. 主板、创业板、科创板等额分层随机抽样，并按股票池实际结构加权。
+8. 对基准组、上升趋势组、回调<30%组及红柱缩短组做稳健性比较。
+9. 模拟 +10%/+20%/+30% 止盈与统一止损后的实际退出收益。
 
 严格口径：
 - 周线信号只使用已经结束的完整周，绝不使用周一至周四的临时周K。
@@ -21,7 +24,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_hypothesis_validator_v1.py
+    streamlit run weekly_macd_hypothesis_validator_v2.py
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V1.0"
+VERSION = "V2.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -63,6 +66,10 @@ TECH_INDUSTRY_KEYWORDS = {
     "电池", "光伏设备", "风电设备", "电网设备", "电机", "医疗器械",
     "生物制品", "汽车电子", "金属新材料", "非金属材料", "膜材料", "碳纤维",
 }
+
+SAMPLE_BOARDS = ("主板", "创业板", "科创板")
+DEFAULT_SAMPLE_PER_BOARD = 200
+DEFAULT_SAMPLE_SEED = 20260806
 
 pro = None
 API_ERRORS: list[str] = []
@@ -248,6 +255,111 @@ def membership_on_date(periods: list[dict[str, str]], trade_date: str):
         if period["in_date"] <= trade_date < period["out_date"]:
             return period
     return None
+
+
+def sample_board(row: pd.Series) -> str:
+    """统一板块名称；优先使用 Tushare market，代码前缀只作兜底。"""
+    market = str(row.get("market", "")).strip()
+    if market in SAMPLE_BOARDS:
+        return market
+    ts_code = str(row.get("ts_code", ""))
+    if ts_code.startswith(("300", "301")):
+        return "创业板"
+    if ts_code.startswith(("688", "689")):
+        return "科创板"
+    return "主板"
+
+
+def representative_membership(
+    periods: list[dict[str, str]],
+    reference_date: str,
+) -> dict[str, str]:
+    active = membership_on_date(periods, reference_date)
+    if active is not None:
+        return active
+    eligible = [period for period in periods if period["in_date"] <= reference_date]
+    if eligible:
+        return max(eligible, key=lambda item: item["in_date"])
+    return periods[-1] if periods else {"l1": "", "l2": "", "l3": ""}
+
+
+def build_stratified_sample(
+    stocks: pd.DataFrame,
+    period_index: dict[str, list[dict[str, str]]],
+    reference_date: str,
+    per_board: int = DEFAULT_SAMPLE_PER_BOARD,
+    seed: int = DEFAULT_SAMPLE_SEED,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    主板、创业板、科创板分别固定随机抽样。
+
+    不足 per_board 的板块取全部，不把空缺名额转给其他板块。每只样本的
+    Sample_Weight=N_board/n_board，用于还原完整股票池的板块实际占比。
+    """
+    if stocks.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty
+    if per_board < 0:
+        raise ValueError("每板块抽样数不能为负数")
+
+    universe = stocks.copy()
+    universe["Sample_Board"] = universe.apply(sample_board, axis=1)
+    universe = universe[universe["Sample_Board"].isin(SAMPLE_BOARDS)].copy()
+    universe = universe.sort_values("ts_code").drop_duplicates("ts_code", keep="first")
+
+    sampled_frames: list[pd.DataFrame] = []
+    population_rows: list[dict[str, Any]] = []
+    for board_no, board in enumerate(SAMPLE_BOARDS):
+        group = universe[universe["Sample_Board"].eq(board)].copy()
+        population_size = int(len(group))
+        requested = population_size if per_board == 0 else int(per_board)
+        sample_size = min(requested, population_size)
+        if sample_size:
+            # 不使用 Python hash，确保不同机器和进程得到同一名单。
+            board_seed_raw = hashlib.sha256(f"{seed}|{board}|{board_no}".encode("utf-8")).hexdigest()
+            board_seed = int(board_seed_raw[:8], 16)
+            chosen = group.sample(n=sample_size, replace=False, random_state=board_seed).copy()
+            chosen["Sample_Seed"] = int(seed)
+            chosen["Board_Universe_Size"] = population_size
+            chosen["Board_Sample_Size"] = sample_size
+            chosen["Sample_Weight"] = population_size / sample_size
+            sampled_frames.append(chosen)
+        population_rows.append({
+            "Sample_Board": board,
+            "Board_Universe_Size": population_size,
+            "Board_Sample_Size": sample_size,
+            "Sampling_Fraction_pct": (
+                sample_size / population_size * 100.0 if population_size else np.nan
+            ),
+            "Sample_Weight": population_size / sample_size if sample_size else np.nan,
+        })
+
+    if not sampled_frames:
+        empty = pd.DataFrame()
+        return empty, empty, pd.DataFrame(population_rows)
+
+    sampled = pd.concat(sampled_frames, ignore_index=True)
+    sampled["Sample_Order"] = np.arange(1, len(sampled) + 1)
+
+    audit = sampled.copy()
+    sw_rows = []
+    for code in audit["ts_code"].astype(str):
+        period = representative_membership(period_index.get(code, []), reference_date)
+        sw_rows.append((period.get("l1", ""), period.get("l2", ""), period.get("l3", "")))
+    audit[["Sample_SW_L1", "Sample_SW_L2", "Sample_SW_L3"]] = pd.DataFrame(
+        sw_rows, index=audit.index
+    )
+    audit_columns = [
+        "Sample_Order", "ts_code", "symbol", "name", "Sample_Board", "market",
+        "exchange", "list_status", "list_date", "delist_date", "Sample_SW_L1",
+        "Sample_SW_L2", "Sample_SW_L3", "Sample_Seed", "Board_Universe_Size",
+        "Board_Sample_Size", "Sampling_Fraction_pct", "Sample_Weight",
+    ]
+    for column in audit_columns:
+        if column not in audit.columns:
+            audit[column] = ""
+    audit = audit[audit_columns].sort_values("Sample_Order").reset_index(drop=True)
+    return sampled.reset_index(drop=True), audit, pd.DataFrame(population_rows)
 
 
 # -----------------------------------------------------------------------------
@@ -452,6 +564,69 @@ def first_hit_result(
     return "八周均未触发", "", np.nan
 
 
+def simulate_fixed_exit(
+    future: pd.DataFrame,
+    entry_price: float,
+    target_pct: float,
+    stop_pct: float,
+    sell_slippage_pct: float = 0.0,
+) -> dict[str, Any]:
+    """
+    模拟固定止盈/止损的可执行退出。
+
+    - 跳空低开越过止损：按开盘价退出，保留真实跳空损失。
+    - 跳空高开越过止盈：按开盘价退出，保留价格改善。
+    - 日内同时触及止损和止盈：无法判定先后，保守按止损价退出。
+    - 八周均未触发：按八周窗口最后一个可用收盘价退出。
+    """
+    target_price = entry_price * (1.0 + target_pct / 100.0)
+    stop_price = entry_price * (1.0 - stop_pct / 100.0)
+    ordered = future.sort_values("trade_date")
+    for day_no, row in enumerate(ordered.itertuples(index=False), start=1):
+        open_price = float(row.open)
+        high_price = float(row.high)
+        low_price = float(row.low)
+        trade_date = str(row.trade_date)
+        if open_price <= stop_price:
+            exit_price, reason = open_price, "跳空止损"
+        elif open_price >= target_price:
+            exit_price, reason = open_price, "跳空止盈"
+        else:
+            hit_target = high_price >= target_price
+            hit_stop = low_price <= stop_price
+            if hit_target and hit_stop:
+                exit_price, reason = stop_price, "同日双触发_按止损"
+            elif hit_stop:
+                exit_price, reason = stop_price, "止损"
+            elif hit_target:
+                exit_price, reason = target_price, "止盈"
+            else:
+                continue
+        executable_price = float(exit_price) * (1.0 - sell_slippage_pct / 100.0)
+        return {
+            "date": trade_date,
+            "price": executable_price,
+            "return_pct": (executable_price / entry_price - 1.0) * 100.0,
+            "holding_days": float(day_no),
+            "reason": reason,
+        }
+
+    if ordered.empty:
+        return {
+            "date": "", "price": np.nan, "return_pct": np.nan,
+            "holding_days": np.nan, "reason": "无行情",
+        }
+    last = ordered.iloc[-1]
+    exit_price = float(last["close"]) * (1.0 - sell_slippage_pct / 100.0)
+    return {
+        "date": str(last["trade_date"]),
+        "price": exit_price,
+        "return_pct": (exit_price / entry_price - 1.0) * 100.0,
+        "holding_days": float(len(ordered)),
+        "reason": "八周到期",
+    }
+
+
 def path_on_or_before(daily: pd.DataFrame, checkpoint: str, entry_date: str) -> float:
     subset = daily[(daily["trade_date"] >= entry_date) & (daily["trade_date"] <= checkpoint)]
     return float(subset.iloc[-1]["close"]) if not subset.empty else np.nan
@@ -463,6 +638,7 @@ def evaluate_event_path(
     open_dates: list[str],
     open_pos: dict[str, int],
     buy_slippage_pct: float,
+    sell_slippage_pct: float,
     stop_threshold_pct: float,
     ts_code: str,
 ) -> dict[str, Any]:
@@ -484,6 +660,11 @@ def evaluate_event_path(
         empty[f"Hit_{target}_Date"] = ""
         empty[f"Days_To_{target}"] = np.nan
         empty[f"First_{target}_vs_Stop"] = ""
+        empty[f"Exit_T{target}_Date"] = ""
+        empty[f"Exit_T{target}_Price"] = np.nan
+        empty[f"Exit_T{target}_Return_pct"] = np.nan
+        empty[f"Exit_T{target}_Holding_Days"] = np.nan
+        empty[f"Exit_T{target}_Reason"] = ""
 
     if signal_date not in open_pos:
         empty["Untradable_Reason"] = "信号日不在交易日历"
@@ -554,6 +735,17 @@ def evaluate_event_path(
             future, entry_price, float(target), float(stop_threshold_pct)
         )
         empty[f"First_{target}_vs_Stop"] = result
+        exit_result = simulate_fixed_exit(
+            future, entry_price, float(target), float(stop_threshold_pct),
+            sell_slippage_pct=float(sell_slippage_pct),
+        )
+        if exit_result["date"] in open_pos:
+            exit_result["holding_days"] = float(open_pos[exit_result["date"]] - entry_pos + 1)
+        empty[f"Exit_T{target}_Date"] = exit_result["date"]
+        empty[f"Exit_T{target}_Price"] = exit_result["price"]
+        empty[f"Exit_T{target}_Return_pct"] = exit_result["return_pct"]
+        empty[f"Exit_T{target}_Holding_Days"] = exit_result["holding_days"]
+        empty[f"Exit_T{target}_Reason"] = exit_result["reason"]
     return empty
 
 
@@ -614,6 +806,7 @@ def build_event_record(
     min_mv: float,
     max_mv: float,
     buy_slippage_pct: float,
+    sell_slippage_pct: float,
     stop_threshold_pct: float,
 ) -> tuple[dict[str, Any] | None, str]:
     row = weekly.iloc[position]
@@ -640,6 +833,10 @@ def build_event_record(
         "ts_code": str(stock["ts_code"]),
         "name": str(stock["name"]),
         "market": str(stock["market"]),
+        "exchange": str(stock.get("exchange", "")),
+        "Sample_Board": str(stock.get("Sample_Board", sample_board(stock))),
+        "Sample_Weight": float(stock.get("Sample_Weight", 1.0)),
+        "Sample_Seed": int(stock.get("Sample_Seed", DEFAULT_SAMPLE_SEED)),
         "SW_L1": membership["l1"],
         "SW_L2": membership["l2"],
         "SW_L3": membership["l3"],
@@ -668,6 +865,7 @@ def build_event_record(
         open_dates=open_dates,
         open_pos=open_pos,
         buy_slippage_pct=buy_slippage_pct,
+        sell_slippage_pct=sell_slippage_pct,
         stop_threshold_pct=stop_threshold_pct,
         ts_code=str(stock["ts_code"]),
     ))
@@ -730,6 +928,7 @@ def analyze_stock(
                 min_mv=config["min_mv"],
                 max_mv=config["max_mv"],
                 buy_slippage_pct=config["buy_slippage_pct"],
+                sell_slippage_pct=config["sell_slippage_pct"],
                 stop_threshold_pct=config["stop_threshold_pct"],
             )
             if record is not None:
@@ -759,6 +958,7 @@ def analyze_stock(
                 min_mv=config["min_mv"],
                 max_mv=config["max_mv"],
                 buy_slippage_pct=config["buy_slippage_pct"],
+                sell_slippage_pct=config["sell_slippage_pct"],
                 stop_threshold_pct=config["stop_threshold_pct"],
             )
             if record is not None:
@@ -887,20 +1087,194 @@ def build_all_summaries(events: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
+def weighted_mean(values: pd.Series, weights: pd.Series) -> float:
+    numeric = pd.to_numeric(values, errors="coerce")
+    weight_values = pd.to_numeric(weights, errors="coerce")
+    valid = numeric.notna() & weight_values.notna() & weight_values.gt(0)
+    if not valid.any():
+        return np.nan
+    return float(np.average(numeric[valid], weights=weight_values[valid]))
+
+
+def weighted_median(values: pd.Series, weights: pd.Series) -> float:
+    numeric = pd.to_numeric(values, errors="coerce")
+    weight_values = pd.to_numeric(weights, errors="coerce")
+    valid = numeric.notna() & weight_values.notna() & weight_values.gt(0)
+    if not valid.any():
+        return np.nan
+    order = np.argsort(numeric[valid].to_numpy())
+    sorted_values = numeric[valid].to_numpy()[order]
+    sorted_weights = weight_values[valid].to_numpy()[order]
+    cutoff = sorted_weights.sum() / 2.0
+    position = int(np.searchsorted(np.cumsum(sorted_weights), cutoff, side="left"))
+    return float(sorted_values[min(position, len(sorted_values) - 1)])
+
+
+def weighted_rate(mask: pd.Series, weights: pd.Series) -> float:
+    values = mask.astype(float)
+    result = weighted_mean(values, weights)
+    return result * 100.0 if np.isfinite(result) else np.nan
+
+
+def weighted_top_removed_mean(
+    values: pd.Series,
+    weights: pd.Series,
+    remove_n: int,
+) -> float:
+    frame = pd.DataFrame({
+        "value": pd.to_numeric(values, errors="coerce"),
+        "weight": pd.to_numeric(weights, errors="coerce"),
+    }).dropna()
+    if len(frame) <= remove_n:
+        return np.nan
+    frame = frame.sort_values("value", ascending=False).iloc[remove_n:]
+    return weighted_mean(frame["value"], frame["weight"])
+
+
+def weighted_trimmed_mean(
+    values: pd.Series,
+    weights: pd.Series,
+    trim_fraction: float = 0.10,
+) -> float:
+    frame = pd.DataFrame({
+        "value": pd.to_numeric(values, errors="coerce"),
+        "weight": pd.to_numeric(weights, errors="coerce"),
+    }).dropna().sort_values("value")
+    trim_n = int(math.floor(len(frame) * trim_fraction))
+    if trim_n and len(frame) > trim_n * 2:
+        frame = frame.iloc[trim_n:-trim_n]
+    return weighted_mean(frame["value"], frame["weight"]) if len(frame) else np.nan
+
+
+def top_positive_contribution(
+    values: pd.Series,
+    weights: pd.Series,
+    top_n: int,
+) -> float:
+    frame = pd.DataFrame({
+        "value": pd.to_numeric(values, errors="coerce"),
+        "weight": pd.to_numeric(weights, errors="coerce"),
+    }).dropna()
+    frame = frame[frame["value"].gt(0)].copy()
+    if frame.empty:
+        return np.nan
+    frame["contribution"] = frame["value"] * frame["weight"]
+    denominator = float(frame["contribution"].sum())
+    if denominator <= 0:
+        return np.nan
+    numerator = float(frame.nlargest(top_n, "contribution")["contribution"].sum())
+    return numerator / denominator * 100.0
+
+
+def strategy_definitions(events: pd.DataFrame) -> list[tuple[str, pd.Series]]:
+    first_red = events["Event_Type"].eq("第一根红柱")
+    uptrend = events["Weekly_Trend"].eq("上升趋势")
+    pullback = pd.to_numeric(events["Pullback_Depth_pct"], errors="coerce")
+    return [
+        ("基准_全部第一根红柱", first_red),
+        ("实验A_上升趋势第一根红柱", first_red & uptrend),
+        ("实验B_上升趋势第一根红柱且回调<30%", first_red & uptrend & pullback.lt(30.0)),
+        ("对照_红柱首次缩短", events["Event_Type"].eq("红柱首次缩短")),
+    ]
+
+
+def strategy_scope_row(
+    strategy_name: str,
+    scope_name: str,
+    group: pd.DataFrame,
+    use_population_weights: bool,
+) -> dict[str, Any]:
+    if group.empty:
+        return {"策略组": strategy_name, "统计口径": scope_name, "信号数": 0}
+    weights = (
+        pd.to_numeric(group["Sample_Weight"], errors="coerce").fillna(1.0)
+        if use_population_weights else pd.Series(1.0, index=group.index)
+    )
+    next_known = group[group["Next_Week_Red"].notna()]
+    next_weights = weights.loc[next_known.index]
+    full = group[group["Tradable"].eq(True) & group["Has_8W_Future"].eq(True)]
+    full_weights = weights.loc[full.index]
+    row: dict[str, Any] = {
+        "策略组": strategy_name,
+        "统计口径": scope_name,
+        "信号数": int(len(group)),
+        "估算股票池信号数": float(weights.sum()),
+        "次周状态有效样本": int(len(next_known)),
+        "下一周继续红柱(%)": weighted_rate(next_known["Next_Week_Red"], next_weights),
+        "下一周立即翻绿(%)": weighted_rate(next_known["Immediate_Green"], next_weights),
+        "八周完整可交易样本": int(len(full)),
+        "估算股票池完整样本数": float(full_weights.sum()),
+    }
+    for target in (10, 20, 30):
+        row[f"八周触及{target}(%)"] = weighted_rate(full[f"Hit_{target}_8W"], full_weights)
+        row[f"{target}%先于止损(%)"] = weighted_rate(
+            full[f"First_{target}_vs_Stop"].eq("目标先到"), full_weights
+        )
+        exit_column = f"Exit_T{target}_Return_pct"
+        row[f"T{target}止盈策略平均收益(%)"] = weighted_mean(full[exit_column], full_weights)
+        row[f"T{target}止盈策略收益中位数(%)"] = weighted_median(full[exit_column], full_weights)
+        row[f"T{target}止盈策略胜率(%)"] = weighted_rate(full[exit_column].gt(0), full_weights)
+        row[f"T{target}平均持有交易日"] = weighted_mean(
+            full[f"Exit_T{target}_Holding_Days"], full_weights
+        )
+    row.update({
+        "触发止损阈值(%)": weighted_rate(full["Hit_Stop_8W"], full_weights),
+        "八周末平均收益(%)": weighted_mean(full["Return_8W_pct"], full_weights),
+        "八周末收益中位数(%)": weighted_median(full["Return_8W_pct"], full_weights),
+        "八周末10%截尾均值(%)": weighted_trimmed_mean(
+            full["Return_8W_pct"], full_weights, 0.10
+        ),
+        "去掉最高3个后均值(%)": weighted_top_removed_mean(
+            full["Return_8W_pct"], full_weights, 3
+        ),
+        "去掉最高5个后均值(%)": weighted_top_removed_mean(
+            full["Return_8W_pct"], full_weights, 5
+        ),
+        "八周末盈利率(%)": weighted_rate(full["Return_8W_pct"].gt(0), full_weights),
+        "最高3个占正收益比例(%)": top_positive_contribution(
+            full["Return_8W_pct"], full_weights, 3
+        ),
+        "最高5个占正收益比例(%)": top_positive_contribution(
+            full["Return_8W_pct"], full_weights, 5
+        ),
+        "八周最大浮盈均值(%)": weighted_mean(full["MFE_8W_pct"], full_weights),
+        "八周最大回撤均值(%)": weighted_mean(full["MAE_8W_pct"], full_weights),
+    })
+    return row
+
+
+def build_strategy_report(events: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for strategy_name, mask in strategy_definitions(events):
+        strategy_events = events[mask].copy()
+        rows.append(strategy_scope_row(
+            strategy_name, "600只样本等权", strategy_events, False
+        ))
+        rows.append(strategy_scope_row(
+            strategy_name, "按完整股票池板块占比加权", strategy_events, True
+        ))
+        for board in SAMPLE_BOARDS:
+            board_events = strategy_events[strategy_events["Sample_Board"].eq(board)]
+            rows.append(strategy_scope_row(
+                strategy_name, f"分板块_{board}", board_events, True
+            ))
+    return pd.DataFrame(rows)
+
+
 # -----------------------------------------------------------------------------
 # Streamlit 页面
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线MACD假设验证器", layout="wide")
-    st.title("周线MACD假设验证器 V1.0")
+    st.set_page_config(page_title="周线MACD假设验证器 V2.0", layout="wide")
+    st.title("周线MACD假设验证器 V2.0")
     st.caption(
-        "只验证周线状态与未来八周价格路径；不使用v40.6选股分数，也不执行组合回测。"
+        "分板块固定随机抽样，验证周线状态、未来八周路径和固定止损止盈退出结果。"
     )
 
     with st.sidebar:
         st.header("研究区间")
-        default_start = date(2020, 1, 1)
+        default_start = date.today() - timedelta(days=365)
         EVENT_START_DATE = st.date_input("信号开始日期", value=default_start)
         EVENT_END_DATE = st.date_input("行情截止日期", value=date.today())
         st.caption("截止日期应至少晚于最后研究信号40个交易日，否则末端事件只统计次周状态。")
@@ -910,9 +1284,14 @@ def main() -> None:
         col1, col2 = st.columns(2)
         MIN_MV = col1.number_input("最小流通市值(亿)", min_value=0.0, value=200.0, step=50.0)
         MAX_MV = col2.number_input("最大流通市值(亿)", min_value=0.0, value=1000.0, step=50.0)
-        MAX_STOCKS = st.number_input(
-            "测试股票数上限（0=全部）", min_value=0, value=0, step=50,
-            help="首次检查运行环境时可填50；正式验证必须设为0。",
+        SAMPLE_PER_BOARD = st.number_input(
+            "每个板块随机抽样数（0=各板块全部）",
+            min_value=0, value=DEFAULT_SAMPLE_PER_BOARD, step=25,
+            help="默认主板、创业板、科创板各200只；不足200只的板块取全部，不转移名额。",
+        )
+        SAMPLE_SEED = st.number_input(
+            "固定随机种子", min_value=0, value=DEFAULT_SAMPLE_SEED, step=1,
+            help="相同股票池、相同种子会生成相同抽样名单。",
         )
 
         st.header("统计定义")
@@ -923,10 +1302,15 @@ def main() -> None:
         STOP_THRESHOLD = st.number_input(
             "失败/止损统计阈值(%)", min_value=1.0, max_value=30.0,
             value=10.0, step=1.0,
-            help="只用于概率统计，不代表最终实盘止损规则。",
+            help="用于屏障先后判断和固定止损止盈退出模拟。",
         )
-        BUY_SLIPPAGE = st.number_input(
-            "D1开盘买入滑点(%)", min_value=0.0, max_value=2.0,
+        slip1, slip2 = st.columns(2)
+        BUY_SLIPPAGE = slip1.number_input(
+            "D1买入滑点(%)", min_value=0.0, max_value=2.0,
+            value=0.20, step=0.05,
+        )
+        SELL_SLIPPAGE = slip2.number_input(
+            "卖出滑点(%)", min_value=0.0, max_value=2.0,
             value=0.20, step=0.05,
         )
 
@@ -943,10 +1327,10 @@ def main() -> None:
 
     TS_TOKEN = st.text_input("Tushare Token", type="password")
     if not TS_TOKEN:
-        st.info("请输入Tushare Token。建议先用50只股票做环境检查，再将上限改为0正式运行。")
+        st.info("请输入Tushare Token。默认抽取三个板块各200只，共约600只。")
         return
 
-    if not st.button("开始验证七项周线假设", type="primary"):
+    if not st.button("开始600只分层验证", type="primary"):
         with st.expander("本程序的关键统计口径"):
             st.markdown(
                 """
@@ -956,6 +1340,7 @@ def main() -> None:
                 - **下降趋势**：周MA20<周MA40、斜率<0、价格未明显站上周MA20。
                 - **回调深度**：绿柱段最低价相对绿柱开始前最多四周最高价的跌幅。
                 - **实际买点**：信号周结束后的下一市场交易日开盘。
+                - **退出模拟**：跳空穿越止损按开盘价；同日双触发保守按止损；计入买卖滑点，不含佣金和印花税。
                 """
             )
         return
@@ -987,6 +1372,9 @@ def main() -> None:
         "price_tolerance_pct": float(PRICE_TOLERANCE),
         "stop_threshold_pct": float(STOP_THRESHOLD),
         "buy_slippage_pct": float(BUY_SLIPPAGE),
+        "sell_slippage_pct": float(SELL_SLIPPAGE),
+        "sample_per_board": int(SAMPLE_PER_BOARD),
+        "sample_seed": int(SAMPLE_SEED),
     }
 
     try:
@@ -1000,20 +1388,37 @@ def main() -> None:
 
     period_index = build_period_index(memberships)
     universe_codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
-    stocks = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
-    stocks = stocks.sort_values("ts_code").reset_index(drop=True)
-    if int(MAX_STOCKS) > 0:
-        stocks = stocks.head(int(MAX_STOCKS)).copy()
+    universe_stocks = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
+    universe_stocks = universe_stocks.sort_values("ts_code").reset_index(drop=True)
+    stocks, sample_audit, population_summary = build_stratified_sample(
+        stocks=universe_stocks,
+        period_index=period_index,
+        reference_date=event_end,
+        per_board=int(SAMPLE_PER_BOARD),
+        seed=int(SAMPLE_SEED),
+    )
     if stocks.empty:
         st.error("历史科技股票池为空")
         return
 
+    sample_hash = cache_key(
+        int(SAMPLE_SEED), int(SAMPLE_PER_BOARD),
+        "|".join(sample_audit["ts_code"].astype(str)),
+    )
+    sample_path = os.path.join(OUTPUT_DIR, f"weekly_macd_sample_{sample_hash}.csv")
+    population_path = os.path.join(OUTPUT_DIR, f"weekly_macd_population_{sample_hash}.csv")
+    # 在耗时行情循环之前保存，程序中断后仍能核对和复用本次样本。
+    atomic_csv(sample_audit, sample_path)
+    atomic_csv(population_summary, population_path)
+
     open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
     week_last_map = complete_week_last_dates(open_dates)
     st.write(
-        f"研究股票：{len(stocks)}只；信号区间：{event_start}—{event_end}；"
+        f"完整历史科技池：{len(universe_stocks)}只；分层样本：{len(stocks)}只；"
+        f"信号区间：{event_start}—{event_end}；"
         f"行情预热起点：{preload_start}。"
     )
+    st.dataframe(style_percent_table(population_summary), use_container_width=True, hide_index=True)
 
     all_records: list[dict[str, Any]] = []
     reject_totals: dict[str, int] = {}
@@ -1063,11 +1468,16 @@ def main() -> None:
     summaries = build_all_summaries(events)
     paired = build_paired_comparison(events)
     pair_summary = paired_summary(paired)
+    strategy_report = build_strategy_report(events)
 
-    run_hash = cache_key(json.dumps(config, ensure_ascii=False, sort_keys=True), len(stocks))
+    run_hash = cache_key(
+        json.dumps(config, ensure_ascii=False, sort_keys=True), sample_hash,
+        "|".join(sample_audit["ts_code"].astype(str)),
+    )
     event_path = os.path.join(OUTPUT_DIR, f"weekly_macd_events_{run_hash}.csv")
     summary_path = os.path.join(OUTPUT_DIR, f"weekly_macd_summary_{run_hash}.csv")
     paired_path = os.path.join(OUTPUT_DIR, f"weekly_macd_paired_{run_hash}.csv")
+    strategy_path = os.path.join(OUTPUT_DIR, f"weekly_macd_strategy_{run_hash}.csv")
     combined_summaries = []
     for title, frame in summaries.items():
         temp = frame.copy()
@@ -1081,6 +1491,7 @@ def main() -> None:
     atomic_csv(events, event_path)
     atomic_csv(summary_export, summary_path)
     atomic_csv(paired, paired_path)
+    atomic_csv(strategy_report, strategy_path)
 
     st.success(
         f"验证完成：事件{len(events)}条；完整八周可交易样本"
@@ -1121,6 +1532,16 @@ def main() -> None:
         use_container_width=True, hide_index=True,
     )
 
+    st.subheader("三组实验与红柱缩短对照")
+    st.caption(
+        "同时给出600只样本等权、按完整股票池板块占比加权，以及三个板块各自结果。"
+        "T10/T20/T30策略收益已经执行固定止损止盈；跳空止损按实际开盘价，"
+        "同日双触发保守按止损处理。"
+    )
+    st.dataframe(
+        style_percent_table(strategy_report), use_container_width=True, hide_index=True,
+    )
+
     st.subheader("逐周收益路径")
     full_events = events[events["Tradable"].eq(True) & events["Has_8W_Future"].eq(True)]
     weekly_rows = []
@@ -1145,7 +1566,7 @@ def main() -> None:
             st.code("\n".join(API_ERRORS[:100]))
 
     st.subheader("下载结果")
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4, d5 = st.columns(5)
     d1.download_button(
         "下载事件明细CSV", events.to_csv(index=False, encoding="utf-8-sig"),
         file_name=os.path.basename(event_path), mime="text/csv",
@@ -1158,13 +1579,20 @@ def main() -> None:
         "下载同周期配对CSV", paired.to_csv(index=False, encoding="utf-8-sig"),
         file_name=os.path.basename(paired_path), mime="text/csv",
     )
+    d4.download_button(
+        "下载策略对照CSV", strategy_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(strategy_path), mime="text/csv",
+    )
+    d5.download_button(
+        "下载600只抽样名单", sample_audit.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(sample_path), mime="text/csv",
+    )
 
     st.warning(
-        "正式下结论前，请将“测试股票数上限”设为0，并至少覆盖一轮上涨、下跌和震荡市场。"
-        "任何少于30条的细分样本都只能视为线索，不能视为规律。"
+        "600只分层样本适合筛选假设，但一年数据仍只代表一个市场阶段。"
+        "任何少于30条的细分样本都只能视为线索；最终规则应再做跨年份样本外验证。"
     )
 
 
 if __name__ == "__main__":
     main()
-
