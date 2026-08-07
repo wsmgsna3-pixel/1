@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线 MACD 红柱周期验证器 V3.1
+周线 MACD 市场环境验证器 V4.0
 ========================================
 
 研究目的（纯统计，不是选股实盘版）：
@@ -16,6 +16,8 @@
 10. 将第一根红柱后的完整周期事后划分为 A/B/C1/C2，验证哪类利润最大。
 11. 只用当时已知数据记录第2—5周状态，检验能否提前识别弱反弹。
 12. 信号截止日与行情截止日分离：股票池和信号严格停在前者，后者仅用于观察未来结果。
+13. 加入宽基、对应板块、申万一级行业指数的信号日周线状态。
+14. 加入样本市场/板块/行业广度、相对强度、过热程度与同周信号拥挤度。
 
 严格口径：
 - 周线信号只使用已经结束的完整周，绝不使用周一至周四的临时周K。
@@ -27,7 +29,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_hypothesis_validator_v3_1.py
+    streamlit run weekly_macd_environment_validator_v4.py
 """
 
 from __future__ import annotations
@@ -48,7 +50,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V3.1"
+VERSION = "V4.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -77,6 +79,19 @@ DEFAULT_LONG_CYCLE_MIN_WEEKS = 6
 DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
+
+BROAD_INDEX_CODE = "000852.SH"  # 中证1000：科技样本整体市场环境代理
+BOARD_INDEX_CODES = {
+    "主板": "000300.SH",       # 沪深300：中大市值主板环境代理
+    "创业板": "399006.SZ",     # 创业板指
+    "科创板": "000688.SH",     # 科创50
+}
+INDEX_NAMES = {
+    "000852.SH": "中证1000",
+    "000300.SH": "沪深300",
+    "399006.SZ": "创业板指",
+    "000688.SH": "科创50",
+}
 
 pro = None
 API_ERRORS: list[str] = []
@@ -236,6 +251,9 @@ def load_sw_tech_memberships(api_pause: float) -> pd.DataFrame:
             if not frame.empty:
                 if "ts_code" not in frame.columns and "con_code" in frame.columns:
                     frame = frame.rename(columns={"con_code": "ts_code"})
+                frame["l1_code"] = str(item["index_code"])
+                if "l1_name" not in frame.columns:
+                    frame["l1_name"] = str(item["industry_name"])
                 frames.append(frame)
             time.sleep(api_pause)
     progress.empty()
@@ -243,14 +261,16 @@ def load_sw_tech_memberships(api_pause: float) -> pd.DataFrame:
         raise RuntimeError("index_member_all 未返回数据，请确认积分权限和 SDK 版本")
 
     result = pd.concat(frames, ignore_index=True)
-    for column in ["ts_code", "l1_name", "l2_name", "l3_name", "in_date", "out_date"]:
+    for column in [
+        "ts_code", "l1_code", "l1_name", "l2_name", "l3_name", "in_date", "out_date"
+    ]:
         if column not in result.columns:
             result[column] = ""
     result = result[result.apply(industry_row_is_tech, axis=1)].copy()
     result["in_date"] = result["in_date"].apply(lambda x: normalize_date(x, "19000101"))
     result["out_date"] = result["out_date"].apply(lambda x: normalize_date(x, "99991231"))
     result = result.drop_duplicates(
-        ["ts_code", "l1_name", "l2_name", "l3_name", "in_date", "out_date"]
+        ["ts_code", "l1_code", "l1_name", "l2_name", "l3_name", "in_date", "out_date"]
     )
     if result.empty:
         raise RuntimeError("科技关键词过滤后行业池为空")
@@ -264,6 +284,7 @@ def build_period_index(memberships: pd.DataFrame) -> dict[str, list[dict[str, st
             "in_date": str(row.in_date),
             "out_date": str(row.out_date),
             "l1": str(row.l1_name),
+            "l1_code": str(row.l1_code),
             "l2": str(row.l2_name),
             "l3": str(row.l3_name),
         })
@@ -300,7 +321,9 @@ def representative_membership(
     eligible = [period for period in periods if period["in_date"] <= reference_date]
     if eligible:
         return max(eligible, key=lambda item: item["in_date"])
-    return periods[-1] if periods else {"l1": "", "l2": "", "l3": ""}
+    return periods[-1] if periods else {
+        "l1": "", "l1_code": "", "l2": "", "l3": ""
+    }
 
 
 def build_stratified_sample(
@@ -365,13 +388,17 @@ def build_stratified_sample(
     sw_rows = []
     for code in audit["ts_code"].astype(str):
         period = representative_membership(period_index.get(code, []), reference_date)
-        sw_rows.append((period.get("l1", ""), period.get("l2", ""), period.get("l3", "")))
-    audit[["Sample_SW_L1", "Sample_SW_L2", "Sample_SW_L3"]] = pd.DataFrame(
+        sw_rows.append((
+            period.get("l1", ""), period.get("l1_code", ""),
+            period.get("l2", ""), period.get("l3", ""),
+        ))
+    audit[["Sample_SW_L1", "Sample_SW_L1_Code", "Sample_SW_L2", "Sample_SW_L3"]] = pd.DataFrame(
         sw_rows, index=audit.index
     )
     audit_columns = [
         "Sample_Order", "ts_code", "symbol", "name", "Sample_Board", "market",
         "exchange", "list_status", "list_date", "delist_date", "Sample_SW_L1",
+        "Sample_SW_L1_Code",
         "Sample_SW_L2", "Sample_SW_L3", "Sample_Seed", "Board_Universe_Size",
         "Board_Sample_Size", "Sampling_Fraction_pct", "Sample_Weight",
     ]
@@ -460,6 +487,54 @@ def fetch_stock_history(
     return daily, basic, False
 
 
+def reference_cache_path(
+    source: str,
+    ts_code: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    digest = cache_key(VERSION, source, ts_code, start_date, end_date)
+    safe_code = ts_code.replace(".", "_")
+    return os.path.join(CACHE_DIR, f"reference_{source}_{safe_code}_{digest}.pkl")
+
+
+def fetch_reference_daily(
+    source: str,
+    ts_code: str,
+    start_date: str,
+    end_date: str,
+    use_cache: bool,
+    api_pause: float,
+) -> tuple[pd.DataFrame, bool]:
+    """读取宽基/板块指数或申万行业指数；无权限时返回空表并由样本广度兜底。"""
+    path = reference_cache_path(source, ts_code, start_date, end_date)
+    if use_cache and os.path.exists(path):
+        try:
+            with open(path, "rb") as file:
+                payload = pickle.load(file)
+            return pd.DataFrame(payload.get("daily", pd.DataFrame())), True
+        except Exception as exc:
+            record_error(f"指数缓存损坏 {source} {ts_code}: {exc}")
+
+    frame = safe_get(
+        source, ts_code=ts_code, start_date=start_date, end_date=end_date,
+        fields="ts_code,trade_date,open,high,low,close,vol",
+    )
+    time.sleep(api_pause)
+    if frame.empty:
+        return pd.DataFrame(), False
+    frame["trade_date"] = frame["trade_date"].astype(str)
+    for column in ["open", "high", "low", "close", "vol"]:
+        if column not in frame.columns:
+            frame[column] = 0.0 if column == "vol" else np.nan
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["trade_date", "open", "high", "low", "close"])
+    frame = frame.drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+    if use_cache and not frame.empty:
+        atomic_pickle({"daily": frame}, path)
+    return frame, False
+
+
 def complete_week_last_dates(open_dates: list[str]) -> dict[pd.Timestamp, str]:
     frame = pd.DataFrame({"trade_date": open_dates})
     frame["dt"] = pd.to_datetime(frame["trade_date"])
@@ -472,6 +547,7 @@ def build_weekly(daily: pd.DataFrame, week_last_map: dict[pd.Timestamp, str]) ->
         return pd.DataFrame()
     work = daily.copy()
     work["dt"] = pd.to_datetime(work["trade_date"])
+    work["_trading_day_count"] = 1
     weekly = work.set_index("dt").resample("W-FRI").agg({
         "trade_date": "last",
         "open": "first",
@@ -479,7 +555,9 @@ def build_weekly(daily: pd.DataFrame, week_last_map: dict[pd.Timestamp, str]) ->
         "low": "min",
         "close": "last",
         "vol": "sum",
+        "_trading_day_count": "sum",
     }).dropna(subset=["close"]).reset_index().rename(columns={"dt": "week_label"})
+    weekly = weekly.rename(columns={"_trading_day_count": "trading_days_in_week"})
     weekly["calendar_week_last"] = weekly["week_label"].map(week_last_map)
     weekly = weekly[
         weekly["calendar_week_last"].notna()
@@ -557,6 +635,113 @@ def pullback_before_first_red(weekly: pd.DataFrame, position: int) -> dict[str, 
         "Pre_Peak": float(pre_peak) if pd.notna(pre_peak) else np.nan,
         "Pullback_Low": float(pullback_low) if pd.notna(pullback_low) else np.nan,
     }
+
+
+def build_reference_feature_frame(
+    daily: pd.DataFrame,
+    week_last_map: dict[pd.Timestamp, str],
+    prefix: str,
+    ts_code: str,
+    display_name: str,
+) -> pd.DataFrame:
+    weekly = build_weekly(daily, week_last_map)
+    if weekly.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for _, row in weekly.iterrows():
+        close = float(row["close"])
+        ma20 = float(row["ma20"]) if pd.notna(row["ma20"]) else np.nan
+        rows.append({
+            "Signal_Date": str(row["trade_date"]),
+            f"{prefix}_Index_Code": ts_code,
+            f"{prefix}_Index_Name": display_name,
+            f"{prefix}_Trend": trend_state(row, 3.0),
+            f"{prefix}_Zero_Axis": zero_axis_state(row),
+            f"{prefix}_Return_13W_pct": float(row["return_13w_pct"])
+            if pd.notna(row["return_13w_pct"]) else np.nan,
+            f"{prefix}_Return_26W_pct": float(row["return_26w_pct"])
+            if pd.notna(row["return_26w_pct"]) else np.nan,
+            f"{prefix}_MA20_Slope4_pct": float(row["ma20_slope4_pct"])
+            if pd.notna(row["ma20_slope4_pct"]) else np.nan,
+            f"{prefix}_Dist_MA20_pct": (
+                (close / ma20 - 1.0) * 100.0
+                if np.isfinite(ma20) and ma20 > 0 else np.nan
+            ),
+            f"{prefix}_MACD_Hist": float(row["hist"]),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_sample_context_observations(
+    stock: pd.Series,
+    periods: list[dict[str, str]],
+    weekly: pd.DataFrame,
+    signal_start: str,
+    signal_end: str,
+    price_tolerance_pct: float,
+) -> pd.DataFrame:
+    """逐股票逐周生成当时可知的市场/板块/行业广度原始观察。"""
+    rows: list[dict[str, Any]] = []
+    if len(weekly) < MACD_WARMUP_WEEKS:
+        return pd.DataFrame()
+    for position in range(MACD_WARMUP_WEEKS, len(weekly)):
+        row = weekly.iloc[position]
+        signal_date = str(row["trade_date"])
+        if signal_date < signal_start or signal_date > signal_end:
+            continue
+        if not (str(stock["list_date"]) <= signal_date < str(stock["delist_date"])):
+            continue
+        membership = membership_on_date(periods, signal_date)
+        if membership is None:
+            continue
+        ma20 = float(row["ma20"]) if pd.notna(row["ma20"]) else np.nan
+        close = float(row["close"])
+        hist = float(row["hist"])
+        hist_prev = float(weekly.iloc[position - 1]["hist"])
+        rows.append({
+            "Signal_Date": signal_date,
+            "Sample_Board": str(stock.get("Sample_Board", sample_board(stock))),
+            "SW_L1": str(membership.get("l1", "")),
+            "SW_L1_Code": str(membership.get("l1_code", "")),
+            "Sample_Weight": float(stock.get("Sample_Weight", 1.0)),
+            "Above_MA20": bool(np.isfinite(ma20) and close >= ma20),
+            "Uptrend": trend_state(row, price_tolerance_pct) == "上升趋势",
+            "First_Red": bool(hist > 0 and hist_prev <= 0),
+            "Return_13W_pct": float(row["return_13w_pct"])
+            if pd.notna(row["return_13w_pct"]) else np.nan,
+            "Return_26W_pct": float(row["return_26w_pct"])
+            if pd.notna(row["return_26w_pct"]) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_breadth_table(
+    observations: pd.DataFrame,
+    group_columns: list[str],
+    prefix: str,
+) -> pd.DataFrame:
+    if observations.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for keys, group in observations.groupby(group_columns, dropna=False, sort=False):
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        weights = pd.to_numeric(group["Sample_Weight"], errors="coerce").fillna(1.0)
+        row = {column: value for column, value in zip(group_columns, keys)}
+        row.update({
+            f"{prefix}_Active_Sample_Count": int(len(group)),
+            f"{prefix}_Estimated_Active_Count": float(weights.sum()),
+            f"{prefix}_Above_MA20_pct": weighted_rate(group["Above_MA20"], weights),
+            f"{prefix}_Uptrend_pct": weighted_rate(group["Uptrend"], weights),
+            f"{prefix}_First_Red_pct": weighted_rate(group["First_Red"], weights),
+            f"{prefix}_Median_13W_Return_pct": weighted_median(
+                group["Return_13W_pct"], weights
+            ),
+            f"{prefix}_Median_26W_Return_pct": weighted_median(
+                group["Return_26W_pct"], weights
+            ),
+        })
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def material_hist_moves(
@@ -1153,9 +1338,11 @@ def build_event_record(
         "Sample_Weight": float(stock.get("Sample_Weight", 1.0)),
         "Sample_Seed": int(stock.get("Sample_Seed", DEFAULT_SAMPLE_SEED)),
         "SW_L1": membership["l1"],
+        "SW_L1_Code": str(membership.get("l1_code", "")),
         "SW_L2": membership["l2"],
         "SW_L3": membership["l3"],
         "Signal_Date": signal_date,
+        "Signal_Week_Trading_Days": int(row.get("trading_days_in_week", 0)),
         "Cycle_Start_Signal_Date": str(weekly.iloc[cycle_start_position]["trade_date"]),
         "Event_Week_In_Cycle": int(position - cycle_start_position + 1),
         "Weekly_Trend": trend_state(row, price_tolerance_pct),
@@ -1165,6 +1352,10 @@ def build_event_record(
         "DIF": float(row["dif"]),
         "DEA": float(row["dea"]),
         "Weekly_Close": float(row["close"]),
+        "Stock_Dist_MA20_pct": (
+            (float(row["close"]) / float(row["ma20"]) - 1.0) * 100.0
+            if pd.notna(row["ma20"]) and float(row["ma20"]) > 0 else np.nan
+        ),
         "W_MA20": float(row["ma20"]) if pd.notna(row["ma20"]) else np.nan,
         "W_MA40": float(row["ma40"]) if pd.notna(row["ma40"]) else np.nan,
         "W_MA20_Slope4_pct": float(row["ma20_slope4_pct"]) if pd.notna(row["ma20_slope4_pct"]) else np.nan,
@@ -1177,6 +1368,12 @@ def build_event_record(
         **snapshot,
         **cycle_features,
     }
+    record["Initial_Red_Strength"] = (
+        float(row["hist"]) / float(cycle_features.get("PreGreen_Abs_Peak_Hist", np.nan))
+        if np.isfinite(float(cycle_features.get("PreGreen_Abs_Peak_Hist", np.nan)))
+        and float(cycle_features.get("PreGreen_Abs_Peak_Hist", np.nan)) > 0
+        else np.nan
+    )
     path_result = evaluate_event_path(
         daily=daily,
         signal_date=signal_date,
@@ -1188,6 +1385,16 @@ def build_event_record(
         ts_code=str(stock["ts_code"]),
     )
     record.update(path_result)
+    entry_date = str(path_result.get("Entry_Date", ""))
+    entry_price = float(path_result.get("Entry_Price", np.nan))
+    record["Calendar_Days_To_Entry"] = (
+        (pd.Timestamp(entry_date) - pd.Timestamp(signal_date)).days
+        if entry_date else np.nan
+    )
+    record["D1_Open_Gap_From_Weekly_Close_pct"] = (
+        ((entry_price / (1.0 + buy_slippage_pct / 100.0)) / float(row["close"]) - 1.0) * 100.0
+        if np.isfinite(entry_price) and float(row["close"]) > 0 else np.nan
+    )
     if event_type == "第一根红柱":
         record.update(build_checkpoint_features(
             weekly=weekly,
@@ -1213,8 +1420,9 @@ def analyze_stock(
     open_dates: list[str],
     open_pos: dict[str, int],
     config: dict[str, Any],
+    weekly: pd.DataFrame | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    weekly = build_weekly(daily, week_last_map)
+    weekly = build_weekly(daily, week_last_map) if weekly is None else weekly.copy()
     if len(weekly) < MACD_WARMUP_WEEKS:
         return [], {"周线不足": 1}
 
@@ -1776,15 +1984,216 @@ def build_checkpoint_report(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def attach_signal_crowding(events: pd.DataFrame) -> pd.DataFrame:
+    """同周拥挤度只由当周已经出现的第一根红柱事件计算。"""
+    result = events.copy()
+    first = result[result["Event_Type"].eq("第一根红柱")].copy()
+    if first.empty:
+        return result
+    market = first.groupby("Signal_Date").size().rename("First_Red_Signals_Market_Week")
+    board = first.groupby(["Signal_Date", "Sample_Board"]).size().rename(
+        "First_Red_Signals_Board_Week"
+    )
+    industry = first.groupby(["Signal_Date", "SW_L1"]).size().rename(
+        "First_Red_Signals_Industry_Week"
+    )
+    result = result.merge(market.reset_index(), on="Signal_Date", how="left")
+    result = result.merge(board.reset_index(), on=["Signal_Date", "Sample_Board"], how="left")
+    result = result.merge(industry.reset_index(), on=["Signal_Date", "SW_L1"], how="left")
+    return result
+
+
+def numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def attach_environment_features(
+    events: pd.DataFrame,
+    observations: pd.DataFrame,
+    broad_features: pd.DataFrame,
+    board_features: pd.DataFrame,
+    industry_features: pd.DataFrame,
+) -> pd.DataFrame:
+    result = attach_signal_crowding(events)
+    if not observations.empty:
+        market_breadth = build_breadth_table(observations, ["Signal_Date"], "Market_Breadth")
+        board_breadth = build_breadth_table(
+            observations, ["Signal_Date", "Sample_Board"], "Board_Breadth"
+        )
+        industry_breadth = build_breadth_table(
+            observations, ["Signal_Date", "SW_L1"], "Industry_Breadth"
+        )
+        result = result.merge(market_breadth, on="Signal_Date", how="left")
+        result = result.merge(
+            board_breadth, on=["Signal_Date", "Sample_Board"], how="left"
+        )
+        result = result.merge(
+            industry_breadth, on=["Signal_Date", "SW_L1"], how="left"
+        )
+    if not broad_features.empty:
+        result = result.merge(broad_features, on="Signal_Date", how="left")
+    if not board_features.empty:
+        result = result.merge(
+            board_features, on=["Signal_Date", "Sample_Board"], how="left"
+        )
+    if not industry_features.empty and "SW_L1_Code" in result.columns:
+        result = result.merge(
+            industry_features, on=["Signal_Date", "SW_L1_Code"], how="left"
+        )
+
+    for prefix in ["Broad_Index", "Board_Index", "Industry_Index"]:
+        for suffix in [
+            "Code", "Name", "Trend", "Zero_Axis", "Return_13W_pct",
+            "Return_26W_pct", "MA20_Slope4_pct", "Dist_MA20_pct", "MACD_Hist",
+        ]:
+            column = f"{prefix}_{suffix}"
+            if column not in result.columns:
+                result[column] = np.nan
+
+    result["Stock_Excess_vs_Board_13W_pct"] = (
+        pd.to_numeric(result["Pre_13W_Return_pct"], errors="coerce")
+        - numeric_column(result, "Board_Index_Return_13W_pct")
+    )
+    result["Stock_Excess_vs_Board_26W_pct"] = (
+        pd.to_numeric(result["Pre_26W_Return_pct"], errors="coerce")
+        - numeric_column(result, "Board_Index_Return_26W_pct")
+    )
+    result["Stock_Excess_vs_Industry_13W_pct"] = (
+        pd.to_numeric(result["Pre_13W_Return_pct"], errors="coerce")
+        - numeric_column(result, "Industry_Index_Return_13W_pct")
+    )
+    result["Stock_Excess_vs_Industry_26W_pct"] = (
+        pd.to_numeric(result["Pre_26W_Return_pct"], errors="coerce")
+        - numeric_column(result, "Industry_Index_Return_26W_pct")
+    )
+    return result
+
+
+def environment_report_row(
+    dimension: str,
+    value: str,
+    group: pd.DataFrame,
+    use_population_weights: bool,
+) -> dict[str, Any]:
+    weights = (
+        pd.to_numeric(group["Sample_Weight"], errors="coerce").fillna(1.0)
+        if use_population_weights else pd.Series(1.0, index=group.index)
+    )
+    full = group[group["Tradable"].eq(True) & group["Has_8W_Future"].eq(True)]
+    full_weights = weights.loc[full.index]
+    completed = group[group["Cycle_Completed"].eq(True)]
+    completed_weights = weights.loc[completed.index]
+    long_cycle = completed["Cycle_Type"].isin([
+        "C1_长周期_缩短后再扩张", "C2_长周期_单峰扩张后缩短",
+    ])
+    row: dict[str, Any] = {
+        "环境维度": dimension,
+        "环境分组": value,
+        "统计口径": "按完整股票池板块占比加权" if use_population_weights else "600只样本等权",
+        "信号数": int(len(group)),
+        "估算股票池信号数": float(weights.sum()),
+        "八周完整样本": int(len(full)),
+        "下一周继续红柱(%)": weighted_rate(group["Next_Week_Red"].eq(True), weights),
+        "C1/C2长周期(%)": weighted_rate(long_cycle, completed_weights),
+        "八周存活率(%)": weighted_rate(full["Hit_Stop_8W"].eq(False), full_weights),
+        "八周平均收益(%)": weighted_mean(full["Return_8W_pct"], full_weights),
+        "八周收益中位数(%)": weighted_median(full["Return_8W_pct"], full_weights),
+        "八周10%截尾均值(%)": weighted_trimmed_mean(
+            full["Return_8W_pct"], full_weights
+        ),
+        "去最高3只均值(%)": weighted_top_removed_mean(
+            full["Return_8W_pct"], full_weights, 3
+        ),
+        "最高3只占正收益贡献(%)": top_positive_contribution(
+            full["Return_8W_pct"], full_weights, 3
+        ),
+        "八周盈利率(%)": weighted_rate(full["Return_8W_pct"].gt(0), full_weights),
+    }
+    for target in (10, 20, 30):
+        row[f"触及{target}%(%)"] = weighted_rate(
+            full[f"Hit_{target}_8W"].eq(True), full_weights
+        )
+        row[f"{target}%先于止损(%)"] = weighted_rate(
+            full[f"First_{target}_vs_Stop"].eq("目标先到"), full_weights
+        )
+        row[f"T{target}退出平均收益(%)"] = weighted_mean(
+            full[f"Exit_T{target}_Return_pct"], full_weights
+        )
+    return row
+
+
+def environment_bins(events: pd.DataFrame) -> pd.DataFrame:
+    result = events.copy()
+    result["市场广度分组"] = pd.cut(
+        numeric_column(result, "Market_Breadth_Above_MA20_pct"),
+        [-np.inf, 30, 50, 70, np.inf], labels=["<30%", "30%-50%", "50%-70%", ">=70%"],
+        right=False,
+    )
+    result["行业广度分组"] = pd.cut(
+        numeric_column(result, "Industry_Breadth_Above_MA20_pct"),
+        [-np.inf, 30, 50, 70, np.inf], labels=["<30%", "30%-50%", "50%-70%", ">=70%"],
+        right=False,
+    )
+    result["相对板块13周分组"] = pd.cut(
+        numeric_column(result, "Stock_Excess_vs_Board_13W_pct"),
+        [-np.inf, -10, 0, 10, 25, np.inf],
+        labels=["<-10%", "-10%-0%", "0%-10%", "10%-25%", ">=25%"], right=False,
+    )
+    result["距周MA20分组"] = pd.cut(
+        pd.to_numeric(result["Stock_Dist_MA20_pct"], errors="coerce"),
+        [-np.inf, 0, 5, 10, 20, np.inf],
+        labels=["<0%", "0%-5%", "5%-10%", "10%-20%", ">=20%"], right=False,
+    )
+    result["过去26周涨幅分组"] = pd.cut(
+        pd.to_numeric(result["Pre_26W_Return_pct"], errors="coerce"),
+        [-np.inf, 0, 20, 40, 70, np.inf],
+        labels=["<0%", "0%-20%", "20%-40%", "40%-70%", ">=70%"], right=False,
+    )
+    crowding = numeric_column(result, "First_Red_Signals_Industry_Week")
+    result["行业同周拥挤度"] = pd.cut(
+        crowding, [-np.inf, 2, 4, np.inf], labels=["1只", "2-3只", ">=4只"], right=False,
+    )
+    week_days = pd.to_numeric(result["Signal_Week_Trading_Days"], errors="coerce")
+    result["信号周长度"] = np.where(week_days.le(3), "1-3个交易日", "4-5个交易日")
+    return result
+
+
+def build_environment_report(events: pd.DataFrame) -> pd.DataFrame:
+    first = environment_bins(events[events["Event_Type"].eq("第一根红柱")].copy())
+    dimensions: list[tuple[str, list[str]]] = [
+        ("个股趋势×宽基趋势", ["Weekly_Trend", "Broad_Index_Trend"]),
+        ("个股趋势×板块指数趋势", ["Weekly_Trend", "Board_Index_Trend"]),
+        ("个股趋势×行业指数趋势", ["Weekly_Trend", "Industry_Index_Trend"]),
+        ("市场广度", ["市场广度分组"]),
+        ("行业广度", ["行业广度分组"]),
+        ("相对板块强度", ["相对板块13周分组"]),
+        ("距离周MA20", ["距周MA20分组"]),
+        ("过去26周涨幅", ["过去26周涨幅分组"]),
+        ("行业信号拥挤度", ["行业同周拥挤度"]),
+        ("信号周交易日数", ["信号周长度"]),
+    ]
+    rows: list[dict[str, Any]] = []
+    for dimension, columns in dimensions:
+        usable = first.dropna(subset=columns)
+        for keys, group in usable.groupby(columns, dropna=False, observed=True, sort=False):
+            keys = keys if isinstance(keys, tuple) else (keys,)
+            value = " × ".join(str(item) for item in keys)
+            rows.append(environment_report_row(dimension, value, group, False))
+            rows.append(environment_report_row(dimension, value, group, True))
+    return pd.DataFrame(rows)
+
+
 # -----------------------------------------------------------------------------
 # Streamlit 页面
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线MACD红柱周期验证器 V3.1", layout="wide")
-    st.title("周线MACD红柱周期验证器 V3.1")
+    st.set_page_config(page_title="周线MACD市场环境验证器 V4.0", layout="wide")
+    st.title("周线MACD市场环境验证器 V4.0")
     st.caption(
-        "信号截止日与行情截止日完全分离，用历史信号做无遗漏的八周样本外验证。"
+        "研究同一根周线红柱在不同大盘、板块、行业广度和过热阶段中的差异。"
     )
 
     with st.sidebar:
@@ -1851,6 +2260,10 @@ def main() -> None:
 
         st.header("数据与缓存")
         USE_CACHE = st.checkbox("使用逐股票缓存", value=True)
+        USE_SW_INDEX = st.checkbox(
+            "读取申万一级行业指数（需要相应积分）", value=True,
+            help="无权限时自动使用600只样本计算的行业广度，不会中断测试。",
+        )
         API_PAUSE = st.number_input(
             "每次API调用后暂停(秒)", min_value=0.0, max_value=3.0,
             value=0.12, step=0.05,
@@ -1865,7 +2278,7 @@ def main() -> None:
         st.info("请输入Tushare Token。默认抽取三个板块各200只，共约600只。")
         return
 
-    if not st.button("开始600只V3.1样本外验证", type="primary"):
+    if not st.button("开始600只V4环境验证", type="primary"):
         with st.expander("本程序的关键统计口径"):
             st.markdown(
                 """
@@ -1878,6 +2291,9 @@ def main() -> None:
                 - **退出模拟**：跳空穿越止损按开盘价；同日双触发保守按止损；计入买卖滑点，不含佣金和印花税。
                 - **A/B/C1/C2**：完整周期结束后才知道，只用于验证形态与收益关系，绝不作为买入日条件。
                 - **第2—5周状态**：每个检查点只使用当时已经完成的周线柱，后续收益从检查点以后单独计算。
+                - **环境字段**：宽基、板块、行业指数和样本广度均只取信号周已经结束的数据。
+                - **行业拥挤度**：统计同一信号周、同一申万一级行业出现多少只第一根红柱。
+                - **V4定位**：本版只寻找跨年度环境规律，不执行最多3只的资金组合回测。
                 """
             )
         return
@@ -1920,6 +2336,7 @@ def main() -> None:
         "long_cycle_min_weeks": int(LONG_CYCLE_MIN_WEEKS),
         "material_hist_change_pct": float(MATERIAL_HIST_CHANGE),
         "short_strength_ratio": float(SHORT_STRENGTH_RATIO),
+        "use_sw_index": bool(USE_SW_INDEX),
     }
 
     try:
@@ -1958,6 +2375,58 @@ def main() -> None:
 
     open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
     week_last_map = complete_week_last_dates(open_dates)
+
+    st.info("正在读取宽基、板块和可用的申万行业指数；无权限的行业指数会自动跳过。")
+    broad_daily, _ = fetch_reference_daily(
+        "index_daily", BROAD_INDEX_CODE, preload_start, market_end,
+        bool(USE_CACHE), float(API_PAUSE),
+    )
+    broad_features = build_reference_feature_frame(
+        broad_daily, week_last_map, "Broad_Index", BROAD_INDEX_CODE,
+        INDEX_NAMES[BROAD_INDEX_CODE],
+    )
+
+    board_feature_frames: list[pd.DataFrame] = []
+    for board, index_code in BOARD_INDEX_CODES.items():
+        reference_daily, _ = fetch_reference_daily(
+            "index_daily", index_code, preload_start, market_end,
+            bool(USE_CACHE), float(API_PAUSE),
+        )
+        feature_frame = build_reference_feature_frame(
+            reference_daily, week_last_map, "Board_Index", index_code,
+            INDEX_NAMES[index_code],
+        )
+        if not feature_frame.empty:
+            feature_frame["Sample_Board"] = board
+            board_feature_frames.append(feature_frame)
+    board_features = (
+        pd.concat(board_feature_frames, ignore_index=True)
+        if board_feature_frames else pd.DataFrame()
+    )
+
+    industry_feature_frames: list[pd.DataFrame] = []
+    if bool(USE_SW_INDEX) and "l1_code" in memberships.columns:
+        industry_catalog = memberships[["l1_code", "l1_name"]].drop_duplicates()
+        for item in industry_catalog.itertuples(index=False):
+            index_code = str(item.l1_code)
+            if not index_code:
+                continue
+            reference_daily, _ = fetch_reference_daily(
+                "sw_daily", index_code, preload_start, market_end,
+                bool(USE_CACHE), float(API_PAUSE),
+            )
+            feature_frame = build_reference_feature_frame(
+                reference_daily, week_last_map, "Industry_Index", index_code,
+                str(item.l1_name),
+            )
+            if not feature_frame.empty:
+                feature_frame["SW_L1_Code"] = index_code
+                industry_feature_frames.append(feature_frame)
+    industry_features = (
+        pd.concat(industry_feature_frames, ignore_index=True)
+        if industry_feature_frames else pd.DataFrame()
+    )
+
     st.write(
         f"完整历史科技池：{len(universe_stocks)}只；分层样本：{len(stocks)}只；"
         f"信号区间：{signal_start}—{signal_end}；"
@@ -1966,6 +2435,7 @@ def main() -> None:
     st.dataframe(style_percent_table(population_summary), use_container_width=True, hide_index=True)
 
     all_records: list[dict[str, Any]] = []
+    context_frames: list[pd.DataFrame] = []
     reject_totals: dict[str, int] = {}
     cache_hits = 0
     data_failures = 0
@@ -1985,6 +2455,17 @@ def main() -> None:
         if daily.empty:
             data_failures += 1
             continue
+        weekly = build_weekly(daily, week_last_map)
+        context = build_sample_context_observations(
+            stock=stock,
+            periods=period_index.get(ts_code, []),
+            weekly=weekly,
+            signal_start=signal_start,
+            signal_end=signal_end,
+            price_tolerance_pct=float(PRICE_TOLERANCE),
+        )
+        if not context.empty:
+            context_frames.append(context)
         records, rejects = analyze_stock(
             stock=stock,
             periods=period_index.get(ts_code, []),
@@ -1994,6 +2475,7 @@ def main() -> None:
             open_dates=open_dates,
             open_pos=open_pos,
             config=config,
+            weekly=weekly,
         )
         all_records.extend(records)
         for reason, count in rejects.items():
@@ -2007,9 +2489,20 @@ def main() -> None:
             st.code("\n".join(API_ERRORS[:50]))
         return
 
+    observations = (
+        pd.concat(context_frames, ignore_index=True)
+        if context_frames else pd.DataFrame()
+    )
     events = pd.DataFrame(all_records).sort_values(
         ["Signal_Date", "ts_code", "Event_Type"]
     ).reset_index(drop=True)
+    events = attach_environment_features(
+        events=events,
+        observations=observations,
+        broad_features=broad_features,
+        board_features=board_features,
+        industry_features=industry_features,
+    )
     summaries = build_all_summaries(events)
     paired = build_paired_comparison(events)
     pair_summary = paired_summary(paired)
@@ -2017,6 +2510,7 @@ def main() -> None:
     cycle_report = build_cycle_report(events)
     cycle_strength_report = build_cycle_strength_report(events)
     checkpoint_report = build_checkpoint_report(events)
+    environment_report = build_environment_report(events)
 
     run_hash = cache_key(
         json.dumps(config, ensure_ascii=False, sort_keys=True), sample_hash,
@@ -2029,6 +2523,7 @@ def main() -> None:
     cycle_path = os.path.join(OUTPUT_DIR, f"weekly_macd_cycles_{run_hash}.csv")
     cycle_strength_path = os.path.join(OUTPUT_DIR, f"weekly_macd_cycle_strength_{run_hash}.csv")
     checkpoint_path = os.path.join(OUTPUT_DIR, f"weekly_macd_checkpoints_{run_hash}.csv")
+    environment_path = os.path.join(OUTPUT_DIR, f"weekly_macd_environment_{run_hash}.csv")
     combined_summaries = []
     for title, frame in summaries.items():
         temp = frame.copy()
@@ -2046,6 +2541,7 @@ def main() -> None:
     atomic_csv(cycle_report, cycle_path)
     atomic_csv(cycle_strength_report, cycle_strength_path)
     atomic_csv(checkpoint_report, checkpoint_path)
+    atomic_csv(environment_report, environment_path)
 
     st.success(
         f"验证完成：事件{len(events)}条；完整八周可交易样本"
@@ -2059,6 +2555,18 @@ def main() -> None:
     c2.metric("完整八周样本", f"{len(full_first):,}")
     c3.metric("下一周继续红柱", f"{pct_mean(first_red['Next_Week_Red']):.2f}%")
     c4.metric("下一周立即翻绿", f"{pct_mean(first_red['Immediate_Green']):.2f}%")
+
+    st.subheader("V4核心：市场、板块、行业与过热阶段")
+    broad_coverage = float(first_red["Broad_Index_Trend"].notna().mean() * 100.0)
+    board_coverage = float(first_red["Board_Index_Trend"].notna().mean() * 100.0)
+    industry_coverage = float(first_red["Industry_Index_Trend"].notna().mean() * 100.0)
+    st.caption(
+        f"环境覆盖率：宽基{broad_coverage:.1f}%，板块{board_coverage:.1f}%，"
+        f"申万行业指数{industry_coverage:.1f}%。行业指数缺失时仍可使用行业广度分组。"
+    )
+    st.dataframe(
+        style_percent_table(environment_report), use_container_width=True, hide_index=True,
+    )
 
     st.subheader("1—3、5：趋势与零轴对第一根红柱的影响")
     st.dataframe(
@@ -2162,7 +2670,7 @@ def main() -> None:
         "下载600只抽样名单", sample_audit.to_csv(index=False, encoding="utf-8-sig"),
         file_name=os.path.basename(sample_path), mime="text/csv",
     )
-    e1, e2, e3 = st.columns(3)
+    e1, e2, e3, e4 = st.columns(4)
     e1.download_button(
         "下载红柱周期CSV", cycle_report.to_csv(index=False, encoding="utf-8-sig"),
         file_name=os.path.basename(cycle_path), mime="text/csv",
@@ -2175,9 +2683,14 @@ def main() -> None:
         "下载第2—5周状态CSV", checkpoint_report.to_csv(index=False, encoding="utf-8-sig"),
         file_name=os.path.basename(checkpoint_path), mime="text/csv",
     )
+    e4.download_button(
+        "下载环境分层CSV", environment_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(environment_path), mime="text/csv",
+    )
 
     st.warning(
         "A/B/C1/C2是事后标签；可以用于发现规律，不能直接当作实时信号。"
+        "环境分组是探索性统计，不会自动选择最优阈值。"
         "600只分层样本适合筛选假设，但一年数据仍只代表一个市场阶段。"
         "任何少于30条的细分样本都只能视为线索；最终规则应再做跨年份样本外验证。"
     )
