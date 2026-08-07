@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线 MACD 假设验证器 V2.0
+周线 MACD 红柱周期验证器 V3.0
 ========================================
 
 研究目的（纯统计，不是选股实盘版）：
@@ -13,6 +13,8 @@
 7. 主板、创业板、科创板等额分层随机抽样，并按股票池实际结构加权。
 8. 对基准组、上升趋势组、回调<30%组及红柱缩短组做稳健性比较。
 9. 模拟 +10%/+20%/+30% 止盈与统一止损后的实际退出收益。
+10. 将第一根红柱后的完整周期事后划分为 A/B/C1/C2，验证哪类利润最大。
+11. 只用当时已知数据记录第2—5周状态，检验能否提前识别弱反弹。
 
 严格口径：
 - 周线信号只使用已经结束的完整周，绝不使用周一至周四的临时周K。
@@ -24,7 +26,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_hypothesis_validator_v2.py
+    streamlit run weekly_macd_hypothesis_validator_v3.py
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V2.0"
+VERSION = "V3.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -70,6 +72,10 @@ TECH_INDUSTRY_KEYWORDS = {
 SAMPLE_BOARDS = ("主板", "创业板", "科创板")
 DEFAULT_SAMPLE_PER_BOARD = 200
 DEFAULT_SAMPLE_SEED = 20260806
+DEFAULT_LONG_CYCLE_MIN_WEEKS = 6
+DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
+DEFAULT_SHORT_STRENGTH_RATIO = 0.50
+CHECKPOINT_WEEKS = (2, 3, 4, 5)
 
 pro = None
 API_ERRORS: list[str] = []
@@ -539,6 +545,132 @@ def pullback_before_first_red(weekly: pd.DataFrame, position: int) -> dict[str, 
     }
 
 
+def material_hist_moves(
+    red_values: list[float],
+    material_change_pct: float,
+) -> dict[str, Any]:
+    """识别有意义的缩短及“缩短后再扩张”，忽略小于阈值的轻微噪声。"""
+    first_shrink_week = np.nan
+    shrink_count = 0
+    reexpansion_count = 0
+    armed_for_reexpansion = False
+    for index in range(1, len(red_values)):
+        previous = float(red_values[index - 1])
+        current = float(red_values[index])
+        if previous <= 0:
+            continue
+        change_pct = (current / previous - 1.0) * 100.0
+        if change_pct <= -material_change_pct:
+            shrink_count += 1
+            if not np.isfinite(first_shrink_week):
+                first_shrink_week = float(index + 1)
+            armed_for_reexpansion = True
+        elif change_pct >= material_change_pct and armed_for_reexpansion:
+            reexpansion_count += 1
+            armed_for_reexpansion = False
+    return {
+        "First_Material_Shrink_Week": first_shrink_week,
+        "Material_Shrink_Count": int(shrink_count),
+        "ReExpansion_Count": int(reexpansion_count),
+    }
+
+
+def build_red_cycle_features(
+    weekly: pd.DataFrame,
+    cycle_start_position: int,
+    long_cycle_min_weeks: int,
+    material_change_pct: float,
+    short_strength_ratio: float,
+) -> dict[str, Any]:
+    """完整红柱周期的事后特征；Cycle_Type 只能用于研究，不能回填到买入日。"""
+    start = int(cycle_start_position)
+    if start < 0 or start >= len(weekly) or float(weekly.iloc[start]["hist"]) <= 0:
+        return {}
+
+    red_end = start
+    while red_end + 1 < len(weekly) and float(weekly.iloc[red_end + 1]["hist"]) > 0:
+        red_end += 1
+    cycle_completed = red_end + 1 < len(weekly) and float(weekly.iloc[red_end + 1]["hist"]) <= 0
+    red_rows = weekly.iloc[start:red_end + 1]
+    red_values = pd.to_numeric(red_rows["hist"], errors="coerce").astype(float).tolist()
+
+    green_start = start - 1
+    while green_start >= 0 and float(weekly.iloc[green_start]["hist"]) <= 0:
+        green_start -= 1
+    previous_green = weekly.iloc[green_start + 1:start]
+    green_values = pd.to_numeric(previous_green.get("hist", pd.Series(dtype=float)), errors="coerce")
+    green_abs_peak = abs(float(green_values.min())) if len(green_values) else np.nan
+    green_abs_area = float(green_values.abs().sum()) if len(green_values) else np.nan
+
+    moves = material_hist_moves(red_values, material_change_pct)
+    cycle_weeks = len(red_values)
+    peak_hist = max(red_values)
+    peak_week = red_values.index(peak_hist) + 1
+    red_area = float(sum(red_values))
+    peak_to_green = (
+        peak_hist / green_abs_peak if np.isfinite(green_abs_peak) and green_abs_peak > 0 else np.nan
+    )
+    area_to_green = (
+        red_area / green_abs_area if np.isfinite(green_abs_area) and green_abs_area > 0 else np.nan
+    )
+    strength_class = (
+        "短小" if np.isfinite(peak_to_green) and peak_to_green < short_strength_ratio
+        else "正常或较强" if np.isfinite(peak_to_green)
+        else "前绿柱不足"
+    )
+
+    if not cycle_completed:
+        cycle_type = "未完成_截至行情末日仍为红柱"
+    elif cycle_weeks == 1:
+        cycle_type = "A_第一根红柱后立即翻绿"
+    elif cycle_weeks < long_cycle_min_weeks:
+        cycle_type = f"B_2至{long_cycle_min_weeks - 1}周短周期"
+    elif moves["ReExpansion_Count"] > 0:
+        cycle_type = "C1_长周期_缩短后再扩张"
+    else:
+        cycle_type = "C2_长周期_单峰扩张后缩短"
+
+    signal_close = float(weekly.iloc[start]["close"])
+    last_red_close = float(red_rows.iloc[-1]["close"])
+    first_green_date = (
+        str(weekly.iloc[red_end + 1]["trade_date"]) if cycle_completed else ""
+    )
+    hist_changes = [
+        (red_values[index] / red_values[index - 1] - 1.0) * 100.0
+        for index in range(1, len(red_values))
+        if red_values[index - 1] > 0
+    ]
+    return {
+        "Cycle_Completed": bool(cycle_completed),
+        "Cycle_Censored": bool(not cycle_completed),
+        "Cycle_Type": cycle_type,
+        "Cycle_Strength_Class": strength_class,
+        "Red_Cycle_Weeks": int(cycle_weeks),
+        "Last_Red_Date": str(red_rows.iloc[-1]["trade_date"]),
+        "First_Green_Date": first_green_date,
+        "Red_Hist_Sequence": "|".join(f"{value:.8f}" for value in red_values),
+        "Red_Hist_Change_Sequence_pct": "|".join(
+            f"{value:.2f}" for value in hist_changes
+        ),
+        "Peak_Red_Hist": float(peak_hist),
+        "Peak_Red_Week": int(peak_week),
+        "Red_Hist_Area": red_area,
+        "PreGreen_Abs_Peak_Hist": green_abs_peak,
+        "PreGreen_Abs_Hist_Area": green_abs_area,
+        "Peak_Red_Hist_to_Close_pct": peak_hist / signal_close * 100.0,
+        "Peak_Red_to_PreGreen_Peak_Ratio": peak_to_green,
+        "Red_Area_to_PreGreen_Area_Ratio": area_to_green,
+        "Cycle_Close_Return_pct": (last_red_close / signal_close - 1.0) * 100.0,
+        "Cycle_Max_High_Return_pct": (
+            float(pd.to_numeric(red_rows["high"], errors="coerce").max()) / signal_close - 1.0
+        ) * 100.0,
+        "Cycle_Min_Low_Return_pct": (
+            float(pd.to_numeric(red_rows["low"], errors="coerce").min()) / signal_close - 1.0
+        ) * 100.0,
+        **moves,
+    }
+
+
 def is_main_board(ts_code: str) -> bool:
     return not ts_code.startswith(("300", "301", "688", "689"))
 
@@ -749,6 +881,164 @@ def evaluate_event_path(
     return empty
 
 
+def checkpoint_state_from_hist(
+    observed_hist: list[float],
+    material_change_pct: float,
+) -> tuple[str, dict[str, Any]]:
+    """只根据截至检查周已经出现的柱体给出实时状态。"""
+    first_green = next((i for i, value in enumerate(observed_hist) if value <= 0), None)
+    if first_green is not None:
+        red_values = observed_hist[:first_green]
+        return f"已翻绿_第{first_green + 1}周", material_hist_moves(red_values, material_change_pct)
+    red_values = observed_hist
+    moves = material_hist_moves(red_values, material_change_pct)
+    if moves["ReExpansion_Count"] > 0:
+        state = "缩短后再扩张"
+    elif moves["Material_Shrink_Count"] > 0:
+        state = "缩短未再扩张"
+    elif len(red_values) >= 2 and red_values[-1] >= red_values[0] * (1.0 + material_change_pct / 100.0):
+        state = "持续扩张"
+    else:
+        state = "红柱平缓延续"
+    return state, moves
+
+
+def build_checkpoint_features(
+    weekly: pd.DataFrame,
+    cycle_start_position: int,
+    daily: pd.DataFrame,
+    path_result: dict[str, Any],
+    open_dates: list[str],
+    open_pos: dict[str, int],
+    stop_threshold_pct: float,
+    material_change_pct: float,
+    short_strength_ratio: float,
+    cycle_features: dict[str, Any],
+) -> dict[str, Any]:
+    """生成第2—5周可实时观察的状态，以及该时点之后的独立结果。"""
+    output: dict[str, Any] = {}
+    start = int(cycle_start_position)
+    pre_green_peak = float(cycle_features.get("PreGreen_Abs_Peak_Hist", np.nan))
+
+    for checkpoint_week in CHECKPOINT_WEEKS:
+        prefix = f"CP_W{checkpoint_week}"
+        position = start + checkpoint_week - 1
+        defaults = {
+            f"{prefix}_Observed": False,
+            f"{prefix}_Date": "",
+            f"{prefix}_State": "未观察到",
+            f"{prefix}_Hist": np.nan,
+            f"{prefix}_Hist_vs_W1_pct": np.nan,
+            f"{prefix}_Peak_to_PreGreen_Ratio": np.nan,
+            f"{prefix}_Material_Shrink_Count": np.nan,
+            f"{prefix}_ReExpansion_Count": np.nan,
+            f"{prefix}_Weak_Candidate": np.nan,
+            f"{prefix}_Return_From_Entry_pct": np.nan,
+            f"{prefix}_Remaining_MFE_pct": np.nan,
+            f"{prefix}_Remaining_MAE_pct": np.nan,
+            f"{prefix}_Remaining_Return_pct": np.nan,
+            f"{prefix}_Stop_Hit_Before": np.nan,
+            f"{prefix}_Remaining_Stop_Hit": np.nan,
+        }
+        for target in (10, 20, 30):
+            defaults[f"{prefix}_T{target}_Still_Open"] = np.nan
+            defaults[f"{prefix}_T{target}_Future_Result"] = ""
+            defaults[f"{prefix}_T{target}_Future_Target_First"] = np.nan
+        output.update(defaults)
+        if position >= len(weekly):
+            continue
+
+        checkpoint_row = weekly.iloc[position]
+        checkpoint_date = str(checkpoint_row["trade_date"])
+        observed = pd.to_numeric(
+            weekly.iloc[start:position + 1]["hist"], errors="coerce"
+        ).astype(float).tolist()
+        state, moves = checkpoint_state_from_hist(observed, material_change_pct)
+        positive_observed = [value for value in observed if value > 0]
+        observed_peak = max(positive_observed) if positive_observed else np.nan
+        peak_ratio = (
+            observed_peak / pre_green_peak
+            if np.isfinite(observed_peak) and np.isfinite(pre_green_peak) and pre_green_peak > 0
+            else np.nan
+        )
+        weak_candidate = bool(
+            state == "缩短未再扩张"
+            and np.isfinite(peak_ratio)
+            and peak_ratio < short_strength_ratio
+        )
+        output.update({
+            f"{prefix}_Observed": True,
+            f"{prefix}_Date": checkpoint_date,
+            f"{prefix}_State": state,
+            f"{prefix}_Hist": float(observed[-1]),
+            f"{prefix}_Hist_vs_W1_pct": (
+                (observed[-1] / observed[0] - 1.0) * 100.0 if observed[0] != 0 else np.nan
+            ),
+            f"{prefix}_Peak_to_PreGreen_Ratio": peak_ratio,
+            f"{prefix}_Material_Shrink_Count": moves["Material_Shrink_Count"],
+            f"{prefix}_ReExpansion_Count": moves["ReExpansion_Count"],
+            f"{prefix}_Weak_Candidate": weak_candidate,
+        })
+
+        if not bool(path_result.get("Tradable", False)):
+            continue
+        entry_date = str(path_result.get("Entry_Date", ""))
+        entry_price = float(path_result.get("Entry_Price", np.nan))
+        if entry_date not in open_pos or checkpoint_date not in open_pos or not np.isfinite(entry_price):
+            continue
+        checkpoint_close = float(checkpoint_row["close"])
+        output[f"{prefix}_Return_From_Entry_pct"] = (
+            checkpoint_close / entry_price - 1.0
+        ) * 100.0
+
+        entry_position = open_pos[entry_date]
+        horizon_position = entry_position + HOLD_TRADING_DAYS - 1
+        if horizon_position >= len(open_dates):
+            continue
+        horizon_date = open_dates[horizon_position]
+        history = daily[
+            (daily["trade_date"] >= entry_date) & (daily["trade_date"] <= checkpoint_date)
+        ].copy().sort_values("trade_date")
+        remaining = daily[
+            (daily["trade_date"] > checkpoint_date) & (daily["trade_date"] <= horizon_date)
+        ].copy().sort_values("trade_date")
+        stop_price = entry_price * (1.0 - stop_threshold_pct / 100.0)
+        output[f"{prefix}_Stop_Hit_Before"] = bool(
+            not history.empty and float(history["low"].min()) <= stop_price
+        )
+        if not remaining.empty:
+            output[f"{prefix}_Remaining_MFE_pct"] = (
+                float(remaining["high"].max()) / checkpoint_close - 1.0
+            ) * 100.0
+            output[f"{prefix}_Remaining_MAE_pct"] = (
+                float(remaining["low"].min()) / checkpoint_close - 1.0
+            ) * 100.0
+            output[f"{prefix}_Remaining_Return_pct"] = (
+                float(remaining.iloc[-1]["close"]) / checkpoint_close - 1.0
+            ) * 100.0
+            output[f"{prefix}_Remaining_Stop_Hit"] = bool(
+                float(remaining["low"].min()) <= stop_price
+            )
+
+        for target in (10, 20, 30):
+            prior_result, _, _ = first_hit_result(
+                history, entry_price, float(target), float(stop_threshold_pct)
+            ) if not history.empty else ("八周均未触发", "", np.nan)
+            still_open = prior_result == "八周均未触发"
+            output[f"{prefix}_T{target}_Still_Open"] = bool(still_open)
+            if still_open and not remaining.empty:
+                future_result, _, _ = first_hit_result(
+                    remaining, entry_price, float(target), float(stop_threshold_pct)
+                )
+                output[f"{prefix}_T{target}_Future_Result"] = future_result
+                output[f"{prefix}_T{target}_Future_Target_First"] = (
+                    future_result == "目标先到"
+                )
+            elif not still_open:
+                output[f"{prefix}_T{target}_Future_Result"] = "此前已退出"
+    return output
+
+
 def signal_market_snapshot(
     basic: pd.DataFrame,
     signal_date: str,
@@ -790,6 +1080,7 @@ def build_event_record(
     *,
     event_type: str,
     cycle_id: str,
+    cycle_start_position: int,
     position: int,
     weekly: pd.DataFrame,
     daily: pd.DataFrame,
@@ -808,6 +1099,9 @@ def build_event_record(
     buy_slippage_pct: float,
     sell_slippage_pct: float,
     stop_threshold_pct: float,
+    long_cycle_min_weeks: int,
+    material_hist_change_pct: float,
+    short_strength_ratio: float,
 ) -> tuple[dict[str, Any] | None, str]:
     row = weekly.iloc[position]
     signal_date = str(row["trade_date"])
@@ -826,6 +1120,13 @@ def build_event_record(
     next_hist = float(weekly.iloc[position + 1]["hist"]) if position + 1 < len(weekly) else np.nan
     next_red = bool(next_hist > 0) if np.isfinite(next_hist) else np.nan
     immediate_green = bool(next_hist <= 0) if np.isfinite(next_hist) else np.nan
+    cycle_features = build_red_cycle_features(
+        weekly=weekly,
+        cycle_start_position=cycle_start_position,
+        long_cycle_min_weeks=long_cycle_min_weeks,
+        material_change_pct=material_hist_change_pct,
+        short_strength_ratio=short_strength_ratio,
+    )
 
     record = {
         "Event_Type": event_type,
@@ -841,6 +1142,8 @@ def build_event_record(
         "SW_L2": membership["l2"],
         "SW_L3": membership["l3"],
         "Signal_Date": signal_date,
+        "Cycle_Start_Signal_Date": str(weekly.iloc[cycle_start_position]["trade_date"]),
+        "Event_Week_In_Cycle": int(position - cycle_start_position + 1),
         "Weekly_Trend": trend_state(row, price_tolerance_pct),
         "Zero_Axis": zero_axis_state(row),
         "Hist": float(row["hist"]),
@@ -858,8 +1161,9 @@ def build_event_record(
         "Immediate_Green": immediate_green,
         **pullback,
         **snapshot,
+        **cycle_features,
     }
-    record.update(evaluate_event_path(
+    path_result = evaluate_event_path(
         daily=daily,
         signal_date=signal_date,
         open_dates=open_dates,
@@ -868,7 +1172,21 @@ def build_event_record(
         sell_slippage_pct=sell_slippage_pct,
         stop_threshold_pct=stop_threshold_pct,
         ts_code=str(stock["ts_code"]),
-    ))
+    )
+    record.update(path_result)
+    if event_type == "第一根红柱":
+        record.update(build_checkpoint_features(
+            weekly=weekly,
+            cycle_start_position=cycle_start_position,
+            daily=daily,
+            path_result=path_result,
+            open_dates=open_dates,
+            open_pos=open_pos,
+            stop_threshold_pct=stop_threshold_pct,
+            material_change_pct=material_hist_change_pct,
+            short_strength_ratio=short_strength_ratio,
+            cycle_features=cycle_features,
+        ))
     return record, ""
 
 
@@ -889,6 +1207,7 @@ def analyze_stock(
     records: list[dict[str, Any]] = []
     rejects: dict[str, int] = {}
     active_cycle_id = ""
+    active_first_red_position = -1
     active_pullback: dict[str, Any] = {}
     first_shrink_emitted = False
 
@@ -906,12 +1225,14 @@ def analyze_stock(
 
         if is_first_red:
             active_cycle_id = f"{stock['ts_code']}|{signal_date}"
+            active_first_red_position = position
             active_pullback = pullback_before_first_red(weekly, position)
             first_shrink_emitted = False
             membership = membership_on_date(periods, signal_date)
             record, reason = build_event_record(
                 event_type="第一根红柱",
                 cycle_id=active_cycle_id,
+                cycle_start_position=active_first_red_position,
                 position=position,
                 weekly=weekly,
                 daily=daily,
@@ -930,6 +1251,9 @@ def analyze_stock(
                 buy_slippage_pct=config["buy_slippage_pct"],
                 sell_slippage_pct=config["sell_slippage_pct"],
                 stop_threshold_pct=config["stop_threshold_pct"],
+                long_cycle_min_weeks=config["long_cycle_min_weeks"],
+                material_hist_change_pct=config["material_hist_change_pct"],
+                short_strength_ratio=config["short_strength_ratio"],
             )
             if record is not None:
                 records.append(record)
@@ -942,6 +1266,7 @@ def analyze_stock(
             record, reason = build_event_record(
                 event_type="红柱首次缩短",
                 cycle_id=active_cycle_id,
+                cycle_start_position=active_first_red_position,
                 position=position,
                 weekly=weekly,
                 daily=daily,
@@ -960,6 +1285,9 @@ def analyze_stock(
                 buy_slippage_pct=config["buy_slippage_pct"],
                 sell_slippage_pct=config["sell_slippage_pct"],
                 stop_threshold_pct=config["stop_threshold_pct"],
+                long_cycle_min_weeks=config["long_cycle_min_weeks"],
+                material_hist_change_pct=config["material_hist_change_pct"],
+                short_strength_ratio=config["short_strength_ratio"],
             )
             if record is not None:
                 records.append(record)
@@ -968,6 +1296,7 @@ def analyze_stock(
 
         if hist <= 0 and not is_first_red:
             active_cycle_id = ""
+            active_first_red_position = -1
             active_pullback = {}
             first_shrink_emitted = False
 
@@ -1261,15 +1590,187 @@ def build_strategy_report(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def cycle_report_row(
+    cycle_type: str,
+    scope_name: str,
+    group: pd.DataFrame,
+    use_population_weights: bool,
+    trend_scope: str = "全部趋势",
+) -> dict[str, Any]:
+    weights = (
+        pd.to_numeric(group["Sample_Weight"], errors="coerce").fillna(1.0)
+        if use_population_weights else pd.Series(1.0, index=group.index)
+    )
+    full = group[group["Tradable"].eq(True) & group["Has_8W_Future"].eq(True)]
+    full_weights = weights.loc[full.index]
+    row: dict[str, Any] = {
+        "周期类型": cycle_type,
+        "趋势范围": trend_scope,
+        "统计口径": scope_name,
+        "周期样本数": int(len(group)),
+        "估算股票池周期数": float(weights.sum()),
+        "完整红柱周期数": int(group["Cycle_Completed"].eq(True).sum()),
+        "八周完整可交易样本": int(len(full)),
+        "红柱周期周数均值": weighted_mean(group["Red_Cycle_Weeks"], weights),
+        "红柱周期周数中位数": weighted_median(group["Red_Cycle_Weeks"], weights),
+        "红柱峰值周中位数": weighted_median(group["Peak_Red_Week"], weights),
+        "红柱峰值/前绿柱峰值中位数": weighted_median(
+            group["Peak_Red_to_PreGreen_Peak_Ratio"], weights
+        ),
+        "红柱面积/前绿柱面积中位数": weighted_median(
+            group["Red_Area_to_PreGreen_Area_Ratio"], weights
+        ),
+        "八周触及止损(%)": weighted_rate(full["Hit_Stop_8W"], full_weights),
+        "八周末平均收益(%)": weighted_mean(full["Return_8W_pct"], full_weights),
+        "八周末收益中位数(%)": weighted_median(full["Return_8W_pct"], full_weights),
+        "八周末10%截尾均值(%)": weighted_trimmed_mean(
+            full["Return_8W_pct"], full_weights
+        ),
+        "八周末去最高3只均值(%)": weighted_top_removed_mean(
+            full["Return_8W_pct"], full_weights, 3
+        ),
+        "最高3只占正收益贡献(%)": top_positive_contribution(
+            full["Return_8W_pct"], full_weights, 3
+        ),
+        "八周末盈利率(%)": weighted_rate(full["Return_8W_pct"].gt(0), full_weights),
+        "八周最大浮盈均值(%)": weighted_mean(full["MFE_8W_pct"], full_weights),
+        "八周最大回撤均值(%)": weighted_mean(full["MAE_8W_pct"], full_weights),
+    }
+    for target in (10, 20, 30):
+        row[f"{target}%先于止损(%)"] = weighted_rate(
+            full[f"First_{target}_vs_Stop"].eq("目标先到"), full_weights
+        )
+        row[f"T{target}退出平均收益(%)"] = weighted_mean(
+            full[f"Exit_T{target}_Return_pct"], full_weights
+        )
+    return row
+
+
+def build_cycle_report(events: pd.DataFrame) -> pd.DataFrame:
+    first_red = events[events["Event_Type"].eq("第一根红柱")].copy()
+    rows: list[dict[str, Any]] = []
+    trend_scopes = [
+        ("全部趋势", first_red),
+        ("仅上升趋势", first_red[first_red["Weekly_Trend"].eq("上升趋势")]),
+    ]
+    for trend_scope, scoped in trend_scopes:
+        for cycle_type, group in scoped.groupby("Cycle_Type", dropna=False, sort=False):
+            label = str(cycle_type)
+            rows.append(cycle_report_row(
+                label, "600只样本等权", group, False, trend_scope
+            ))
+            rows.append(cycle_report_row(
+                label, "按完整股票池板块占比加权", group, True, trend_scope
+            ))
+    return pd.DataFrame(rows)
+
+
+def build_cycle_strength_report(events: pd.DataFrame) -> pd.DataFrame:
+    first_red = events[events["Event_Type"].eq("第一根红柱")].copy()
+    rows: list[dict[str, Any]] = []
+    grouped = first_red.groupby(["Cycle_Type", "Cycle_Strength_Class"], dropna=False, sort=False)
+    for (cycle_type, strength), group in grouped:
+        for scope, weighted in [
+            ("600只样本等权", False),
+            ("按完整股票池板块占比加权", True),
+        ]:
+            row = cycle_report_row(str(cycle_type), scope, group, weighted)
+            row["红柱相对强度"] = str(strength)
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def checkpoint_report_row(
+    checkpoint_week: int,
+    state: str,
+    group: pd.DataFrame,
+    use_population_weights: bool,
+    trend_scope: str = "全部趋势",
+) -> dict[str, Any]:
+    prefix = f"CP_W{checkpoint_week}"
+    weights = (
+        pd.to_numeric(group["Sample_Weight"], errors="coerce").fillna(1.0)
+        if use_population_weights else pd.Series(1.0, index=group.index)
+    )
+    full = group[group["Tradable"].eq(True) & group["Has_8W_Future"].eq(True)]
+    full_weights = weights.loc[full.index]
+    stop_live = full[full[f"{prefix}_Stop_Hit_Before"].eq(False)]
+    stop_live_weights = weights.loc[stop_live.index]
+    row: dict[str, Any] = {
+        "检查周": checkpoint_week,
+        "当周可知状态": state,
+        "趋势范围": trend_scope,
+        "统计口径": "按完整股票池板块占比加权" if use_population_weights else "600只样本等权",
+        "观察样本数": int(len(group)),
+        "八周完整样本数": int(len(full)),
+        "弱反弹候选比例(%)": weighted_rate(full[f"{prefix}_Weak_Candidate"].eq(True), full_weights),
+        "红柱峰值/前绿柱峰值中位数": weighted_median(
+            full[f"{prefix}_Peak_to_PreGreen_Ratio"], full_weights
+        ),
+        "截至当周收益均值(%)": weighted_mean(full[f"{prefix}_Return_From_Entry_pct"], full_weights),
+        "截至当周收益中位数(%)": weighted_median(full[f"{prefix}_Return_From_Entry_pct"], full_weights),
+        "截至当周已触及止损(%)": weighted_rate(
+            full[f"{prefix}_Stop_Hit_Before"].eq(True), full_weights
+        ),
+        "未止损仍存活样本": int(len(stop_live)),
+        "存活样本之后再触及止损(%)": weighted_rate(
+            stop_live[f"{prefix}_Remaining_Stop_Hit"].eq(True), stop_live_weights
+        ),
+        "当周以后最大浮盈均值(%)": weighted_mean(
+            stop_live[f"{prefix}_Remaining_MFE_pct"], stop_live_weights
+        ),
+        "当周以后最大回撤均值(%)": weighted_mean(
+            stop_live[f"{prefix}_Remaining_MAE_pct"], stop_live_weights
+        ),
+        "当周至第八周收益均值(%)": weighted_mean(
+            stop_live[f"{prefix}_Remaining_Return_pct"], stop_live_weights
+        ),
+        "当周至第八周收益中位数(%)": weighted_median(
+            stop_live[f"{prefix}_Remaining_Return_pct"], stop_live_weights
+        ),
+    }
+    for target in (10, 20, 30):
+        open_group = full[full[f"{prefix}_T{target}_Still_Open"].eq(True)]
+        open_weights = weights.loc[open_group.index]
+        known = open_group[open_group[f"{prefix}_T{target}_Future_Target_First"].notna()]
+        known_weights = weights.loc[known.index]
+        row[f"T{target}当周仍持仓样本"] = int(len(open_group))
+        row[f"T{target}此后目标先于止损(%)"] = weighted_rate(
+            known[f"{prefix}_T{target}_Future_Target_First"].eq(True), known_weights
+        )
+    return row
+
+
+def build_checkpoint_report(events: pd.DataFrame) -> pd.DataFrame:
+    first_red = events[events["Event_Type"].eq("第一根红柱")].copy()
+    rows: list[dict[str, Any]] = []
+    trend_scopes = [
+        ("全部趋势", first_red),
+        ("仅上升趋势", first_red[first_red["Weekly_Trend"].eq("上升趋势")]),
+    ]
+    for trend_scope, scoped in trend_scopes:
+        for checkpoint_week in CHECKPOINT_WEEKS:
+            prefix = f"CP_W{checkpoint_week}"
+            observed = scoped[scoped[f"{prefix}_Observed"].eq(True)]
+            for state, group in observed.groupby(f"{prefix}_State", dropna=False, sort=False):
+                rows.append(checkpoint_report_row(
+                    checkpoint_week, str(state), group, False, trend_scope
+                ))
+                rows.append(checkpoint_report_row(
+                    checkpoint_week, str(state), group, True, trend_scope
+                ))
+    return pd.DataFrame(rows)
+
+
 # -----------------------------------------------------------------------------
 # Streamlit 页面
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线MACD假设验证器 V2.0", layout="wide")
-    st.title("周线MACD假设验证器 V2.0")
+    st.set_page_config(page_title="周线MACD红柱周期验证器 V3.0", layout="wide")
+    st.title("周线MACD红柱周期验证器 V3.0")
     st.caption(
-        "分板块固定随机抽样，验证周线状态、未来八周路径和固定止损止盈退出结果。"
+        "在V2分层样本基础上，验证完整红柱周期A/B/C1/C2，以及第2—5周可实时识别的状态。"
     )
 
     with st.sidebar:
@@ -1314,6 +1815,23 @@ def main() -> None:
             value=0.20, step=0.05,
         )
 
+        st.header("红柱周期定义")
+        LONG_CYCLE_MIN_WEEKS = st.number_input(
+            "长红柱周期最少周数", min_value=3, max_value=12,
+            value=DEFAULT_LONG_CYCLE_MIN_WEEKS, step=1,
+            help="默认6周：1周=A，2—5周=B，6周及以上再区分C1/C2。",
+        )
+        MATERIAL_HIST_CHANGE = st.number_input(
+            "有效缩短/扩张幅度(%)", min_value=1.0, max_value=50.0,
+            value=DEFAULT_MATERIAL_HIST_CHANGE_PCT, step=1.0,
+            help="柱体相对上周变化不足该幅度视为噪声；默认10%。",
+        )
+        SHORT_STRENGTH_RATIO = st.number_input(
+            "短小红柱阈值（红峰/前绿峰）", min_value=0.05, max_value=2.0,
+            value=DEFAULT_SHORT_STRENGTH_RATIO, step=0.05,
+            help="默认0.5：红柱峰值不到前一轮绿柱绝对峰值的一半，标记为短小。",
+        )
+
         st.header("数据与缓存")
         USE_CACHE = st.checkbox("使用逐股票缓存", value=True)
         API_PAUSE = st.number_input(
@@ -1330,7 +1848,7 @@ def main() -> None:
         st.info("请输入Tushare Token。默认抽取三个板块各200只，共约600只。")
         return
 
-    if not st.button("开始600只分层验证", type="primary"):
+    if not st.button("开始600只红柱周期验证", type="primary"):
         with st.expander("本程序的关键统计口径"):
             st.markdown(
                 """
@@ -1341,6 +1859,8 @@ def main() -> None:
                 - **回调深度**：绿柱段最低价相对绿柱开始前最多四周最高价的跌幅。
                 - **实际买点**：信号周结束后的下一市场交易日开盘。
                 - **退出模拟**：跳空穿越止损按开盘价；同日双触发保守按止损；计入买卖滑点，不含佣金和印花税。
+                - **A/B/C1/C2**：完整周期结束后才知道，只用于验证形态与收益关系，绝不作为买入日条件。
+                - **第2—5周状态**：每个检查点只使用当时已经完成的周线柱，后续收益从检查点以后单独计算。
                 """
             )
         return
@@ -1375,6 +1895,9 @@ def main() -> None:
         "sell_slippage_pct": float(SELL_SLIPPAGE),
         "sample_per_board": int(SAMPLE_PER_BOARD),
         "sample_seed": int(SAMPLE_SEED),
+        "long_cycle_min_weeks": int(LONG_CYCLE_MIN_WEEKS),
+        "material_hist_change_pct": float(MATERIAL_HIST_CHANGE),
+        "short_strength_ratio": float(SHORT_STRENGTH_RATIO),
     }
 
     try:
@@ -1469,6 +1992,9 @@ def main() -> None:
     paired = build_paired_comparison(events)
     pair_summary = paired_summary(paired)
     strategy_report = build_strategy_report(events)
+    cycle_report = build_cycle_report(events)
+    cycle_strength_report = build_cycle_strength_report(events)
+    checkpoint_report = build_checkpoint_report(events)
 
     run_hash = cache_key(
         json.dumps(config, ensure_ascii=False, sort_keys=True), sample_hash,
@@ -1478,6 +2004,9 @@ def main() -> None:
     summary_path = os.path.join(OUTPUT_DIR, f"weekly_macd_summary_{run_hash}.csv")
     paired_path = os.path.join(OUTPUT_DIR, f"weekly_macd_paired_{run_hash}.csv")
     strategy_path = os.path.join(OUTPUT_DIR, f"weekly_macd_strategy_{run_hash}.csv")
+    cycle_path = os.path.join(OUTPUT_DIR, f"weekly_macd_cycles_{run_hash}.csv")
+    cycle_strength_path = os.path.join(OUTPUT_DIR, f"weekly_macd_cycle_strength_{run_hash}.csv")
+    checkpoint_path = os.path.join(OUTPUT_DIR, f"weekly_macd_checkpoints_{run_hash}.csv")
     combined_summaries = []
     for title, frame in summaries.items():
         temp = frame.copy()
@@ -1492,6 +2021,9 @@ def main() -> None:
     atomic_csv(summary_export, summary_path)
     atomic_csv(paired, paired_path)
     atomic_csv(strategy_report, strategy_path)
+    atomic_csv(cycle_report, cycle_path)
+    atomic_csv(cycle_strength_report, cycle_strength_path)
+    atomic_csv(checkpoint_report, checkpoint_path)
 
     st.success(
         f"验证完成：事件{len(events)}条；完整八周可交易样本"
@@ -1542,6 +2074,27 @@ def main() -> None:
         style_percent_table(strategy_report), use_container_width=True, hide_index=True,
     )
 
+    st.subheader("红柱完整周期A/B/C1/C2：事后验证")
+    st.warning(
+        "周期类型必须等到红柱转绿后才能确定，只能回答哪种形态历史利润最大，"
+        "不能直接用于第一根红柱当天选股。未完成周期单独标记，避免把长周期误删。"
+    )
+    st.dataframe(style_percent_table(cycle_report), use_container_width=True, hide_index=True)
+
+    st.subheader("周期类型 × 红柱相对强度")
+    st.dataframe(
+        style_percent_table(cycle_strength_report), use_container_width=True, hide_index=True,
+    )
+
+    st.subheader("第2—5周实时状态：无未来数据")
+    st.caption(
+        "仅统计在相应止盈/止损方案下截至检查周仍未退出的股票，"
+        "再观察检查周之后目标先于止损的概率。"
+    )
+    st.dataframe(
+        style_percent_table(checkpoint_report), use_container_width=True, hide_index=True,
+    )
+
     st.subheader("逐周收益路径")
     full_events = events[events["Tradable"].eq(True) & events["Has_8W_Future"].eq(True)]
     weekly_rows = []
@@ -1587,8 +2140,22 @@ def main() -> None:
         "下载600只抽样名单", sample_audit.to_csv(index=False, encoding="utf-8-sig"),
         file_name=os.path.basename(sample_path), mime="text/csv",
     )
+    e1, e2, e3 = st.columns(3)
+    e1.download_button(
+        "下载红柱周期CSV", cycle_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(cycle_path), mime="text/csv",
+    )
+    e2.download_button(
+        "下载周期强度CSV", cycle_strength_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(cycle_strength_path), mime="text/csv",
+    )
+    e3.download_button(
+        "下载第2—5周状态CSV", checkpoint_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(checkpoint_path), mime="text/csv",
+    )
 
     st.warning(
+        "A/B/C1/C2是事后标签；可以用于发现规律，不能直接当作实时信号。"
         "600只分层样本适合筛选假设，但一年数据仍只代表一个市场阶段。"
         "任何少于30条的细分样本都只能视为线索；最终规则应再做跨年份样本外验证。"
     )
