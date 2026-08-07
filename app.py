@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线 MACD 红柱周期验证器 V3.0
+周线 MACD 红柱周期验证器 V3.1
 ========================================
 
 研究目的（纯统计，不是选股实盘版）：
@@ -15,6 +15,7 @@
 9. 模拟 +10%/+20%/+30% 止盈与统一止损后的实际退出收益。
 10. 将第一根红柱后的完整周期事后划分为 A/B/C1/C2，验证哪类利润最大。
 11. 只用当时已知数据记录第2—5周状态，检验能否提前识别弱反弹。
+12. 信号截止日与行情截止日分离：股票池和信号严格停在前者，后者仅用于观察未来结果。
 
 严格口径：
 - 周线信号只使用已经结束的完整周，绝不使用周一至周四的临时周K。
@@ -26,7 +27,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_hypothesis_validator_v3.py
+    streamlit run weekly_macd_hypothesis_validator_v3_1.py
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V3.0"
+VERSION = "V3.1"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -91,6 +92,19 @@ def normalize_date(value: Any, default: str = "") -> str:
     if text.endswith(".0"):
         text = text[:-2]
     return text[:8] if len(text) >= 8 and text[:8].isdigit() else default
+
+
+def validate_research_dates(
+    signal_start_date: date,
+    signal_end_date: date,
+    market_end_date: date,
+) -> str:
+    """返回日期配置错误；空字符串表示配置有效。"""
+    if signal_start_date >= signal_end_date:
+        return "信号开始日期必须早于信号截止日期"
+    if market_end_date <= signal_end_date:
+        return "行情截止日期必须晚于信号截止日期"
+    return ""
 
 
 def record_error(message: str) -> None:
@@ -1088,8 +1102,8 @@ def build_event_record(
     stock: pd.Series,
     membership: dict[str, str],
     pullback: dict[str, Any],
-    event_start: str,
-    event_end: str,
+    signal_start: str,
+    signal_end: str,
     open_dates: list[str],
     open_pos: dict[str, int],
     price_tolerance_pct: float,
@@ -1105,7 +1119,7 @@ def build_event_record(
 ) -> tuple[dict[str, Any] | None, str]:
     row = weekly.iloc[position]
     signal_date = str(row["trade_date"])
-    if signal_date < event_start or signal_date > event_end:
+    if signal_date < signal_start or signal_date > signal_end:
         return None, "事件不在研究区间"
     if not (str(stock["list_date"]) <= signal_date < str(stock["delist_date"])):
         return None, "当时未上市或已退市"
@@ -1240,8 +1254,8 @@ def analyze_stock(
                 stock=stock,
                 membership=membership,
                 pullback=active_pullback,
-                event_start=config["event_start"],
-                event_end=config["event_end"],
+                signal_start=config["signal_start"],
+                signal_end=config["signal_end"],
                 open_dates=open_dates,
                 open_pos=open_pos,
                 price_tolerance_pct=config["price_tolerance_pct"],
@@ -1274,8 +1288,8 @@ def analyze_stock(
                 stock=stock,
                 membership=membership,
                 pullback=active_pullback,
-                event_start=config["event_start"],
-                event_end=config["event_end"],
+                signal_start=config["signal_start"],
+                signal_end=config["signal_end"],
                 open_dates=open_dates,
                 open_pos=open_pos,
                 price_tolerance_pct=config["price_tolerance_pct"],
@@ -1767,18 +1781,21 @@ def build_checkpoint_report(events: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线MACD红柱周期验证器 V3.0", layout="wide")
-    st.title("周线MACD红柱周期验证器 V3.0")
+    st.set_page_config(page_title="周线MACD红柱周期验证器 V3.1", layout="wide")
+    st.title("周线MACD红柱周期验证器 V3.1")
     st.caption(
-        "在V2分层样本基础上，验证完整红柱周期A/B/C1/C2，以及第2—5周可实时识别的状态。"
+        "信号截止日与行情截止日完全分离，用历史信号做无遗漏的八周样本外验证。"
     )
 
     with st.sidebar:
         st.header("研究区间")
-        default_start = date.today() - timedelta(days=365)
-        EVENT_START_DATE = st.date_input("信号开始日期", value=default_start)
-        EVENT_END_DATE = st.date_input("行情截止日期", value=date.today())
-        st.caption("截止日期应至少晚于最后研究信号40个交易日，否则末端事件只统计次周状态。")
+        SIGNAL_START_DATE = st.date_input("信号开始日期", value=date(2024, 8, 7))
+        SIGNAL_END_DATE = st.date_input("信号截止日期", value=date(2025, 8, 7))
+        MARKET_END_DATE = st.date_input("行情数据截止日期", value=date(2026, 2, 28))
+        st.caption(
+            "默认验证2024-08-07至2025-08-07的信号；行情延长至2026-02-28，"
+            "只用于计算后续八周收益和完成红柱周期，不会生成新的研究信号。"
+        )
 
         st.header("历史股票池口径")
         MIN_PRICE = st.number_input("信号日最低股价(元)", min_value=0.0, value=20.0, step=1.0)
@@ -1848,7 +1865,7 @@ def main() -> None:
         st.info("请输入Tushare Token。默认抽取三个板块各200只，共约600只。")
         return
 
-    if not st.button("开始600只红柱周期验证", type="primary"):
+    if not st.button("开始600只V3.1样本外验证", type="primary"):
         with st.expander("本程序的关键统计口径"):
             st.markdown(
                 """
@@ -1875,16 +1892,21 @@ def main() -> None:
     except Exception:
         pass
 
-    event_start = EVENT_START_DATE.strftime("%Y%m%d")
-    event_end = EVENT_END_DATE.strftime("%Y%m%d")
-    if event_start >= event_end:
-        st.error("信号开始日期必须早于行情截止日期")
+    date_error = validate_research_dates(
+        SIGNAL_START_DATE, SIGNAL_END_DATE, MARKET_END_DATE
+    )
+    if date_error:
+        st.error(date_error)
         return
-    preload_start = (EVENT_START_DATE - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    signal_start = SIGNAL_START_DATE.strftime("%Y%m%d")
+    signal_end = SIGNAL_END_DATE.strftime("%Y%m%d")
+    market_end = MARKET_END_DATE.strftime("%Y%m%d")
+    preload_start = (SIGNAL_START_DATE - timedelta(days=3 * 365)).strftime("%Y%m%d")
 
     config = {
-        "event_start": event_start,
-        "event_end": event_end,
+        "signal_start": signal_start,
+        "signal_end": signal_end,
+        "market_end": market_end,
         "preload_start": preload_start,
         "min_price": float(MIN_PRICE),
         "min_mv": float(MIN_MV),
@@ -1902,7 +1924,7 @@ def main() -> None:
 
     try:
         with st.spinner("正在加载交易日历、历史股票池和申万历史成分..."):
-            open_dates = load_trade_calendar(preload_start, event_end)
+            open_dates = load_trade_calendar(preload_start, market_end)
             stock_basic = load_stock_basic()
             memberships = load_sw_tech_memberships(float(API_PAUSE))
     except Exception as exc:
@@ -1916,7 +1938,7 @@ def main() -> None:
     stocks, sample_audit, population_summary = build_stratified_sample(
         stocks=universe_stocks,
         period_index=period_index,
-        reference_date=event_end,
+        reference_date=signal_end,
         per_board=int(SAMPLE_PER_BOARD),
         seed=int(SAMPLE_SEED),
     )
@@ -1938,8 +1960,8 @@ def main() -> None:
     week_last_map = complete_week_last_dates(open_dates)
     st.write(
         f"完整历史科技池：{len(universe_stocks)}只；分层样本：{len(stocks)}只；"
-        f"信号区间：{event_start}—{event_end}；"
-        f"行情预热起点：{preload_start}。"
+        f"信号区间：{signal_start}—{signal_end}；"
+        f"行情结果观察至：{market_end}；行情预热起点：{preload_start}。"
     )
     st.dataframe(style_percent_table(population_summary), use_container_width=True, hide_index=True)
 
@@ -1957,7 +1979,7 @@ def main() -> None:
             f"已产生事件 {len(all_records)} 条；缓存命中 {cache_hits}；行情失败 {data_failures}"
         )
         daily, basic, cache_hit = fetch_stock_history(
-            ts_code, preload_start, event_end, bool(USE_CACHE), float(API_PAUSE)
+            ts_code, preload_start, market_end, bool(USE_CACHE), float(API_PAUSE)
         )
         cache_hits += int(cache_hit)
         if daily.empty:
