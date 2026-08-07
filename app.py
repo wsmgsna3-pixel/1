@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-周线 MACD 市场环境验证器 V4.0
+周线 MACD 第一根红柱策略验证器 V5.0
 ========================================
 
-研究目的（纯统计，不是选股实盘版）：
+研究目的（冻结阈值后的策略验证版）：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30% 的概率。
 3. 第一根红柱买入 vs 同一红柱周期第一次红柱缩短买入。
@@ -18,6 +18,11 @@
 12. 信号截止日与行情截止日分离：股票池和信号严格停在前者，后者仅用于观察未来结果。
 13. 加入宽基、对应板块、申万一级行业指数的信号日周线状态。
 14. 加入样本市场/板块/行业广度、相对强度、过热程度与同周信号拥挤度。
+15. 按宽基与板块六项过热事实计分，0—1分为A级、2—3分为B级、4分以上禁入。
+16. A严格模式与A+B平衡模式分别按信号日排序，每个信号周最多选3只。
+17. 同时模拟-10%/-12%/-15%止损与+10%/+20%/+30%止盈。
+18. 对比固定退出和“第5周红柱缩短且未再扩张则收盘退出”。
+19. 输出预先登记的预测区间与实际结果对照，避免事后移动阈值。
 
 严格口径：
 - 周线信号只使用已经结束的完整周，绝不使用周一至周四的临时周K。
@@ -29,7 +34,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_environment_validator_v4.py
+    streamlit run weekly_macd_strategy_validator_v5.py
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V4.0"
+VERSION = "V5.0"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -79,6 +84,17 @@ DEFAULT_LONG_CYCLE_MIN_WEEKS = 6
 DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
+
+# V5冻结参数：这些阈值来自V4的两段年度研究，V5不得根据单次结果自动优化。
+V5_MAX_PICKS_PER_WEEK = 3
+V5_STOP_LEVELS = (10, 12, 15)
+V5_TARGET_LEVELS = (10, 20, 30)
+V5_HEAT_RETURN_26W_PCT = 20.0
+V5_HEAT_DIST_MA20_PCT = 5.0
+V5_HEAT_BREADTH_PCT = 70.0
+V5_RELATIVE_STRENGTH_LOW = 10.0
+V5_RELATIVE_STRENGTH_HIGH = 25.0
+V5_DEEP_PULLBACK_PCT = 30.0
 
 BROAD_INDEX_CODE = "000852.SH"  # 中证1000：科技样本整体市场环境代理
 BOARD_INDEX_CODES = {
@@ -958,6 +974,126 @@ def simulate_fixed_exit(
     }
 
 
+def simulate_week5_exit(
+    future: pd.DataFrame,
+    entry_price: float,
+    target_pct: float,
+    stop_pct: float,
+    checkpoint_date: str,
+    checkpoint_state: str,
+    sell_slippage_pct: float = 0.0,
+) -> dict[str, Any]:
+    """固定止盈止损之上，增加冻结的第5周弱化退出规则。"""
+    fixed = simulate_fixed_exit(
+        future, entry_price, target_pct, stop_pct, sell_slippage_pct
+    )
+    should_exit = checkpoint_state == "缩短未再扩张" and bool(checkpoint_date)
+    if not should_exit:
+        return fixed
+
+    through_checkpoint = future[
+        future["trade_date"].astype(str).le(str(checkpoint_date))
+    ].copy().sort_values("trade_date")
+    if through_checkpoint.empty:
+        return fixed
+
+    barrier_result = simulate_fixed_exit(
+        through_checkpoint, entry_price, target_pct, stop_pct, sell_slippage_pct
+    )
+    if barrier_result["reason"] != "八周到期":
+        return barrier_result
+
+    last = through_checkpoint.iloc[-1]
+    exit_price = float(last["close"]) * (1.0 - sell_slippage_pct / 100.0)
+    return {
+        "date": str(last["trade_date"]),
+        "price": exit_price,
+        "return_pct": (exit_price / entry_price - 1.0) * 100.0,
+        "holding_days": float(len(through_checkpoint)),
+        "reason": "W5缩短未扩张退出",
+    }
+
+
+def build_v5_exit_grid(
+    *,
+    daily: pd.DataFrame,
+    path_result: dict[str, Any],
+    checkpoint_features: dict[str, Any],
+    open_dates: list[str],
+    open_pos: dict[str, int],
+    sell_slippage_pct: float,
+) -> dict[str, Any]:
+    """生成3档止损 × 3档止盈 × 固定/W5动态两种退出的可执行结果。"""
+    output: dict[str, Any] = {
+        "V5_W5_State": str(checkpoint_features.get("CP_W5_State", "未观察到")),
+        "V5_W5_Date": str(checkpoint_features.get("CP_W5_Date", "")),
+    }
+    for stop in V5_STOP_LEVELS:
+        output[f"V5_S{stop}_Survived_8W"] = np.nan
+        for target in V5_TARGET_LEVELS:
+            for variant in ("Fixed", "W5"):
+                prefix = f"V5_S{stop}_T{target}_{variant}"
+                output[f"{prefix}_Exit_Date"] = ""
+                output[f"{prefix}_Exit_Price"] = np.nan
+                output[f"{prefix}_Return_pct"] = np.nan
+                output[f"{prefix}_Holding_Days"] = np.nan
+                output[f"{prefix}_Reason"] = ""
+
+    if not bool(path_result.get("Tradable", False)):
+        return output
+    if not bool(path_result.get("Has_8W_Future", False)):
+        return output
+    entry_date = str(path_result.get("Entry_Date", ""))
+    entry_price = float(path_result.get("Entry_Price", np.nan))
+    if entry_date not in open_pos or not np.isfinite(entry_price):
+        return output
+    entry_position = open_pos[entry_date]
+    horizon_position = entry_position + HOLD_TRADING_DAYS - 1
+    if horizon_position >= len(open_dates):
+        return output
+    horizon_date = open_dates[horizon_position]
+    future = daily[
+        daily["trade_date"].astype(str).between(entry_date, horizon_date)
+    ].copy().sort_values("trade_date")
+    if future.empty:
+        return output
+
+    checkpoint_date = str(checkpoint_features.get("CP_W5_Date", ""))
+    checkpoint_state = str(checkpoint_features.get("CP_W5_State", "未观察到"))
+    min_low = float(pd.to_numeric(future["low"], errors="coerce").min())
+    for stop in V5_STOP_LEVELS:
+        output[f"V5_S{stop}_Survived_8W"] = bool(
+            min_low > entry_price * (1.0 - float(stop) / 100.0)
+        )
+        for target in V5_TARGET_LEVELS:
+            results = {
+                "Fixed": simulate_fixed_exit(
+                    future, entry_price, float(target), float(stop), sell_slippage_pct
+                ),
+                "W5": simulate_week5_exit(
+                    future=future,
+                    entry_price=entry_price,
+                    target_pct=float(target),
+                    stop_pct=float(stop),
+                    checkpoint_date=checkpoint_date,
+                    checkpoint_state=checkpoint_state,
+                    sell_slippage_pct=sell_slippage_pct,
+                ),
+            }
+            for variant, result in results.items():
+                if result["date"] in open_pos:
+                    result["holding_days"] = float(
+                        open_pos[result["date"]] - entry_position + 1
+                    )
+                prefix = f"V5_S{stop}_T{target}_{variant}"
+                output[f"{prefix}_Exit_Date"] = result["date"]
+                output[f"{prefix}_Exit_Price"] = result["price"]
+                output[f"{prefix}_Return_pct"] = result["return_pct"]
+                output[f"{prefix}_Holding_Days"] = result["holding_days"]
+                output[f"{prefix}_Reason"] = result["reason"]
+    return output
+
+
 def path_on_or_before(daily: pd.DataFrame, checkpoint: str, entry_date: str) -> float:
     subset = daily[(daily["trade_date"] >= entry_date) & (daily["trade_date"] <= checkpoint)]
     return float(subset.iloc[-1]["close"]) if not subset.empty else np.nan
@@ -1396,7 +1532,7 @@ def build_event_record(
         if np.isfinite(entry_price) and float(row["close"]) > 0 else np.nan
     )
     if event_type == "第一根红柱":
-        record.update(build_checkpoint_features(
+        checkpoint_features = build_checkpoint_features(
             weekly=weekly,
             cycle_start_position=cycle_start_position,
             daily=daily,
@@ -1407,6 +1543,15 @@ def build_event_record(
             material_change_pct=material_hist_change_pct,
             short_strength_ratio=short_strength_ratio,
             cycle_features=cycle_features,
+        )
+        record.update(checkpoint_features)
+        record.update(build_v5_exit_grid(
+            daily=daily,
+            path_result=path_result,
+            checkpoint_features=checkpoint_features,
+            open_dates=open_dates,
+            open_pos=open_pos,
+            sell_slippage_pct=float(sell_slippage_pct),
         ))
     return record, ""
 
@@ -2186,14 +2331,303 @@ def build_environment_report(events: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
+# V5冻结策略：过热评分、最多3只与退出网格
+# -----------------------------------------------------------------------------
+def attach_v5_scores_and_selection(events: pd.DataFrame) -> pd.DataFrame:
+    result = events.copy()
+    required = {
+        "宽基26周涨幅过热": ("Broad_Index_Return_26W_pct", V5_HEAT_RETURN_26W_PCT),
+        "宽基偏离MA20过热": ("Broad_Index_Dist_MA20_pct", V5_HEAT_DIST_MA20_PCT),
+        "市场广度过热": ("Market_Breadth_Above_MA20_pct", V5_HEAT_BREADTH_PCT),
+        "板块26周涨幅过热": ("Board_Index_Return_26W_pct", V5_HEAT_RETURN_26W_PCT),
+        "板块偏离MA20过热": ("Board_Index_Dist_MA20_pct", V5_HEAT_DIST_MA20_PCT),
+        "板块广度过热": ("Board_Breadth_Above_MA20_pct", V5_HEAT_BREADTH_PCT),
+    }
+    flag_columns: list[str] = []
+    available = pd.Series(True, index=result.index)
+    for label, (source, threshold) in required.items():
+        values = numeric_column(result, source)
+        column = f"V5_{label}"
+        result[column] = values.ge(threshold).where(values.notna(), np.nan)
+        flag_columns.append(column)
+        available &= values.notna()
+
+    flag_values = result[flag_columns].fillna(False).astype(int)
+    result["V5_Overheat_Score"] = flag_values.sum(axis=1).where(available, np.nan)
+    result["V5_Grade"] = np.select(
+        [
+            result["V5_Overheat_Score"].le(1),
+            result["V5_Overheat_Score"].between(2, 3, inclusive="both"),
+            result["V5_Overheat_Score"].ge(4),
+        ],
+        ["A_严格候选", "B_平衡候选", "C_过热禁入"],
+        default="环境缺失",
+    )
+    excess = numeric_column(result, "Stock_Excess_vs_Board_13W_pct")
+    result["V5_Relative_10_25"] = excess.between(
+        V5_RELATIVE_STRENGTH_LOW,
+        V5_RELATIVE_STRENGTH_HIGH,
+        inclusive="left",
+    )
+    result["V5_Relative_Distance_17_5"] = (excess - 17.5).abs()
+    result["V5_Deep_Pullback"] = numeric_column(
+        result, "Pullback_Depth_pct"
+    ).ge(V5_DEEP_PULLBACK_PCT)
+
+    first_red = result["Event_Type"].eq("第一根红柱")
+    tradable = result["Tradable"].eq(True)
+    for mode, max_score in (("A", 1), ("AB", 3)):
+        rank_column = f"V5_{mode}_Rank"
+        selected_column = f"V5_{mode}_Selected"
+        result[rank_column] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+        result[selected_column] = False
+        eligible = result[
+            first_red & tradable & result["V5_Overheat_Score"].le(max_score)
+        ].copy()
+        if eligible.empty:
+            continue
+        eligible = eligible.sort_values(
+            [
+                "Signal_Date", "V5_Overheat_Score", "V5_Relative_10_25",
+                "V5_Relative_Distance_17_5", "Pullback_Depth_pct", "ts_code",
+            ],
+            ascending=[True, True, False, True, False, True],
+            kind="mergesort",
+        )
+        eligible[rank_column] = eligible.groupby("Signal_Date").cumcount() + 1
+        result.loc[eligible.index, rank_column] = eligible[rank_column].astype("Int64")
+        chosen = eligible[eligible[rank_column].le(V5_MAX_PICKS_PER_WEEK)]
+        result.loc[chosen.index, selected_column] = True
+    return result
+
+
+def v5_weight_series(group: pd.DataFrame, population_weighted: bool) -> pd.Series:
+    if population_weighted:
+        return pd.to_numeric(group["Sample_Weight"], errors="coerce").fillna(1.0)
+    return pd.Series(1.0, index=group.index)
+
+
+def build_v5_heat_report(events: pd.DataFrame) -> pd.DataFrame:
+    full = events[
+        events["Event_Type"].eq("第一根红柱")
+        & events["Tradable"].eq(True)
+        & events["Has_8W_Future"].eq(True)
+        & events["V5_Overheat_Score"].notna()
+    ].copy()
+    rows: list[dict[str, Any]] = []
+    groups: list[tuple[str, pd.DataFrame]] = []
+    for score, group in full.groupby("V5_Overheat_Score", sort=True):
+        groups.append((f"过热{int(score)}分", group))
+    groups.extend([
+        ("A_0至1分", full[full["V5_Overheat_Score"].le(1)]),
+        ("B_2至3分", full[full["V5_Overheat_Score"].between(2, 3)]),
+        ("C_4分以上", full[full["V5_Overheat_Score"].ge(4)]),
+    ])
+    for label, group in groups:
+        if group.empty:
+            continue
+        for weighted in (False, True):
+            weights = v5_weight_series(group, weighted)
+            row: dict[str, Any] = {
+                "过热分组": label,
+                "统计口径": "按完整股票池板块占比加权" if weighted else "600只样本等权",
+                "样本数": int(len(group)),
+                "股票数": int(group["ts_code"].nunique()),
+                "信号周数": int(group["Signal_Date"].nunique()),
+                "估算股票池信号数": float(weights.sum()),
+                "八周收益均值(%)": weighted_mean(group["Return_8W_pct"], weights),
+                "八周收益中位数(%)": weighted_median(group["Return_8W_pct"], weights),
+                "八周10%截尾均值(%)": weighted_trimmed_mean(group["Return_8W_pct"], weights),
+                "去最高3只均值(%)": weighted_top_removed_mean(
+                    group["Return_8W_pct"], weights, 3
+                ),
+                "最高3只占正收益贡献(%)": top_positive_contribution(
+                    group["Return_8W_pct"], weights, 3
+                ),
+            }
+            for stop in V5_STOP_LEVELS:
+                row[f"-{stop}%止损存活率(%)"] = weighted_rate(
+                    group[f"V5_S{stop}_Survived_8W"].eq(True), weights
+                )
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def v5_strategy_row(
+    *,
+    mode: str,
+    group: pd.DataFrame,
+    stop: int,
+    target: int,
+    variant: str,
+    total_signal_weeks: int,
+    population_weighted: bool,
+) -> dict[str, Any]:
+    weights = v5_weight_series(group, population_weighted)
+    prefix = f"V5_S{stop}_T{target}_{variant}"
+    returns = pd.to_numeric(group[f"{prefix}_Return_pct"], errors="coerce")
+    reasons = group[f"{prefix}_Reason"].fillna("").astype(str)
+    active_weeks = int(group["Signal_Date"].nunique())
+    return {
+        "模式": mode,
+        "退出规则": "固定止盈止损" if variant == "Fixed" else "第5周缩短未扩张退出",
+        "止损(%)": -float(stop),
+        "止盈(%)": float(target),
+        "统计口径": "按完整股票池板块占比加权" if population_weighted else "600只样本等权",
+        "入选样本数": int(len(group)),
+        "估算股票池入选数": float(weights.sum()),
+        "股票数": int(group["ts_code"].nunique()),
+        "有信号周数": active_weeks,
+        "完整研究周数": int(total_signal_weeks),
+        "无入选信号周数": max(int(total_signal_weeks) - active_weeks, 0),
+        "每个有信号周平均入选数": len(group) / active_weeks if active_weeks else np.nan,
+        "八周不触及该止损(%)": weighted_rate(
+            group[f"V5_S{stop}_Survived_8W"].eq(True), weights
+        ),
+        "目标止盈退出率(%)": weighted_rate(reasons.str.contains("止盈"), weights),
+        "止损退出率(%)": weighted_rate(reasons.str.contains("止损"), weights),
+        "第5周条件退出率(%)": weighted_rate(
+            reasons.eq("W5缩短未扩张退出"), weights
+        ),
+        "八周到期退出率(%)": weighted_rate(reasons.eq("八周到期"), weights),
+        "策略平均收益(%)": weighted_mean(returns, weights),
+        "策略收益中位数(%)": weighted_median(returns, weights),
+        "策略10%截尾均值(%)": weighted_trimmed_mean(returns, weights),
+        "去最高3只后均值(%)": weighted_top_removed_mean(returns, weights, 3),
+        "最高3只占正收益贡献(%)": top_positive_contribution(returns, weights, 3),
+        "策略盈利率(%)": weighted_rate(returns.gt(0), weights),
+        "平均持有交易日": weighted_mean(group[f"{prefix}_Holding_Days"], weights),
+    }
+
+
+def build_v5_strategy_report(
+    events: pd.DataFrame,
+    total_signal_weeks: int,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    modes = {
+        "A严格_过热0至1分": "V5_A_Selected",
+        "AB平衡_过热0至3分": "V5_AB_Selected",
+    }
+    for mode, selected_column in modes.items():
+        group = events[
+            events[selected_column].eq(True)
+            & events["Tradable"].eq(True)
+            & events["Has_8W_Future"].eq(True)
+        ].copy()
+        if group.empty:
+            continue
+        for stop in V5_STOP_LEVELS:
+            for target in V5_TARGET_LEVELS:
+                for variant in ("Fixed", "W5"):
+                    rows.append(v5_strategy_row(
+                        mode=mode, group=group, stop=stop, target=target,
+                        variant=variant, total_signal_weeks=total_signal_weeks,
+                        population_weighted=False,
+                    ))
+                    rows.append(v5_strategy_row(
+                        mode=mode, group=group, stop=stop, target=target,
+                        variant=variant, total_signal_weeks=total_signal_weeks,
+                        population_weighted=True,
+                    ))
+    return pd.DataFrame(rows)
+
+
+def build_v5_prediction_comparison(strategy_report: pd.DataFrame) -> pd.DataFrame:
+    """把生成V5之前公开写下的区间与本次等权结果逐项比较。"""
+    predictions = [
+        ("A严格_过热0至1分", "入选样本数", 28.0, 32.0, 10, 10),
+        ("A严格_过热0至1分", "有信号周数", 14.0, 17.0, 10, 10),
+        ("A严格_过热0至1分", "-10%止损存活率", 64.0, 72.0, 10, 10),
+        ("A严格_过热0至1分", "-12%止损存活率", 68.0, 78.0, 12, 10),
+        ("A严格_过热0至1分", "-15%止损存活率", 80.0, 84.0, 15, 10),
+        ("A严格_过热0至1分", "-10止损/+10止盈平均收益", 3.0, 5.0, 10, 10),
+        ("A严格_过热0至1分", "-10止损/+20止盈平均收益", 6.0, 10.0, 10, 20),
+        ("A严格_过热0至1分", "-10止损/+30止盈平均收益", 8.0, 14.0, 10, 30),
+        ("AB平衡_过热0至3分", "入选样本数", 49.0, 51.0, 10, 10),
+        ("AB平衡_过热0至3分", "有信号周数", 24.0, 24.0, 10, 10),
+        ("AB平衡_过热0至3分", "-10%止损存活率", 51.0, 72.0, 10, 10),
+        ("AB平衡_过热0至3分", "-12%止损存活率", 57.0, 78.0, 12, 10),
+        ("AB平衡_过热0至3分", "-15%止损存活率", 69.0, 82.0, 15, 10),
+    ]
+    if strategy_report.empty or not {"统计口径", "退出规则"}.issubset(
+        strategy_report.columns
+    ):
+        equal_fixed = pd.DataFrame()
+    else:
+        equal_fixed = strategy_report[
+            strategy_report["统计口径"].eq("600只样本等权")
+            & strategy_report["退出规则"].eq("固定止盈止损")
+        ]
+    rows: list[dict[str, Any]] = []
+    for mode, metric, low, high, stop, target in predictions:
+        match = pd.DataFrame()
+        if not equal_fixed.empty:
+            match = equal_fixed[
+                equal_fixed["模式"].eq(mode)
+                & equal_fixed["止损(%)"].eq(-float(stop))
+                & equal_fixed["止盈(%)"].eq(float(target))
+            ]
+        actual = np.nan
+        if not match.empty:
+            source = match.iloc[0]
+            if metric == "入选样本数":
+                actual = float(source["入选样本数"])
+            elif metric == "有信号周数":
+                actual = float(source["有信号周数"])
+            elif "存活率" in metric:
+                actual = float(source["八周不触及该止损(%)"])
+            else:
+                actual = float(source["策略平均收益(%)"])
+        if not np.isfinite(actual):
+            verdict = "无可比样本"
+        elif actual < low:
+            verdict = "低于预测"
+        elif actual > high:
+            verdict = "高于预测"
+        else:
+            verdict = "命中预测"
+        rows.append({
+            "模式": mode,
+            "预测指标": metric,
+            "预测下限": low,
+            "预测上限": high,
+            "本次实际值": actual,
+            "判断": verdict,
+            "适用说明": "预测以600只、约一年、每周最多3只的既有两段样本重放为基准",
+        })
+    return pd.DataFrame(rows)
+
+
+def build_v5_selection_detail(events: pd.DataFrame) -> pd.DataFrame:
+    selected = events[
+        events["V5_A_Selected"].eq(True) | events["V5_AB_Selected"].eq(True)
+    ].copy()
+    preferred = [
+        "Signal_Date", "ts_code", "name", "Sample_Board", "SW_L1",
+        "V5_Overheat_Score", "V5_Grade", "V5_A_Rank", "V5_A_Selected",
+        "V5_AB_Rank", "V5_AB_Selected", "V5_Relative_10_25",
+        "Stock_Excess_vs_Board_13W_pct", "V5_Deep_Pullback",
+        "Pullback_Depth_pct", "Weekly_Trend", "Initial_Red_Strength",
+        "Entry_Date", "Entry_Price", "V5_W5_State", "V5_W5_Date",
+        "Return_8W_pct", "MFE_8W_pct", "MAE_8W_pct",
+    ]
+    grid = [column for column in selected.columns if column.startswith("V5_S")]
+    columns = [column for column in preferred if column in selected.columns] + grid
+    return selected[columns].sort_values(
+        ["Signal_Date", "V5_Overheat_Score", "V5_AB_Rank", "ts_code"]
+    ).reset_index(drop=True)
+
+
+# -----------------------------------------------------------------------------
 # Streamlit 页面
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线MACD市场环境验证器 V4.0", layout="wide")
-    st.title("周线MACD市场环境验证器 V4.0")
+    st.set_page_config(page_title="周线MACD策略验证器 V5.0", layout="wide")
+    st.title("周线MACD策略验证器 V5.0")
     st.caption(
-        "研究同一根周线红柱在不同大盘、板块、行业广度和过热阶段中的差异。"
+        "冻结V4发现：六项过热评分、每个信号周最多3只、三档止损止盈与第5周条件退出。"
     )
 
     with st.sidebar:
@@ -2227,9 +2661,9 @@ def main() -> None:
             value=3.0, step=0.5,
         )
         STOP_THRESHOLD = st.number_input(
-            "失败/止损统计阈值(%)", min_value=1.0, max_value=30.0,
+            "V4兼容报表止损阈值(%)", min_value=1.0, max_value=30.0,
             value=10.0, step=1.0,
-            help="用于屏障先后判断和固定止损止盈退出模拟。",
+            help="只影响V4延续报表；V5始终固定比较10%、12%、15%三档止损。",
         )
         slip1, slip2 = st.columns(2)
         BUY_SLIPPAGE = slip1.number_input(
@@ -2278,7 +2712,7 @@ def main() -> None:
         st.info("请输入Tushare Token。默认抽取三个板块各200只，共约600只。")
         return
 
-    if not st.button("开始600只V4环境验证", type="primary"):
+    if not st.button("开始600只V5策略验证", type="primary"):
         with st.expander("本程序的关键统计口径"):
             st.markdown(
                 """
@@ -2293,7 +2727,13 @@ def main() -> None:
                 - **第2—5周状态**：每个检查点只使用当时已经完成的周线柱，后续收益从检查点以后单独计算。
                 - **环境字段**：宽基、板块、行业指数和样本广度均只取信号周已经结束的数据。
                 - **行业拥挤度**：统计同一信号周、同一申万一级行业出现多少只第一根红柱。
-                - **V4定位**：本版只寻找跨年度环境规律，不执行最多3只的资金组合回测。
+                - **V5过热评分**：宽基/板块的26周涨幅、距MA20幅度和广度共六项，每项过热计1分。
+                - **V5分级**：0—1分=A，2—3分=B，4分以上禁入；A与A+B分别验证。
+                - **排序**：先按过热分数，再优先相对板块13周强度10%—25%，然后优先更深回调。
+                - **最多3只**：限制同一信号周入选数，不限制跨周持仓重叠；本版仍是策略验证，不是资金组合回测。
+                - **退出网格**：固定比较-10%/-12%/-15%止损与+10%/+20%/+30%止盈。
+                - **第5周退出**：仅当第5周状态为“缩短未再扩张”且此前未退出时，按第5周收盘卖出。
+                - **预测对照**：预测区间已经固定写入代码，不会根据本次结果自动修改。
                 """
             )
         return
@@ -2320,6 +2760,7 @@ def main() -> None:
     preload_start = (SIGNAL_START_DATE - timedelta(days=3 * 365)).strftime("%Y%m%d")
 
     config = {
+        "version": VERSION,
         "signal_start": signal_start,
         "signal_end": signal_end,
         "market_end": market_end,
@@ -2337,6 +2778,14 @@ def main() -> None:
         "material_hist_change_pct": float(MATERIAL_HIST_CHANGE),
         "short_strength_ratio": float(SHORT_STRENGTH_RATIO),
         "use_sw_index": bool(USE_SW_INDEX),
+        "v5_max_picks_per_week": V5_MAX_PICKS_PER_WEEK,
+        "v5_stop_levels": list(V5_STOP_LEVELS),
+        "v5_target_levels": list(V5_TARGET_LEVELS),
+        "v5_frozen_heat_thresholds": {
+            "return_26w_pct": V5_HEAT_RETURN_26W_PCT,
+            "dist_ma20_pct": V5_HEAT_DIST_MA20_PCT,
+            "breadth_pct": V5_HEAT_BREADTH_PCT,
+        },
     }
 
     try:
@@ -2503,6 +2952,12 @@ def main() -> None:
         board_features=board_features,
         industry_features=industry_features,
     )
+    events = attach_v5_scores_and_selection(events)
+    signal_week_dates = sorted({
+        str(value) for value in week_last_map.values()
+        if signal_start <= str(value) <= signal_end
+    })
+    total_signal_weeks = len(signal_week_dates)
     summaries = build_all_summaries(events)
     paired = build_paired_comparison(events)
     pair_summary = paired_summary(paired)
@@ -2511,6 +2966,10 @@ def main() -> None:
     cycle_strength_report = build_cycle_strength_report(events)
     checkpoint_report = build_checkpoint_report(events)
     environment_report = build_environment_report(events)
+    v5_heat_report = build_v5_heat_report(events)
+    v5_strategy_report = build_v5_strategy_report(events, total_signal_weeks)
+    v5_prediction_report = build_v5_prediction_comparison(v5_strategy_report)
+    v5_selection_detail = build_v5_selection_detail(events)
 
     run_hash = cache_key(
         json.dumps(config, ensure_ascii=False, sort_keys=True), sample_hash,
@@ -2524,6 +2983,14 @@ def main() -> None:
     cycle_strength_path = os.path.join(OUTPUT_DIR, f"weekly_macd_cycle_strength_{run_hash}.csv")
     checkpoint_path = os.path.join(OUTPUT_DIR, f"weekly_macd_checkpoints_{run_hash}.csv")
     environment_path = os.path.join(OUTPUT_DIR, f"weekly_macd_environment_{run_hash}.csv")
+    v5_heat_path = os.path.join(OUTPUT_DIR, f"weekly_macd_v5_heat_{run_hash}.csv")
+    v5_grid_path = os.path.join(OUTPUT_DIR, f"weekly_macd_v5_grid_{run_hash}.csv")
+    v5_prediction_path = os.path.join(
+        OUTPUT_DIR, f"weekly_macd_v5_prediction_{run_hash}.csv"
+    )
+    v5_selected_path = os.path.join(
+        OUTPUT_DIR, f"weekly_macd_v5_selected_{run_hash}.csv"
+    )
     combined_summaries = []
     for title, frame in summaries.items():
         temp = frame.copy()
@@ -2542,6 +3009,10 @@ def main() -> None:
     atomic_csv(cycle_strength_report, cycle_strength_path)
     atomic_csv(checkpoint_report, checkpoint_path)
     atomic_csv(environment_report, environment_path)
+    atomic_csv(v5_heat_report, v5_heat_path)
+    atomic_csv(v5_strategy_report, v5_grid_path)
+    atomic_csv(v5_prediction_report, v5_prediction_path)
+    atomic_csv(v5_selection_detail, v5_selected_path)
 
     st.success(
         f"验证完成：事件{len(events)}条；完整八周可交易样本"
@@ -2556,7 +3027,34 @@ def main() -> None:
     c3.metric("下一周继续红柱", f"{pct_mean(first_red['Next_Week_Red']):.2f}%")
     c4.metric("下一周立即翻绿", f"{pct_mean(first_red['Immediate_Green']):.2f}%")
 
-    st.subheader("V4核心：市场、板块、行业与过热阶段")
+    st.subheader("V5核心一：冻结过热评分")
+    st.caption(
+        "六项过热事实每项1分：宽基与对应板块的26周涨幅、距周MA20幅度、"
+        "高于周MA20的市场/板块广度。0—1分=A，2—3分=B，4分以上禁入。"
+    )
+    st.dataframe(
+        style_percent_table(v5_heat_report), use_container_width=True, hide_index=True,
+    )
+
+    st.subheader("V5核心二：每周最多3只后的完整策略网格")
+    st.caption(
+        "A严格与A+B平衡分别选股；同一周先选过热分更低者，再看相对板块强度10%—25%，"
+        "最后看回调深度。固定退出与第5周缩短未扩张退出同时保留。"
+    )
+    st.dataframe(
+        style_percent_table(v5_strategy_report), use_container_width=True, hide_index=True,
+    )
+
+    st.subheader("V5核心三：生成代码前的预测与实际结果")
+    st.caption(
+        "预测区间在V5生成前已经公开固定。若研究区间长度明显不是约一年，"
+        "入选数量和有信号周数不宜直接比较，但收益率与存活率仍可参考。"
+    )
+    st.dataframe(
+        style_percent_table(v5_prediction_report), use_container_width=True, hide_index=True,
+    )
+
+    st.subheader("V4延续报告：市场、板块、行业与过热阶段")
     broad_coverage = float(first_red["Broad_Index_Trend"].notna().mean() * 100.0)
     board_coverage = float(first_red["Board_Index_Trend"].notna().mean() * 100.0)
     industry_coverage = float(first_red["Industry_Index_Trend"].notna().mean() * 100.0)
@@ -2687,10 +3185,28 @@ def main() -> None:
         "下载环境分层CSV", environment_report.to_csv(index=False, encoding="utf-8-sig"),
         file_name=os.path.basename(environment_path), mime="text/csv",
     )
+    f1, f2, f3, f4 = st.columns(4)
+    f1.download_button(
+        "下载V5过热评分CSV", v5_heat_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(v5_heat_path), mime="text/csv",
+    )
+    f2.download_button(
+        "下载V5策略网格CSV", v5_strategy_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(v5_grid_path), mime="text/csv",
+    )
+    f3.download_button(
+        "下载预测对照CSV", v5_prediction_report.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(v5_prediction_path), mime="text/csv",
+    )
+    f4.download_button(
+        "下载V5入选明细CSV", v5_selection_detail.to_csv(index=False, encoding="utf-8-sig"),
+        file_name=os.path.basename(v5_selected_path), mime="text/csv",
+    )
 
     st.warning(
         "A/B/C1/C2是事后标签；可以用于发现规律，不能直接当作实时信号。"
-        "环境分组是探索性统计，不会自动选择最优阈值。"
+        "V5过热阈值与排序已经冻结，程序不会自动寻找最优参数。"
+        "本版限制每个信号周最多3只，但不限制跨周持仓重叠，因此不是资金组合收益率。"
         "600只分层样本适合筛选假设，但一年数据仍只代表一个市场阶段。"
         "任何少于30条的细分样本都只能视为线索；最终规则应再做跨年份样本外验证。"
     )
