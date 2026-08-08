@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线 MACD 第一根红柱策略验证器 V5.0
+周线 MACD 第一根红柱策略验证器 V5.1（下载修正版）
 ========================================
 
 研究目的（冻结阈值后的策略验证版）：
@@ -40,12 +40,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
 import pickle
 import shutil
 import time
+import zipfile
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -55,7 +57,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V5.0"
+VERSION = "V5.1-download-fix"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -2624,8 +2626,8 @@ def build_v5_selection_detail(events: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线MACD策略验证器 V5.0", layout="wide")
-    st.title("周线MACD策略验证器 V5.0")
+    st.set_page_config(page_title="周线MACD策略验证器 V5.1", layout="wide")
+    st.title("周线MACD策略验证器 V5.1（下载修正版）")
     st.caption(
         "冻结V4发现：六项过热评分、每个信号周最多3只、三档止损止盈与第5周条件退出。"
     )
@@ -3146,62 +3148,59 @@ def main() -> None:
         if API_ERRORS:
             st.code("\n".join(API_ERRORS[:100]))
 
-    st.subheader("下载结果")
-    d1, d2, d3, d4, d5 = st.columns(5)
-    d1.download_button(
-        "下载事件明细CSV", events.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(event_path), mime="text/csv",
+    st.subheader("下载结果（点击不会重新运行回测）")
+    st.caption(
+        "0号是一键备份全部结果；V6概率研究只需要1号事件明细。"
+        "以后沟通时可以直接说“上传1号、11号”等。"
     )
-    d2.download_button(
-        "下载汇总CSV", summary_export.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(summary_path), mime="text/csv",
+    numbered_exports = [
+        (1, "事件明细（V6必需）", events, event_path),
+        (2, "600只抽样名单", sample_audit, sample_path),
+        (3, "综合汇总", summary_export, summary_path),
+        (4, "策略对照", strategy_report, strategy_path),
+        (5, "同周期配对", paired, paired_path),
+        (6, "红柱周期", cycle_report, cycle_path),
+        (7, "周期强度", cycle_strength_report, cycle_strength_path),
+        (8, "第2—5周状态", checkpoint_report, checkpoint_path),
+        (9, "环境分层", environment_report, environment_path),
+        (10, "V5过热评分", v5_heat_report, v5_heat_path),
+        (11, "V5策略网格", v5_strategy_report, v5_grid_path),
+        (12, "预测对照", v5_prediction_report, v5_prediction_path),
+        (13, "V5入选明细", v5_selection_detail, v5_selected_path),
+    ]
+    export_payloads = [
+        (
+            number,
+            title,
+            os.path.basename(path),
+            frame.to_csv(index=False).encode("utf-8-sig"),
+        )
+        for number, title, frame, path in numbered_exports
+    ]
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for _, _, file_name, payload in export_payloads:
+            archive.writestr(file_name, payload)
+    zip_buffer.seek(0)
+    st.download_button(
+        "0号｜一键下载全部结果ZIP",
+        data=zip_buffer.getvalue(),
+        file_name=f"weekly_macd_v5_all_{run_hash}.zip",
+        mime="application/zip",
+        key=f"v5_download_all_{run_hash}",
+        on_click="ignore",
+        type="primary",
     )
-    d3.download_button(
-        "下载同周期配对CSV", paired.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(paired_path), mime="text/csv",
-    )
-    d4.download_button(
-        "下载策略对照CSV", strategy_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(strategy_path), mime="text/csv",
-    )
-    d5.download_button(
-        "下载600只抽样名单", sample_audit.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(sample_path), mime="text/csv",
-    )
-    e1, e2, e3, e4 = st.columns(4)
-    e1.download_button(
-        "下载红柱周期CSV", cycle_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(cycle_path), mime="text/csv",
-    )
-    e2.download_button(
-        "下载周期强度CSV", cycle_strength_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(cycle_strength_path), mime="text/csv",
-    )
-    e3.download_button(
-        "下载第2—5周状态CSV", checkpoint_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(checkpoint_path), mime="text/csv",
-    )
-    e4.download_button(
-        "下载环境分层CSV", environment_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(environment_path), mime="text/csv",
-    )
-    f1, f2, f3, f4 = st.columns(4)
-    f1.download_button(
-        "下载V5过热评分CSV", v5_heat_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(v5_heat_path), mime="text/csv",
-    )
-    f2.download_button(
-        "下载V5策略网格CSV", v5_strategy_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(v5_grid_path), mime="text/csv",
-    )
-    f3.download_button(
-        "下载预测对照CSV", v5_prediction_report.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(v5_prediction_path), mime="text/csv",
-    )
-    f4.download_button(
-        "下载V5入选明细CSV", v5_selection_detail.to_csv(index=False, encoding="utf-8-sig"),
-        file_name=os.path.basename(v5_selected_path), mime="text/csv",
-    )
+    download_columns = st.columns(4)
+    for position, (number, title, file_name, payload) in enumerate(export_payloads):
+        download_columns[position % 4].download_button(
+            f"{number}号｜{title}",
+            data=payload,
+            file_name=file_name,
+            mime="text/csv",
+            key=f"v5_download_{run_hash}_{number}",
+            on_click="ignore",
+        )
 
     st.warning(
         "A/B/C1/C2是事后标签；可以用于发现规律，不能直接当作实时信号。"
