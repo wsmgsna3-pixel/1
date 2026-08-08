@@ -50,7 +50,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V4.0-ALL-TECH"
+VERSION = "V4.1-ALL-TECH-DELAYED-ENTRY"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -926,6 +926,7 @@ def build_checkpoint_features(
     path_result: dict[str, Any],
     open_dates: list[str],
     open_pos: dict[str, int],
+    buy_slippage_pct: float,
     stop_threshold_pct: float,
     material_change_pct: float,
     short_strength_ratio: float,
@@ -955,11 +956,20 @@ def build_checkpoint_features(
             f"{prefix}_Remaining_Return_pct": np.nan,
             f"{prefix}_Stop_Hit_Before": np.nan,
             f"{prefix}_Remaining_Stop_Hit": np.nan,
+            f"{prefix}_Delayed_Entry_Date": "",
+            f"{prefix}_Delayed_Entry_Price": np.nan,
+            f"{prefix}_Delayed_Has_8W_Future": False,
+            f"{prefix}_Delayed_MFE_8W_pct": np.nan,
+            f"{prefix}_Delayed_MAE_8W_pct": np.nan,
+            f"{prefix}_Delayed_Return_8W_pct": np.nan,
+            f"{prefix}_Delayed_Hit_Stop_8W": np.nan,
         }
         for target in (10, 20, 30):
             defaults[f"{prefix}_T{target}_Still_Open"] = np.nan
             defaults[f"{prefix}_T{target}_Future_Result"] = ""
             defaults[f"{prefix}_T{target}_Future_Target_First"] = np.nan
+            defaults[f"{prefix}_Delayed_Hit_{target}_8W"] = np.nan
+            defaults[f"{prefix}_Delayed_First_{target}_vs_Stop"] = ""
         output.update(defaults)
         if position >= len(weekly):
             continue
@@ -1006,6 +1016,52 @@ def build_checkpoint_features(
         output[f"{prefix}_Return_From_Entry_pct"] = (
             checkpoint_close / entry_price - 1.0
         ) * 100.0
+
+        # 独立延迟买点：确认第N根周线状态后，下一市场交易日开盘买入，
+        # 从这个新买点重新观察40个交易日，而不是沿用第一根红柱的原八周终点。
+        checkpoint_market_pos = open_pos[checkpoint_date]
+        delayed_entry_pos = checkpoint_market_pos + 1
+        delayed_horizon_pos = delayed_entry_pos + HOLD_TRADING_DAYS - 1
+        if delayed_horizon_pos < len(open_dates):
+            delayed_entry_date = open_dates[delayed_entry_pos]
+            delayed_horizon_date = open_dates[delayed_horizon_pos]
+            delayed_entry_row = daily[daily["trade_date"].eq(delayed_entry_date)]
+            delayed_path = daily[
+                (daily["trade_date"] >= delayed_entry_date)
+                & (daily["trade_date"] <= delayed_horizon_date)
+            ].copy().sort_values("trade_date")
+            if not delayed_entry_row.empty and not delayed_path.empty:
+                delayed_entry_price = float(delayed_entry_row.iloc[-1]["open"]) * (
+                    1.0 + buy_slippage_pct / 100.0
+                )
+                delayed_stop_price = delayed_entry_price * (1.0 - stop_threshold_pct / 100.0)
+                output.update({
+                    f"{prefix}_Delayed_Entry_Date": delayed_entry_date,
+                    f"{prefix}_Delayed_Entry_Price": delayed_entry_price,
+                    f"{prefix}_Delayed_Has_8W_Future": True,
+                    f"{prefix}_Delayed_MFE_8W_pct": (
+                        float(delayed_path["high"].max()) / delayed_entry_price - 1.0
+                    ) * 100.0,
+                    f"{prefix}_Delayed_MAE_8W_pct": (
+                        float(delayed_path["low"].min()) / delayed_entry_price - 1.0
+                    ) * 100.0,
+                    f"{prefix}_Delayed_Return_8W_pct": (
+                        float(delayed_path.iloc[-1]["close"]) / delayed_entry_price - 1.0
+                    ) * 100.0,
+                    f"{prefix}_Delayed_Hit_Stop_8W": bool(
+                        float(delayed_path["low"].min()) <= delayed_stop_price
+                    ),
+                })
+                for target in (10, 20, 30):
+                    output[f"{prefix}_Delayed_Hit_{target}_8W"] = bool(
+                        float(delayed_path["high"].max())
+                        >= delayed_entry_price * (1.0 + target / 100.0)
+                    )
+                    result, _, _ = first_hit_result(
+                        delayed_path, delayed_entry_price,
+                        float(target), float(stop_threshold_pct),
+                    )
+                    output[f"{prefix}_Delayed_First_{target}_vs_Stop"] = result
 
         entry_position = open_pos[entry_date]
         horizon_position = entry_position + HOLD_TRADING_DAYS - 1
@@ -1198,6 +1254,7 @@ def build_event_record(
             path_result=path_result,
             open_dates=open_dates,
             open_pos=open_pos,
+            buy_slippage_pct=buy_slippage_pct,
             stop_threshold_pct=stop_threshold_pct,
             material_change_pct=material_hist_change_pct,
             short_strength_ratio=short_strength_ratio,
@@ -1780,13 +1837,47 @@ def build_checkpoint_report(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_delayed_entry_report(events: pd.DataFrame) -> pd.DataFrame:
+    """严格比较第2—5周确认后、下一交易日开盘买入并重新持有八周。"""
+    first_red = events[events["Event_Type"].eq("第一根红柱")].copy()
+    rows: list[dict[str, Any]] = []
+    for checkpoint_week in CHECKPOINT_WEEKS:
+        prefix = f"CP_W{checkpoint_week}"
+        observed = first_red[first_red[f"{prefix}_Observed"].eq(True)]
+        for state, group in observed.groupby(f"{prefix}_State", dropna=False, sort=False):
+            full = group[group[f"{prefix}_Delayed_Has_8W_Future"].eq(True)].copy()
+            row = {
+                "确认周": checkpoint_week,
+                "当周可知状态": str(state),
+                "观察样本": int(len(group)),
+                "延迟买入完整八周样本": int(len(full)),
+                # 下面一列是事后验证标签，不能作为实时选股条件。
+                "最终持续至少9周比例(%)": pct_mean(full["Red_Cycle_Weeks"].ge(9)),
+                "延迟买入八周触及10%(%)": pct_mean(full[f"{prefix}_Delayed_Hit_10_8W"]),
+                "延迟买入八周触及20%(%)": pct_mean(full[f"{prefix}_Delayed_Hit_20_8W"]),
+                "延迟买入八周触及30%(%)": pct_mean(full[f"{prefix}_Delayed_Hit_30_8W"]),
+                "延迟买入八周平均收益(%)": numeric_mean(full[f"{prefix}_Delayed_Return_8W_pct"]),
+                "延迟买入八周收益中位数(%)": numeric_median(full[f"{prefix}_Delayed_Return_8W_pct"]),
+                "延迟买入八周盈利率(%)": pct_mean(full[f"{prefix}_Delayed_Return_8W_pct"].gt(0)),
+                "延迟买入最大浮盈中位数(%)": numeric_median(full[f"{prefix}_Delayed_MFE_8W_pct"]),
+                "延迟买入最大回撤中位数(%)": numeric_median(full[f"{prefix}_Delayed_MAE_8W_pct"]),
+                "延迟买入触及止损(%)": pct_mean(full[f"{prefix}_Delayed_Hit_Stop_8W"]),
+            }
+            for target in (10, 20, 30):
+                row[f"延迟买入{target}%先于止损(%)"] = pct_mean(
+                    full[f"{prefix}_Delayed_First_{target}_vs_Stop"].eq("目标先到")
+                )
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
 # -----------------------------------------------------------------------------
 # Streamlit 页面
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="全量科技股周线MACD验证器 V4.0", layout="wide")
-    st.title("全量科技股周线MACD红柱周期验证器 V4.0")
+    st.set_page_config(page_title="全量科技股周线MACD验证器 V4.1", layout="wide")
+    st.title("全量科技股周线MACD红柱周期验证器 V4.1")
     st.caption(
         "历史科技股票池全部纳入，不随机抽样；信号日股价≥10元、流通市值≥100亿元。"
     )
@@ -1864,7 +1955,19 @@ def main() -> None:
         st.info("请输入Tushare Token。程序将检查完整历史科技股票池，不限制股票数量。")
         return
 
-    if not st.button("开始全量科技股验证", type="primary"):
+    run_requested = st.button("开始全量科技股验证", type="primary")
+    if not run_requested:
+        if "v41_result_zip" in st.session_state:
+            st.success("上一次验证结果仍然保留，可直接下载，无需重新运行。")
+            st.download_button(
+                "下载1号：上一次全部结果ZIP",
+                data=st.session_state["v41_result_zip"],
+                file_name="weekly_macd_all_tech_v4_1_all_results.zip",
+                mime="application/zip",
+                type="primary",
+                on_click="ignore",
+            )
+            return
         with st.expander("本程序的关键统计口径"):
             st.markdown(
                 """
@@ -2016,6 +2119,7 @@ def main() -> None:
     cycle_report = build_cycle_report(events)
     cycle_strength_report = build_cycle_strength_report(events)
     checkpoint_report = build_checkpoint_report(events)
+    delayed_entry_report = build_delayed_entry_report(events)
 
     run_hash = cache_key(
         json.dumps(config, ensure_ascii=False, sort_keys=True), sample_hash,
@@ -2116,6 +2220,15 @@ def main() -> None:
         style_percent_table(checkpoint_report), use_container_width=True, hide_index=True,
     )
 
+    st.subheader("第2—5周确认后再买入：独立八周验证")
+    st.caption(
+        "每个检查周结束后，下一市场交易日开盘并计入买入滑点；"
+        "从这个新买点重新计算40个交易日，解决过去只观察原始第八周的问题。"
+    )
+    st.dataframe(
+        style_percent_table(delayed_entry_report), use_container_width=True, hide_index=True,
+    )
+
     st.subheader("逐周收益路径")
     full_events = events[events["Tradable"].eq(True) & events["Has_8W_Future"].eq(True)]
     weekly_rows = []
@@ -2167,6 +2280,7 @@ def main() -> None:
         "09_checkpoints_w2_w5.csv": checkpoint_report,
         "10_rejection_audit.csv": reject_frame,
         "11_weekly_path.csv": weekly_report,
+        "12_delayed_entry_w2_w5.csv": delayed_entry_report,
     }
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in zip_items.items():
@@ -2174,12 +2288,15 @@ def main() -> None:
                 filename,
                 frame.to_csv(index=False).encode("utf-8-sig"),
             )
+    result_zip_bytes = zip_buffer.getvalue()
+    st.session_state["v41_result_zip"] = result_zip_bytes
     st.download_button(
         "下载1号：全部结果ZIP",
-        data=zip_buffer.getvalue(),
-        file_name="weekly_macd_all_tech_v4_all_results.zip",
+        data=result_zip_bytes,
+        file_name="weekly_macd_all_tech_v4_1_all_results.zip",
         mime="application/zip",
         type="primary",
+        on_click="ignore",
     )
     st.warning(
         "A/B/C1/C2是事后标签；可以用于发现规律，不能直接当作实时信号。"
