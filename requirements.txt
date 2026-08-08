@@ -8,3 +8,4 @@ tushare
 scipy
 matplotlib
 yfinance
+scikit-learn
