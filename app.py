@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-周线首红柱全候选评分与三仓回测一体版 V5.0
+科技股周线MACD首红柱周期最高利润验证器 V1.0
 ======================================
 
-本文件把原先分散在V4.1、V4.4、V4.6和V4.7中的历史股票池、第一根红柱、
-板块相对强度、透明评分排序和30万元组合回测合并为一次运行。V5.0不再让
-日线趋势、箱体、成交量和日线MACD一票否决；它们只负责评分，第一根真正
-周线红柱负责产生足够多的候选。
+本程序只验证一个底层事实：第一根真正周线红柱确认后，于下一交易日开盘
+买入，在第一根完整绿柱确认以前，价格曾经提供过多大的最高利润空间。
+它不设置八周上限、不止损、不止盈、不评分、不做资金组合，也不把最高价
+伪装成可实现卖价。最高价只作为事后机会空间上限，为后续识别弱反弹、
+持续强势和止盈研究提供依据。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30% 的概率。
@@ -54,7 +55,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V5.0-FIRST-RED-RANKING-ALL-IN-ONE"
+VERSION = "V1.0-FIRST-RED-CYCLE-OPPORTUNITY"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -84,7 +85,7 @@ DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
 
-TITLE = "周线首红柱全候选评分与三仓回测一体版 V5.0"
+TITLE = "科技股周线MACD首红柱周期最高利润验证器 V1.0"
 INITIAL_CAPITAL = 300_000.0
 MAX_POSITIONS = 3
 POSITION_BUDGET = 100_000.0
@@ -2441,6 +2442,196 @@ def make_result_zip(files: dict[str, pd.DataFrame]) -> bytes:
 
 
 # -----------------------------------------------------------------------------
+# 首红柱至第一根完整绿柱：最高利润机会空间
+# -----------------------------------------------------------------------------
+OPPORTUNITY_TARGETS = (5, 10, 20, 30, 50, 100)
+
+
+def first_red_strength_group(value: float) -> str:
+    if not math.isfinite(value):
+        return "无法计算"
+    if value < 0.25:
+        return "很短_<前绿柱峰值25%"
+    if value < 0.50:
+        return "偏短_25%至50%"
+    if value < 1.00:
+        return "正常_50%至100%"
+    return "较强_不低于前绿柱峰值"
+
+
+def build_cycle_opportunities(
+    events: pd.DataFrame,
+    daily_histories: dict[str, pd.DataFrame],
+    observation_end: str,
+    sell_slippage_pct: float,
+) -> pd.DataFrame:
+    """计算首红柱买入后，到第一根完整绿柱确认日为止的事后最高利润。"""
+    first = events[events["Event_Type"].astype(str).eq("第一根红柱")].copy()
+    first = first.drop_duplicates("Cycle_ID", keep="first")
+    rows: list[dict[str, Any]] = []
+    keep_columns = [
+        "Cycle_ID", "ts_code", "name", "Sample_Board", "SW_L1", "SW_L2", "SW_L3",
+        "Signal_Date", "Weekly_Trend", "Zero_Axis", "Hist", "Hist_Prev", "DIF", "DEA",
+        "Weekly_Close", "W_MA20", "W_MA40", "W_MA20_Slope4_pct",
+        "Pre_13W_Return_pct", "Pre_26W_Return_pct", "Pullback_Depth_pct",
+        "Raw_Close", "Circ_MV_Billion", "Turnover_Rate", "Tradable", "Untradable_Reason",
+        "Entry_Date", "Entry_Price", "Cycle_Completed", "Cycle_Censored", "Cycle_Type",
+        "Cycle_Strength_Class", "Red_Cycle_Weeks", "Last_Red_Date", "First_Green_Date",
+        "Red_Hist_Sequence", "Peak_Red_Hist", "Peak_Red_Week", "Red_Hist_Area",
+        "PreGreen_Abs_Peak_Hist", "Peak_Red_to_PreGreen_Peak_Ratio",
+        "First_Material_Shrink_Week", "Material_Shrink_Count", "ReExpansion_Count",
+        "CP_W2_State", "CP_W2_Hist_vs_W1_pct", "CP_W2_Weak_Candidate",
+    ]
+
+    for _, event in first.iterrows():
+        base = {column: event.get(column, np.nan) for column in keep_columns}
+        code = str(event.get("ts_code", ""))
+        entry_date = normalize_date(event.get("Entry_Date"))
+        entry_price = finite_num(event.get("Entry_Price"))
+        completed = to_bool(event.get("Cycle_Completed"))
+        first_green = normalize_date(event.get("First_Green_Date"))
+        last_red = normalize_date(event.get("Last_Red_Date"))
+        end_date = first_green if completed and first_green else observation_end
+        daily = daily_histories.get(code, pd.DataFrame())
+
+        pre_green_peak = abs(finite_num(event.get("PreGreen_Abs_Peak_Hist")))
+        first_hist = finite_num(event.get("Hist"))
+        first_strength_ratio = (
+            first_hist / pre_green_peak
+            if math.isfinite(first_hist) and math.isfinite(pre_green_peak) and pre_green_peak > 0
+            else np.nan
+        )
+        result: dict[str, Any] = {
+            **base,
+            "Opportunity_Status": "完整周期" if completed else "截至观察日仍未翻绿",
+            "Opportunity_Valid": False,
+            "Observation_End_Date": end_date,
+            "First_Red_to_PreGreen_Peak_Ratio": first_strength_ratio,
+            "First_Red_Strength_Group": first_red_strength_group(first_strength_ratio),
+        }
+        for target in OPPORTUNITY_TARGETS:
+            result[f"Reached_{target}_pct"] = False
+            result[f"First_{target}_Date"] = ""
+            result[f"Trading_Days_To_{target}"] = np.nan
+
+        if not to_bool(event.get("Tradable")) or not entry_date or not math.isfinite(entry_price):
+            result["Opportunity_Invalid_Reason"] = str(
+                event.get("Untradable_Reason", "无法按次日开盘买入")
+            )
+            rows.append(result)
+            continue
+        if daily.empty:
+            result["Opportunity_Invalid_Reason"] = "个股日线不存在"
+            rows.append(result)
+            continue
+
+        path = daily[
+            daily["trade_date"].astype(str).ge(entry_date)
+            & daily["trade_date"].astype(str).le(end_date)
+        ].copy().sort_values("trade_date").reset_index(drop=True)
+        for column in ("high", "low", "close"):
+            path[column] = pd.to_numeric(path[column], errors="coerce")
+        path = path.dropna(subset=["high", "low", "close"])
+        if path.empty:
+            result["Opportunity_Invalid_Reason"] = "买入日至观察结束日无行情"
+            rows.append(result)
+            continue
+
+        peak_position = int(path["high"].idxmax())
+        trough_position = int(path["low"].idxmin())
+        peak_price = float(path.loc[peak_position, "high"])
+        trough_price = float(path.loc[trough_position, "low"])
+        peak_date = str(path.loc[peak_position, "trade_date"])
+        trough_date = str(path.loc[trough_position, "trade_date"])
+        end_close = float(path.iloc[-1]["close"])
+        peak_net_price = peak_price * (1.0 - sell_slippage_pct / 100.0)
+        result.update({
+            "Opportunity_Valid": True,
+            "Opportunity_Invalid_Reason": "",
+            "Observation_Trading_Days": int(len(path)),
+            "Peak_Date": peak_date,
+            "Peak_High": peak_price,
+            "Peak_MFE_pct": (peak_price / entry_price - 1.0) * 100.0,
+            "Peak_MFE_After_Sell_Slippage_pct": (peak_net_price / entry_price - 1.0) * 100.0,
+            "Trading_Days_To_Peak": int(peak_position + 1),
+            "Calendar_Days_To_Peak": int(
+                (pd.to_datetime(peak_date) - pd.to_datetime(entry_date)).days
+            ),
+            "Peak_During_Green_Confirmation_Week": bool(
+                completed and bool(last_red) and peak_date > last_red
+            ),
+            "Trough_Date": trough_date,
+            "Trough_Low": trough_price,
+            "Path_MAE_pct": (trough_price / entry_price - 1.0) * 100.0,
+            "Observation_End_Close": end_close,
+            "End_Close_Return_pct": (end_close / entry_price - 1.0) * 100.0,
+            "Peak_to_End_Close_Giveback_pct_points": (
+                (peak_price / entry_price - 1.0) - (end_close / entry_price - 1.0)
+            ) * 100.0,
+        })
+        for target in OPPORTUNITY_TARGETS:
+            hit = path[path["high"].ge(entry_price * (1.0 + target / 100.0))]
+            if not hit.empty:
+                first_position = int(hit.index[0])
+                result[f"Reached_{target}_pct"] = True
+                result[f"First_{target}_Date"] = str(path.loc[first_position, "trade_date"])
+                result[f"Trading_Days_To_{target}"] = int(first_position + 1)
+        rows.append(result)
+
+    return pd.DataFrame(rows).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
+
+
+def opportunity_summary(frame: pd.DataFrame, group_columns: list[str] | None = None) -> pd.DataFrame:
+    """只汇总完整且可计算的周期；未翻绿周期另表保留。"""
+    valid = frame[
+        frame["Opportunity_Valid"].map(to_bool)
+        & frame["Cycle_Completed"].map(to_bool)
+    ].copy()
+    if valid.empty:
+        return pd.DataFrame()
+    valid["Peak_MFE_pct"] = pd.to_numeric(valid["Peak_MFE_pct"], errors="coerce")
+    valid["Path_MAE_pct"] = pd.to_numeric(valid["Path_MAE_pct"], errors="coerce")
+    valid["Trading_Days_To_Peak"] = pd.to_numeric(
+        valid["Trading_Days_To_Peak"], errors="coerce"
+    )
+    valid["Red_Cycle_Weeks"] = pd.to_numeric(valid["Red_Cycle_Weeks"], errors="coerce")
+
+    if group_columns:
+        grouped = valid.groupby(group_columns, dropna=False, sort=False)
+    else:
+        grouped = [((), valid)]
+    rows: list[dict[str, Any]] = []
+    for keys, group in grouped:
+        keys = keys if isinstance(keys, tuple) else (keys,)
+        mfe = group["Peak_MFE_pct"].dropna()
+        row = {
+            column: key for column, key in zip(group_columns or [], keys)
+        }
+        row.update({
+            "完整周期数": int(len(group)),
+            "涉及股票数": int(group["ts_code"].nunique()),
+            "最高利润均值(%)": mfe.mean(),
+            "最高利润中位数(%)": mfe.median(),
+            "最高利润P25(%)": mfe.quantile(0.25),
+            "最高利润P75(%)": mfe.quantile(0.75),
+            "最高利润P90(%)": mfe.quantile(0.90),
+            "最高利润最大值(%)": mfe.max(),
+            "最大浮亏中位数(%)": group["Path_MAE_pct"].median(),
+            "到最高价交易日中位数": group["Trading_Days_To_Peak"].median(),
+            "红柱持续周数中位数": group["Red_Cycle_Weeks"].median(),
+            "峰值发生在翻绿确认周(%)": pct_mean(
+                group["Peak_During_Green_Confirmation_Week"].map(to_bool)
+            ),
+        })
+        for target in OPPORTUNITY_TARGETS:
+            row[f"曾达到{target}%(%)"] = pct_mean(
+                group[f"Reached_{target}_pct"].map(to_bool)
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# -----------------------------------------------------------------------------
 # Streamlit 页面
 # -----------------------------------------------------------------------------
 def main() -> None:
@@ -2882,5 +3073,379 @@ def main() -> None:
     )
 
 
+def opportunity_main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption(
+        "只验证首红柱周期内曾经出现的最高利润空间：不设八周、不止损、不止盈、"
+        "不评分、不做资金组合。最高价是事后机会空间上限，不是卖出信号。"
+    )
+
+    with st.sidebar:
+        st.header("信号与观察区间")
+        SIGNAL_START_DATE = st.date_input(
+            "首红柱信号开始日期", value=date(2022, 6, 5), key="opp_signal_start"
+        )
+        SIGNAL_END_DATE = st.date_input(
+            "首红柱信号截止日期", value=date(2023, 6, 5), key="opp_signal_end"
+        )
+        suggested_observation_end = min(
+            date.today(), SIGNAL_END_DATE + timedelta(days=550)
+        )
+        OBSERVATION_END_DATE = st.date_input(
+            "周期观察截止日期",
+            value=suggested_observation_end,
+            max_value=date.today(),
+            key="opp_observation_end",
+        )
+        st.caption(
+            "观察截止日不是持有上限，只是可用行情的边界。到该日仍未翻绿的周期会单列为截断样本。"
+        )
+
+        st.header("固定股票池")
+        st.info("不抽样：历史科技板块中的主板、创业板、科创板全部检查。")
+        MIN_PRICE = 10.0
+        MIN_MV = 100.0
+        MAX_MV = 1_000_000_000.0
+        SAMPLE_PER_BOARD = 0
+        SAMPLE_SEED = DEFAULT_SAMPLE_SEED
+        st.write("信号日原始股价≥10元")
+        st.write("信号日流通市值≥100亿元，不设上限")
+
+        st.header("唯一买入口径")
+        PRICE_TOLERANCE = 3.0
+        BUY_SLIPPAGE = 0.20
+        SELL_SLIPPAGE = 0.20
+        STOP_THRESHOLD = 10.0  # 仅供底层兼容字段计算，不参与本验证
+        LONG_CYCLE_MIN_WEEKS = DEFAULT_LONG_CYCLE_MIN_WEEKS
+        MATERIAL_HIST_CHANGE = DEFAULT_MATERIAL_HIST_CHANGE_PCT
+        SHORT_STRENGTH_RATIO = DEFAULT_SHORT_STRENGTH_RATIO
+        st.write("完整周MACD：上周柱≤0，本周柱>0")
+        st.write("信号周结束后的下一交易日开盘买入，计0.2%买入滑点")
+        st.write("统计至第一根完整绿柱确认日，不模拟卖出")
+
+        st.header("数据与缓存")
+        USE_CACHE = st.checkbox("使用逐股票缓存", value=True, key="opp_use_cache")
+        API_PAUSE = st.number_input(
+            "每次API调用后暂停(秒)", min_value=0.0, max_value=3.0,
+            value=0.12, step=0.05, key="opp_api_pause",
+        )
+        if st.button("清除本程序缓存", key="opp_clear_cache"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("验证器专用缓存已清除")
+
+    TS_TOKEN = st.text_input("Tushare Token", type="password", key="opp_token")
+    if not TS_TOKEN:
+        st.info("请输入Tushare Token。")
+        return
+
+    run_requested = st.button("开始验证首红柱周期最高利润", type="primary")
+    if not run_requested:
+        if "cycle_opportunity_v1_zip" in st.session_state:
+            st.success("上一次验证结果仍然保留，可直接下载。")
+            st.download_button(
+                "下载1号：上一次全部结果ZIP",
+                data=st.session_state["cycle_opportunity_v1_zip"],
+                file_name="weekly_macd_cycle_opportunity_v1_0_all_results.zip",
+                mime="application/zip", type="primary", on_click="ignore",
+            )
+            return
+        with st.expander("本验证器回答什么问题"):
+            st.markdown(
+                """
+                - 信号周结束后，以下一交易日开盘价作为买入成本。
+                - 从买入日开始，观察到第一根完整绿柱确认日（含确认周）。
+                - 只统计这段期间的最高价与买入价差距，不假设能够卖在最高价。
+                - 完整周期用于核心统计；到观察截止日仍为红柱的周期单独列出。
+                - 均值、中位数、分位数以及达到5%/10%/20%/30%/50%/100%的比例同时输出。
+                """
+            )
+        return
+
+    if SIGNAL_START_DATE >= SIGNAL_END_DATE:
+        st.error("信号开始日期必须早于信号截止日期。")
+        return
+    if OBSERVATION_END_DATE <= SIGNAL_END_DATE:
+        st.error("周期观察截止日期必须晚于信号截止日期。")
+        return
+    if OBSERVATION_END_DATE > date.today():
+        st.error("周期观察截止日期不能晚于今天。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(TS_TOKEN)
+    pro = ts.pro_api()
+    signal_start = SIGNAL_START_DATE.strftime("%Y%m%d")
+    signal_end = SIGNAL_END_DATE.strftime("%Y%m%d")
+    observation_end = OBSERVATION_END_DATE.strftime("%Y%m%d")
+    preload_start = (SIGNAL_START_DATE - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    calendar_tail = (OBSERVATION_END_DATE + timedelta(days=7)).strftime("%Y%m%d")
+    config = {
+        "signal_start": signal_start,
+        "signal_end": signal_end,
+        "market_end": observation_end,
+        "preload_start": preload_start,
+        "min_price": float(MIN_PRICE), "min_mv": float(MIN_MV), "max_mv": float(MAX_MV),
+        "price_tolerance_pct": float(PRICE_TOLERANCE),
+        "stop_threshold_pct": float(STOP_THRESHOLD),
+        "buy_slippage_pct": float(BUY_SLIPPAGE),
+        "sell_slippage_pct": float(SELL_SLIPPAGE),
+        "sample_per_board": int(SAMPLE_PER_BOARD), "sample_seed": int(SAMPLE_SEED),
+        "long_cycle_min_weeks": int(LONG_CYCLE_MIN_WEEKS),
+        "material_hist_change_pct": float(MATERIAL_HIST_CHANGE),
+        "short_strength_ratio": float(SHORT_STRENGTH_RATIO),
+    }
+
+    try:
+        with st.spinner("正在加载交易日历、历史科技股票池和申万历史成分..."):
+            open_dates = load_trade_calendar(preload_start, observation_end)
+            full_calendar = load_trade_calendar(preload_start, calendar_tail)
+            stock_basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(API_PAUSE))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+
+    # 用多取7天的交易日历识别完整周；观察截止日落在周中时，该临时周不会被误当成完整周。
+    week_last_map = complete_week_last_dates(full_calendar)
+    period_index = build_period_index(memberships)
+    universe_codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
+    universe_stocks = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
+    universe_stocks = universe_stocks.sort_values("ts_code").reset_index(drop=True)
+    stocks, sample_audit, population_summary = build_stratified_sample(
+        stocks=universe_stocks, period_index=period_index, reference_date=signal_end,
+        per_board=int(SAMPLE_PER_BOARD), seed=int(SAMPLE_SEED),
+    )
+    if stocks.empty:
+        st.error("历史科技股票池为空。")
+        return
+
+    list_dates = stocks["list_date"].apply(lambda value: normalize_date(value, "19000101"))
+    delist_dates = stocks["delist_date"].apply(lambda value: normalize_date(value, "99991231"))
+    listed_after_signal = list_dates.gt(signal_end)
+    listed_after_observation = list_dates.gt(observation_end)
+    no_history_overlap = delist_dates.lt(preload_start)
+    post_signal_listings = int(listed_after_signal.sum())
+    post_observation_listings = int(listed_after_observation.sum())
+    no_overlap_stocks = int(no_history_overlap.sum())
+    stocks_to_fetch = stocks[~listed_after_signal & ~no_history_overlap].copy().reset_index(drop=True)
+
+    st.write(
+        f"完整历史科技池{len(universe_stocks)}只；实际读取{len(stocks_to_fetch)}只；"
+        f"首红柱信号区间{signal_start}—{signal_end}；周期观察至{observation_end}。"
+    )
+    st.dataframe(population_summary, use_container_width=True, hide_index=True)
+
+    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
+    all_records: list[dict[str, Any]] = []
+    daily_histories: dict[str, pd.DataFrame] = {}
+    reject_totals: dict[str, int] = {}
+    cache_hits = 0
+    data_failures = 0
+    progress = st.progress(0.0, text="正在逐股票验证完整周线周期...")
+    status = st.empty()
+
+    for idx, stock in stocks_to_fetch.iterrows():
+        ts_code = str(stock["ts_code"])
+        progress.progress(
+            (idx + 1) / len(stocks_to_fetch),
+            text=f"{idx + 1}/{len(stocks_to_fetch)} {ts_code}",
+        )
+        status.caption(
+            f"已产生底层事件{len(all_records)}条；缓存命中{cache_hits}；真实行情失败{data_failures}"
+        )
+        daily, basic, cache_hit = fetch_stock_history(
+            ts_code, preload_start, observation_end, bool(USE_CACHE), float(API_PAUSE)
+        )
+        cache_hits += int(cache_hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        records, rejects, _ = analyze_stock(
+            stock=stock, periods=period_index.get(ts_code, []), daily=daily, basic=basic,
+            week_last_map=week_last_map, open_dates=open_dates, open_pos=open_pos,
+            config=config,
+        )
+        all_records.extend(records)
+        if records:
+            daily_histories[ts_code] = daily.copy()
+        for reason, count in rejects.items():
+            reject_totals[reason] = reject_totals.get(reason, 0) + count
+
+    progress.empty()
+    status.empty()
+    if not all_records:
+        st.error("没有生成有效事件，请检查区间、Token权限和价格市值条件。")
+        if API_ERRORS:
+            st.code("\n".join(API_ERRORS[:50]))
+        return
+
+    events = pd.DataFrame(all_records).sort_values(
+        ["Signal_Date", "ts_code", "Event_Type"]
+    ).reset_index(drop=True)
+    with st.spinner("正在计算每一轮首红柱周期的最高价、分位数和目标命中率..."):
+        opportunities = build_cycle_opportunities(
+            events, daily_histories, observation_end, float(SELL_SLIPPAGE)
+        )
+    if opportunities.empty:
+        st.error("没有形成第一根红柱机会样本。")
+        return
+
+    opportunities["Signal_Year"] = opportunities["Signal_Date"].astype(str).str[:4]
+    opportunities["Circ_MV_Group"] = pd.cut(
+        pd.to_numeric(opportunities["Circ_MV_Billion"], errors="coerce"),
+        bins=[0, 100, 200, 500, 1000, np.inf],
+        labels=["低于100亿", "100—200亿", "200—500亿", "500—1000亿", "1000亿以上"],
+        right=False,
+    ).astype(str)
+    completed = opportunities[
+        opportunities["Opportunity_Valid"].map(to_bool)
+        & opportunities["Cycle_Completed"].map(to_bool)
+    ].copy()
+    censored = opportunities[
+        opportunities["Opportunity_Valid"].map(to_bool)
+        & ~opportunities["Cycle_Completed"].map(to_bool)
+    ].copy()
+    invalid = opportunities[~opportunities["Opportunity_Valid"].map(to_bool)].copy()
+    if completed.empty:
+        st.error("没有完整结束的红柱周期；请把周期观察截止日期向后延长。")
+        return
+
+    overall_summary = opportunity_summary(opportunities)
+    overall_summary.insert(0, "范围", "全部完整首红柱周期")
+    year_summary = opportunity_summary(opportunities, ["Signal_Year"])
+    board_summary = opportunity_summary(opportunities, ["Sample_Board"])
+    mv_summary = opportunity_summary(opportunities, ["Circ_MV_Group"])
+    cycle_summary = opportunity_summary(opportunities, ["Cycle_Type"])
+    w2_summary = opportunity_summary(opportunities, ["CP_W2_State"])
+    first_strength_summary = opportunity_summary(
+        opportunities, ["First_Red_Strength_Group"]
+    )
+    threshold_rows = []
+    for target in OPPORTUNITY_TARGETS:
+        hit = completed[f"Reached_{target}_pct"].map(to_bool)
+        days = pd.to_numeric(
+            completed.loc[hit, f"Trading_Days_To_{target}"], errors="coerce"
+        )
+        threshold_rows.append({
+            "目标涨幅": f"+{target}%", "完整周期数": len(completed),
+            "曾达到数量": int(hit.sum()), "曾达到比例(%)": pct_mean(hit),
+            "达到目标交易日中位数": days.median(),
+        })
+    threshold_summary = pd.DataFrame(threshold_rows)
+    distribution = pd.cut(
+        pd.to_numeric(completed["Peak_MFE_pct"], errors="coerce"),
+        bins=[-np.inf, 0, 5, 10, 20, 30, 50, 100, np.inf],
+        labels=["≤0%", "0—5%", "5—10%", "10—20%", "20—30%", "30—50%", "50—100%", ">100%"],
+        right=False,
+    ).value_counts(sort=False).rename_axis("最高利润区间").reset_index(name="周期数")
+    distribution["占完整周期比例(%)"] = distribution["周期数"] / len(completed) * 100.0
+    reject_frame = pd.DataFrame(
+        [{"剔除原因": reason, "次数": count} for reason, count in reject_totals.items()]
+    ).sort_values("次数", ascending=False) if reject_totals else pd.DataFrame(
+        columns=["剔除原因", "次数"]
+    )
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "信号开始": signal_start, "信号截止": signal_end,
+        "观察截止": observation_end, "首红柱事件": len(opportunities),
+        "完整可计算周期": len(completed), "未翻绿截断周期": len(censored),
+        "无法按口径计算": len(invalid), "涉及股票": opportunities["ts_code"].nunique(),
+        "信号截止日后上市股票": post_signal_listings,
+        "其中观察截止日后上市": post_observation_listings,
+        "历史无重叠股票": no_overlap_stocks,
+        "真实无行情或接口失败": data_failures, "缓存命中股票": cache_hits,
+    }])
+    metadata = pd.DataFrame([
+        {"项目": "程序", "值": TITLE},
+        {"项目": "生成时间", "值": datetime.now().isoformat(timespec="seconds")},
+        {"项目": "首红柱信号区间", "值": f"{signal_start}—{signal_end}"},
+        {"项目": "周期观察截止", "值": observation_end},
+        {"项目": "买入价", "值": "信号周结束后下一交易日开盘价×1.002"},
+        {"项目": "观察窗口", "值": "买入日至第一根完整绿柱确认日（含确认日）；未翻绿者截至观察日并单列"},
+        {"项目": "核心指标", "值": "窗口内最高日线价相对买入价的涨幅；最高价仅为事后机会空间"},
+        {"项目": "明确不包含", "值": "无八周上限、无止损、无止盈、无评分、无资金组合、无最高价卖出假设"},
+        {"项目": "股票池", "值": "历史科技板块；主板/创业板/科创板；信号日价≥10元、流通市值≥100亿元"},
+    ])
+
+    files = {
+        "01_run_summary_cycle_opportunity_v1_0.csv": run_summary,
+        "02_overall_summary_cycle_opportunity_v1_0.csv": overall_summary,
+        "03_threshold_summary_cycle_opportunity_v1_0.csv": threshold_summary,
+        "04_peak_distribution_cycle_opportunity_v1_0.csv": distribution,
+        "05_year_summary_cycle_opportunity_v1_0.csv": year_summary,
+        "06_board_summary_cycle_opportunity_v1_0.csv": board_summary,
+        "07_market_cap_summary_cycle_opportunity_v1_0.csv": mv_summary,
+        "08_cycle_type_summary_cycle_opportunity_v1_0.csv": cycle_summary,
+        "09_week2_state_summary_cycle_opportunity_v1_0.csv": w2_summary,
+        "10_first_red_strength_summary_cycle_opportunity_v1_0.csv": first_strength_summary,
+        "11_completed_cycle_events_v1_0.csv": completed,
+        "12_censored_open_cycles_v1_0.csv": censored,
+        "13_invalid_events_v1_0.csv": invalid,
+        "14_full_first_red_opportunities_v1_0.csv": opportunities,
+        "15_full_tech_universe_v1_0.csv": sample_audit,
+        "16_population_v1_0.csv": population_summary,
+        "17_rejection_audit_v1_0.csv": reject_frame,
+        "18_metadata_v1_0.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state["cycle_opportunity_v1_zip"] = result_zip
+
+    overall = overall_summary.iloc[0]
+    st.success(
+        f"验证完成：首红柱{len(opportunities)}个；完整周期{len(completed)}个；"
+        f"截至观察日仍未翻绿{len(censored)}个。"
+    )
+    metrics = st.columns(6)
+    metrics[0].metric("完整周期", f"{len(completed)}")
+    metrics[1].metric("最高利润中位数", f"{overall['最高利润中位数(%)']:.2f}%")
+    metrics[2].metric("最高利润P75", f"{overall['最高利润P75(%)']:.2f}%")
+    metrics[3].metric("曾达到20%", f"{overall['曾达到20%(%)']:.2f}%")
+    metrics[4].metric("曾达到30%", f"{overall['曾达到30%(%)']:.2f}%")
+    metrics[5].metric("到峰值中位日数", f"{overall['到最高价交易日中位数']:.0f}")
+
+    st.subheader("核心结果：最高利润空间")
+    st.dataframe(overall_summary, use_container_width=True, hide_index=True)
+    st.dataframe(threshold_summary, use_container_width=True, hide_index=True)
+    chart = distribution.set_index("最高利润区间")[["周期数"]]
+    st.bar_chart(chart)
+    with st.expander("年度、板块、市值、周期类型与第二周状态"):
+        st.dataframe(year_summary, use_container_width=True, hide_index=True)
+        st.dataframe(board_summary, use_container_width=True, hide_index=True)
+        st.dataframe(mv_summary, use_container_width=True, hide_index=True)
+        st.dataframe(cycle_summary, use_container_width=True, hide_index=True)
+        st.dataframe(w2_summary, use_container_width=True, hide_index=True)
+        st.dataframe(first_strength_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("下载结果")
+    st.download_button(
+        "下载1号：全部结果ZIP", result_zip,
+        file_name="weekly_macd_cycle_opportunity_v1_0_all_results.zip",
+        mime="application/zip", type="primary", on_click="ignore",
+    )
+    labels = [
+        "2号：运行总表", "3号：总体机会空间", "4号：目标命中率", "5号：最高利润分布",
+        "6号：年度汇总", "7号：板块汇总", "8号：市值汇总", "9号：周期类型汇总",
+        "10号：第二周状态", "11号：首红柱强度", "12号：完整周期明细", "13号：未翻绿周期",
+        "14号：无效事件", "15号：全部首红柱机会", "16号：科技股票池", "17号：板块数量",
+        "18号：剔除审计", "19号：运行口径",
+    ]
+    columns = st.columns(4)
+    for index, (filename, frame) in enumerate(files.items()):
+        with columns[index % 4]:
+            st.download_button(
+                labels[index], csv_bytes(frame), file_name=filename,
+                mime="text/csv", key=f"cycle_opp_{filename}", on_click="ignore",
+            )
+    if API_ERRORS:
+        with st.expander("接口错误记录（最多显示50条）"):
+            st.code("\n".join(API_ERRORS[:50]))
+    st.warning(
+        "最高价只能事后知道。本验证器只判断红柱周期是否存在足够大的机会空间，"
+        "不能把最高利润当成可实现交易收益。"
+    )
+
+
 if __name__ == "__main__":
-    main()
+    opportunity_main()
