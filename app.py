@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-全量科技股独立选股与三仓回测一体版 V4.9
+周线首红柱全候选评分与三仓回测一体版 V5.0
 ======================================
 
 本文件把原先分散在V4.1、V4.4、V4.6和V4.7中的历史股票池、第一根红柱、
-板块相对强度、冻结门槛、评分排序和30万元组合回测合并为一次运行。
+板块相对强度、透明评分排序和30万元组合回测合并为一次运行。V5.0不再让
+日线趋势、箱体、成交量和日线MACD一票否决；它们只负责评分，第一根真正
+周线红柱负责产生足够多的候选。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30% 的概率。
@@ -29,7 +31,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_hypothesis_validator_v3_1.py
+    streamlit run app.py
 """
 
 from __future__ import annotations
@@ -52,7 +54,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V4.9-LIVE-BACKTEST-ALL-IN-ONE"
+VERSION = "V5.0-FIRST-RED-RANKING-ALL-IN-ONE"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -82,17 +84,15 @@ DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
 
-TITLE = "全量科技股选股与三仓回测一体版 V4.9"
+TITLE = "周线首红柱全候选评分与三仓回测一体版 V5.0"
 INITIAL_CAPITAL = 300_000.0
 MAX_POSITIONS = 3
 POSITION_BUDGET = 100_000.0
 LOT_SIZE = 100
 BOARD_INDEX = {"主板": "000905.SH", "创业板": "399006.SZ", "科创板": "000688.SH"}
-V49_HARD_GATES = [
-    "True_First_Red_Audit", "Weekly_Bias_Pass", "Weekly_Shadow_Pass",
-    "Daily_Trend_Pass", "Box_Breakout_Pass", "Daily_Breakout_Pass",
-    "MA20_Healthy_Pass", "Volume_Pass", "Daily_MACD_Pass",
-    "One_Word_Pass", "Gap_Pass",
+# 只有信号真实性和次日可执行性可以一票否决。V40.6形态全部改为评分项。
+V50_EXECUTION_GATES = [
+    "True_First_Red_Audit", "One_Word_Pass", "Gap_Pass",
 ]
 
 pro = None
@@ -1887,7 +1887,7 @@ def build_delayed_entry_report(events: pd.DataFrame) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# V4.9冻结选股规则：板块相对强度、V40.6门槛、V4.7评分
+# V5.0透明评分：第一根红柱产生候选，V40.6形态只评分不否决
 # -----------------------------------------------------------------------------
 def to_bool(value: Any) -> bool:
     if pd.isna(value):
@@ -2007,58 +2007,77 @@ def v49_wave_count(weekly: pd.DataFrame, position: int) -> int:
 
 
 def bucket_rs(percentile: float) -> float:
+    """板块内相对强度位置，最高20分；避免只追逐最极端的强势股。"""
     if not math.isfinite(percentile):
         return 0.0
     if 60 < percentile <= 80:
-        return 30.0
-    if 40 < percentile <= 60 or 80 < percentile <= 90:
         return 20.0
+    if 40 < percentile <= 60 or 80 < percentile <= 90:
+        return 15.0
     if 20 < percentile <= 40 or 90 < percentile <= 100:
         return 10.0
     return 5.0
 
 
 def bucket_breakout(value: float) -> float:
+    """突破幅度质量，作为突破组中的0—4分，不再作为硬门槛。"""
     if not math.isfinite(value) or value <= 0:
         return 0.0
     if value <= 1:
-        return 18.0
+        return 3.0
     if value <= 3:
-        return 25.0
+        return 4.0
     if value <= 5:
-        return 15.0
-    return 5.0
+        return 2.0
+    return 1.0
 
 
 def bucket_volume(value: float) -> float:
-    if not math.isfinite(value) or value < 1.3 or value > 3.0:
+    """成交量质量0—15分；非标准放量只是不加高分，不再直接剔除。"""
+    if not math.isfinite(value) or value < 0:
         return 0.0
+    if value < 1.0:
+        return 0.0
+    if 1.0 <= value < 1.3:
+        return 5.0
     if value < 1.6:
-        return 15.0
-    if value <= 2.2:
-        return 20.0
-    if value <= 2.6:
         return 12.0
-    return 5.0
+    if value <= 2.2:
+        return 15.0
+    if value <= 2.6:
+        return 10.0
+    if value <= 3.0:
+        return 6.0
+    if value <= 4.0:
+        return 3.0
+    return 0.0
 
 
 def bucket_bias(value: float) -> float:
+    """周线乖离风险0—6分；高乖离不再一票否决。"""
     if not math.isfinite(value):
         return 0.0
     if value <= 15:
-        return 15.0
+        return 6.0
     if value <= 25:
-        return 10.0
+        return 4.0
     if value <= 35:
-        return 5.0
-    if value <= 45:
         return 2.0
+    if value <= 45:
+        return 1.0
     return 0.0
 
 
 def bucket_body(value: float) -> float:
-    if not math.isfinite(value) or value < 0.60:
+    """K线实体质量0—10分；实体不足60%仍可参加排序。"""
+    if not math.isfinite(value):
         return 0.0
+    if value <= 0:
+        return 0.0
+    if value < 0.30:
+        return 2.0
+    if value < 0.60:
+        return 5.0
     if value <= 0.80:
         return 10.0
     if value <= 0.95:
@@ -2188,23 +2207,39 @@ def enrich_first_red_v49(
         .rank(method="average", pct=True) * 100.0
     )
     enriched["RS_Position_Score"] = enriched["RS13_Weekly_Percentile"].map(bucket_rs)
+    enriched["Daily_Long_Trend_Score"] = np.where(enriched["Daily_Trend_Pass"], 10.0, 0.0)
+    enriched["MA20_Trend_Score"] = np.where(enriched["MA20_Healthy_Pass"], 5.0, 0.0)
+    enriched["Trend_Group_Score"] = (
+        enriched["Daily_Long_Trend_Score"] + enriched["MA20_Trend_Score"]
+    )
+    enriched["Box_First_Breakout_Score"] = np.where(enriched["Box_Breakout_Pass"], 12.0, 0.0)
+    enriched["Daily_Breakout_Score"] = np.where(enriched["Daily_Breakout_Pass"], 4.0, 0.0)
     enriched["Breakout_Quality_Score"] = enriched["Box_Breakout_pct"].map(bucket_breakout)
+    enriched["Breakout_Group_Score"] = enriched[[
+        "Box_First_Breakout_Score", "Daily_Breakout_Score", "Breakout_Quality_Score",
+    ]].sum(axis=1)
     enriched["Volume_Quality_Score"] = enriched["Volume_Ratio"].map(bucket_volume)
+    enriched["Daily_MACD_Score"] = np.where(enriched["Daily_MACD_Pass"], 10.0, 0.0)
+    enriched["Weekly_Shadow_Score"] = np.where(enriched["Weekly_Shadow_Pass"], 4.0, 0.0)
     enriched["Weekly_Bias_Score"] = enriched["Weekly_Bias_pct"].map(bucket_bias)
+    enriched["Weekly_Risk_Group_Score"] = (
+        enriched["Weekly_Shadow_Score"] + enriched["Weekly_Bias_Score"]
+    )
     enriched["Body_Quality_Score"] = enriched["Body_Ratio"].map(bucket_body)
     enriched["New_Score_100"] = enriched[[
-        "RS_Position_Score", "Breakout_Quality_Score", "Volume_Quality_Score",
-        "Weekly_Bias_Score", "Body_Quality_Score",
+        "RS_Position_Score", "Trend_Group_Score", "Breakout_Group_Score",
+        "Volume_Quality_Score", "Daily_MACD_Score", "Weekly_Risk_Group_Score",
+        "Body_Quality_Score",
     ]].sum(axis=1)
-    enriched["V49_Candidate_Pass"] = enriched[V49_HARD_GATES].all(axis=1)
-    candidates = enriched[enriched["V49_Candidate_Pass"]].copy().sort_values(
+    enriched["V50_Candidate_Pass"] = enriched[V50_EXECUTION_GATES].all(axis=1)
+    candidates = enriched[enriched["V50_Candidate_Pass"]].copy().sort_values(
         ["Signal_Date", "New_Score_100", "Original_V406_Score", "Board_RS_13W_pct", "ts_code"],
         ascending=[True, False, False, False, True], kind="mergesort",
     )
-    candidates["V49_Weekly_Rank"] = candidates.groupby("Signal_Date").cumcount() + 1
-    rank_map = candidates.set_index("Cycle_ID")["V49_Weekly_Rank"]
-    enriched["V49_Weekly_Rank"] = enriched["Cycle_ID"].map(rank_map)
-    enriched["V49_Selected"] = enriched["V49_Weekly_Rank"].eq(1)
+    candidates["V50_Weekly_Rank"] = candidates.groupby("Signal_Date").cumcount() + 1
+    rank_map = candidates.set_index("Cycle_ID")["V50_Weekly_Rank"]
+    enriched["V50_Weekly_Rank"] = enriched["Cycle_ID"].map(rank_map)
+    enriched["V50_Selected"] = enriched["V50_Weekly_Rank"].eq(1)
     return enriched.sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
 
 
@@ -2414,7 +2449,7 @@ def main() -> None:
     st.title(TITLE)
     st.caption(
         "无需上传任何前置结果：选择任意完整历史区间，程序自行扫描当时的全量科技股票池、"
-        "每周选择评分第一名，并以30万元、最多三仓完成组合回测。"
+        "对所有可买的第一根真正周线红柱透明评分，每周选择第一名，并以30万元、最多三仓完成组合回测。"
     )
 
     with st.sidebar:
@@ -2437,7 +2472,7 @@ def main() -> None:
         st.write("信号日原始股价：≥10元")
         st.write("信号日流通市值：≥100亿元（不设上限）")
 
-        st.header("冻结交易规则")
+        st.header("固定交易与评分规则")
         PRICE_TOLERANCE = 3.0
         STOP_THRESHOLD = 10.0
         BUY_SLIPPAGE = 0.20
@@ -2445,7 +2480,7 @@ def main() -> None:
         LONG_CYCLE_MIN_WEEKS = DEFAULT_LONG_CYCLE_MIN_WEEKS
         MATERIAL_HIST_CHANGE = DEFAULT_MATERIAL_HIST_CHANGE_PCT
         SHORT_STRENGTH_RATIO = DEFAULT_SHORT_STRENGTH_RATIO
-        st.write("第一根真正周线红柱；取消波浪和实体阳线硬门槛")
+        st.write("第一根真正周线红柱产生候选；V40.6日线形态只评分、不再一票否决")
         st.write("每周评分第一名；30万元；最多3只；单只目标10万元")
         st.write("-10%止损；+30%止盈；最长8周；买卖各0.2%滑点")
 
@@ -2467,12 +2502,12 @@ def main() -> None:
 
     run_requested = st.button("开始一体化选股与三仓回测", type="primary")
     if not run_requested:
-        if "v49_result_zip" in st.session_state:
+        if "v50_result_zip" in st.session_state:
             st.success("上一次回测结果仍然保留，可直接下载，无需重新运行。")
             st.download_button(
                 "下载1号：上一次全部结果ZIP",
-                data=st.session_state["v49_result_zip"],
-                file_name="weekly_macd_standalone_backtest_v4_9_all_results.zip",
+                data=st.session_state["v50_result_zip"],
+                file_name="weekly_macd_rank_first_v5_0_all_results.zip",
                 mime="application/zip",
                 type="primary",
                 on_click="ignore",
@@ -2484,8 +2519,9 @@ def main() -> None:
                 - **第一根红柱**：完整周MACD柱本周 `>0`，上周 `<=0`。
                 - **实际买点**：信号周结束后的下一市场交易日开盘。
                 - **退出模拟**：+30%止盈、-10%止损、最长40个交易日；同日双触发保守按止损。
-                - **候选门槛**：保留周线安全、日线趋势、箱体突破、MA20、温和放量、日线MACD及T+1开盘限制。
-                - **明确取消**：波浪2—5次、实体阳线≥60%不再作为硬门槛，但仍保留审计与评分信息。
+                - **候选门槛**：真正第一根周线红柱、T+1非一字板、T+1开盘跳空在-3%至+5%。
+                - **只评分不否决**：日线趋势、箱体突破、MA20、成交量、日线MACD、周线乖离、上影线及实体质量。
+                - **明确取消**：波浪2—5次完全不参与选股；实体阳线≥60%不再作为硬门槛。
                 - **组合**：每周最多产生一个第一名；30万元；最多3只；每只目标10万元；100股整数倍。
                 """
             )
@@ -2577,6 +2613,18 @@ def main() -> None:
         st.error("历史科技股票池为空")
         return
 
+    # 当前股票基础表包含回测结束后才上市的公司。它们不可能在信号区间产生事件，
+    # 不应发起行情请求，更不能被误报为“数据获取失败”。
+    list_dates = stocks["list_date"].apply(lambda value: normalize_date(value, "19000101"))
+    delist_dates = stocks["delist_date"].apply(lambda value: normalize_date(value, "99991231"))
+    listed_after_signal = list_dates.gt(signal_end)
+    listed_after_market = list_dates.gt(market_end)
+    no_history_overlap = delist_dates.lt(preload_start)
+    post_signal_listings = int(listed_after_signal.sum())
+    post_market_listings = int(listed_after_market.sum())
+    no_overlap_stocks = int(no_history_overlap.sum())
+    stocks_to_fetch = stocks[~listed_after_signal & ~no_history_overlap].copy().reset_index(drop=True)
+
     sample_hash = cache_key(
         int(SAMPLE_SEED), int(SAMPLE_PER_BOARD),
         "|".join(sample_audit["ts_code"].astype(str)),
@@ -2590,9 +2638,15 @@ def main() -> None:
     open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
     st.write(
         f"完整历史科技池：{len(universe_stocks)}只；本次全量检查：{len(stocks)}只；"
+        f"实际读取历史行情：{len(stocks_to_fetch)}只；"
         f"信号区间：{signal_start}—{signal_end}；"
         f"行情结果观察至：{market_end}；行情预热起点：{preload_start}。"
     )
+    if post_signal_listings:
+        st.caption(
+            f"有{post_signal_listings}只股票在信号截止日后才上市，已按时间事实跳过；"
+            f"其中{post_market_listings}只在行情观察截止日后才上市，不再计为行情失败。"
+        )
     st.dataframe(style_percent_table(population_summary), use_container_width=True, hide_index=True)
 
     all_records: list[dict[str, Any]] = []
@@ -2604,9 +2658,12 @@ def main() -> None:
     progress = st.progress(0.0, text="正在逐股票验证周线状态...")
     status = st.empty()
 
-    for idx, stock in stocks.iterrows():
+    for idx, stock in stocks_to_fetch.iterrows():
         ts_code = str(stock["ts_code"])
-        progress.progress((idx + 1) / len(stocks), text=f"{idx + 1}/{len(stocks)} {ts_code}")
+        progress.progress(
+            (idx + 1) / len(stocks_to_fetch),
+            text=f"{idx + 1}/{len(stocks_to_fetch)} {ts_code}",
+        )
         status.caption(
             f"已产生事件 {len(all_records)} 条；缓存命中 {cache_hits}；行情失败 {data_failures}"
         )
@@ -2645,17 +2702,22 @@ def main() -> None:
     events = pd.DataFrame(all_records).sort_values(
         ["Signal_Date", "ts_code", "Event_Type"]
     ).reset_index(drop=True)
-    with st.spinner("正在计算板块相对强度、冻结门槛和每周评分第一名..."):
+    with st.spinner("正在对全部可买第一根红柱计算透明评分和每周排名..."):
         enriched = enrich_first_red_v49(
             events, daily_histories, weekly_histories, board_weeklies
         )
     if enriched.empty:
         st.error("没有形成可评分的完整第一根红柱事件。")
         return
-    candidates = enriched[enriched["V49_Candidate_Pass"]].copy()
-    selected = enriched[enriched["V49_Selected"]].copy().sort_values("Signal_Date")
+    candidates = enriched[enriched["V50_Candidate_Pass"]].copy().sort_values(
+        ["Signal_Date", "V50_Weekly_Rank", "ts_code"]
+    )
+    top3 = candidates[candidates["V50_Weekly_Rank"].le(3)].copy().sort_values(
+        ["Signal_Date", "V50_Weekly_Rank", "ts_code"]
+    )
+    selected = enriched[enriched["V50_Selected"]].copy().sort_values("Signal_Date")
     if selected.empty:
-        st.error("所选区间没有通过冻结规则的评分第一名，组合保持空仓。")
+        st.error("所选区间没有形成可执行的评分第一名，组合保持空仓。")
         return
 
     with st.spinner("正在执行30万元、最多三仓的真实资金占用模拟..."):
@@ -2683,8 +2745,11 @@ def main() -> None:
         "区间周数": len(weekly_coverage), "实际持仓覆盖周": covered_weeks,
         "完全空仓周": len(weekly_coverage) - covered_weeks,
         "持仓周覆盖率(%)": covered_weeks / len(weekly_coverage) * 100.0,
-        "全量第一根红柱": len(enriched), "冻结门槛候选": len(candidates),
-        "数据失败股票": data_failures, "缓存命中股票": cache_hits,
+        "全量第一根红柱": len(enriched), "可评分候选": len(candidates),
+        "信号截止日后上市股票": post_signal_listings,
+        "其中行情观察截止后上市": post_market_listings,
+        "历史无重叠股票": no_overlap_stocks,
+        "真实无行情或接口失败股票": data_failures, "缓存命中股票": cache_hits,
     })
     summary_frame = pd.DataFrame([portfolio_summary])
 
@@ -2698,10 +2763,24 @@ def main() -> None:
             "止损率(%)": frame["Exit_T30_Reason"].astype(str).str.contains("止损").mean() * 100.0,
         }
 
+    rank2 = candidates[candidates["V50_Weekly_Rank"].eq(2)].copy()
+    rank3 = candidates[candidates["V50_Weekly_Rank"].eq(3)].copy()
     candidate_summary = pd.DataFrame([
         stage_row("全部完整第一根红柱", enriched),
-        stage_row("冻结门槛候选池", candidates),
+        stage_row("通过T+1执行限制的评分池", candidates),
         stage_row("每周评分第一名", selected),
+        stage_row("每周评分第二名", rank2),
+        stage_row("每周评分第三名", rank3),
+        stage_row("每周评分前三名合计", top3),
+    ])
+    score_definition = pd.DataFrame([
+        {"评分组": "板块相对强度", "最高分": 20, "规则": "信号周相对所属板块指数的13周强度位置"},
+        {"评分组": "日线趋势", "最高分": 15, "规则": "MA60>MA120得10分；MA20不下降得5分"},
+        {"评分组": "突破质量", "最高分": 20, "规则": "十日箱体首次突破12分；站上MA20 2%得4分；突破幅度质量0—4分"},
+        {"评分组": "成交量质量", "最高分": 15, "规则": "量比1.0—4.0分档；1.6—2.2倍最高，不符合不剔除"},
+        {"评分组": "日线MACD", "最高分": 10, "规则": "DIF>0且MACD柱增长得10分"},
+        {"评分组": "周线风险", "最高分": 10, "规则": "前周上影线合格4分；周线乖离分档0—6分"},
+        {"评分组": "实体质量", "最高分": 10, "规则": "实体比例分档0—10分；不足60%仍可参加排序"},
     ])
     trade_year = ledger.assign(
         Entry_Year=ledger["Entry_Date"].astype(str).str[:4]
@@ -2721,33 +2800,36 @@ def main() -> None:
         {"项目": "信号区间", "值": f"{signal_start}—{signal_end}"},
         {"项目": "行情观察截止", "值": market_end},
         {"项目": "股票池", "值": "历史申万科技成分；主板/创业板/科创板；信号日股价≥10元、流通市值≥100亿元"},
-        {"项目": "冻结规则", "值": "取消波浪与实体阳线硬门槛；其他V40.6门槛；每周新100分第一名"},
+        {"项目": "候选规则", "值": "第一根真正周线红柱；T+1非一字板且跳空-3%至+5%；其他V40.6形态全部改为评分"},
+        {"项目": "评分规则", "值": "固定透明100分；同时输出每周第一、第二、第三名的未来表现"},
         {"项目": "组合", "值": "30万元；最多3只；单只目标10万元；100股整数倍"},
         {"项目": "退出", "值": "+30%止盈；-10%止损；最长40个交易日；同日双触发按止损"},
         {"项目": "摩擦", "值": "买入和卖出各0.2%滑点；未另计佣金与印花税"},
     ])
     files = {
-        "01_portfolio_summary_v4_9.csv": summary_frame,
-        "02_portfolio_curve_v4_9.csv": curve,
-        "03_portfolio_ledger_v4_9.csv": ledger,
-        "04_portfolio_orders_v4_9.csv": orders,
-        "05_missed_signals_v4_9.csv": missed,
-        "06_selected_top1_v4_9.csv": selected,
-        "07_candidate_pool_v4_9.csv": candidates,
-        "08_first_red_audit_v4_9.csv": enriched,
-        "09_weekly_coverage_v4_9.csv": weekly_coverage,
-        "10_trade_year_v4_9.csv": trade_year,
-        "11_candidate_summary_v4_9.csv": candidate_summary,
-        "12_full_tech_universe_v4_9.csv": sample_audit,
-        "13_population_v4_9.csv": population_summary,
-        "14_rejection_audit_v4_9.csv": reject_frame,
-        "15_metadata_v4_9.csv": metadata,
+        "01_portfolio_summary_v5_0.csv": summary_frame,
+        "02_portfolio_curve_v5_0.csv": curve,
+        "03_portfolio_ledger_v5_0.csv": ledger,
+        "04_portfolio_orders_v5_0.csv": orders,
+        "05_missed_signals_v5_0.csv": missed,
+        "06_selected_top1_v5_0.csv": selected,
+        "07_weekly_top3_v5_0.csv": top3,
+        "08_scored_candidate_pool_v5_0.csv": candidates,
+        "09_first_red_audit_v5_0.csv": enriched,
+        "10_weekly_coverage_v5_0.csv": weekly_coverage,
+        "11_trade_year_v5_0.csv": trade_year,
+        "12_rank_summary_v5_0.csv": candidate_summary,
+        "13_score_definition_v5_0.csv": score_definition,
+        "14_full_tech_universe_v5_0.csv": sample_audit,
+        "15_population_v5_0.csv": population_summary,
+        "16_rejection_audit_v5_0.csv": reject_frame,
+        "17_metadata_v5_0.csv": metadata,
     }
     result_zip_bytes = make_result_zip(files)
-    st.session_state["v49_result_zip"] = result_zip_bytes
+    st.session_state["v50_result_zip"] = result_zip_bytes
 
     st.success(
-        f"回测完成：完整第一根红柱{len(enriched)}个，候选{len(candidates)}个，"
+        f"回测完成：完整第一根红柱{len(enriched)}个，可评分候选{len(candidates)}个，"
         f"评分第一名{len(selected)}个，实际买入{len(ledger)}个。"
     )
     metrics1 = st.columns(5)
@@ -2778,24 +2860,25 @@ def main() -> None:
     st.subheader("下载结果")
     st.download_button(
         "下载1号：全部结果ZIP", result_zip_bytes,
-        file_name="weekly_macd_standalone_backtest_v4_9_all_results.zip",
+        file_name="weekly_macd_rank_first_v5_0_all_results.zip",
         mime="application/zip", type="primary", on_click="ignore",
     )
     labels = [
         "2号：组合总表", "3号：资金曲线", "4号：成交账本", "5号：下单审计",
-        "6号：错过信号", "7号：评分第一名", "8号：候选池", "9号：第一红柱审计",
-        "10号：持仓周覆盖", "11号：分年交易", "12号：候选摘要", "13号：科技股票池",
-        "14号：板块统计", "15号：剔除审计", "16号：运行信息",
+        "6号：错过信号", "7号：评分第一名", "8号：每周前三名", "9号：全部评分池",
+        "10号：第一红柱审计", "11号：持仓周覆盖", "12号：分年交易", "13号：排名摘要",
+        "14号：评分说明", "15号：科技股票池", "16号：板块统计", "17号：剔除审计",
+        "18号：运行信息",
     ]
     columns = st.columns(4)
     for index, (filename, frame) in enumerate(files.items()):
         with columns[index % 4]:
             st.download_button(
                 labels[index], csv_bytes(frame), file_name=filename,
-                mime="text/csv", key=f"v49_{filename}", on_click="ignore",
+                mime="text/csv", key=f"v50_{filename}", on_click="ignore",
             )
     st.warning(
-        "这是历史回测，不是未来保证。为了保持跨年度可比性，请只修改起止日期，不调整冻结规则。"
+        "这是历史回测，不是未来保证。为了保持跨年度可比性，请只修改起止日期，不调整评分权重。"
     )
 
 
