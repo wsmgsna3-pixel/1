@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import math
 import zipfile
 from dataclasses import dataclass
@@ -14,43 +13,44 @@ import pandas as pd
 import streamlit as st
 
 
-APP_TITLE = "周线MACD透明动态持仓验证器 V4.2"
+TITLE = "周线MACD动态退出成交验证器 V4.3"
 CHECKPOINTS = (2, 3, 4, 5)
-MIN_REQUIRED = {
-    "Event_Type",
-    "Cycle_ID",
-    "Signal_Date",
-    "Hist",
-    "Red_Cycle_Weeks",
-    "Cycle_Type",
-    "Has_8W_Future",
-    "MFE_8W_pct",
-    "MAE_8W_pct",
-    "Return_8W_pct",
-    "Hit_Stop_8W",
-    "Hit_30_8W",
-}
+TARGETS = (10, 20, 30)
 
 
 @dataclass(frozen=True)
-class Rule:
+class Policy:
     code: str
     name: str
     explanation: str
 
 
-RULES = (
-    Rule("R0", "基准：检查周仍未止损", "不看柱体形态；只要此前没有触发-10%止损。"),
-    Rule("R1", "红柱仍为正", "检查周标准MACD柱仍大于0。"),
-    Rule("R2", "本周柱体扩张", "红柱为正，且本周柱高于上周。"),
-    Rule("R3", "速度或加速度改善", "红柱为正，且柱体正在扩张，或收缩速度已经改善。"),
-    Rule(
-        "R4",
-        "C1友好：只排除明确衰弱",
-        "允许首次缩短和缩短后再扩张；只排除翻绿，或连续至少两周缩短且加速度不改善。",
+POLICIES = (
+    Policy("P0", "基准：固定止盈/止损/八周", "不使用MACD动态退出。"),
+    Policy(
+        "P1", "W2缩短立即退出",
+        "W2红柱不扩张即全部退出；W3同样要求扩张；W4/W5只排明确衰弱。",
     ),
-    Rule("R5", "严格：扩张且加速", "红柱为正、柱体扩张，并且扩张速度不低于上周。"),
+    Policy(
+        "P2", "W2缩短减仓一半",
+        "W2翻绿全部退出；W2首次缩短卖一半；W3不扩张退出余仓；W4/W5只排明确衰弱。",
+    ),
+    Policy(
+        "P3", "W2缩短观察至W3",
+        "W2只有翻绿才退出；W3若不扩张则退出；W4/W5只排明确衰弱。",
+    ),
+    Policy(
+        "P4", "全程C1友好",
+        "W2翻绿退出；W3—W5允许首次缩短和再扩张，只排翻绿或连续明确衰弱。",
+    ),
+    Policy("P5", "只在翻绿时退出", "W2—W5只要标准MACD柱翻绿，下一交易日开盘全部退出。"),
 )
+
+
+BASE_REQUIRED = {
+    "Event_Type", "Cycle_ID", "Signal_Date", "Entry_Date", "Entry_Price",
+    "Tradable", "Has_8W_Future", "Cycle_Type", "Red_Cycle_Weeks", "Hist",
+}
 
 
 def to_bool(value: Any) -> bool:
@@ -63,7 +63,7 @@ def to_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "是"}
 
 
-def num(value: Any) -> float:
+def number(value: Any) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError):
@@ -71,325 +71,323 @@ def num(value: Any) -> float:
     return result if math.isfinite(result) else np.nan
 
 
-def rate(mask: pd.Series) -> float:
-    clean = mask.dropna()
-    return float(clean.astype(bool).mean() * 100.0) if len(clean) else np.nan
+def date8(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    digits = "".join(ch for ch in str(value).split(".")[0] if ch.isdigit())
+    return digits[:8] if len(digits) >= 8 else ""
 
 
-def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
-    if total <= 0:
-        return np.nan, np.nan
-    p = successes / total
-    denominator = 1.0 + z * z / total
-    centre = (p + z * z / (2 * total)) / denominator
-    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / denominator
-    return max(0.0, centre - margin) * 100.0, min(1.0, centre + margin) * 100.0
-
-
-def read_csv_bytes(raw: bytes) -> pd.DataFrame:
-    last_error: Exception | None = None
+def read_csv(raw: bytes) -> pd.DataFrame:
+    error: Exception | None = None
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
             return pd.read_csv(io.BytesIO(raw), encoding=encoding, low_memory=False)
-        except Exception as exc:  # pragma: no cover - only used for fallback encodings
-            last_error = exc
-    raise ValueError(f"CSV无法读取：{last_error}")
+        except Exception as exc:
+            error = exc
+    raise ValueError(f"CSV无法读取：{error}")
 
 
 def load_events(uploaded: Any) -> tuple[pd.DataFrame, str]:
     raw = uploaded.getvalue()
-    name = uploaded.name.lower()
-    if name.endswith(".csv"):
-        return read_csv_bytes(raw), uploaded.name
-    if not name.endswith(".zip"):
-        raise ValueError("只接受V4.1结果ZIP或01_events.csv。")
+    if uploaded.name.lower().endswith(".csv"):
+        return read_csv(raw), uploaded.name
+    if not uploaded.name.lower().endswith(".zip"):
+        raise ValueError("请上传V4.1全部结果ZIP或原始01_events.csv。")
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        files = [n for n in archive.namelist() if not n.endswith("/")]
-        preferred = [n for n in files if Path(n).name.lower() == "01_events.csv"]
-        if not preferred:
-            preferred = [n for n in files if "events" in Path(n).name.lower() and n.lower().endswith(".csv")]
-        if not preferred:
-            raise ValueError("ZIP中没有找到01_events.csv或events CSV。")
-        target = sorted(preferred, key=len)[0]
-        return read_csv_bytes(archive.read(target)), f"{uploaded.name}/{target}"
+        names = [n for n in archive.namelist() if not n.endswith("/")]
+        candidates = [n for n in names if Path(n).name.lower() == "01_events.csv"]
+        if not candidates:
+            candidates = [n for n in names if "events" in Path(n).name.lower() and n.endswith(".csv")]
+        if not candidates:
+            raise ValueError("ZIP中没有找到V4.1的01_events.csv。不要上传V4.2结果ZIP。")
+        target = sorted(candidates, key=len)[0]
+        return read_csv(archive.read(target)), f"{uploaded.name}/{target}"
 
 
-def validate_events(events: pd.DataFrame) -> None:
-    missing = sorted(MIN_REQUIRED - set(events.columns))
+def validate(frame: pd.DataFrame, targets: tuple[int, ...]) -> None:
+    required = set(BASE_REQUIRED)
     for week in CHECKPOINTS:
-        for column in (f"CP_W{week}_Observed", f"CP_W{week}_Hist", f"CP_W{week}_Stop_Hit_Before"):
-            if column not in events.columns:
-                missing.append(column)
+        required.update({
+            f"CP_W{week}_Observed", f"CP_W{week}_Hist",
+            f"CP_W{week}_Delayed_Entry_Date", f"CP_W{week}_Delayed_Entry_Price",
+        })
+    for target in targets:
+        required.update({
+            f"Exit_T{target}_Date", f"Exit_T{target}_Price",
+            f"Exit_T{target}_Return_pct", f"Exit_T{target}_Holding_Days",
+            f"Exit_T{target}_Reason",
+        })
+    missing = sorted(required - set(frame.columns))
     if missing:
-        raise ValueError("缺少V4.1字段：" + "、".join(sorted(set(missing))))
+        raise ValueError("输入不是V4.1原始事件表，缺少字段：" + "、".join(missing))
 
 
-def signal_year(series: pd.Series) -> pd.Series:
-    text = series.astype(str).str.replace(r"\D", "", regex=True)
-    return pd.to_numeric(text.str[:4], errors="coerce").astype("Int64")
-
-
-def hist_path(row: pd.Series, week: int) -> list[float]:
-    values = [num(row.get("Hist"))]
-    for k in range(2, week + 1):
-        values.append(num(row.get(f"CP_W{k}_Hist")))
-    return values
-
-
-def consecutive_shrinks(values: list[float]) -> int:
-    diffs = [values[i] - values[i - 1] for i in range(1, len(values))]
-    streak = 0
-    for value in reversed(diffs):
-        if math.isfinite(value) and value < 0:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def checkpoint_features(row: pd.Series, week: int) -> dict[str, Any]:
-    values = hist_path(row, week)
-    observed = to_bool(row.get(f"CP_W{week}_Observed")) and math.isfinite(values[-1])
-    stopped_before = to_bool(row.get(f"CP_W{week}_Stop_Hit_Before"))
-    h = values[-1]
-    velocity = h - values[-2] if observed and math.isfinite(values[-2]) else np.nan
+def velocity_features(row: pd.Series, week: int) -> dict[str, Any]:
+    hist = [number(row.get("Hist"))]
+    hist.extend(number(row.get(f"CP_W{k}_Hist")) for k in range(2, week + 1))
+    observed = to_bool(row.get(f"CP_W{week}_Observed")) and math.isfinite(hist[-1])
+    velocity = hist[-1] - hist[-2] if observed and math.isfinite(hist[-2]) else np.nan
     previous_velocity = (
-        values[-2] - values[-3]
-        if week >= 3 and all(math.isfinite(v) for v in values[-3:-1])
-        else np.nan
+        hist[-2] - hist[-3]
+        if week >= 3 and all(math.isfinite(v) for v in hist[-3:-1]) else np.nan
     )
     acceleration = velocity - previous_velocity if math.isfinite(previous_velocity) else np.nan
-    shrink_streak = consecutive_shrinks(values) if observed else 0
-    prior_diffs = [values[i] - values[i - 1] for i in range(1, len(values) - 1)]
-    had_prior_shrink = any(math.isfinite(v) and v < 0 for v in prior_diffs)
-    re_expansion = observed and h > 0 and velocity > 0 and had_prior_shrink
-
-    if not observed:
-        state = "数据不足"
-    elif h <= 0:
-        state = "已经翻绿"
-    elif re_expansion:
-        state = "C1式再扩张"
-    elif velocity > 0 and (not math.isfinite(acceleration) or acceleration >= 0):
-        state = "红柱扩张加速"
-    elif velocity > 0:
-        state = "红柱扩张减速"
-    elif shrink_streak == 1:
-        state = "首次缩短"
-    else:
-        state = "连续缩短"
-
-    eligible = observed and not stopped_before
-    red = eligible and h > 0
-    v_improves = red and (velocity > 0 or (math.isfinite(acceleration) and acceleration > 0))
+    shrink_streak = 0
+    for i in range(len(hist) - 1, 0, -1):
+        if math.isfinite(hist[i]) and math.isfinite(hist[i - 1]) and hist[i] < hist[i - 1]:
+            shrink_streak += 1
+        else:
+            break
+    red = observed and hist[-1] > 0
+    expanding = red and velocity > 0
     clearly_weak = red and shrink_streak >= 2 and velocity < 0 and (
         not math.isfinite(acceleration) or acceleration <= 0
     )
-    decisions = {
-        "R0": eligible,
-        "R1": red,
-        "R2": red and velocity > 0,
-        "R3": v_improves,
-        "R4": red and not clearly_weak,
-        "R5": red and velocity > 0 and math.isfinite(acceleration) and acceleration >= 0,
-    }
-    if week == 2:
-        # W2只有一个速度，无法计算加速度；R5不参与W2比较。
-        decisions["R5"] = False
-
-    result: dict[str, Any] = {
-        "Observed": observed,
-        "Stopped_Before": stopped_before,
-        "Eligible": eligible,
-        "Hist": h,
-        "Velocity": velocity,
-        "Acceleration": acceleration,
-        "Velocity_vs_W1": velocity / abs(values[0]) if math.isfinite(values[0]) and values[0] != 0 else np.nan,
-        "Acceleration_vs_W1": acceleration / abs(values[0]) if math.isfinite(values[0]) and values[0] != 0 else np.nan,
-        "Shrink_Streak": shrink_streak,
-        "ReExpansion": re_expansion,
-        "State": state,
-    }
-    result.update({f"Keep_{code}": value for code, value in decisions.items()})
-    return result
-
-
-def prepare_events(raw: pd.DataFrame, complete_8w_only: bool) -> pd.DataFrame:
-    frame = raw[raw["Event_Type"].astype(str).eq("第一根红柱")].copy()
-    if "Tradable" in frame.columns:
-        frame = frame[frame["Tradable"].map(to_bool)]
-    if complete_8w_only:
-        frame = frame[frame["Has_8W_Future"].map(to_bool)]
-    frame = frame.drop_duplicates("Cycle_ID").reset_index(drop=True)
-    frame["Signal_Year"] = signal_year(frame["Signal_Date"])
-    frame["Long_9W"] = pd.to_numeric(frame["Red_Cycle_Weeks"], errors="coerce").ge(9)
-    frame["Cycle_Max_30"] = pd.to_numeric(frame.get("Cycle_Max_High_Return_pct"), errors="coerce").ge(30)
-    frame["Hit_30"] = frame["Hit_30_8W"].map(to_bool)
-    frame["Stop_10"] = frame["Hit_Stop_8W"].map(to_bool)
-    if "First_30_vs_Stop" in frame.columns:
-        frame["Target30_Before_Stop"] = frame["First_30_vs_Stop"].astype(str).eq("目标先到")
-    else:
-        frame["Target30_Before_Stop"] = frame["Hit_30"] & ~frame["Stop_10"]
-    red_weeks = pd.to_numeric(frame["Red_Cycle_Weeks"], errors="coerce")
-    completed = frame.get("Cycle_Completed", pd.Series(True, index=frame.index)).map(to_bool)
-    frame["Weak_Rebound_3W"] = completed & red_weeks.le(3)
-    frame["Is_C1"] = frame["Cycle_Type"].astype(str).str.startswith("C1_")
-    frame["Is_C2"] = frame["Cycle_Type"].astype(str).str.startswith("C2_")
-    for column in ("Return_8W_pct", "MFE_8W_pct", "MAE_8W_pct"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-
-    for week in CHECKPOINTS:
-        features = frame.apply(lambda row: pd.Series(checkpoint_features(row, week)), axis=1)
-        features = features.add_prefix(f"W{week}_")
-        frame = pd.concat([frame, features], axis=1)
-    return frame
-
-
-def subset_metrics(group: pd.DataFrame) -> dict[str, Any]:
-    n = len(group)
-    long_n = int(group["Long_9W"].sum())
-    ci_low, ci_high = wilson_interval(long_n, n)
+    c1_friendly = red and not clearly_weak
     return {
-        "入选数": n,
-        "红柱持续至少9周(%)": rate(group["Long_9W"]),
-        "九周概率95%下限(%)": ci_low,
-        "九周概率95%上限(%)": ci_high,
-        "八周最高涨幅≥30%(%)": rate(group["Hit_30"]),
-        "30%先于止损(%)": rate(group["Target30_Before_Stop"]),
-        "完整周期最高涨幅≥30%(%)": rate(group["Cycle_Max_30"]),
-        "八周触及-10%(%)": rate(group["Stop_10"]),
-        "八周收益均值(%)": float(group["Return_8W_pct"].mean()) if n else np.nan,
-        "八周收益中位数(%)": float(group["Return_8W_pct"].median()) if n else np.nan,
-        "弱反弹≤3周(%)": rate(group["Weak_Rebound_3W"]),
+        "observed": observed, "hist": hist[-1], "velocity": velocity,
+        "acceleration": acceleration, "shrink_streak": shrink_streak,
+        "red": red, "expanding": expanding, "c1_friendly": c1_friendly,
     }
 
 
-def build_rule_report(events: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for week in CHECKPOINTS:
-        eligible = events[events[f"W{week}_Eligible"].map(to_bool)].copy()
-        if eligible.empty:
-            continue
-        base = subset_metrics(eligible)
-        c1_total = int(eligible["Is_C1"].sum())
-        c2_total = int(eligible["Is_C2"].sum())
-        winners_total = int(eligible["Target30_Before_Stop"].sum())
-        for rule in RULES:
-            if week == 2 and rule.code == "R5":
-                continue
-            chosen = eligible[eligible[f"W{week}_Keep_{rule.code}"].map(to_bool)].copy()
-            metrics = subset_metrics(chosen)
-            row = {
-                "检查周": f"W{week}",
-                "规则编号": rule.code,
-                "规则": rule.name,
-                "规则说明": rule.explanation,
-                "可检查持仓数": len(eligible),
-                "保留覆盖率(%)": len(chosen) / len(eligible) * 100.0,
-                **metrics,
-                "九周概率较基准变化(百分点)": metrics["红柱持续至少9周(%)"] - base["红柱持续至少9周(%)"],
-                "30%先于止损较基准变化(百分点)": metrics["30%先于止损(%)"] - base["30%先于止损(%)"],
-                "止损率较基准变化(百分点)": metrics["八周触及-10%(%)"] - base["八周触及-10%(%)"],
-                "30%赢家保留率(%)": (
-                    chosen["Target30_Before_Stop"].sum() / winners_total * 100.0 if winners_total else np.nan
-                ),
-                "C1保留率(%)": chosen["Is_C1"].sum() / c1_total * 100.0 if c1_total else np.nan,
-                "C2保留率(%)": chosen["Is_C2"].sum() / c2_total * 100.0 if c2_total else np.nan,
-            }
-            rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def build_state_report(events: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for week in CHECKPOINTS:
-        eligible = events[events[f"W{week}_Eligible"].map(to_bool)].copy()
-        for state, group in eligible.groupby(f"W{week}_State", dropna=False):
-            rows.append({"检查周": f"W{week}", "柱体状态": str(state), **subset_metrics(group)})
-    return pd.DataFrame(rows)
-
-
-def build_year_report(events: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for year, year_frame in events.groupby("Signal_Year", dropna=True):
-        for week in CHECKPOINTS:
-            eligible = year_frame[year_frame[f"W{week}_Eligible"].map(to_bool)].copy()
-            if eligible.empty:
-                continue
-            baseline = rate(eligible["Long_9W"])
-            for rule in RULES:
-                if week == 2 and rule.code == "R5":
-                    continue
-                chosen = eligible[eligible[f"W{week}_Keep_{rule.code}"].map(to_bool)]
-                metrics = subset_metrics(chosen)
-                rows.append(
-                    {
-                        "年份": int(year),
-                        "检查周": f"W{week}",
-                        "规则编号": rule.code,
-                        "规则": rule.name,
-                        "可检查持仓数": len(eligible),
-                        "保留覆盖率(%)": len(chosen) / len(eligible) * 100.0,
-                        **metrics,
-                        "九周概率较当年基准变化(百分点)": metrics["红柱持续至少9周(%)"] - baseline,
-                    }
-                )
-    return pd.DataFrame(rows)
-
-
-def build_verdicts(rule_report: pd.DataFrame, year_report: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    candidates = rule_report[~rule_report["规则编号"].eq("R0")]
-    for _, row in candidates.iterrows():
-        years = year_report[
-            year_report["检查周"].eq(row["检查周"])
-            & year_report["规则编号"].eq(row["规则编号"])
-            & year_report["入选数"].ge(20)
-        ]
-        stable_years = int(years["九周概率较当年基准变化(百分点)"].gt(0).sum())
-        testable_years = len(years)
-        tests = {
-            "覆盖率≥60%": row["保留覆盖率(%)"] >= 60,
-            "九周概率提高≥5个百分点": row["九周概率较基准变化(百分点)"] >= 5,
-            "止损率不升高": row["止损率较基准变化(百分点)"] <= 0,
-            "保留≥75%的30%赢家": pd.isna(row["30%赢家保留率(%)"]) or row["30%赢家保留率(%)"] >= 75,
-            "跨年方向稳定": testable_years >= 2 and stable_years / testable_years >= 0.67,
-        }
-        passed = sum(bool(v) for v in tests.values())
-        if passed == 5:
-            verdict = "通过：值得进入模拟交易回测"
-        elif passed >= 3:
-            verdict = "观察：有局部效果，暂不进入正式规则"
-        else:
-            verdict = "拒绝：效果或稳定性不足"
-        rows.append(
-            {
-                "检查周": row["检查周"],
-                "规则编号": row["规则编号"],
-                "规则": row["规则"],
-                "通过条件数/5": passed,
-                "结论": verdict,
-                "覆盖率≥60%": tests["覆盖率≥60%"],
-                "九周概率提高≥5个百分点": tests["九周概率提高≥5个百分点"],
-                "止损率不升高": tests["止损率不升高"],
-                "保留≥75%的30%赢家": tests["保留≥75%的30%赢家"],
-                "跨年方向稳定": tests["跨年方向稳定"],
-                "可比较年份": testable_years,
-                "正向年份": stable_years,
-            }
+def policy_action(policy_code: str, week: int, feature: dict[str, Any]) -> tuple[float, str]:
+    """返回本次卖出占当前剩余仓位的比例和原因。"""
+    if policy_code == "P0" or not feature["observed"]:
+        return 0.0, ""
+    if policy_code == "P5":
+        return (1.0, "MACD翻绿") if not feature["red"] else (0.0, "")
+    if policy_code == "P4":
+        keep = feature["red"] if week == 2 else feature["c1_friendly"]
+        return (0.0, "") if keep else (1.0, "C1友好规则退出")
+    if policy_code == "P1":
+        keep = feature["expanding"] if week in (2, 3) else feature["c1_friendly"]
+        return (0.0, "") if keep else (1.0, "动态衰弱退出")
+    if policy_code == "P3":
+        keep = feature["red"] if week == 2 else (
+            feature["expanding"] if week == 3 else feature["c1_friendly"]
         )
-    return pd.DataFrame(rows).sort_values(
-        ["通过条件数/5", "检查周", "规则编号"], ascending=[False, True, True]
-    )
+        return (0.0, "") if keep else (1.0, "观察后衰弱退出")
+    if policy_code == "P2":
+        if week == 2:
+            if not feature["red"]:
+                return 1.0, "W2翻绿退出"
+            if not feature["expanding"]:
+                return 0.5, "W2首次缩短减半"
+            return 0.0, ""
+        keep = feature["expanding"] if week == 3 else feature["c1_friendly"]
+        return (0.0, "") if keep else (1.0, "余仓动态退出")
+    raise ValueError(f"未知策略：{policy_code}")
 
 
-def display_frame(frame: pd.DataFrame, percent_decimals: int = 2) -> None:
-    formats = {
-        col: f"{{:.{percent_decimals}f}}"
-        for col in frame.columns
-        if "(%)" in col or "百分点" in col or "覆盖率" in col or "保留率" in col
+def scheduled_exit_return(
+    row: pd.Series, week: int, source_buy_slippage_pct: float, sell_slippage_pct: float,
+) -> tuple[str, float, float]:
+    scheduled_date = date8(row.get(f"CP_W{week}_Delayed_Entry_Date"))
+    delayed_buy_price = number(row.get(f"CP_W{week}_Delayed_Entry_Price"))
+    entry_price = number(row.get("Entry_Price"))
+    if not scheduled_date or not math.isfinite(delayed_buy_price) or not math.isfinite(entry_price):
+        return "", np.nan, np.nan
+    raw_open = delayed_buy_price / (1.0 + source_buy_slippage_pct / 100.0)
+    sell_price = raw_open * (1.0 - sell_slippage_pct / 100.0)
+    return scheduled_date, sell_price, (sell_price / entry_price - 1.0) * 100.0
+
+
+def simulate_one(
+    row: pd.Series, target: int, policy: Policy,
+    source_buy_slippage_pct: float, sell_slippage_pct: float,
+) -> dict[str, Any]:
+    base_date = date8(row.get(f"Exit_T{target}_Date"))
+    base_return = number(row.get(f"Exit_T{target}_Return_pct"))
+    base_reason = str(row.get(f"Exit_T{target}_Reason", ""))
+    base_holding = number(row.get(f"Exit_T{target}_Holding_Days"))
+    if not base_date or not math.isfinite(base_return):
+        return {"Comparable": False}
+
+    remaining = 1.0
+    total_return = 0.0
+    weighted_days = 0.0
+    macd_weight = 0.0
+    stop_weight = 0.0
+    target_weight = 0.0
+    pieces: list[str] = []
+    final_date = base_date
+    final_reason = base_reason
+
+    if policy.code != "P0":
+        for week in CHECKPOINTS:
+            feature = velocity_features(row, week)
+            fraction, reason = policy_action(policy.code, week, feature)
+            if fraction <= 0 or remaining <= 1e-12:
+                continue
+            scheduled_date, _, scheduled_return = scheduled_exit_return(
+                row, week, source_buy_slippage_pct, sell_slippage_pct
+            )
+            if not scheduled_date or not math.isfinite(scheduled_return):
+                return {"Comparable": False}
+            # 同日时，周线决定在开盘执行；优先于当天盘中的止盈/止损。
+            if base_date and base_date < scheduled_date:
+                break
+            sold_weight = remaining * fraction
+            total_return += sold_weight * scheduled_return
+            weighted_days += sold_weight * (5 * (week - 1) + 1)
+            macd_weight += sold_weight
+            remaining -= sold_weight
+            pieces.append(f"W{week}:{reason}:{sold_weight:.2f}")
+            final_date, final_reason = scheduled_date, f"W{week}_{reason}"
+
+    if remaining > 1e-12:
+        total_return += remaining * base_return
+        weighted_days += remaining * base_holding
+        if "止损" in base_reason:
+            stop_weight += remaining
+        elif "止盈" in base_reason:
+            target_weight += remaining
+        pieces.append(f"基准退出:{base_reason}:{remaining:.2f}")
+        if base_date >= final_date:
+            final_date, final_reason = base_date, base_reason
+
+    return {
+        "Comparable": True,
+        "Strategy_Return_pct": total_return,
+        "Weighted_Holding_Days": weighted_days,
+        "MACD_Exit_Weight": macd_weight,
+        "Stop_Exit_Weight": stop_weight,
+        "Target_Exit_Weight": target_weight,
+        "Any_Stop": stop_weight > 1e-12,
+        "Any_MACD_Exit": macd_weight > 1e-12,
+        "Final_Exit_Date": final_date,
+        "Final_Exit_Reason": final_reason,
+        "Exit_Pieces": "|".join(pieces),
     }
-    st.dataframe(frame.style.format(formats, na_rep="—"), use_container_width=True, hide_index=True)
+
+
+def common_sample(raw: pd.DataFrame, targets: tuple[int, ...]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    first = raw[raw["Event_Type"].astype(str).eq("第一根红柱")].copy()
+    first = first[first["Tradable"].map(to_bool) & first["Has_8W_Future"].map(to_bool)]
+    first = first.drop_duplicates("Cycle_ID").reset_index(drop=True)
+    reasons = []
+    for _, row in first.iterrows():
+        reason = ""
+        for week in CHECKPOINTS:
+            if not date8(row.get(f"CP_W{week}_Delayed_Entry_Date")) or not math.isfinite(
+                number(row.get(f"CP_W{week}_Delayed_Entry_Price"))
+            ):
+                reason = f"缺少W{week}下一交易日开盘价"
+                break
+        if not reason:
+            for target in targets:
+                if not date8(row.get(f"Exit_T{target}_Date")) or not math.isfinite(
+                    number(row.get(f"Exit_T{target}_Return_pct"))
+                ):
+                    reason = f"缺少T{target}基准退出"
+                    break
+        reasons.append(reason)
+    first["V43_Exclusion_Reason"] = reasons
+    excluded = first[first["V43_Exclusion_Reason"].ne("")].copy()
+    included = first[first["V43_Exclusion_Reason"].eq("")].copy().reset_index(drop=True)
+    included["Signal_Year"] = pd.to_numeric(
+        included["Signal_Date"].astype(str).str.replace(r"\D", "", regex=True).str[:4], errors="coerce"
+    ).astype("Int64")
+    return included, excluded
+
+
+def run_simulation(
+    events: pd.DataFrame, targets: tuple[int, ...],
+    source_buy_slippage_pct: float, sell_slippage_pct: float,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    identity = [
+        "Cycle_ID", "ts_code", "name", "Sample_Board", "SW_L1", "SW_L2", "SW_L3",
+        "Signal_Date", "Signal_Year", "Entry_Date", "Entry_Price", "Cycle_Type", "Red_Cycle_Weeks",
+    ]
+    for _, event in events.iterrows():
+        base = {column: event.get(column, "") for column in identity}
+        for target in targets:
+            for policy in POLICIES:
+                result = simulate_one(
+                    event, target, policy, source_buy_slippage_pct, sell_slippage_pct
+                )
+                if result.get("Comparable"):
+                    rows.append({
+                        **base, "Target_pct": target, "Policy_Code": policy.code,
+                        "Policy": policy.name, **result,
+                    })
+    return pd.DataFrame(rows)
+
+
+def cvar(series: pd.Series, quantile: float = 0.10) -> float:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return np.nan
+    cutoff = clean.quantile(quantile)
+    return float(clean[clean <= cutoff].mean())
+
+
+def summary_row(group: pd.DataFrame) -> dict[str, Any]:
+    returns = pd.to_numeric(group["Strategy_Return_pct"], errors="coerce")
+    return {
+        "交易数": len(group),
+        "平均收益(%)": returns.mean(),
+        "收益中位数(%)": returns.median(),
+        "胜率(%)": (returns > 0).mean() * 100.0,
+        "盈利≥10%(%)": (returns >= 10).mean() * 100.0,
+        "盈利≥20%(%)": (returns >= 20).mean() * 100.0,
+        "亏损≤-10%(%)": (returns <= -10).mean() * 100.0,
+        "最差10%平均收益(%)": cvar(returns),
+        "平均持有交易日": pd.to_numeric(group["Weighted_Holding_Days"], errors="coerce").mean(),
+        "MACD退出资金占比(%)": pd.to_numeric(group["MACD_Exit_Weight"], errors="coerce").mean() * 100.0,
+        "止损退出资金占比(%)": pd.to_numeric(group["Stop_Exit_Weight"], errors="coerce").mean() * 100.0,
+        "止盈退出资金占比(%)": pd.to_numeric(group["Target_Exit_Weight"], errors="coerce").mean() * 100.0,
+        "发生MACD退出的交易(%)": group["Any_MACD_Exit"].map(to_bool).mean() * 100.0,
+        "仍有仓位触发止损的交易(%)": group["Any_Stop"].map(to_bool).mean() * 100.0,
+    }
+
+
+def build_summary(trades: pd.DataFrame, groups: list[str]) -> pd.DataFrame:
+    rows = []
+    for keys, group in trades.groupby(groups, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        rows.append({**dict(zip(groups, keys)), **summary_row(group)})
+    return pd.DataFrame(rows)
+
+
+def add_baseline_delta(summary: pd.DataFrame, scope: list[str]) -> pd.DataFrame:
+    frame = summary.copy()
+    metrics = [
+        "平均收益(%)", "收益中位数(%)", "胜率(%)", "亏损≤-10%(%)",
+        "最差10%平均收益(%)", "平均持有交易日", "止损退出资金占比(%)",
+    ]
+    baseline = frame[frame["Policy_Code"].eq("P0")][scope + metrics].copy()
+    baseline = baseline.rename(columns={metric: f"__base_{metric}" for metric in metrics})
+    frame = frame.merge(baseline, on=scope, how="left")
+    for metric in metrics:
+        frame[f"较基准_{metric}"] = frame[metric] - frame[f"__base_{metric}"]
+    return frame.drop(columns=[f"__base_{metric}" for metric in metrics])
+
+
+def build_reports(trades: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    total = add_baseline_delta(
+        build_summary(trades, ["Target_pct", "Policy_Code", "Policy"]), ["Target_pct"]
+    )
+    yearly = add_baseline_delta(
+        build_summary(trades, ["Signal_Year", "Target_pct", "Policy_Code", "Policy"]),
+        ["Signal_Year", "Target_pct"],
+    )
+    board = add_baseline_delta(
+        build_summary(trades, ["Sample_Board", "Target_pct", "Policy_Code", "Policy"]),
+        ["Sample_Board", "Target_pct"],
+    )
+    reasons = (
+        trades.groupby(["Target_pct", "Policy_Code", "Policy", "Final_Exit_Reason"], dropna=False)
+        .size().rename("交易数").reset_index()
+    )
+    definitions = pd.DataFrame(
+        [{"策略编号": p.code, "策略": p.name, "定义": p.explanation} for p in POLICIES]
+    )
+    return {"total": total, "yearly": yearly, "board": board, "reasons": reasons, "definitions": definitions}
 
 
 def csv_bytes(frame: pd.DataFrame) -> bytes:
@@ -404,156 +402,147 @@ def make_zip(files: dict[str, bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def build_outputs(events: pd.DataFrame, source_name: str, complete_8w_only: bool) -> dict[str, Any]:
-    rule_report = build_rule_report(events)
-    state_report = build_state_report(events)
-    year_report = build_year_report(events)
-    verdicts = build_verdicts(rule_report, year_report)
-    identity = [
-        "Cycle_ID", "ts_code", "name", "Sample_Board", "SW_L1", "SW_L2", "SW_L3",
-        "Signal_Date", "Signal_Year", "Cycle_Type", "Red_Cycle_Weeks", "Long_9W",
-        "Return_8W_pct", "MFE_8W_pct", "MAE_8W_pct", "Hit_30", "Target30_Before_Stop",
-        "Stop_10", "Weak_Rebound_3W", "Is_C1", "Is_C2",
-    ]
-    checkpoint_columns = [
-        col for col in events.columns if any(col.startswith(f"W{k}_") for k in CHECKPOINTS)
-    ]
-    audit = events[[c for c in identity if c in events.columns] + checkpoint_columns].copy()
-    metadata = pd.DataFrame(
-        [
-            {"项目": "程序", "值": APP_TITLE},
-            {"项目": "输入文件", "值": source_name},
-            {"项目": "生成时间", "值": datetime.now().isoformat(timespec="seconds")},
-            {"项目": "第一根红柱事件数", "值": len(events)},
-            {"项目": "仅保留完整八周", "值": complete_8w_only},
-            {"项目": "快MACD", "值": "本版未加入；先验证标准柱体速度/加速度"},
-            {"项目": "重要限制", "值": "规则结论是条件统计，不是可直接实盘的逐日成交回测"},
-        ]
+def build_result(
+    raw: pd.DataFrame, source: str, targets: tuple[int, ...],
+    source_buy_slippage_pct: float, sell_slippage_pct: float,
+) -> dict[str, Any]:
+    events, excluded = common_sample(raw, targets)
+    if events.empty:
+        raise ValueError("共同可比较样本为空。")
+    trades = run_simulation(events, targets, source_buy_slippage_pct, sell_slippage_pct)
+    reports = build_reports(trades)
+    exclusion_summary = (
+        excluded.groupby("V43_Exclusion_Reason").size().rename("事件数").reset_index()
+        if not excluded.empty else pd.DataFrame(columns=["V43_Exclusion_Reason", "事件数"])
     )
-    definitions = pd.DataFrame(
-        [{"规则编号": r.code, "规则": r.name, "定义": r.explanation} for r in RULES]
-    )
+    metadata = pd.DataFrame([
+        {"项目": "程序", "值": TITLE},
+        {"项目": "输入", "值": source},
+        {"项目": "生成时间", "值": datetime.now().isoformat(timespec="seconds")},
+        {"项目": "第一根红柱完整八周事件", "值": len(events) + len(excluded)},
+        {"项目": "共同可比较事件", "值": len(events)},
+        {"项目": "因W2-W5开盘价不完整而剔除", "值": len(excluded)},
+        {"项目": "目标止盈", "值": ",".join(f"+{t}%" for t in targets)},
+        {"项目": "原V4.1买入滑点(%)", "值": source_buy_slippage_pct},
+        {"项目": "本次动态卖出滑点(%)", "值": sell_slippage_pct},
+        {"项目": "成交顺序", "值": "周末确认，下一交易日开盘退出；同日早于盘中止盈止损"},
+        {"项目": "限制", "值": "逐事件等权，不模拟最多三仓的资金占用和信号冲突"},
+    ])
     files = {
-        "01_event_audit.csv": csv_bytes(audit),
-        "02_rule_report.csv": csv_bytes(rule_report),
-        "03_state_report.csv": csv_bytes(state_report),
-        "04_year_stability.csv": csv_bytes(year_report),
-        "05_verdicts.csv": csv_bytes(verdicts),
-        "06_rule_definitions.csv": csv_bytes(definitions),
-        "07_metadata.csv": csv_bytes(metadata),
+        "01_trade_ledger.csv": csv_bytes(trades),
+        "02_strategy_summary.csv": csv_bytes(reports["total"]),
+        "03_year_stability.csv": csv_bytes(reports["yearly"]),
+        "04_board_stability.csv": csv_bytes(reports["board"]),
+        "05_exit_reasons.csv": csv_bytes(reports["reasons"]),
+        "06_policy_definitions.csv": csv_bytes(reports["definitions"]),
+        "07_exclusion_summary.csv": csv_bytes(exclusion_summary),
+        "08_metadata.csv": csv_bytes(metadata),
     }
     return {
-        "events": events,
-        "rule_report": rule_report,
-        "state_report": state_report,
-        "year_report": year_report,
-        "verdicts": verdicts,
-        "definitions": definitions,
-        "metadata": metadata,
-        "files": files,
-        "zip": make_zip(files),
+        "events": events, "excluded": excluded, "trades": trades, **reports,
+        "exclusion_summary": exclusion_summary, "metadata": metadata,
+        "files": files, "zip": make_zip(files),
     }
 
 
-def render_results(result: dict[str, Any]) -> None:
-    events = result["events"]
+def show_frame(frame: pd.DataFrame) -> None:
+    formats = {
+        column: "{:.2f}" for column in frame.columns
+        if "(%)" in column or "交易日" in column
+    }
+    st.dataframe(frame.style.format(formats, na_rep="—"), use_container_width=True, hide_index=True)
+
+
+def render(result: dict[str, Any]) -> None:
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("第一根红柱样本", f"{len(events):,}")
-    c2.metric("C1", f"{int(events['Is_C1'].sum()):,}")
-    c3.metric("C2", f"{int(events['Is_C2'].sum()):,}")
-    c4.metric("完整周期≥9周", f"{rate(events['Long_9W']):.2f}%")
-
-    st.subheader("先看结论：哪些规则达到预设门槛")
-    st.caption("门槛在查看结果之前已经固定。五项全部通过，才建议进入下一轮逐日模拟回测。")
-    display_frame(result["verdicts"])
-
-    st.subheader("规则总表")
-    st.caption(
-        "R0是同一检查周的基准。覆盖率和赢家保留率很重要：概率提高但把多数C1或大赢家删掉，同样不可接受。"
-    )
-    display_frame(result["rule_report"])
-
-    st.subheader("柱体状态的真实后续表现")
-    display_frame(result["state_report"])
-
+    c1.metric("原始完整八周事件", f"{len(result['events']) + len(result['excluded']):,}")
+    c2.metric("共同可比较事件", f"{len(result['events']):,}")
+    c3.metric("剔除事件", f"{len(result['excluded']):,}")
+    c4.metric("模拟交易明细", f"{len(result['trades']):,}")
+    st.subheader("策略总比较")
+    st.caption("正的收益变化代表优于同一止盈目标下的P0；负的亏损率变化代表风险降低。")
+    show_frame(result["total"])
     st.subheader("逐年稳定性")
-    st.caption("单年入选数少于20时，只展示，不参与‘跨年方向稳定’判定。")
-    display_frame(result["year_report"])
-
-    st.subheader("规则定义")
+    show_frame(result["yearly"])
+    st.subheader("主板/创业板/科创板")
+    show_frame(result["board"])
+    with st.expander("退出原因与剔除原因"):
+        show_frame(result["reasons"])
+        show_frame(result["exclusion_summary"])
+    st.subheader("策略定义")
     st.dataframe(result["definitions"], use_container_width=True, hide_index=True)
-
-    st.subheader("下载（编号与压缩包内文件一致）")
+    st.subheader("下载")
     st.download_button(
-        "下载全部结果 ZIP",
-        data=result["zip"],
-        file_name="weekly_macd_transparent_hold_v4_2_all_results.zip",
-        mime="application/zip",
-        type="primary",
-        key="download_all_v42",
+        "下载全部结果ZIP", result["zip"],
+        file_name="weekly_macd_dynamic_exit_v4_3_all_results.zip",
+        mime="application/zip", type="primary", key="v43_all", on_click="ignore",
     )
-    labels = {
-        "01_event_audit.csv": "1号：逐事件审查",
-        "02_rule_report.csv": "2号：规则总表",
-        "03_state_report.csv": "3号：柱体状态",
-        "04_year_stability.csv": "4号：逐年稳定性",
-        "05_verdicts.csv": "5号：预设门槛结论",
-        "06_rule_definitions.csv": "6号：规则定义",
-        "07_metadata.csv": "7号：运行信息",
-    }
+    labels = [
+        "1号：逐笔成交", "2号：策略总表", "3号：逐年", "4号：分板块",
+        "5号：退出原因", "6号：策略定义", "7号：剔除审计", "8号：运行信息",
+    ]
     columns = st.columns(4)
     for index, (name, data) in enumerate(result["files"].items()):
         with columns[index % 4]:
             st.download_button(
-                labels[name], data=data, file_name=name, mime="text/csv", key=f"download_{name}"
+                labels[index], data, file_name=name, mime="text/csv",
+                key=f"v43_{name}", on_click="ignore",
             )
 
 
 def main() -> None:
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
     st.info(
-        "本版不寻找最优参数，也不加入快MACD。先用V4.1现成结果验证：标准周线MACD柱体的速度和加速度，"
-        "能否提高九周持续概率、降低止损，同时保住C1、C2和八周大赢家。"
+        "本版使用V4.1已经保存的真实下一交易日开盘价，将周线决定推迟到下一交易日开盘执行；"
+        "固定止盈和-10%止损仍按日线先后执行。重点比较W2缩短立即退出、减半和观察至W3。"
     )
-    with st.expander("本版如何防止过拟合", expanded=False):
+    with st.expander("成交口径", expanded=False):
         st.markdown(
             """
-            - 只验证5条预先写死的规则，不扫描阈值。
-            - 每条规则都与同一检查周R0基准比较。
-            - 同时检查覆盖率、C1/C2保留率和30%赢家保留率，避免只追求漂亮概率。
-            - 必须查看逐年结果；单年好看不算稳定。
-            - 本轮通过后，才值得加入逐日成交、交易成本并做真正的模拟持仓。
+            - 第一根红柱后的原始买点与V4.1完全相同。
+            - 周线状态只能在该周收盘后确认，动态卖出使用下一交易日开盘价。
+            - 动态退出价计入卖出滑点；固定止盈/止损直接沿用V4.1已计算的成交结果。
+            - 若动态退出与止盈/止损发生在同一交易日，开盘动态退出先于盘中触发。
+            - 所有策略使用完全相同的共同样本；结果是逐事件等权，尚未处理最多三仓和信号冲突。
             """
         )
-    with st.form("analysis_form"):
-        uploaded = st.file_uploader(
-            "上传V4.1的全部结果ZIP（推荐）或01_events.csv",
+    with st.form("v43_form"):
+        upload = st.file_uploader(
+            "上传V4.1全部结果ZIP或V4.1的01_events.csv",
             type=["zip", "csv"],
-            help="直接使用刚才全量科技股V4.1结果，无需重新下载行情。",
+            help="必须是V4.1原始文件；V4.2结果已删除成交价字段，不能用于本模拟。",
         )
-        complete_8w_only = st.checkbox("只使用具有完整未来八周的样本", value=True)
-        submitted = st.form_submit_button("开始透明验证", type="primary")
-
+        selected = st.multiselect(
+            "统一止盈目标", options=list(TARGETS), default=list(TARGETS),
+            format_func=lambda x: f"+{x}%",
+        )
+        c1, c2 = st.columns(2)
+        source_buy_slip = c1.number_input(
+            "原V4.1买入滑点(%)", 0.0, 2.0, 0.20, 0.05,
+            help="必须与生成V4.1结果时的设置一致，默认0.20%。",
+        )
+        sell_slip = c2.number_input("动态卖出滑点(%)", 0.0, 2.0, 0.20, 0.05)
+        submitted = st.form_submit_button("开始动态退出模拟", type="primary")
     if submitted:
-        if uploaded is None:
-            st.error("请先上传V4.1结果ZIP或01_events.csv。")
+        if upload is None:
+            st.error("请先上传V4.1结果。")
+        elif not selected:
+            st.error("至少选择一个止盈目标。")
         else:
             try:
-                raw, source_name = load_events(uploaded)
-                validate_events(raw)
-                events = prepare_events(raw, complete_8w_only)
-                if events.empty:
-                    raise ValueError("筛选后没有第一根红柱事件。")
-                st.session_state["v42_result"] = build_outputs(events, source_name, complete_8w_only)
-                st.session_state["v42_source"] = source_name
+                raw, source = load_events(upload)
+                targets = tuple(sorted(set(int(v) for v in selected)))
+                validate(raw, targets)
+                st.session_state["v43_result"] = build_result(
+                    raw, source, targets, float(source_buy_slip), float(sell_slip)
+                )
             except Exception as exc:
                 st.exception(exc)
-
-    if "v42_result" in st.session_state:
-        render_results(st.session_state["v42_result"])
+    if "v43_result" in st.session_state:
+        render(st.session_state["v43_result"])
     else:
-        st.caption("上传后通常数秒即可完成。本程序不会访问行情接口。")
+        st.caption("使用现成结果，通常数秒完成，不需要Tushare，也不重新下载行情。")
 
 
 if __name__ == "__main__":
