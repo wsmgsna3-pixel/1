@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD第二周持有退出验证器 V1.0
-===================================
+科技股周线MACD C1/C2与A/B样本外特征验证器 V1.0
+============================================
 
-本程序固定在第一根真正周线红柱确认后的下一交易日开盘买入。第二根完整
-周线红柱若严格长于第一根则继续持有；若缩短、持平或翻绿，则在第二周
-确认后的下一可交易日开盘退出。它验证提前退出减少了多少弱周期损失、
-误杀了多少长周期，以及退出后还剩多少上涨空间。继续持有组仍只统计至
-第一根完整绿柱前的机会空间，不把最高价伪装成可实现卖价。
+本程序使用2024-06-05至2026-06-05的新样本，验证旧样本发现的C1/C2与
+A/B实时特征差异能否样本外重复。旧阈值全部冻结，不允许在新样本上重新
+调参。只使用首红柱与第二周当时已经可见的信息；周期类型与最高价只用于
+事后检验。观察期未结束的周期采用审慎的未决处理。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30% 的概率。
@@ -55,7 +54,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V1.0-WEEK2-HOLD-EXIT"
+VERSION = "V1.0-C1C2-AB-OUT-OF-SAMPLE"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -85,7 +84,7 @@ DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
 
-TITLE = "科技股周线MACD第二周持有退出验证器 V1.0"
+TITLE = "科技股周线MACD C1/C2与A/B样本外特征验证器 V1.0"
 INITIAL_CAPITAL = 300_000.0
 MAX_POSITIONS = 3
 POSITION_BUDGET = 100_000.0
@@ -4579,5 +4578,554 @@ def week2_hold_exit_main() -> None:
     )
 
 
+FROZEN_REFERENCE_RATES = {
+    "全部首红柱": 58.70253164556962,
+    "DEA/股价≤-8%": 92.17391304347827,
+    "MA20四周斜率≤-8%": 90.19607843137256,
+    "前26周收益≤-30%": 84.72222222222221,
+    "下降趋势且零轴下": 71.29032258064515,
+    "DEA/股价≤-5%且MA20斜率≤-5%": 83.91608391608392,
+    "首红柱在零轴上": 31.818181818181817,
+    "首红柱为上升趋势": 28.225806451612907,
+    "第二根柱严格扩张": 65.28776978417267,
+}
+
+
+def oos_half_year(value: Any) -> str:
+    text_value = normalize_date(value)
+    if len(text_value) != 8:
+        return "未知"
+    return f"{text_value[:4]}{'H1' if text_value[4:6] <= '06' else 'H2'}"
+
+
+def add_oos_research_features(opportunities: pd.DataFrame) -> pd.DataFrame:
+    frame = opportunities.copy()
+    for column in [
+        "Weekly_Close", "DEA", "DIF", "W_MA20", "W_MA40",
+        "W_MA20_Slope4_pct", "Pre_13W_Return_pct", "Pre_26W_Return_pct",
+        "Pullback_Depth_pct", "CP_W2_Hist", "Hist",
+        "CP_W2_Hist_vs_W1_pct", "Red_Cycle_Weeks",
+    ]:
+        frame[column] = pd.to_numeric(frame.get(column), errors="coerce")
+    frame["DEA_to_Price_pct"] = frame["DEA"] / frame["Weekly_Close"] * 100.0
+    frame["DIF_to_Price_pct"] = frame["DIF"] / frame["Weekly_Close"] * 100.0
+    frame["Close_vs_MA20_pct"] = (frame["Weekly_Close"] / frame["W_MA20"] - 1.0) * 100.0
+    frame["Close_vs_MA40_pct"] = (frame["Weekly_Close"] / frame["W_MA40"] - 1.0) * 100.0
+    frame["MA20_vs_MA40_pct"] = (frame["W_MA20"] / frame["W_MA40"] - 1.0) * 100.0
+    frame["W2_Observed"] = (
+        frame.get("CP_W2_Date", pd.Series("", index=frame.index)).fillna("").astype(str).ne("")
+        & frame["CP_W2_Hist"].notna()
+    )
+    frame["W2_Exact_Expansion"] = (
+        frame["W2_Observed"]
+        & frame["Hist"].gt(0)
+        & frame["CP_W2_Hist"].gt(frame["Hist"])
+    )
+    frame["Signal_Half_Year"] = frame["Signal_Date"].map(oos_half_year)
+
+    research_family: list[str] = []
+    research_status: list[str] = []
+    for _, row in frame.iterrows():
+        completed = to_bool(row.get("Cycle_Completed"))
+        weeks = finite_num(row.get("Red_Cycle_Weeks"))
+        if completed:
+            family = cycle_family(row.get("Cycle_Type"))
+            if family == "C1C2_长周期":
+                research_family.append("C1C2_长周期")
+                research_status.append("完整C1C2")
+            elif family == "AB_弱或短周期":
+                research_family.append("AB_弱或短周期")
+                research_status.append("完整AB")
+            else:
+                research_family.append("未决")
+                research_status.append("完整但无法分类")
+        elif math.isfinite(weeks) and weeks >= DEFAULT_LONG_CYCLE_MIN_WEEKS:
+            research_family.append("C1C2_长周期")
+            research_status.append("进行中但已满9周_确认C类")
+        else:
+            research_family.append("未决")
+            research_status.append("进行中不足9周_未决")
+    frame["Research_Family"] = research_family
+    frame["Research_Status"] = research_status
+
+    high = frame["DEA_to_Price_pct"].le(-8.0)
+    low = (
+        frame["Zero_Axis"].astype(str).eq("DIF与DEA均在零轴上")
+        | frame["Weekly_Trend"].astype(str).eq("上升趋势")
+    )
+    frame["Exploratory_Tier"] = np.select(
+        [high, ~high & low],
+        ["高概率C候选_DEA深于-8%", "低概率C候选_零轴上或上升趋势"],
+        default="中间未定区",
+    )
+    return frame
+
+
+def frozen_oos_rule_masks(frame: pd.DataFrame) -> list[tuple[str, pd.Series, str]]:
+    return [
+        ("全部首红柱", pd.Series(True, index=frame.index), "基准"),
+        ("DEA/股价≤-8%", frame["DEA_to_Price_pct"].le(-8.0), "预期C1C2显著更高"),
+        ("MA20四周斜率≤-8%", frame["W_MA20_Slope4_pct"].le(-8.0), "预期C1C2显著更高"),
+        ("前26周收益≤-30%", frame["Pre_26W_Return_pct"].le(-30.0), "预期C1C2显著更高"),
+        (
+            "下降趋势且零轴下",
+            frame["Weekly_Trend"].astype(str).eq("下降趋势")
+            & frame["Zero_Axis"].astype(str).eq("DIF与DEA均在零轴下"),
+            "预期C1C2更高",
+        ),
+        (
+            "DEA/股价≤-5%且MA20斜率≤-5%",
+            frame["DEA_to_Price_pct"].le(-5.0)
+            & frame["W_MA20_Slope4_pct"].le(-5.0),
+            "预期C1C2显著更高",
+        ),
+        (
+            "首红柱在零轴上",
+            frame["Zero_Axis"].astype(str).eq("DIF与DEA均在零轴上"),
+            "预期AB显著更多",
+        ),
+        (
+            "首红柱为上升趋势",
+            frame["Weekly_Trend"].astype(str).eq("上升趋势"),
+            "预期AB显著更多",
+        ),
+        ("第二根柱严格扩张", frame["W2_Exact_Expansion"].map(to_bool), "预期C1C2更高"),
+    ]
+
+
+def oos_rule_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    valid = frame[frame["Opportunity_Valid"].map(to_bool)].copy()
+    resolved_all = valid[valid["Research_Family"].ne("未决")]
+    total_c = int(resolved_all["Research_Family"].eq("C1C2_长周期").sum())
+    total_ab = int(resolved_all["Research_Family"].eq("AB_弱或短周期").sum())
+    base_rate = pct_mean(resolved_all["Research_Family"].eq("C1C2_长周期"))
+    rows: list[dict[str, Any]] = []
+    for name, mask, expectation in frozen_oos_rule_masks(valid):
+        selected = valid[mask].copy()
+        resolved = selected[selected["Research_Family"].ne("未决")]
+        complete = resolved[resolved["Cycle_Completed"].map(to_bool)]
+        c_mask = resolved["Research_Family"].eq("C1C2_长周期")
+        ab_mask = resolved["Research_Family"].eq("AB_弱或短周期")
+        new_rate = pct_mean(c_mask)
+        reference_rate = FROZEN_REFERENCE_RATES.get(name, np.nan)
+        if name == "全部首红柱":
+            repeated = "基准"
+        elif "AB" in expectation:
+            repeated = "是" if math.isfinite(new_rate) and new_rate < base_rate else "否"
+        else:
+            repeated = "是" if math.isfinite(new_rate) and new_rate > base_rate else "否"
+        row = {
+            "冻结条件": name,
+            "旧样本预期": expectation,
+            "新样本信号数": int(len(selected)),
+            "新样本已决数": int(len(resolved)),
+            "新样本未决数": int(selected["Research_Family"].eq("未决").sum()),
+            "新样本未决比例(%)": pct_mean(selected["Research_Family"].eq("未决")),
+            "新样本C1C2数": int(c_mask.sum()),
+            "新样本AB数": int(ab_mask.sum()),
+            "新样本C1C2比例(%)": new_rate,
+            "旧样本C1C2比例(%)": reference_rate,
+            "新旧差异(百分点)": (
+                new_rate - reference_rate
+                if math.isfinite(new_rate) and math.isfinite(reference_rate) else np.nan
+            ),
+            "相对新样本总体提升(百分点)": (
+                new_rate - base_rate if math.isfinite(new_rate) else np.nan
+            ),
+            "方向是否重复": repeated,
+            "覆盖全部C1C2(%)": c_mask.sum() / total_c * 100.0 if total_c else np.nan,
+            "纳入全部AB(%)": ab_mask.sum() / total_ab * 100.0 if total_ab else np.nan,
+            "利润完整周期数": int(len(complete)),
+            "最高利润中位数(%)": pd.to_numeric(complete["Peak_MFE_pct"], errors="coerce").median(),
+            "最大浮亏中位数(%)": pd.to_numeric(complete["Path_MAE_pct"], errors="coerce").median(),
+        }
+        for target in (10, 20, 30):
+            row[f"曾达到{target}%(%)"] = pct_mean(
+                complete[f"Reached_{target}_pct"].map(to_bool)
+            ) if len(complete) else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def oos_period_rule_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    valid = frame[frame["Opportunity_Valid"].map(to_bool)].copy()
+    for period, period_frame in valid.groupby("Signal_Half_Year", sort=True):
+        base_resolved = period_frame[period_frame["Research_Family"].ne("未决")]
+        base_rate = pct_mean(base_resolved["Research_Family"].eq("C1C2_长周期"))
+        for name, mask, _ in frozen_oos_rule_masks(period_frame):
+            selected = period_frame[mask]
+            resolved = selected[selected["Research_Family"].ne("未决")]
+            rate = pct_mean(resolved["Research_Family"].eq("C1C2_长周期"))
+            rows.append({
+                "信号半年": period,
+                "冻结条件": name,
+                "信号数": int(len(selected)),
+                "已决数": int(len(resolved)),
+                "未决数": int(selected["Research_Family"].eq("未决").sum()),
+                "C1C2比例(%)": rate,
+                "同期总体C1C2比例(%)": base_rate,
+                "相对同期总体差异(百分点)": (
+                    rate - base_rate if math.isfinite(rate) and math.isfinite(base_rate) else np.nan
+                ),
+            })
+    return pd.DataFrame(rows)
+
+
+def rank_auc(values: pd.Series, target: pd.Series) -> float:
+    numeric = pd.to_numeric(values, errors="coerce")
+    mask = numeric.notna() & target.notna()
+    numeric = numeric[mask]
+    binary = target[mask].astype(int)
+    n1 = int(binary.sum())
+    n0 = int(len(binary) - n1)
+    if n1 == 0 or n0 == 0:
+        return np.nan
+    ranks = numeric.rank(method="average")
+    rank_sum = float(ranks[binary.eq(1)].sum())
+    return (rank_sum - n1 * (n1 + 1) / 2.0) / (n1 * n0)
+
+
+def oos_numeric_feature_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    resolved = frame[
+        frame["Opportunity_Valid"].map(to_bool)
+        & frame["Research_Family"].ne("未决")
+    ].copy()
+    target = resolved["Research_Family"].eq("C1C2_长周期").astype(int)
+    definitions = [
+        ("DEA/股价(%)", "DEA_to_Price_pct", "越低越偏C1C2"),
+        ("DIF/股价(%)", "DIF_to_Price_pct", "越低越偏C1C2"),
+        ("MA20四周斜率(%)", "W_MA20_Slope4_pct", "越低越偏C1C2"),
+        ("MA20相对MA40(%)", "MA20_vs_MA40_pct", "越低越偏C1C2"),
+        ("收盘相对MA40(%)", "Close_vs_MA40_pct", "越低越偏C1C2"),
+        ("前26周收益(%)", "Pre_26W_Return_pct", "越低越偏C1C2"),
+        ("前13周收益(%)", "Pre_13W_Return_pct", "越低越偏C1C2"),
+        ("回调深度(%)", "Pullback_Depth_pct", "越高越偏C1C2"),
+        ("第二根相对第一根增幅(%)", "CP_W2_Hist_vs_W1_pct", "越高越偏C1C2"),
+        ("第一根相对前绿柱峰值", "First_Red_to_PreGreen_Peak_Ratio", "旧样本几乎无效"),
+        ("流通市值(亿元)", "Circ_MV_Billion", "旧样本较弱"),
+        ("换手率", "Turnover_Rate", "旧样本较弱"),
+    ]
+    rows = []
+    for label, column, expected in definitions:
+        values = pd.to_numeric(resolved[column], errors="coerce")
+        auc = rank_auc(values, target)
+        observed_direction = "越高越偏C1C2" if auc >= 0.5 else "越低越偏C1C2"
+        if expected.startswith("越高"):
+            repeated = "是" if auc >= 0.5 else "否"
+        elif expected.startswith("越低"):
+            repeated = "是" if auc < 0.5 else "否"
+        else:
+            repeated = "不设方向"
+        rows.append({
+            "实时特征": label,
+            "旧样本发现": expected,
+            "AB中位数": values[target.eq(0)].median(),
+            "C1C2中位数": values[target.eq(1)].median(),
+            "原始AUC_高值偏C": auc,
+            "分离度AUC": max(auc, 1.0 - auc) if math.isfinite(auc) else np.nan,
+            "新样本方向": observed_direction,
+            "方向是否重复": repeated,
+            "有效样本数": int(values.notna().sum()),
+        })
+    return pd.DataFrame(rows).sort_values("分离度AUC", ascending=False)
+
+
+def oos_categorical_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    resolved = frame[
+        frame["Opportunity_Valid"].map(to_bool)
+        & frame["Research_Family"].ne("未决")
+    ].copy()
+    rows: list[dict[str, Any]] = []
+    for column, label in [
+        ("Weekly_Trend", "周线趋势"),
+        ("Zero_Axis", "零轴位置"),
+        ("Sample_Board", "上市板块"),
+        ("First_Red_Strength_Group", "第一根红柱强度"),
+        ("CP_W2_State", "第二周状态"),
+        ("Exploratory_Tier", "探索性三层"),
+    ]:
+        for value, group in resolved.groupby(column, dropna=False, sort=False):
+            rows.append({
+                "特征": label,
+                "分组": value,
+                "已决数": int(len(group)),
+                "C1C2数": int(group["Research_Family"].eq("C1C2_长周期").sum()),
+                "AB数": int(group["Research_Family"].eq("AB_弱或短周期").sum()),
+                "C1C2比例(%)": pct_mean(group["Research_Family"].eq("C1C2_长周期")),
+                "最高利润中位数_仅完整周期(%)": pd.to_numeric(
+                    group[group["Cycle_Completed"].map(to_bool)]["Peak_MFE_pct"], errors="coerce"
+                ).median(),
+            })
+    return pd.DataFrame(rows)
+
+
+def oos_status_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    valid = frame[frame["Opportunity_Valid"].map(to_bool)].copy()
+    return valid.groupby("Research_Status", dropna=False).agg(
+        事件数=("Cycle_ID", "size"),
+        涉及股票=("ts_code", "nunique"),
+        红柱周数中位数=("Red_Cycle_Weeks", "median"),
+    ).reset_index()
+
+
+def c1c2_ab_oos_main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption(
+        "冻结旧样本阈值，在2024-06-05至2026-06-05的新样本上验证。"
+        "不重新调参；未翻绿且不足9周的周期一律标为未决。"
+    )
+    with st.sidebar:
+        st.header("样本外信号区间")
+        signal_start_date = st.date_input("信号开始日期", value=date(2024, 6, 5))
+        signal_end_date = st.date_input("信号截止日期", value=date(2026, 6, 5))
+        observation_end_date = st.date_input(
+            "可用行情观察截止", value=date.today(), max_value=date.today()
+        )
+        st.header("固定口径")
+        st.write("历史科技板块全量，不抽样")
+        st.write("信号日股价≥10元、流通市值≥100亿元")
+        st.write("周MACD(12,26,9)，仅使用完整周")
+        st.write("C类长周期门槛固定为9周")
+        st.write("所有特征阈值冻结，禁止新样本调参")
+        use_cache = st.checkbox("使用逐股票缓存", value=True)
+        api_pause = st.number_input(
+            "每次API调用后暂停(秒)", min_value=0.0, max_value=3.0,
+            value=0.12, step=0.05,
+        )
+        if st.button("清除本程序缓存"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("缓存已清除")
+
+    token = st.text_input("Tushare Token", type="password")
+    if not token:
+        st.info("请输入Tushare Token。")
+        return
+    session_key = "c1c2_ab_oos_v1_0_zip"
+    run_requested = st.button("开始样本外特征验证", type="primary")
+    if not run_requested:
+        if session_key in st.session_state:
+            st.success("上一次结果仍在，可直接下载。")
+            st.download_button(
+                "下载1号：上一次全部结果ZIP", st.session_state[session_key],
+                file_name="weekly_macd_c1c2_ab_oos_v1_0_all_results.zip",
+                mime="application/zip", type="primary", on_click="ignore",
+            )
+        else:
+            st.info("重点看冻结条件是否在新样本中保持同方向，以及2024H2—2026H1各阶段是否稳定。")
+        return
+    if signal_start_date >= signal_end_date:
+        st.error("信号开始日期必须早于截止日期。")
+        return
+    if signal_end_date > observation_end_date:
+        st.error("信号截止日期不能晚于可用行情观察截止。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    signal_start = signal_start_date.strftime("%Y%m%d")
+    signal_end = signal_end_date.strftime("%Y%m%d")
+    observation_end = observation_end_date.strftime("%Y%m%d")
+    preload_start = (signal_start_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    calendar_tail = (observation_end_date + timedelta(days=7)).strftime("%Y%m%d")
+    config = {
+        "signal_start": signal_start, "signal_end": signal_end,
+        "market_end": observation_end, "preload_start": preload_start,
+        "min_price": 10.0, "min_mv": 100.0, "max_mv": 1_000_000_000.0,
+        "price_tolerance_pct": 3.0, "stop_threshold_pct": 10.0,
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "sample_per_board": 0, "sample_seed": DEFAULT_SAMPLE_SEED,
+        "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+    }
+    try:
+        with st.spinner("加载交易日历、历史科技股票池和申万历史成分..."):
+            open_dates = load_trade_calendar(preload_start, observation_end)
+            full_calendar = load_trade_calendar(preload_start, calendar_tail)
+            stock_basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(api_pause))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+
+    week_last_map = complete_week_last_dates(full_calendar)
+    period_index = build_period_index(memberships)
+    universe_codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
+    universe = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
+    stocks, sample_audit, population_summary = build_stratified_sample(
+        stocks=universe, period_index=period_index, reference_date=signal_end,
+        per_board=0, seed=DEFAULT_SAMPLE_SEED,
+    )
+    list_dates = stocks["list_date"].apply(lambda x: normalize_date(x, "19000101"))
+    delist_dates = stocks["delist_date"].apply(lambda x: normalize_date(x, "99991231"))
+    stocks_to_fetch = stocks[
+        ~list_dates.gt(signal_end) & ~delist_dates.lt(preload_start)
+    ].copy().reset_index(drop=True)
+    st.write(
+        f"历史科技池{len(universe)}只；实际读取{len(stocks_to_fetch)}只；"
+        f"信号区间{signal_start}—{signal_end}；行情观察至{observation_end}。"
+    )
+
+    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
+    all_records: list[dict[str, Any]] = []
+    daily_histories: dict[str, pd.DataFrame] = {}
+    reject_totals: dict[str, int] = {}
+    cache_hits = data_failures = 0
+    progress = st.progress(0.0, text="逐股票生成首红柱事件...")
+    status = st.empty()
+    for idx, stock in stocks_to_fetch.iterrows():
+        code = str(stock["ts_code"])
+        progress.progress((idx + 1) / len(stocks_to_fetch), text=f"{idx + 1}/{len(stocks_to_fetch)} {code}")
+        status.caption(f"底层事件{len(all_records)}；缓存命中{cache_hits}；行情失败{data_failures}")
+        daily, basic, cache_hit = fetch_stock_history(
+            code, preload_start, observation_end, bool(use_cache), float(api_pause)
+        )
+        cache_hits += int(cache_hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        records, rejects, _ = analyze_stock(
+            stock=stock, periods=period_index.get(code, []), daily=daily, basic=basic,
+            week_last_map=week_last_map, open_dates=open_dates, open_pos=open_pos,
+            config=config,
+        )
+        all_records.extend(records)
+        if records:
+            daily_histories[code] = daily.copy()
+        for reason, count in rejects.items():
+            reject_totals[reason] = reject_totals.get(reason, 0) + count
+    progress.empty()
+    status.empty()
+    if not all_records:
+        st.error("没有生成有效事件，请检查日期、Token权限和价格市值条件。")
+        return
+
+    events = pd.DataFrame(all_records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+    with st.spinner("计算周期标签、冻结条件与样本外稳定性..."):
+        opportunities = build_cycle_opportunities(
+            events, daily_histories, observation_end, config["sell_slippage_pct"]
+        )
+        research = add_oos_research_features(opportunities)
+        rule_summary = oos_rule_summary(research)
+        period_summary = oos_period_rule_summary(research)
+        numeric_summary = oos_numeric_feature_summary(research)
+        categorical_summary = oos_categorical_summary(research)
+        status_summary = oos_status_summary(research)
+
+    valid = research[research["Opportunity_Valid"].map(to_bool)].copy()
+    resolved = valid[valid["Research_Family"].ne("未决")].copy()
+    unresolved = valid[valid["Research_Family"].eq("未决")].copy()
+    ongoing_confirmed = valid[
+        valid["Research_Status"].eq("进行中但已满9周_确认C类")
+    ].copy()
+    reject_frame = pd.DataFrame([
+        {"剔除原因": reason, "次数": count} for reason, count in reject_totals.items()
+    ]).sort_values("次数", ascending=False) if reject_totals else pd.DataFrame(
+        columns=["剔除原因", "次数"]
+    )
+    base_row = rule_summary[rule_summary["冻结条件"].eq("全部首红柱")].iloc[0]
+    direction_repeated = int(rule_summary["方向是否重复"].eq("是").sum())
+    tested_direction_rules = int(rule_summary["方向是否重复"].isin(["是", "否"]).sum())
+    run_summary = pd.DataFrame([{
+        "程序": TITLE,
+        "信号开始": signal_start,
+        "信号截止": signal_end,
+        "行情观察截止": observation_end,
+        "首红柱事件": len(research),
+        "可买入有效事件": len(valid),
+        "已决事件": len(resolved),
+        "完整周期": int(valid["Cycle_Completed"].map(to_bool).sum()),
+        "进行中满9周确认C": len(ongoing_confirmed),
+        "进行中不足9周未决": len(unresolved),
+        "已决C1C2比例(%)": base_row["新样本C1C2比例(%)"],
+        "冻结方向重复数": direction_repeated,
+        "冻结方向检验数": tested_direction_rules,
+        "涉及股票": research["ts_code"].nunique(),
+        "真实行情失败": data_failures,
+        "缓存命中": cache_hits,
+    }])
+    metadata = pd.DataFrame([
+        {"项目": "程序", "值": TITLE},
+        {"项目": "用途", "值": "验证旧样本发现是否在2024-06-05至2026-06-05的新时期重复"},
+        {"项目": "禁止事项", "值": "不在新样本重新选择阈值，不根据结果回改条件"},
+        {"项目": "A/B", "值": "完整红柱周期少于9周；1周为A，2至8周为B"},
+        {"项目": "C1/C2", "值": "完整周期不少于9周；进行中已经满9周也可安全确认属于C类"},
+        {"项目": "未决", "值": "截至行情末日仍为红柱且不足9周；绝不强行归入A/B"},
+        {"项目": "实时特征", "值": "只使用首红柱与第二周当时可见信息"},
+        {"项目": "利润指标", "值": "仅完整周期用于最高利润与最大浮亏比较；最高价不是卖出价"},
+        {"项目": "股票池", "值": "历史科技板块全量；信号日价≥10元、流通市值≥100亿元"},
+    ])
+    files = {
+        "01_run_summary_c1c2_ab_oos_v1_0.csv": run_summary,
+        "02_frozen_rule_validation_c1c2_ab_oos_v1_0.csv": rule_summary,
+        "03_half_year_robustness_c1c2_ab_oos_v1_0.csv": period_summary,
+        "04_numeric_feature_separation_c1c2_ab_oos_v1_0.csv": numeric_summary,
+        "05_categorical_feature_separation_c1c2_ab_oos_v1_0.csv": categorical_summary,
+        "06_cycle_resolution_status_c1c2_ab_oos_v1_0.csv": status_summary,
+        "07_resolved_event_detail_c1c2_ab_oos_v1_0.csv": resolved,
+        "08_unresolved_event_detail_c1c2_ab_oos_v1_0.csv": unresolved,
+        "09_ongoing_confirmed_c_detail_c1c2_ab_oos_v1_0.csv": ongoing_confirmed,
+        "10_all_event_detail_c1c2_ab_oos_v1_0.csv": research,
+        "11_full_tech_universe_c1c2_ab_oos_v1_0.csv": sample_audit,
+        "12_population_c1c2_ab_oos_v1_0.csv": population_summary,
+        "13_rejection_audit_c1c2_ab_oos_v1_0.csv": reject_frame,
+        "14_metadata_c1c2_ab_oos_v1_0.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state[session_key] = result_zip
+
+    high_row = rule_summary[rule_summary["冻结条件"].eq("DEA/股价≤-8%")].iloc[0]
+    low_row = rule_summary[rule_summary["冻结条件"].eq("首红柱在零轴上")].iloc[0]
+    st.success(
+        f"验证完成：有效事件{len(valid)}个，已决{len(resolved)}个，未决{len(unresolved)}个；"
+        f"冻结方向{direction_repeated}/{tested_direction_rules}项重复。"
+    )
+    metrics = st.columns(6)
+    metrics[0].metric("已决总体C1C2", f"{base_row['新样本C1C2比例(%)']:.2f}%")
+    metrics[1].metric("DEA深于-8%的C1C2", f"{high_row['新样本C1C2比例(%)']:.2f}%")
+    metrics[2].metric("零轴上C1C2", f"{low_row['新样本C1C2比例(%)']:.2f}%")
+    metrics[3].metric("已决事件", f"{len(resolved)}")
+    metrics[4].metric("未决事件", f"{len(unresolved)}")
+    metrics[5].metric("方向重复", f"{direction_repeated}/{tested_direction_rules}")
+
+    st.subheader("冻结条件样本外验证")
+    st.dataframe(rule_summary, use_container_width=True, hide_index=True)
+    st.subheader("2024H2—2026H1分阶段稳定性")
+    st.dataframe(period_summary, use_container_width=True, hide_index=True)
+    with st.expander("数值特征、分类特征与周期解决状态"):
+        st.dataframe(numeric_summary, use_container_width=True, hide_index=True)
+        st.dataframe(categorical_summary, use_container_width=True, hide_index=True)
+        st.dataframe(status_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("下载结果")
+    st.download_button(
+        "下载1号：全部结果ZIP", result_zip,
+        file_name="weekly_macd_c1c2_ab_oos_v1_0_all_results.zip",
+        mime="application/zip", type="primary", on_click="ignore",
+    )
+    labels = [
+        "2号：运行总表", "3号：冻结条件验证", "4号：半年稳定性", "5号：数值特征",
+        "6号：分类特征", "7号：周期解决状态", "8号：已决明细", "9号：未决明细",
+        "10号：进行中已确认C", "11号：全部事件", "12号：科技股票池", "13号：板块数量",
+        "14号：剔除审计", "15号：验证口径",
+    ]
+    columns = st.columns(4)
+    for index, (filename, frame) in enumerate(files.items()):
+        with columns[index % 4]:
+            st.download_button(
+                labels[index], csv_bytes(frame), file_name=filename,
+                mime="text/csv", key=f"c1c2_ab_oos_{filename}", on_click="ignore",
+            )
+    st.warning(
+        "接近2026-06-05的信号可能尚未满9周，因此未决比例必须与命中率一起看。"
+        "若某条件未决比例过高，不能提前宣布规律成立。"
+    )
+
+
 if __name__ == "__main__":
-    week2_hold_exit_main()
+    c1c2_ab_oos_main()
