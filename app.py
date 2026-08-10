@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD C1/C2与A/B样本外特征验证器 V1.0
-============================================
+科技股周线MACD硬条件＋周内评分排名验证器 V1.0
+==========================================
 
-本程序使用2024-06-05至2026-06-05的新样本，验证旧样本发现的C1/C2与
-A/B实时特征差异能否样本外重复。旧阈值全部冻结，不允许在新样本上重新
-调参。只使用首红柱与第二周当时已经可见的信息；周期类型与最高价只用于
-事后检验。观察期未结束的周期采用审慎的未决处理。
+本程序固定少量硬条件，把极端超跌条件改为连续评分，并在每个第二周确认日
+分别比较全部候选、Top1、Top3和Top5。严格池只纳入第二根红柱严格扩张；
+宽容池只淘汰第二周直接翻绿，对仍红但不扩张固定扣25分。评分只使用当时
+已经可见的信息；周期类型与未来利润只用于事后检验。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30% 的概率。
@@ -54,7 +54,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V1.0-C1C2-AB-OUT-OF-SAMPLE"
+VERSION = "V1.0-WEEKLY-SCORE-RANK"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -84,7 +84,7 @@ DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
 
-TITLE = "科技股周线MACD C1/C2与A/B样本外特征验证器 V1.0"
+TITLE = "科技股周线MACD硬条件＋周内评分排名验证器 V1.0"
 INITIAL_CAPITAL = 300_000.0
 MAX_POSITIONS = 3
 POSITION_BUDGET = 100_000.0
@@ -5127,5 +5127,715 @@ def c1c2_ab_oos_main() -> None:
     )
 
 
+SCORE_WEIGHTS = {
+    "第二根柱扩张幅度": 40.0,
+    "DEA相对股价深度": 25.0,
+    "MA20四周斜率": 20.0,
+    "前26周收益": 10.0,
+    "前期回调深度": 5.0,
+}
+TOLERANT_NONEXPANSION_PENALTY = 25.0
+SCORE_POOL_STRICT = "严格池_第二周严格扩张"
+SCORE_POOL_TOLERANT = "宽容池_第二周仍红"
+SCORE_SCOPES = ("全部候选", "Top1", "Top3", "Top5")
+
+
+def weekly_score_percentile(
+    frame: pd.DataFrame,
+    column: str,
+    higher_is_better: bool,
+) -> pd.Series:
+    """在同一个第二周确认日内计算0—1百分位；缺失值按中性0.5处理。"""
+    values = pd.to_numeric(frame[column], errors="coerce")
+    oriented = values if higher_is_better else -values
+    result = oriented.groupby(frame["Selection_Date"]).rank(
+        method="average", pct=True, ascending=True,
+    )
+    return result.fillna(0.5)
+
+
+def add_weekly_score_features(opportunities: pd.DataFrame) -> pd.DataFrame:
+    """只用第二周确认时已知数据计算固定权重周内评分。"""
+    frame = add_oos_research_features(opportunities)
+    frame["Selection_Date"] = frame.get(
+        "CP_W2_Date", pd.Series("", index=frame.index)
+    ).map(normalize_date)
+    frame["Selection_Half_Year"] = frame["Selection_Date"].map(oos_half_year)
+    valid = frame["Opportunity_Valid"].map(to_bool)
+    w2_observed = frame["W2_Observed"].map(to_bool)
+    w2_red = pd.to_numeric(frame["CP_W2_Hist"], errors="coerce").gt(0)
+    has_date = frame["Selection_Date"].ne("")
+    frame["Score_Eligible_Tolerant"] = valid & w2_observed & w2_red & has_date
+    frame["Score_Eligible_Strict"] = (
+        frame["Score_Eligible_Tolerant"] & frame["W2_Exact_Expansion"].map(to_bool)
+    )
+
+    eligible = frame[frame["Score_Eligible_Tolerant"]].copy()
+    component_specs = [
+        ("ScorePct_W2_Expansion", "CP_W2_Hist_vs_W1_pct", True, 40.0),
+        ("ScorePct_DEA_Depth", "DEA_to_Price_pct", False, 25.0),
+        ("ScorePct_MA20_Slope", "W_MA20_Slope4_pct", False, 20.0),
+        ("ScorePct_Pre26_Return", "Pre_26W_Return_pct", False, 10.0),
+        ("ScorePct_Pullback_Depth", "Pullback_Depth_pct", True, 5.0),
+    ]
+    component_columns: list[str] = []
+    for percentile_column, source_column, higher_is_better, weight in component_specs:
+        eligible[percentile_column] = weekly_score_percentile(
+            eligible, source_column, higher_is_better
+        )
+        points_column = percentile_column.replace("ScorePct_", "ScorePoints_")
+        eligible[points_column] = eligible[percentile_column] * weight
+        component_columns.append(points_column)
+    eligible["Score_Base_100"] = eligible[component_columns].sum(axis=1)
+    eligible["Score_NonExpansion_Penalty"] = np.where(
+        eligible["W2_Exact_Expansion"].map(to_bool),
+        0.0,
+        TOLERANT_NONEXPANSION_PENALTY,
+    )
+    eligible["Score_Strict_Final"] = eligible["Score_Base_100"]
+    eligible["Score_Tolerant_Final"] = (
+        eligible["Score_Base_100"] - eligible["Score_NonExpansion_Penalty"]
+    )
+
+    new_columns = [
+        "ScorePct_W2_Expansion", "ScorePct_DEA_Depth", "ScorePct_MA20_Slope",
+        "ScorePct_Pre26_Return", "ScorePct_Pullback_Depth",
+        "ScorePoints_W2_Expansion", "ScorePoints_DEA_Depth",
+        "ScorePoints_MA20_Slope", "ScorePoints_Pre26_Return",
+        "ScorePoints_Pullback_Depth", "Score_Base_100",
+        "Score_NonExpansion_Penalty", "Score_Strict_Final", "Score_Tolerant_Final",
+    ]
+    for column in new_columns:
+        frame[column] = np.nan
+        frame.loc[eligible.index, column] = eligible[column]
+    return frame
+
+
+def build_score_pool(
+    scored: pd.DataFrame,
+    pool_name: str,
+    eligible_column: str,
+    score_column: str,
+) -> pd.DataFrame:
+    pool = scored[scored[eligible_column].map(to_bool)].copy()
+    if pool.empty:
+        return pool
+    pool["Candidate_Pool"] = pool_name
+    pool["Final_Score"] = pd.to_numeric(pool[score_column], errors="coerce")
+    pool["_Tie_W2"] = pd.to_numeric(pool["CP_W2_Hist_vs_W1_pct"], errors="coerce")
+    pool["_Tie_DEA"] = pd.to_numeric(pool["DEA_to_Price_pct"], errors="coerce")
+    pool["_Tie_Slope"] = pd.to_numeric(pool["W_MA20_Slope4_pct"], errors="coerce")
+    pool = pool.sort_values(
+        ["Selection_Date", "Final_Score", "_Tie_W2", "_Tie_DEA", "_Tie_Slope", "ts_code"],
+        ascending=[True, False, False, True, True, True],
+        na_position="last",
+    ).copy()
+    pool["Weekly_Rank"] = pool.groupby("Selection_Date").cumcount() + 1
+    pool["Selected_Top1"] = pool["Weekly_Rank"].le(1)
+    pool["Selected_Top3"] = pool["Weekly_Rank"].le(3)
+    pool["Selected_Top5"] = pool["Weekly_Rank"].le(5)
+    pool["Rank_Cohort"] = np.select(
+        [
+            pool["Weekly_Rank"].eq(1),
+            pool["Weekly_Rank"].between(2, 3),
+            pool["Weekly_Rank"].between(4, 5),
+        ],
+        ["第1名", "第2—3名", "第4—5名"],
+        default="第6名以后",
+    )
+    return pool.drop(columns=["_Tie_W2", "_Tie_DEA", "_Tie_Slope"])
+
+
+def score_scope_mask(pool: pd.DataFrame, scope: str) -> pd.Series:
+    if scope == "全部候选":
+        return pd.Series(True, index=pool.index)
+    return pool[f"Selected_{scope}"].map(to_bool)
+
+
+def score_reference_weeks(scored: pd.DataFrame) -> pd.PeriodIndex:
+    dates = pd.to_datetime(
+        scored.loc[
+            scored["Opportunity_Valid"].map(to_bool)
+            & scored["W2_Observed"].map(to_bool)
+            & scored["Selection_Date"].ne(""),
+            "Selection_Date",
+        ],
+        format="%Y%m%d", errors="coerce",
+    ).dropna()
+    if dates.empty:
+        return pd.PeriodIndex([], freq="W-SUN")
+    periods = dates.dt.to_period("W-SUN")
+    return pd.period_range(periods.min(), periods.max(), freq="W-SUN")
+
+
+def longest_blank_run(counts: pd.Series) -> tuple[int, str, str]:
+    best_length = current_length = 0
+    best_start = best_end = current_start = None
+    for period, value in counts.items():
+        if int(value) == 0:
+            if current_length == 0:
+                current_start = period
+            current_length += 1
+            if current_length > best_length:
+                best_length = current_length
+                best_start = current_start
+                best_end = period
+        else:
+            current_length = 0
+            current_start = None
+    def label(period: Any) -> str:
+        if period is None:
+            return ""
+        return f"{period.start_time:%Y-%m-%d}—{period.end_time:%Y-%m-%d}"
+    return best_length, label(best_start), label(best_end)
+
+
+def score_strategy_summary(
+    pools: dict[str, pd.DataFrame],
+    reference_weeks: pd.PeriodIndex,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for pool_name, pool in pools.items():
+        base_resolved = pool[pool["Research_Family"].ne("未决")]
+        base_c = int(base_resolved["Research_Family"].eq("C1C2_长周期").sum())
+        base_ab = int(base_resolved["Research_Family"].eq("AB_弱或短周期").sum())
+        base_rate = pct_mean(base_resolved["Research_Family"].eq("C1C2_长周期"))
+        for scope in SCORE_SCOPES:
+            selected = pool[score_scope_mask(pool, scope)].copy()
+            resolved = selected[selected["Research_Family"].ne("未决")]
+            complete = resolved[resolved["Cycle_Completed"].map(to_bool)]
+            c_count = int(resolved["Research_Family"].eq("C1C2_长周期").sum())
+            ab_count = int(resolved["Research_Family"].eq("AB_弱或短周期").sum())
+            c_rate = pct_mean(resolved["Research_Family"].eq("C1C2_长周期"))
+            periods = pd.to_datetime(
+                selected["Selection_Date"], format="%Y%m%d", errors="coerce"
+            ).dt.to_period("W-SUN")
+            counts = periods.value_counts().reindex(reference_weeks, fill_value=0).sort_index()
+            nonzero = counts[counts.gt(0)]
+            blank_length, blank_start, blank_end = longest_blank_run(counts)
+            maximum = int(counts.max()) if len(counts) else 0
+            max_weeks = [
+                f"{period.start_time:%Y-%m-%d}—{period.end_time:%Y-%m-%d}"
+                for period in counts[counts.eq(maximum)].index
+            ] if maximum else []
+            row = {
+                "候选池": pool_name,
+                "选择范围": scope,
+                "入选事件": int(len(selected)),
+                "不同股票": int(selected["ts_code"].nunique()),
+                "已决事件": int(len(resolved)),
+                "未决事件": int(selected["Research_Family"].eq("未决").sum()),
+                "C1C2数": c_count,
+                "AB数": ab_count,
+                "C1C2比例(%)": c_rate,
+                "候选池基准C1C2比例(%)": base_rate,
+                "相对候选池提升(百分点)": c_rate - base_rate if math.isfinite(c_rate) else np.nan,
+                "保留候选池C1C2(%)": c_count / base_c * 100.0 if base_c else np.nan,
+                "保留候选池AB(%)": ab_count / base_ab * 100.0 if base_ab else np.nan,
+                "完整周期数": int(len(complete)),
+                "最高利润中位数(%)": numeric_median(complete["Peak_MFE_pct"]),
+                "最大浮亏中位数(%)": numeric_median(complete["Path_MAE_pct"]),
+                "达到10%(%)": pct_mean(complete["Reached_10_pct"].map(to_bool)) if len(complete) else np.nan,
+                "达到20%(%)": pct_mean(complete["Reached_20_pct"].map(to_bool)) if len(complete) else np.nan,
+                "达到30%(%)": pct_mean(complete["Reached_30_pct"].map(to_bool)) if len(complete) else np.nan,
+                "总统计周数": int(len(reference_weeks)),
+                "非空周": int(len(nonzero)),
+                "空窗周": int(counts.eq(0).sum()),
+                "非空周最少入选": int(nonzero.min()) if len(nonzero) else 0,
+                "非空周平均入选": float(nonzero.mean()) if len(nonzero) else 0.0,
+                "单周最多入选": maximum,
+                "最多入选周": "|".join(max_weeks),
+                "最长连续空窗(周)": int(blank_length),
+                "最长空窗开始周": blank_start,
+                "最长空窗结束周": blank_end,
+            }
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def score_half_year_summary(pools: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for pool_name, pool in pools.items():
+        for half_year, half in pool.groupby("Selection_Half_Year", sort=True):
+            base_resolved = half[half["Research_Family"].ne("未决")]
+            base_rate = pct_mean(base_resolved["Research_Family"].eq("C1C2_长周期"))
+            for scope in SCORE_SCOPES:
+                selected = half[score_scope_mask(half, scope)]
+                resolved = selected[selected["Research_Family"].ne("未决")]
+                complete = resolved[resolved["Cycle_Completed"].map(to_bool)]
+                c_rate = pct_mean(resolved["Research_Family"].eq("C1C2_长周期"))
+                rows.append({
+                    "确认半年": half_year,
+                    "候选池": pool_name,
+                    "选择范围": scope,
+                    "入选事件": int(len(selected)),
+                    "已决事件": int(len(resolved)),
+                    "C1C2数": int(resolved["Research_Family"].eq("C1C2_长周期").sum()),
+                    "AB数": int(resolved["Research_Family"].eq("AB_弱或短周期").sum()),
+                    "C1C2比例(%)": c_rate,
+                    "同期候选池基准(%)": base_rate,
+                    "相对同期基准(百分点)": c_rate - base_rate if math.isfinite(c_rate) else np.nan,
+                    "最高利润中位数(%)": numeric_median(complete["Peak_MFE_pct"]),
+                    "最大浮亏中位数(%)": numeric_median(complete["Path_MAE_pct"]),
+                    "达到10%(%)": pct_mean(complete["Reached_10_pct"].map(to_bool)) if len(complete) else np.nan,
+                    "达到20%(%)": pct_mean(complete["Reached_20_pct"].map(to_bool)) if len(complete) else np.nan,
+                    "达到30%(%)": pct_mean(complete["Reached_30_pct"].map(to_bool)) if len(complete) else np.nan,
+                })
+    return pd.DataFrame(rows)
+
+
+def score_weekly_detail(pools: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for pool_name, pool in pools.items():
+        for selection_date, week in pool.groupby("Selection_Date", sort=True):
+            for scope in SCORE_SCOPES:
+                selected = week[score_scope_mask(week, scope)]
+                resolved = selected[selected["Research_Family"].ne("未决")]
+                rows.append({
+                    "确认日期": selection_date,
+                    "确认半年": oos_half_year(selection_date),
+                    "候选池": pool_name,
+                    "选择范围": scope,
+                    "入选数": int(len(selected)),
+                    "不同股票": int(selected["ts_code"].nunique()),
+                    "已决数": int(len(resolved)),
+                    "C1C2数": int(resolved["Research_Family"].eq("C1C2_长周期").sum()),
+                    "AB数": int(resolved["Research_Family"].eq("AB_弱或短周期").sum()),
+                    "C1C2比例(%)": pct_mean(resolved["Research_Family"].eq("C1C2_长周期")),
+                    "平均评分": numeric_mean(selected["Final_Score"]),
+                    "最低入选评分": pd.to_numeric(selected["Final_Score"], errors="coerce").min(),
+                    "最高入选评分": pd.to_numeric(selected["Final_Score"], errors="coerce").max(),
+                })
+    return pd.DataFrame(rows)
+
+
+def score_rank_cohort_summary(pools: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for pool_name, pool in pools.items():
+        for cohort, group in pool.groupby("Rank_Cohort", sort=False):
+            resolved = group[group["Research_Family"].ne("未决")]
+            complete = resolved[resolved["Cycle_Completed"].map(to_bool)]
+            rows.append({
+                "候选池": pool_name,
+                "周排名分层": cohort,
+                "事件数": int(len(group)),
+                "已决数": int(len(resolved)),
+                "C1C2数": int(resolved["Research_Family"].eq("C1C2_长周期").sum()),
+                "AB数": int(resolved["Research_Family"].eq("AB_弱或短周期").sum()),
+                "C1C2比例(%)": pct_mean(resolved["Research_Family"].eq("C1C2_长周期")),
+                "评分中位数": numeric_median(group["Final_Score"]),
+                "最高利润中位数(%)": numeric_median(complete["Peak_MFE_pct"]),
+                "最大浮亏中位数(%)": numeric_median(complete["Path_MAE_pct"]),
+                "达到10%(%)": pct_mean(complete["Reached_10_pct"].map(to_bool)) if len(complete) else np.nan,
+                "达到20%(%)": pct_mean(complete["Reached_20_pct"].map(to_bool)) if len(complete) else np.nan,
+                "达到30%(%)": pct_mean(complete["Reached_30_pct"].map(to_bool)) if len(complete) else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def score_concentration_summary(pools: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    dimensions = [
+        ("申万一级行业", "SW_L1"),
+        ("申万二级行业", "SW_L2"),
+        ("上市板块", "Sample_Board"),
+        ("单只股票", "ts_code"),
+        ("确认日期", "Selection_Date"),
+    ]
+    for pool_name, pool in pools.items():
+        for scope in SCORE_SCOPES:
+            selected = pool[score_scope_mask(pool, scope)]
+            for label, column in dimensions:
+                counts = selected[column].fillna("未知").astype(str).value_counts()
+                top_value = counts.index[0] if len(counts) else ""
+                top_count = int(counts.iloc[0]) if len(counts) else 0
+                rows.append({
+                    "候选池": pool_name,
+                    "选择范围": scope,
+                    "集中维度": label,
+                    "入选总数": int(len(selected)),
+                    "不同类别数": int(len(counts)),
+                    "最大类别": top_value,
+                    "最大类别数量": top_count,
+                    "最大类别占比(%)": top_count / len(selected) * 100.0 if len(selected) else np.nan,
+                })
+    return pd.DataFrame(rows)
+
+
+def score_component_audit(scored: pd.DataFrame) -> pd.DataFrame:
+    definitions = [
+        ("第二根柱相对第一根增幅", "CP_W2_Hist_vs_W1_pct", "越高越好", 40.0),
+        ("DEA/股价", "DEA_to_Price_pct", "越低越好", 25.0),
+        ("MA20四周斜率", "W_MA20_Slope4_pct", "越低越好", 20.0),
+        ("前26周收益", "Pre_26W_Return_pct", "越低越好", 10.0),
+        ("前期回调深度", "Pullback_Depth_pct", "越高越好", 5.0),
+    ]
+    eligible = scored[scored["Score_Eligible_Tolerant"].map(to_bool)]
+    rows = []
+    for name, column, direction, weight in definitions:
+        values = pd.to_numeric(eligible[column], errors="coerce")
+        rows.append({
+            "评分项": name,
+            "原始字段": column,
+            "方向": direction,
+            "固定权重": weight,
+            "有效数": int(values.notna().sum()),
+            "缺失数": int(values.isna().sum()),
+            "中位数": values.median(),
+            "最小值": values.min(),
+            "最大值": values.max(),
+            "周内百分位规则": "同一第二周确认日内排名；缺失按中性50%",
+        })
+    rows.append({
+        "评分项": "第二周仍红但不扩张扣分",
+        "原始字段": "W2_Exact_Expansion",
+        "方向": "宽容池固定扣分",
+        "固定权重": -TOLERANT_NONEXPANSION_PENALTY,
+        "有效数": int(len(eligible)),
+        "缺失数": 0,
+        "中位数": np.nan,
+        "最小值": np.nan,
+        "最大值": np.nan,
+        "周内百分位规则": "严格池不适用；宽容池第二周仍红但未严格扩张固定扣25分",
+    })
+    return pd.DataFrame(rows)
+
+
+def score_ablation_summary(pools: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """固定权重逐项删除，检查Top3恶化来自哪一个评分项；不据此自动调参。"""
+    components = [
+        ("删除第二根柱扩张40分", "ScorePoints_W2_Expansion"),
+        ("删除DEA深度25分", "ScorePoints_DEA_Depth"),
+        ("删除MA20斜率20分", "ScorePoints_MA20_Slope"),
+        ("删除前26周收益10分", "ScorePoints_Pre26_Return"),
+        ("删除回调深度5分", "ScorePoints_Pullback_Depth"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for pool_name, pool in pools.items():
+        base_resolved = pool[pool["Research_Family"].ne("未决")]
+        base_rate = pct_mean(base_resolved["Research_Family"].eq("C1C2_长周期"))
+        variants = [("完整固定评分", None)] + components
+        for variant_name, removed_column in variants:
+            working = pool.copy()
+            score = pd.to_numeric(working["Final_Score"], errors="coerce")
+            if removed_column is not None:
+                score = score - pd.to_numeric(working[removed_column], errors="coerce").fillna(0.0)
+            working["Ablation_Score"] = score
+            working = working.sort_values(
+                ["Selection_Date", "Ablation_Score", "CP_W2_Hist_vs_W1_pct", "ts_code"],
+                ascending=[True, False, False, True], na_position="last",
+            )
+            working["Ablation_Rank"] = working.groupby("Selection_Date").cumcount() + 1
+            selected = working[working["Ablation_Rank"].le(3)]
+            resolved = selected[selected["Research_Family"].ne("未决")]
+            complete = resolved[resolved["Cycle_Completed"].map(to_bool)]
+            c_rate = pct_mean(resolved["Research_Family"].eq("C1C2_长周期"))
+            rows.append({
+                "候选池": pool_name,
+                "评分变体": variant_name,
+                "Top3事件": int(len(selected)),
+                "已决事件": int(len(resolved)),
+                "C1C2数": int(resolved["Research_Family"].eq("C1C2_长周期").sum()),
+                "AB数": int(resolved["Research_Family"].eq("AB_弱或短周期").sum()),
+                "C1C2比例(%)": c_rate,
+                "候选池基准(%)": base_rate,
+                "相对候选池提升(百分点)": c_rate - base_rate if math.isfinite(c_rate) else np.nan,
+                "最高利润中位数(%)": numeric_median(complete["Peak_MFE_pct"]),
+                "最大浮亏中位数(%)": numeric_median(complete["Path_MAE_pct"]),
+                "达到10%(%)": pct_mean(complete["Reached_10_pct"].map(to_bool)) if len(complete) else np.nan,
+                "达到20%(%)": pct_mean(complete["Reached_20_pct"].map(to_bool)) if len(complete) else np.nan,
+                "达到30%(%)": pct_mean(complete["Reached_30_pct"].map(to_bool)) if len(complete) else np.nan,
+                "说明": "只做诊断，不自动采用表现最好的变体",
+            })
+    return pd.DataFrame(rows)
+
+
+def weekly_score_rank_main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption(
+        "固定硬条件与100分制，在每个第二周确认日内比较全部候选、Top1、Top3和Top5。"
+        "严格池要求第二根红柱严格扩张；宽容池只淘汰翻绿，对不扩张固定扣25分。"
+    )
+    with st.sidebar:
+        st.header("验证区间")
+        signal_start_date = st.date_input("首红柱信号开始", value=date(2024, 6, 5))
+        signal_end_date = st.date_input("首红柱信号截止", value=date(2026, 6, 5))
+        observation_end_date = st.date_input(
+            "行情观察截止", value=date.today(), max_value=date.today()
+        )
+        st.header("冻结硬条件")
+        st.write("历史科技板块全量；股价≥10元；流通市值≥100亿元；可交易")
+        st.write("严格池：第二根红柱严格长于第一根")
+        st.write("宽容池：第二周仍为红柱；不扩张扣25分")
+        st.header("冻结评分")
+        for name, weight in SCORE_WEIGHTS.items():
+            st.write(f"{name}：{weight:.0f}分")
+        st.caption("所有评分均为同一确认周内的百分位，不使用绝对阈值。")
+        use_cache = st.checkbox("使用逐股票缓存", value=True)
+        api_pause = st.number_input(
+            "每次API调用后暂停(秒)", min_value=0.0, max_value=3.0,
+            value=0.12, step=0.05,
+        )
+        if st.button("清除本程序缓存"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("缓存已清除")
+
+    token = st.text_input("Tushare Token", type="password")
+    if not token:
+        st.info("请输入Tushare Token。")
+        return
+    session_key = "weekly_score_rank_v1_0_zip"
+    run_requested = st.button("开始周内评分排名验证", type="primary")
+    if not run_requested:
+        if session_key in st.session_state:
+            st.success("上一次结果仍在，可直接下载。")
+            st.download_button(
+                "下载上一次全部结果ZIP", st.session_state[session_key],
+                file_name="weekly_macd_score_rank_v1_0_all_results.zip",
+                mime="application/zip", type="primary", on_click="ignore",
+            )
+        else:
+            st.info("重点比较两套候选池的Top3能否提高C1/C2比例，同时保持较少空窗。")
+        return
+    date_error = validate_research_dates(
+        signal_start_date, signal_end_date, observation_end_date
+    )
+    if date_error:
+        st.error(date_error)
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    signal_start = signal_start_date.strftime("%Y%m%d")
+    signal_end = signal_end_date.strftime("%Y%m%d")
+    observation_end = observation_end_date.strftime("%Y%m%d")
+    preload_start = (signal_start_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    calendar_tail = (observation_end_date + timedelta(days=7)).strftime("%Y%m%d")
+    config = {
+        "signal_start": signal_start, "signal_end": signal_end,
+        "market_end": observation_end, "preload_start": preload_start,
+        "min_price": 10.0, "min_mv": 100.0, "max_mv": 1_000_000_000.0,
+        "price_tolerance_pct": 3.0, "stop_threshold_pct": 10.0,
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "sample_per_board": 0, "sample_seed": DEFAULT_SAMPLE_SEED,
+        "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+    }
+    try:
+        with st.spinner("加载交易日历、历史科技股票池和申万历史成分..."):
+            open_dates = load_trade_calendar(preload_start, observation_end)
+            full_calendar = load_trade_calendar(preload_start, calendar_tail)
+            stock_basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(api_pause))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+
+    week_last_map = complete_week_last_dates(full_calendar)
+    period_index = build_period_index(memberships)
+    universe_codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
+    universe = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
+    stocks, sample_audit, population_summary = build_stratified_sample(
+        stocks=universe, period_index=period_index, reference_date=signal_end,
+        per_board=0, seed=DEFAULT_SAMPLE_SEED,
+    )
+    list_dates = stocks["list_date"].apply(lambda x: normalize_date(x, "19000101"))
+    delist_dates = stocks["delist_date"].apply(lambda x: normalize_date(x, "99991231"))
+    stocks_to_fetch = stocks[
+        ~list_dates.gt(signal_end) & ~delist_dates.lt(preload_start)
+    ].copy().reset_index(drop=True)
+    st.write(
+        f"历史科技池{len(universe)}只；实际读取{len(stocks_to_fetch)}只；"
+        f"首红柱信号{signal_start}—{signal_end}；观察至{observation_end}。"
+    )
+
+    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
+    all_records: list[dict[str, Any]] = []
+    daily_histories: dict[str, pd.DataFrame] = {}
+    reject_totals: dict[str, int] = {}
+    cache_hits = data_failures = 0
+    progress = st.progress(0.0, text="逐股票生成首红柱事件...")
+    status = st.empty()
+    for idx, stock in stocks_to_fetch.iterrows():
+        code = str(stock["ts_code"])
+        progress.progress(
+            (idx + 1) / len(stocks_to_fetch),
+            text=f"{idx + 1}/{len(stocks_to_fetch)} {code}",
+        )
+        status.caption(
+            f"底层事件{len(all_records)}；缓存命中{cache_hits}；行情失败{data_failures}"
+        )
+        daily, basic, cache_hit = fetch_stock_history(
+            code, preload_start, observation_end, bool(use_cache), float(api_pause)
+        )
+        cache_hits += int(cache_hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        records, rejects, _ = analyze_stock(
+            stock=stock, periods=period_index.get(code, []), daily=daily, basic=basic,
+            week_last_map=week_last_map, open_dates=open_dates, open_pos=open_pos,
+            config=config,
+        )
+        all_records.extend(records)
+        if records:
+            daily_histories[code] = daily.copy()
+        for reason, count in rejects.items():
+            reject_totals[reason] = reject_totals.get(reason, 0) + count
+    progress.empty()
+    status.empty()
+    if not all_records:
+        st.error("没有生成有效事件，请检查日期、Token权限和价格市值条件。")
+        return
+
+    events = pd.DataFrame(all_records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+    with st.spinner("计算周期标签、周内百分位评分和Top1/Top3/Top5..."):
+        opportunities = build_cycle_opportunities(
+            events, daily_histories, observation_end, config["sell_slippage_pct"]
+        )
+        scored = add_weekly_score_features(opportunities)
+        strict_pool = build_score_pool(
+            scored, SCORE_POOL_STRICT, "Score_Eligible_Strict", "Score_Strict_Final"
+        )
+        tolerant_pool = build_score_pool(
+            scored, SCORE_POOL_TOLERANT, "Score_Eligible_Tolerant", "Score_Tolerant_Final"
+        )
+        if strict_pool.empty or tolerant_pool.empty:
+            st.error("评分候选池为空，请检查第二周数据和日期区间。")
+            return
+        pools = {SCORE_POOL_STRICT: strict_pool, SCORE_POOL_TOLERANT: tolerant_pool}
+        reference_weeks = score_reference_weeks(scored)
+        strategy_summary = score_strategy_summary(pools, reference_weeks)
+        half_year_summary = score_half_year_summary(pools)
+        weekly_detail = score_weekly_detail(pools)
+        rank_cohort = score_rank_cohort_summary(pools)
+        concentration = score_concentration_summary(pools)
+        component_audit = score_component_audit(scored)
+        ablation = score_ablation_summary(pools)
+
+    valid = scored[scored["Opportunity_Valid"].map(to_bool)].copy()
+    unresolved = valid[valid["Research_Family"].eq("未决")].copy()
+    reject_frame = pd.DataFrame([
+        {"剔除原因": reason, "次数": count} for reason, count in reject_totals.items()
+    ]).sort_values("次数", ascending=False) if reject_totals else pd.DataFrame(
+        columns=["剔除原因", "次数"]
+    )
+    strict_top3 = strategy_summary[
+        strategy_summary["候选池"].eq(SCORE_POOL_STRICT)
+        & strategy_summary["选择范围"].eq("Top3")
+    ].iloc[0]
+    tolerant_top3 = strategy_summary[
+        strategy_summary["候选池"].eq(SCORE_POOL_TOLERANT)
+        & strategy_summary["选择范围"].eq("Top3")
+    ].iloc[0]
+    run_summary = pd.DataFrame([{
+        "程序": TITLE,
+        "版本": VERSION,
+        "信号开始": signal_start,
+        "信号截止": signal_end,
+        "观察截止": observation_end,
+        "首红柱事件": int(len(scored)),
+        "有效事件": int(len(valid)),
+        "严格池候选": int(len(strict_pool)),
+        "严格池不同股票": int(strict_pool["ts_code"].nunique()),
+        "宽容池候选": int(len(tolerant_pool)),
+        "宽容池不同股票": int(tolerant_pool["ts_code"].nunique()),
+        "严格池Top3事件": int(strict_top3["入选事件"]),
+        "严格池Top3_C1C2比例(%)": strict_top3["C1C2比例(%)"],
+        "严格池Top3空窗周": int(strict_top3["空窗周"]),
+        "宽容池Top3事件": int(tolerant_top3["入选事件"]),
+        "宽容池Top3_C1C2比例(%)": tolerant_top3["C1C2比例(%)"],
+        "宽容池Top3空窗周": int(tolerant_top3["空窗周"]),
+        "未决事件": int(len(unresolved)),
+        "真实行情失败": int(data_failures),
+        "缓存命中": int(cache_hits),
+    }])
+    metadata = pd.DataFrame([
+        {"项目": "程序", "值": TITLE},
+        {"项目": "目的", "值": "验证少量硬条件＋连续评分＋每周Top1/Top3/Top5能否减少AB且保持信号连续"},
+        {"项目": "严格池", "值": "第二周红柱严格长于第一根"},
+        {"项目": "宽容池", "值": "第二周仍为红柱；未严格扩张固定扣25分；直接翻绿淘汰"},
+        {"项目": "评分方法", "值": "同一第二周确认日内计算百分位；缺失值按中性50%"},
+        {"项目": "固定权重", "值": "第二周扩张40、DEA深度25、MA20斜率20、前26周收益10、回调深度5"},
+        {"项目": "排名并列处理", "值": "总分、第二周扩张幅度、DEA深度、MA20斜率、股票代码依次破同分"},
+        {"项目": "A/B与C", "值": "A/B为完整红柱周期少于9周；C1/C2为不少于9周；进行中满9周可确认C"},
+        {"项目": "利润口径", "值": "最高利润和最大浮亏只用于事后评价，不是最终止盈止损收益"},
+        {"项目": "组合限制", "值": "本版不模拟三仓占用、资金曲线和最终退出"},
+        {"项目": "股票池", "值": "历史科技板块全量；信号日股价≥10元、流通市值≥100亿元"},
+    ])
+    files = {
+        "01_run_summary_score_rank_v1_0.csv": run_summary,
+        "02_strategy_comparison_score_rank_v1_0.csv": strategy_summary,
+        "03_half_year_robustness_score_rank_v1_0.csv": half_year_summary,
+        "04_weekly_selection_detail_score_rank_v1_0.csv": weekly_detail,
+        "05_rank_cohort_quality_score_rank_v1_0.csv": rank_cohort,
+        "06_concentration_audit_score_rank_v1_0.csv": concentration,
+        "07_score_component_audit_score_rank_v1_0.csv": component_audit,
+        "08_score_ablation_top3_score_rank_v1_0.csv": ablation,
+        "09_strict_pool_candidate_detail_score_rank_v1_0.csv": strict_pool,
+        "10_tolerant_pool_candidate_detail_score_rank_v1_0.csv": tolerant_pool,
+        "11_unresolved_event_detail_score_rank_v1_0.csv": unresolved,
+        "12_all_event_score_detail_score_rank_v1_0.csv": scored,
+        "13_full_tech_universe_score_rank_v1_0.csv": sample_audit,
+        "14_population_score_rank_v1_0.csv": population_summary,
+        "15_rejection_audit_score_rank_v1_0.csv": reject_frame,
+        "16_metadata_score_rank_v1_0.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state[session_key] = result_zip
+
+    st.success(
+        f"验证完成：严格池{len(strict_pool)}个，宽容池{len(tolerant_pool)}个；"
+        f"严格池Top3的C1/C2比例{strict_top3['C1C2比例(%)']:.2f}%，"
+        f"宽容池Top3为{tolerant_top3['C1C2比例(%)']:.2f}%。"
+    )
+    metrics = st.columns(6)
+    metrics[0].metric("严格池候选", f"{len(strict_pool)}")
+    metrics[1].metric("严格池Top3 C1C2", f"{strict_top3['C1C2比例(%)']:.2f}%")
+    metrics[2].metric("严格池Top3空窗", f"{int(strict_top3['空窗周'])}周")
+    metrics[3].metric("宽容池候选", f"{len(tolerant_pool)}")
+    metrics[4].metric("宽容池Top3 C1C2", f"{tolerant_top3['C1C2比例(%)']:.2f}%")
+    metrics[5].metric("宽容池Top3空窗", f"{int(tolerant_top3['空窗周'])}周")
+
+    st.subheader("候选池与Top1/Top3/Top5总比较")
+    st.dataframe(strategy_summary, use_container_width=True, hide_index=True)
+    st.subheader("半年稳定性")
+    st.dataframe(half_year_summary, use_container_width=True, hide_index=True)
+    with st.expander("周度明细、排名分层与集中度审计"):
+        st.dataframe(weekly_detail, use_container_width=True, hide_index=True)
+        st.dataframe(rank_cohort, use_container_width=True, hide_index=True)
+        st.dataframe(concentration, use_container_width=True, hide_index=True)
+        st.dataframe(ablation, use_container_width=True, hide_index=True)
+
+    st.subheader("下载结果")
+    st.download_button(
+        "下载1号：全部结果ZIP", result_zip,
+        file_name="weekly_macd_score_rank_v1_0_all_results.zip",
+        mime="application/zip", type="primary", on_click="ignore",
+    )
+    labels = [
+        "2号：运行总表", "3号：策略总比较", "4号：半年稳定性", "5号：每周选择明细",
+        "6号：排名分层质量", "7号：集中度审计", "8号：评分项审计", "9号：Top3删项诊断",
+        "10号：严格池明细", "11号：宽容池明细", "12号：未决事件", "13号：全部评分事件",
+        "14号：科技股票池", "15号：板块数量", "16号：剔除审计", "17号：验证口径",
+    ]
+    columns = st.columns(4)
+    for index, (filename, frame) in enumerate(files.items()):
+        with columns[index % 4]:
+            st.download_button(
+                labels[index], csv_bytes(frame), file_name=filename,
+                mime="text/csv", key=f"score_rank_{filename}", on_click="ignore",
+            )
+    st.warning(
+        "本版只验证选股排序质量。Top3不是三仓资金组合：没有处理持仓重叠、退出、"
+        "资金占用和收益复利；只有评分稳定后才应进入组合回测。"
+    )
+
+
 if __name__ == "__main__":
-    c1c2_ab_oos_main()
+    weekly_score_rank_main()
