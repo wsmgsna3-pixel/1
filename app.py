@@ -985,6 +985,10 @@ def build_checkpoint_features(
             f"{prefix}_ReExpansion_Count": np.nan,
             f"{prefix}_Weak_Candidate": np.nan,
             f"{prefix}_Close": np.nan,
+            f"{prefix}_DIF": np.nan,
+            f"{prefix}_DEA": np.nan,
+            f"{prefix}_DIF_to_Price_pct": np.nan,
+            f"{prefix}_DEA_to_Price_pct": np.nan,
             f"{prefix}_MA20": np.nan,
             f"{prefix}_MA20_Slope4_pct": np.nan,
             f"{prefix}_Return_13W_pct": np.nan,
@@ -1001,6 +1005,7 @@ def build_checkpoint_features(
             f"{prefix}_Stop_Hit_Before": np.nan,
             f"{prefix}_Remaining_Stop_Hit": np.nan,
             f"{prefix}_Delayed_Entry_Date": "",
+            f"{prefix}_Delayed_Observation_End_Date": "",
             f"{prefix}_Delayed_Entry_Price": np.nan,
             f"{prefix}_Delayed_Has_8W_Future": False,
             f"{prefix}_Delayed_MFE_8W_pct": np.nan,
@@ -1049,6 +1054,16 @@ def build_checkpoint_features(
             f"{prefix}_ReExpansion_Count": moves["ReExpansion_Count"],
             f"{prefix}_Weak_Candidate": weak_candidate,
             f"{prefix}_Close": finite_num(checkpoint_row.get("close")),
+            f"{prefix}_DIF": finite_num(checkpoint_row.get("dif")),
+            f"{prefix}_DEA": finite_num(checkpoint_row.get("dea")),
+            f"{prefix}_DIF_to_Price_pct": (
+                finite_num(checkpoint_row.get("dif")) / finite_num(checkpoint_row.get("close")) * 100.0
+                if finite_num(checkpoint_row.get("close")) > 0 else np.nan
+            ),
+            f"{prefix}_DEA_to_Price_pct": (
+                finite_num(checkpoint_row.get("dea")) / finite_num(checkpoint_row.get("close")) * 100.0
+                if finite_num(checkpoint_row.get("close")) > 0 else np.nan
+            ),
             f"{prefix}_MA20": finite_num(checkpoint_row.get("ma20")),
             f"{prefix}_MA20_Slope4_pct": finite_num(checkpoint_row.get("ma20_slope4_pct")),
             f"{prefix}_Return_13W_pct": finite_num(checkpoint_row.get("return_13w_pct")),
@@ -1095,6 +1110,7 @@ def build_checkpoint_features(
                 delayed_stop_price = delayed_entry_price * (1.0 - stop_threshold_pct / 100.0)
                 output.update({
                     f"{prefix}_Delayed_Entry_Date": delayed_entry_date,
+                    f"{prefix}_Delayed_Observation_End_Date": delayed_horizon_date,
                     f"{prefix}_Delayed_Entry_Price": delayed_entry_price,
                     f"{prefix}_Delayed_Has_8W_Future": True,
                     f"{prefix}_Delayed_MFE_8W_pct": (
@@ -2529,11 +2545,13 @@ def build_cycle_opportunities(
         "First_Material_Shrink_Week", "Material_Shrink_Count", "ReExpansion_Count",
         "CP_W2_Date", "CP_W2_State", "CP_W2_Hist", "CP_W2_Hist_vs_W1_pct",
         "CP_W2_Weak_Candidate", "CP_W2_Close", "CP_W2_MA20",
+        "CP_W2_DIF", "CP_W2_DEA", "CP_W2_DIF_to_Price_pct", "CP_W2_DEA_to_Price_pct",
         "CP_W2_MA20_Slope4_pct", "CP_W2_Return_13W_pct", "CP_W2_Return_26W_pct",
         "CP_W2_Close_vs_MA20_pct", "CP_W2_Week_Return_pct",
         "CP_W2_Volume_Ratio20", "CP_W2_ATR14_pct", "CP_W2_Close_Location",
         "CP_W2_Return_From_Entry_pct", "CP_W2_Delayed_Entry_Date",
         "CP_W2_Delayed_Entry_Price", "CP_W2_Delayed_Has_8W_Future",
+        "CP_W2_Delayed_Observation_End_Date",
         "CP_W2_Delayed_MFE_8W_pct", "CP_W2_Delayed_MAE_8W_pct",
         "CP_W2_Delayed_Return_8W_pct", "CP_W2_Delayed_Hit_Stop_8W",
         "CP_W2_Delayed_Hit_10_8W", "CP_W2_Delayed_Hit_20_8W",
@@ -5894,728 +5912,406 @@ def weekly_score_rank_main() -> None:
         "资金占用和收益复利；只有评分稳定后才应进入组合回测。"
     )
 
-# =============================================================================
-# 多模型评分实验室 V2.0（单文件界面与评分逻辑）
-# 本文件由已验证的底层引擎和实验版界面机械合并生成。
-# =============================================================================
-TITLE = "科技股周线MACD多模型评分实验室 V2.0"
-VERSION = "V2.0-SCORING-LAB"
-MODEL_OLD = "旧五因子基准"
-MODEL_REVERSAL = "修复反转模型"
-MODEL_MOMENTUM = "趋势延续模型"
-MODEL_BALANCED = "双模型均衡"
-MODEL_ADAPTIVE = "市场自适应双模型"
-MODELS = (MODEL_OLD, MODEL_REVERSAL, MODEL_MOMENTUM, MODEL_BALANCED, MODEL_ADAPTIVE)
-SCOPES = ("全部候选", "Top1", "Top3", "行业分散Top3", "Top5")
+# ===== V2.1 rolling dynamic experts (single file) =====
+TITLE = "科技股周线MACD滚动专家自适应评分验证器 V2.1"
+VERSION = "V2.1-ROLLING-DYNAMIC-EXPERTS"
+TREND, REPAIR, AUTO = "趋势延续", "超跌修复", "自动选择"
+TRAIN_WEEKS = PERF_WEEKS = 26
+HALF_LIFE = 13.0
+MIN_WEEKS, MIN_ROWS, RIDGE = 13, 120, 8.0
+WARMUP_DAYS = 600
+TREND_FEATURES = (
+    "TF_Return13", "TF_Return26", "TF_MA20Slope", "TF_W2Return",
+    "TF_CloseLocation", "TF_BoardRS", "TF_Volume", "TF_W2Expansion",
+)
+REPAIR_FEATURES = (
+    "RF_DEADepth", "RF_Pullback", "RF_PriorLoss", "RF_SlopeImprove",
+    "RF_DEAImprove", "RF_ReclaimMA20", "RF_W2Return", "RF_CloseLocation",
+    "RF_BoardRS", "RF_Volume", "RF_RepairConfirmation",
+)
 
 
-def number(series: pd.Series | Any, index: pd.Index | None = None) -> pd.Series:
-    if isinstance(series, pd.Series):
-        return pd.to_numeric(series, errors="coerce")
-    return pd.Series(series, index=index, dtype="float64")
+def num(v: Any, index: pd.Index | None = None) -> pd.Series:
+    return pd.to_numeric(v, errors="coerce") if isinstance(v, pd.Series) else pd.Series(v, index=index, dtype=float)
 
 
-def bool_value(value: Any) -> bool:
-    return to_bool(value)
+def bool_value(v: Any) -> bool:
+    return to_bool(v)
 
 
-def rate(mask: pd.Series) -> float:
-    return float(mask.astype(bool).mean() * 100.0) if len(mask) else np.nan
+def rate(v: pd.Series) -> float:
+    return float(v.astype(bool).mean() * 100.0) if len(v) else np.nan
 
 
-def median(series: pd.Series) -> float:
-    return number(series).median()
+def exp_weights(dates: pd.Series, current: pd.Timestamp) -> np.ndarray:
+    age = (current - pd.to_datetime(dates)).dt.days.to_numpy(float) / 7.0
+    return np.power(0.5, np.maximum(age, 0.0) / HALF_LIFE)
 
 
-def mean(series: pd.Series) -> float:
-    return number(series).mean()
+def wmean(values: np.ndarray, weights: np.ndarray) -> float:
+    ok = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    return float(np.average(values[ok], weights=weights[ok])) if ok.any() else np.nan
 
 
-def weekly_percentile(
-    frame: pd.DataFrame, column: str, higher_is_better: bool = True
-) -> pd.Series:
-    values = number(frame.get(column), frame.index)
-    oriented = values if higher_is_better else -values
-    return oriented.groupby(frame["Selection_Date"]).rank(
-        method="average", pct=True, ascending=True
-    ).fillna(0.5)
+def week_pct(frame: pd.DataFrame, values: Any, higher: bool = True) -> pd.Series:
+    x = num(values, frame.index)
+    oriented = x if higher else -x
+    return oriented.groupby(frame["Selection_Date"]).rank(method="average", pct=True).fillna(0.5)
 
 
-def attach_board_environment(
-    frame: pd.DataFrame,
-    board_weeklies: dict[str, pd.DataFrame],
-) -> pd.DataFrame:
-    result = frame.copy()
-    result["Board_Index"] = result["Sample_Board"].map(BOARD_INDEX).fillna("")
-    environment_rows: list[dict[str, Any]] = []
-    for board_code, weekly in board_weeklies.items():
-        if weekly.empty:
-            continue
-        for _, row in weekly.iterrows():
-            ma20 = finite_num(row.get("ma20"))
-            close = finite_num(row.get("close"))
-            environment_rows.append({
-                "Board_Index": board_code,
-                "Selection_Date": normalize_date(row.get("trade_date")),
-                "Board_Return_13W_pct": finite_num(row.get("return_13w_pct")),
-                "Board_Return_26W_pct": finite_num(row.get("return_26w_pct")),
-                "Board_MA20_Slope4_pct": finite_num(row.get("ma20_slope4_pct")),
-                "Board_Close_vs_MA20_pct": (
-                    (close / ma20 - 1.0) * 100.0 if ma20 > 0 else np.nan
-                ),
+def add_board_data(frame: pd.DataFrame, board_weeklies: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    out = frame.copy()
+    out["Board_Index"] = out["Sample_Board"].map(BOARD_INDEX).fillna("")
+    rows = []
+    for code, weekly in board_weeklies.items():
+        for _, r in weekly.iterrows():
+            rows.append({
+                "Board_Index": code, "Selection_Date": normalize_date(r.get("trade_date")),
+                "Board_Return_13W_pct": finite_num(r.get("return_13w_pct")),
+                "Board_MA20_Slope4_pct": finite_num(r.get("ma20_slope4_pct")),
             })
-    environment = pd.DataFrame(environment_rows)
-    if environment.empty:
-        for column in (
-            "Board_Return_13W_pct", "Board_Return_26W_pct",
-            "Board_MA20_Slope4_pct", "Board_Close_vs_MA20_pct",
-        ):
-            result[column] = np.nan
-        return result
-    environment = environment.drop_duplicates(
-        ["Board_Index", "Selection_Date"], keep="last"
-    )
-    return result.merge(
-        environment, on=["Board_Index", "Selection_Date"], how="left"
-    )
+    env = pd.DataFrame(rows)
+    if env.empty:
+        out["Board_Return_13W_pct"] = np.nan
+        out["Board_MA20_Slope4_pct"] = np.nan
+        return out
+    return out.merge(env.drop_duplicates(["Board_Index", "Selection_Date"]),
+                     on=["Board_Index", "Selection_Date"], how="left")
 
 
-def add_scoring_models(
-    opportunities: pd.DataFrame,
-    board_weeklies: dict[str, pd.DataFrame],
-) -> pd.DataFrame:
-    """只使用第二周收盘时已经可见的数据；未来字段仅用于结果审计。"""
+def utility(frame: pd.DataFrame) -> pd.Series:
+    state = frame["CP_W2_Delayed_First_20_vs_Stop"].fillna("").astype(str)
+    ending = num(frame["CP_W2_Delayed_Return_8W_pct"]).clip(-10, 20)
+    return pd.Series(np.select(
+        [state.eq("目标先到"), state.isin(["止损先到", "同日不确定_按止损"])],
+        [20.0, -10.0], default=ending), index=frame.index, dtype=float)
+
+
+def prepare_features(opportunities: pd.DataFrame, board_weeklies: dict[str, pd.DataFrame]) -> pd.DataFrame:
     frame = add_oos_research_features(opportunities)
-    frame["Selection_Date"] = frame.get(
-        "CP_W2_Date", pd.Series("", index=frame.index)
-    ).map(normalize_date)
-    frame["Selection_Half_Year"] = frame["Selection_Date"].map(oos_half_year)
-    frame["Score_Eligible_Strict"] = (
-        frame["Opportunity_Valid"].map(bool_value)
-        & frame["W2_Observed"].map(bool_value)
-        & frame["W2_Exact_Expansion"].map(bool_value)
-        & frame["Selection_Date"].ne("")
+    frame["Selection_Date"] = frame.get("CP_W2_Date", pd.Series("", index=frame.index)).map(normalize_date)
+    frame["Selection_Date_dt"] = pd.to_datetime(frame["Selection_Date"], format="%Y%m%d", errors="coerce")
+    frame["Selection_Year"] = frame["Selection_Date"].str[:4]
+    frame["Strict_Eligible"] = (
+        frame["Opportunity_Valid"].map(bool_value) & frame["W2_Observed"].map(bool_value)
+        & frame["W2_Exact_Expansion"].map(bool_value) & frame["Selection_Date_dt"].notna()
     )
-    frame = attach_board_environment(frame, board_weeklies)
-    eligible = frame[frame["Score_Eligible_Strict"]].copy()
-    if eligible.empty:
+    frame = add_board_data(frame, board_weeklies)
+    x = frame[frame["Strict_Eligible"]].copy()
+    if x.empty:
         return frame
-
-    # 衍生变量。成交量评分奖励“有确认但不过热”，而不是原始成交量越大越好。
-    volume_ratio = number(eligible.get("CP_W2_Volume_Ratio20"), eligible.index).clip(0.05, 20.0)
-    w1_volume = number(eligible.get("W1_Volume_Ratio20"), eligible.index).clip(0.05, 20.0)
-    eligible["Volume_Change_W2_vs_W1"] = volume_ratio / w1_volume
-    eligible["Volume_Confirmation_Raw"] = -(
-        np.log(volume_ratio / 1.50).abs()
-        + 0.35 * np.log(eligible["Volume_Change_W2_vs_W1"].clip(0.10, 10.0) / 1.10).abs()
-    )
-    eligible["Extension_Risk_Raw"] = number(
-        eligible.get("CP_W2_Close_vs_MA20_pct"), eligible.index
-    ).abs()
-    eligible["OneWeek_Move_Risk_Raw"] = number(
-        eligible.get("CP_W2_Week_Return_pct"), eligible.index
-    ).abs()
-    eligible["Board_RS_13W_pct"] = (
-        number(eligible.get("CP_W2_Return_13W_pct"), eligible.index)
-        - number(eligible.get("Board_Return_13W_pct"), eligible.index)
-    )
-
-    percentile_specs = {
-        "P_W2_Expansion": ("CP_W2_Hist_vs_W1_pct", True),
-        "P_DEA_Deep": ("DEA_to_Price_pct", False),
-        "P_Slope_Low": ("CP_W2_MA20_Slope4_pct", False),
-        "P_Slope_High": ("CP_W2_MA20_Slope4_pct", True),
-        "P_Return13_Low": ("CP_W2_Return_13W_pct", False),
-        "P_Return13_High": ("CP_W2_Return_13W_pct", True),
-        "P_Return26_Low": ("CP_W2_Return_26W_pct", False),
-        "P_Return26_High": ("CP_W2_Return_26W_pct", True),
-        "P_Pullback": ("Pullback_Depth_pct", True),
-        "P_W2_Return": ("CP_W2_Week_Return_pct", True),
-        "P_Close_Location": ("CP_W2_Close_Location", True),
-        "P_Board_RS": ("Board_RS_13W_pct", True),
-        "P_Volume": ("Volume_Confirmation_Raw", True),
-        "P_ATR_Low": ("CP_W2_ATR14_pct", False),
-        "P_Extension_Low": ("Extension_Risk_Raw", False),
-        "P_OneWeekRisk_Low": ("OneWeek_Move_Risk_Raw", False),
-        "P_Liquidity": ("Circ_MV_Billion", True),
+    x["Board_RS"] = num(x.get("CP_W2_Return_13W_pct"), x.index) - num(x.get("Board_Return_13W_pct"), x.index)
+    x["Slope_Improve"] = num(x.get("CP_W2_MA20_Slope4_pct"), x.index) - num(x.get("W_MA20_Slope4_pct"), x.index)
+    x["DEA_Improve"] = num(x.get("CP_W2_DEA_to_Price_pct"), x.index) - num(x.get("DEA_to_Price_pct"), x.index)
+    specs = {
+        "TF_Return13": (x.get("CP_W2_Return_13W_pct"), True),
+        "TF_Return26": (x.get("CP_W2_Return_26W_pct"), True),
+        "TF_MA20Slope": (x.get("CP_W2_MA20_Slope4_pct"), True),
+        "TF_W2Return": (x.get("CP_W2_Week_Return_pct"), True),
+        "TF_CloseLocation": (x.get("CP_W2_Close_Location"), True),
+        "TF_BoardRS": (x["Board_RS"], True),
+        "TF_Volume": (num(x.get("CP_W2_Volume_Ratio20"), x.index).clip(0, 5), True),
+        "TF_W2Expansion": (x.get("CP_W2_Hist_vs_W1_pct"), True),
+        "RF_DEADepth": (x.get("CP_W2_DEA_to_Price_pct"), False),
+        "RF_Pullback": (x.get("Pullback_Depth_pct"), True),
+        "RF_PriorLoss": (x.get("CP_W2_Return_26W_pct"), False),
+        "RF_SlopeImprove": (x["Slope_Improve"], True),
+        "RF_DEAImprove": (x["DEA_Improve"], True),
+        "RF_ReclaimMA20": (x.get("CP_W2_Close_vs_MA20_pct"), True),
+        "RF_W2Return": (x.get("CP_W2_Week_Return_pct"), True),
+        "RF_CloseLocation": (x.get("CP_W2_Close_Location"), True),
+        "RF_BoardRS": (x["Board_RS"], True),
+        "RF_Volume": (num(x.get("CP_W2_Volume_Ratio20"), x.index).clip(0, 5), True),
     }
-    for target, (source, direction) in percentile_specs.items():
-        eligible[target] = weekly_percentile(eligible, source, direction)
-
-    eligible["Repair_Core"] = 100.0 * (
-        0.30 * eligible["P_DEA_Deep"]
-        + 0.25 * eligible["P_Slope_Low"]
-        + 0.20 * eligible["P_Return26_Low"]
-        + 0.15 * eligible["P_Return13_Low"]
-        + 0.10 * eligible["P_Pullback"]
+    for name, (values, direction) in specs.items():
+        x[name] = week_pct(x, values, direction)
+    improve = 0.5 * x["RF_SlopeImprove"] + 0.5 * x["RF_DEAImprove"]
+    x["RF_RepairConfirmation"] = x["RF_DEADepth"] * improve
+    x["Outcome_Mature"] = x["CP_W2_Delayed_Has_8W_Future"].map(bool_value)
+    maturity_source = x.get(
+        "CP_W2_Delayed_Observation_End_Date", pd.Series("", index=x.index)
     )
-    eligible["Momentum_Core"] = 100.0 * (
-        0.25 * eligible["P_Return13_High"]
-        + 0.15 * eligible["P_Return26_High"]
-        + 0.20 * eligible["P_Slope_High"]
-        + 0.15 * eligible["P_W2_Return"]
-        + 0.10 * eligible["P_Close_Location"]
-        + 0.15 * eligible["P_Board_RS"]
-    )
-    eligible["Event_Quality"] = 100.0 * eligible["P_W2_Expansion"]
-    eligible["Volume_Quality"] = 100.0 * eligible["P_Volume"]
-    eligible["Risk_Quality"] = 100.0 * (
-        0.40 * eligible["P_ATR_Low"]
-        + 0.25 * eligible["P_Extension_Low"]
-        + 0.15 * eligible["P_OneWeekRisk_Low"]
-        + 0.20 * eligible["P_Liquidity"]
-    )
-
-    trend = (
-        number(eligible.get("Board_Return_13W_pct"), eligible.index).gt(0)
-        & number(eligible.get("Board_MA20_Slope4_pct"), eligible.index).gt(0)
-    )
-    weak = (
-        number(eligible.get("Board_Return_13W_pct"), eligible.index).lt(0)
-        & number(eligible.get("Board_MA20_Slope4_pct"), eligible.index).lt(0)
-    )
-    eligible["Market_Regime"] = np.select(
-        [trend, weak], ["趋势环境", "弱势环境"], default="混合环境"
-    )
-    eligible["Momentum_Weight"] = np.select([trend, weak], [0.70, 0.30], default=0.50)
-
-    # 旧分数完整保留，作为真正的同场基准。
-    eligible[f"Score_{MODEL_OLD}"] = 100.0 * (
-        0.40 * eligible["P_W2_Expansion"]
-        + 0.25 * eligible["P_DEA_Deep"]
-        + 0.20 * eligible["P_Slope_Low"]
-        + 0.10 * eligible["P_Return26_Low"]
-        + 0.05 * eligible["P_Pullback"]
-    )
-    eligible[f"Score_{MODEL_REVERSAL}"] = (
-        0.20 * eligible["Event_Quality"]
-        + 0.65 * eligible["Repair_Core"]
-        + 0.15 * eligible["Risk_Quality"]
-    )
-    eligible[f"Score_{MODEL_MOMENTUM}"] = (
-        0.25 * eligible["Event_Quality"]
-        + 0.50 * eligible["Momentum_Core"]
-        + 0.15 * eligible["Volume_Quality"]
-        + 0.10 * eligible["Risk_Quality"]
-    )
-    eligible[f"Score_{MODEL_BALANCED}"] = (
-        0.25 * eligible["Event_Quality"]
-        + 0.20 * eligible["Repair_Core"]
-        + 0.25 * eligible["Momentum_Core"]
-        + 0.15 * eligible["Volume_Quality"]
-        + 0.15 * eligible["Risk_Quality"]
-    )
-    style_alpha = (
-        eligible["Momentum_Weight"] * eligible["Momentum_Core"]
-        + (1.0 - eligible["Momentum_Weight"]) * eligible["Repair_Core"]
-    )
-    eligible[f"Score_{MODEL_ADAPTIVE}"] = (
-        0.25 * eligible["Event_Quality"]
-        + 0.45 * style_alpha
-        + 0.15 * eligible["Volume_Quality"]
-        + 0.15 * eligible["Risk_Quality"]
-    )
-
-    new_columns = [
-        "Volume_Change_W2_vs_W1", "Volume_Confirmation_Raw",
-        "Extension_Risk_Raw", "OneWeek_Move_Risk_Raw", "Board_RS_13W_pct",
-        *percentile_specs.keys(), "Repair_Core", "Momentum_Core", "Event_Quality",
-        "Volume_Quality", "Risk_Quality", "Market_Regime", "Momentum_Weight",
-        *(f"Score_{model}" for model in MODELS),
-    ]
-    for column in new_columns:
-        frame[column] = np.nan if column != "Market_Regime" else ""
-        frame.loc[eligible.index, column] = eligible[column]
+    maturity = pd.to_datetime(maturity_source.astype(str), format="%Y%m%d", errors="coerce")
+    x["Outcome_Maturity_Date_dt"] = maturity.fillna(x["Selection_Date_dt"] + pd.Timedelta(days=56))
+    x["Realised_Utility"] = utility(x)
+    new = ["Board_RS", "Slope_Improve", "DEA_Improve", *TREND_FEATURES, *REPAIR_FEATURES,
+           "Outcome_Mature", "Outcome_Maturity_Date_dt", "Realised_Utility"]
+    for c in new:
+        frame[c] = False if c == "Outcome_Mature" else (pd.NaT if c == "Outcome_Maturity_Date_dt" else np.nan)
+        frame.loc[x.index, c] = x[c]
     return frame
 
 
-def build_rankings(scored: pd.DataFrame) -> pd.DataFrame:
-    base = scored[scored["Score_Eligible_Strict"].map(bool_value)].copy()
-    ranked_parts: list[pd.DataFrame] = []
-    for model in MODELS:
-        part = base.copy()
-        part["评分模型"] = model
-        part["Final_Score"] = number(part[f"Score_{model}"])
-        part = part.sort_values(
-            ["Selection_Date", "Final_Score", "CP_W2_Hist_vs_W1_pct", "ts_code"],
-            ascending=[True, False, False, True], na_position="last",
-        )
-        part["Weekly_Rank"] = part.groupby("Selection_Date").cumcount() + 1
-        part["Selected_Top1"] = part["Weekly_Rank"].le(1)
-        part["Selected_Top3"] = part["Weekly_Rank"].le(3)
-        part["Selected_Top5"] = part["Weekly_Rank"].le(5)
-        part["Diversified_Rank"] = np.nan
-        for _, week in part.groupby("Selection_Date", sort=False):
-            chosen: list[int] = []
-            skipped: list[int] = []
-            used_industries: set[str] = set()
-            for idx, row in week.iterrows():
-                industry = str(row.get("SW_L2", "未知"))
-                if industry not in used_industries and len(chosen) < 3:
-                    chosen.append(idx)
-                    used_industries.add(industry)
-                else:
-                    skipped.append(idx)
-            if len(chosen) < 3:
-                chosen.extend(skipped[: 3 - len(chosen)])
-            for order, idx in enumerate(chosen, start=1):
-                part.loc[idx, "Diversified_Rank"] = order
-        part["Selected_Diversified_Top3"] = part["Diversified_Rank"].le(3)
-        ranked_parts.append(part)
-    return pd.concat(ranked_parts, ignore_index=True)
+def fit_ridge(train: pd.DataFrame, features: tuple[str, ...], current: pd.Timestamp) -> dict[str, Any]:
+    if len(train) < MIN_ROWS:
+        return {"ready": False}
+    X = train.loc[:, features].apply(pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(float)
+    y = num(train["Realised_Utility"]).to_numpy(float)
+    w = exp_weights(train["Selection_Date_dt"], current)
+    ok = np.isfinite(y) & np.isfinite(w)
+    X, y, w = X[ok], y[ok], w[ok]
+    if len(y) < MIN_ROWS:
+        return {"ready": False}
+    mu = (X * w[:, None]).sum(0) / w.sum()
+    scale = np.sqrt(np.maximum((((X - mu) ** 2) * w[:, None]).sum(0) / w.sum(), 1e-8))
+    Z = (X - mu) / scale
+    D = np.column_stack([np.ones(len(Z)), Z])
+    Dw, yw = D * np.sqrt(w[:, None]), y * np.sqrt(w)
+    P = np.eye(D.shape[1]) * RIDGE; P[0, 0] = 0
+    beta = np.linalg.pinv(Dw.T @ Dw + P) @ (Dw.T @ yw)
+    fitted = D @ beta
+    denom = np.sum(w * (y - wmean(y, w)) ** 2)
+    r2 = 1 - np.sum(w * (y - fitted) ** 2) / denom if denom > 0 else np.nan
+    return {"ready": True, "features": features, "mu": mu, "scale": scale,
+            "beta": beta, "rows": len(y), "r2": r2}
 
 
-def scope_mask(frame: pd.DataFrame, scope: str) -> pd.Series:
-    if scope == "全部候选":
-        return pd.Series(True, index=frame.index)
-    if scope == "行业分散Top3":
-        return frame["Selected_Diversified_Top3"].map(bool_value)
-    return frame[f"Selected_{scope}"].map(bool_value)
+def predict(frame: pd.DataFrame, features: tuple[str, ...], state: dict[str, Any]) -> np.ndarray:
+    X = frame.loc[:, features].apply(pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(float)
+    if not state.get("ready"):
+        return X.mean(1) * 100
+    return state["beta"][0] + ((X - state["mu"]) / state["scale"]) @ state["beta"][1:]
 
 
-def matched_week_rate(
-    selected: pd.DataFrame,
-    pool: pd.DataFrame,
-    predicate,
-) -> tuple[float, float, float]:
-    if selected.empty:
-        return np.nan, np.nan, np.nan
-    dates = selected["Selection_Date"].unique()
-    reference = pool[pool["Selection_Date"].isin(dates)]
-    selected_weekly = selected.assign(_y=predicate(selected)).groupby("Selection_Date")["_y"].mean()
-    reference_weekly = reference.assign(_y=predicate(reference)).groupby("Selection_Date")["_y"].mean()
-    common = selected_weekly.index.intersection(reference_weekly.index)
-    if len(common) == 0:
-        return np.nan, np.nan, np.nan
-    selected_rate = float(selected_weekly.loc[common].mean() * 100.0)
-    reference_rate = float(reference_weekly.loc[common].mean() * 100.0)
-    return selected_rate, reference_rate, selected_rate - reference_rate
+def coefficient_rows(dt: pd.Timestamp, model: str, state: dict[str, Any], train: pd.DataFrame) -> list[dict[str, Any]]:
+    base = {"确认日期": dt.strftime("%Y%m%d"), "专家模型": model,
+            "训练完成": bool(state.get("ready")), "训练周数": train.Selection_Date.nunique(),
+            "训练候选": len(train), "训练开始": train.Selection_Date.min() if len(train) else "",
+            "训练截止": train.Selection_Date.max() if len(train) else "", "加权R2": state.get("r2", np.nan)}
+    if not state.get("ready"):
+        return [{**base, "特征": "预热期等权先验", "标准化系数": np.nan}]
+    return [{**base, "特征": f, "标准化系数": float(b)} for f, b in zip(state["features"], state["beta"][1:])]
 
 
-def reference_weeks(pool: pd.DataFrame) -> pd.PeriodIndex:
-    dates = pd.to_datetime(pool["Selection_Date"], format="%Y%m%d", errors="coerce").dropna()
-    if dates.empty:
-        return pd.PeriodIndex([], freq="W-SUN")
-    periods = dates.dt.to_period("W-SUN")
-    return pd.period_range(periods.min(), periods.max(), freq="W-SUN")
+def recent_edges(history: list[dict[str, Any]], current: pd.Timestamp) -> tuple[dict[str, float], int, str, str]:
+    h = pd.DataFrame(history)
+    empty = {TREND: np.nan, REPAIR: np.nan}
+    if h.empty:
+        return empty, 0, "", ""
+    h = h[h["Maturity_Date_dt"].lt(current)].sort_values("Date_dt")
+    dates = h.Date_dt.drop_duplicates().tail(PERF_WEEKS)
+    h = h[h.Date_dt.isin(dates)]
+    if len(dates) < MIN_WEEKS:
+        return empty, len(dates), "", ""
+    wd = pd.Series(exp_weights(pd.Series(dates), current), index=dates.to_numpy())
+    edges = {}
+    for model in (TREND, REPAIR):
+        g = h[h["专家模型"].eq(model)]
+        edges[model] = wmean(g["相对候选效用"].to_numpy(float), g.Date_dt.map(wd).to_numpy(float))
+    return edges, len(dates), dates.min().strftime("%Y%m%d"), dates.max().strftime("%Y%m%d")
 
 
-def longest_blank(counts: pd.Series) -> int:
-    best = current = 0
-    for value in counts:
-        current = current + 1 if int(value) == 0 else 0
-        best = max(best, current)
-    return best
+def walk_forward(candidates: pd.DataFrame, eval_start: pd.Timestamp):
+    candidates = candidates.sort_values(["Selection_Date_dt", "ts_code"]).copy()
+    ranks, auto_parts, perf, coefs, modes, switches = [], [], [], [], [], []
+    active = challenger = None; streak = 0
+    for raw_dt in sorted(candidates.Selection_Date_dt.dropna().unique()):
+        dt = pd.Timestamp(raw_dt); week = candidates[candidates.Selection_Date_dt.eq(dt)].copy()
+        matured = candidates[candidates.Outcome_Mature.map(bool_value) & candidates.Outcome_Maturity_Date_dt.lt(dt)]
+        train_dates = matured.Selection_Date_dt.drop_duplicates().sort_values().tail(TRAIN_WEEKS)
+        train = matured[matured.Selection_Date_dt.isin(train_dates)]
+        model_rankings = {}
+        for model, features in ((TREND, TREND_FEATURES), (REPAIR, REPAIR_FEATURES)):
+            state = fit_ridge(train, features, dt) if len(train_dates) >= MIN_WEEKS else {"ready": False}
+            coefs.extend(coefficient_rows(dt, model, state, train))
+            g = week.copy(); g["专家模型"] = model; g["Predicted_Utility"] = predict(g, features, state)
+            g = g.sort_values(["Predicted_Utility", "CP_W2_Hist_vs_W1_pct", "ts_code"], ascending=[False, False, True])
+            g["Expert_Rank"] = np.arange(1, len(g) + 1)
+            for n in (1, 2, 3): g[f"Selected_Top{n}"] = g.Expert_Rank.le(n)
+            ranks.append(g); model_rankings[model] = g
+            top2 = g[g.Expert_Rank.le(2) & g.Outcome_Mature.map(bool_value)]
+            pool = week[week.Outcome_Mature.map(bool_value)]
+            mu, base = num(top2.Realised_Utility).mean(), num(pool.Realised_Utility).mean()
+            perf.append({"Date_dt": dt, "Maturity_Date_dt": week.Outcome_Maturity_Date_dt.max(),
+                         "确认日期": dt.strftime("%Y%m%d"), "专家模型": model,
+                         "Top2效用": mu, "候选池效用": base, "相对候选效用": mu - base})
+        edges, nperf, pstart, pend = recent_edges(perf, dt)
+        lead = TREND if math.isfinite(edges[TREND]) and math.isfinite(edges[REPAIR]) and edges[TREND] > edges[REPAIR] else (
+            REPAIR if math.isfinite(edges[TREND]) and math.isfinite(edges[REPAIR]) else "")
+        action = "维持"; previous = active or ""
+        if lead:
+            if active is None or lead != active:
+                if challenger == lead: streak += 1
+                else: challenger, streak = lead, 1
+                action = f"{lead}挑战第{streak}周"
+                if streak >= 2:
+                    old = active or "预热期"; active = lead; challenger = None; streak = 0
+                    action = f"切换至{active}" if old != "预热期" else f"自动启动{active}"
+                    switches.append({"切换日期": dt.strftime("%Y%m%d"), "切换前": old, "切换后": active,
+                                     "趋势近期优势": edges[TREND], "修复近期优势": edges[REPAIR], "依据": "连续两个确认周领先"})
+            else:
+                challenger = None; streak = 0
+        elif active is None: action = "表现预热中"
+        positions = 0
+        if active:
+            edge = edges.get(active, np.nan); positions = 2 if math.isfinite(edge) and edge > 0 else 1
+            picks = model_rankings[active][model_rankings[active].Expert_Rank.le(positions)].copy()
+            picks["自动模式"] = active; picks["Auto_Rank"] = picks.Expert_Rank
+            picks["Auto_Position_Count"] = positions; picks["趋势近期优势"] = edges[TREND]; picks["修复近期优势"] = edges[REPAIR]
+            auto_parts.append(picks)
+        modes.append({"确认日期": dt.strftime("%Y%m%d"), "是否正式评价期": dt >= eval_start,
+                      "自动模式": active or "预热期", "当周领先模式": lead or "数据不足",
+                      "趋势近期优势": edges[TREND], "修复近期优势": edges[REPAIR], "表现观察周数": nperf,
+                      "表现窗口开始": pstart, "表现窗口截止": pend, "挑战模式": challenger or "",
+                      "连续领先周数": streak, "本周动作": action, "自动计划持仓数": positions,
+                      "训练成熟周数": len(train_dates), "训练候选数": len(train),
+                      "训练结果截止": train.Selection_Date.max() if len(train) else "",
+                      "训练结果成熟截止": train.Outcome_Maturity_Date_dt.max().strftime("%Y%m%d") if len(train) else ""})
+    rankings = pd.concat(ranks, ignore_index=True)
+    if auto_parts: auto = pd.concat(auto_parts, ignore_index=True)
+    else:
+        auto = candidates.head(0).copy()
+        for c in ("自动模式", "Auto_Rank", "Auto_Position_Count", "趋势近期优势", "修复近期优势"): auto[c] = pd.Series(dtype=float)
+    return rankings, auto, pd.DataFrame(modes), pd.DataFrame(switches), pd.DataFrame(coefs)
 
 
-def one_summary_row(
-    model: str,
-    scope: str,
-    selected: pd.DataFrame,
-    pool: pd.DataFrame,
-    weeks: pd.PeriodIndex,
-    half_year: str = "全部",
-) -> dict[str, Any]:
-    resolved = selected[selected["Research_Family"].ne("未决")]
-    future = selected[selected["CP_W2_Delayed_Has_8W_Future"].map(bool_value)].copy()
-    periods = pd.to_datetime(
-        selected["Selection_Date"], format="%Y%m%d", errors="coerce"
-    ).dt.to_period("W-SUN")
-    counts = periods.value_counts().reindex(weeks, fill_value=0).sort_index()
-    nonzero = counts[counts.gt(0)]
-    c_selected, c_base, c_uplift = matched_week_rate(
-        resolved,
-        pool[pool["Research_Family"].ne("未决")],
-        lambda x: x["Research_Family"].eq("C1C2_长周期"),
-    )
-    hit20_selected, hit20_base, hit20_uplift = matched_week_rate(
-        future,
-        pool[pool["CP_W2_Delayed_Has_8W_Future"].map(bool_value)],
-        lambda x: x["CP_W2_Delayed_Hit_20_8W"].map(bool_value),
-    )
-    barrier20_selected, barrier20_base, barrier20_uplift = matched_week_rate(
-        future,
-        pool[pool["CP_W2_Delayed_Has_8W_Future"].map(bool_value)],
-        lambda x: x["CP_W2_Delayed_First_20_vs_Stop"].astype(str).eq("目标先到"),
-    )
-    return {
-        "确认半年": half_year,
-        "评分模型": model,
-        "选择范围": scope,
-        "入选事件": int(len(selected)),
-        "不同股票": int(selected["ts_code"].nunique()),
-        "已决事件": int(len(resolved)),
-        "C1C2比例_事件加权(%)": rate(resolved["Research_Family"].eq("C1C2_长周期")),
-        "C1C2比例_同周等权(%)": c_selected,
-        "同期候选基准_同周等权(%)": c_base,
-        "C1C2同周提升(百分点)": c_uplift,
-        "第二周买入有效样本": int(len(future)),
-        "第二周买入8周收益均值(%)": mean(future["CP_W2_Delayed_Return_8W_pct"]),
-        "第二周买入8周收益中位数(%)": median(future["CP_W2_Delayed_Return_8W_pct"]),
-        "第二周买入MFE中位数(%)": median(future["CP_W2_Delayed_MFE_8W_pct"]),
-        "第二周买入MAE中位数(%)": median(future["CP_W2_Delayed_MAE_8W_pct"]),
-        "第二周买入达到10%(%)": rate(future["CP_W2_Delayed_Hit_10_8W"].map(bool_value)),
-        "第二周买入达到20%(%)": rate(future["CP_W2_Delayed_Hit_20_8W"].map(bool_value)),
-        "第二周买入达到30%(%)": rate(future["CP_W2_Delayed_Hit_30_8W"].map(bool_value)),
-        "达到20_同周候选基准(%)": hit20_base,
-        "达到20_同周提升(百分点)": hit20_uplift,
-        "20%先于-10%(%)": rate(
-            future["CP_W2_Delayed_First_20_vs_Stop"].astype(str).eq("目标先到")
-        ),
-        "20%先于-10_同周等权(%)": barrier20_selected,
-        "20%先于-10_同期候选基准(%)": barrier20_base,
-        "20%先于-10_同周提升(百分点)": barrier20_uplift,
-        "触及-10%(%)": rate(future["CP_W2_Delayed_Hit_Stop_8W"].map(bool_value)),
-        "总统计周数": int(len(weeks)),
-        "非空周": int(len(nonzero)),
-        "空窗周": int(counts.eq(0).sum()),
-        "非空周最少入选": int(nonzero.min()) if len(nonzero) else 0,
-        "非空周平均入选": float(nonzero.mean()) if len(nonzero) else 0.0,
-        "单周最多入选": int(counts.max()) if len(counts) else 0,
-        "最长连续空窗(周)": int(longest_blank(counts)),
-    }
+def summary_row(frame: pd.DataFrame, plan: str, scope: str, period: str) -> dict[str, Any]:
+    m = frame[frame.Outcome_Mature.map(bool_value)].copy(); ret = num(m.CP_W2_Delayed_Return_8W_pct)
+    resolved = m[m.Research_Family.ne("未决")]
+    return {"统计期": period, "方案": plan, "选择范围": scope, "入选事件": len(frame),
+            "入选周数": frame.Selection_Date.nunique(), "不同股票": frame.ts_code.nunique(), "成熟结果": len(m),
+            "交易效用均值": num(m.Realised_Utility).mean(), "交易效用中位数": num(m.Realised_Utility).median(),
+            "8周收益均值(%)": ret.mean(), "8周收益中位数(%)": ret.median(), "盈利比例(%)": rate(ret.gt(0)),
+            "20%先于-10%(%)": rate(m.CP_W2_Delayed_First_20_vs_Stop.astype(str).eq("目标先到")),
+            "触及-10%(%)": rate(m.CP_W2_Delayed_Hit_Stop_8W.map(bool_value)),
+            "MFE中位数(%)": num(m.CP_W2_Delayed_MFE_8W_pct).median(),
+            "MAE中位数(%)": num(m.CP_W2_Delayed_MAE_8W_pct).median(),
+            "C1C2比例(%)": rate(resolved.Research_Family.eq("C1C2_长周期"))}
 
 
-def build_strategy_summary(rankings: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for model, pool in rankings.groupby("评分模型", sort=False):
-        weeks = reference_weeks(pool)
-        for scope in SCOPES:
-            selected = pool[scope_mask(pool, scope)].copy()
-            rows.append(one_summary_row(model, scope, selected, pool, weeks))
+def make_summary(rankings: pd.DataFrame, auto: pd.DataFrame, start: pd.Timestamp) -> pd.DataFrame:
+    r = rankings[rankings.Selection_Date_dt.ge(start)]; a = auto[auto.Selection_Date_dt.ge(start)]
+    periods = [("全部", None)] + [(y, y) for y in sorted(r.Selection_Year.dropna().unique())]
+    rows = []
+    for label, year in periods:
+        aa = a if year is None else a[a.Selection_Year.eq(year)]
+        rows.append(summary_row(aa, AUTO, "动态Top1/Top2", label))
+        for model in (TREND, REPAIR):
+            g = r[r.专家模型.eq(model)]; g = g if year is None else g[g.Selection_Year.eq(year)]
+            for n in (1, 2, 3): rows.append(summary_row(g[g.Expert_Rank.le(n)], model, f"Top{n}", label))
     return pd.DataFrame(rows)
 
 
-def build_half_year_summary(rankings: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for (model, half_year), pool in rankings.groupby(
-        ["评分模型", "Selection_Half_Year"], sort=False
-    ):
-        weeks = reference_weeks(pool)
-        for scope in ("Top1", "Top3", "行业分散Top3", "Top5"):
-            selected = pool[scope_mask(pool, scope)].copy()
-            rows.append(one_summary_row(model, scope, selected, pool, weeks, half_year))
-    return pd.DataFrame(rows)
-
-
-def build_weekly_selection(rankings: pd.DataFrame) -> pd.DataFrame:
-    chosen = rankings[rankings["Selected_Top5"].map(bool_value)].copy()
-    columns = [
-        "Selection_Date", "Selection_Half_Year", "评分模型", "Weekly_Rank",
-        "Diversified_Rank", "ts_code", "name", "Sample_Board", "SW_L1", "SW_L2",
-        "Final_Score", "Market_Regime", "Momentum_Weight", "Event_Quality",
-        "Repair_Core", "Momentum_Core", "Volume_Quality", "Risk_Quality",
-        "CP_W2_Hist_vs_W1_pct", "CP_W2_Return_13W_pct",
-        "CP_W2_MA20_Slope4_pct", "CP_W2_Volume_Ratio20", "Turnover_Rate",
-        "Research_Family", "CP_W2_Delayed_Return_8W_pct",
-        "CP_W2_Delayed_MFE_8W_pct", "CP_W2_Delayed_MAE_8W_pct",
-        "CP_W2_Delayed_First_20_vs_Stop",
-    ]
-    return chosen[[column for column in columns if column in chosen.columns]].sort_values(
-        ["Selection_Date", "评分模型", "Weekly_Rank"]
-    )
-
-
-def build_model_agreement(rankings: pd.DataFrame) -> pd.DataFrame:
-    top3 = rankings[rankings["Selected_Top3"].map(bool_value)]
-    rows: list[dict[str, Any]] = []
-    for selection_date, week in top3.groupby("Selection_Date"):
-        sets = {
-            model: set(group["ts_code"].astype(str))
-            for model, group in week.groupby("评分模型")
-        }
-        all_codes = sorted(set().union(*sets.values())) if sets else []
-        for code in all_codes:
-            models = [model for model in MODELS if code in sets.get(model, set())]
-            stock = week[week["ts_code"].astype(str).eq(code)].iloc[0]
-            rows.append({
-                "确认日期": selection_date,
-                "股票代码": code,
-                "股票名称": stock.get("name", ""),
-                "进入Top3模型数": len(models),
-                "进入的模型": "|".join(models),
-                "五模型一致入选": len(models) == len(MODELS),
-                "事后类别": stock.get("Research_Family", ""),
-                "第二周买入8周收益(%)": stock.get("CP_W2_Delayed_Return_8W_pct", np.nan),
-                "20%先于-10%": str(stock.get("CP_W2_Delayed_First_20_vs_Stop", "")) == "目标先到",
-            })
-    return pd.DataFrame(rows)
-
-
-def model_definition() -> pd.DataFrame:
+def feature_dict() -> pd.DataFrame:
     return pd.DataFrame([
-        {"评分模型": MODEL_OLD, "结构": "扩张40%＋DEA深度25%＋低斜率20%＋前26周弱势10%＋回调5%", "用途": "旧版同场基准"},
-        {"评分模型": MODEL_REVERSAL, "结构": "事件20%＋修复核心65%＋风险15%", "用途": "寻找深跌后的修复行情"},
-        {"评分模型": MODEL_MOMENTUM, "结构": "事件25%＋趋势核心50%＋量价15%＋风险10%", "用途": "寻找已走强并继续加速的股票"},
-        {"评分模型": MODEL_BALANCED, "结构": "事件25%＋修复20%＋趋势25%＋量价15%＋风险15%", "用途": "不判断市场环境，均衡两类机会"},
-        {"评分模型": MODEL_ADAPTIVE, "结构": "按对应板块指数13周收益和MA20斜率，在趋势70/30、混合50/50、弱势30/70之间切换", "用途": "验证固定权重失效是否源于市场切换"},
-    ])
+        (TREND, "TF_Return13/26", "中期趋势"), (TREND, "TF_MA20Slope", "均线趋势"),
+        (TREND, "TF_W2Return/CloseLocation", "第二周价格确认"), (TREND, "TF_BoardRS", "相对板块强度"),
+        (TREND, "TF_Volume/W2Expansion", "量价与红柱扩张；系数允许为负"),
+        (REPAIR, "RF_DEADepth/Pullback/PriorLoss", "深跌背景"),
+        (REPAIR, "RF_SlopeImprove/DEAImprove", "修复速度"),
+        (REPAIR, "RF_ReclaimMA20/W2Return", "重新转强确认"),
+        (REPAIR, "RF_BoardRS/Volume/Confirmation", "相对强度、成交量及深度×改善交互"),
+    ], columns=["专家模型", "特征组", "含义"])
 
 
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title=TITLE, layout="wide")
-    st.title(TITLE)
-    st.caption(
-        "严格红柱扩张只负责生成候选；五套评分同场排名。收益评价统一改为第二周确认后"
-        "下一交易日开盘买入，再观察40个市场交易日，避免用第一根红柱的利润错评第二周排名。"
-    )
+    st.set_page_config(page_title=TITLE, layout="wide"); st.title(TITLE)
+    st.caption("两个专家每周仅用当时已成熟结果学习；最近26周、13周半衰期，挑战者连续领先两周切换。")
     with st.sidebar:
-        st.header("验证区间")
-        signal_start_date = st.date_input("首红柱信号开始", value=date(2023, 6, 5))
-        signal_end_date = st.date_input("首红柱信号截止", value=date(2026, 6, 5))
-        observation_end_date = st.date_input(
-            "行情观察截止", value=date.today(), max_value=date.today()
-        )
-        st.header("固定硬条件")
-        st.write("历史科技板块；股价≥10元；流通市值≥100亿元；可交易")
-        st.write("第二根完整周线红柱严格长于第一根")
-        st.write("其余条件全部评分，不再一票否决")
-        st.header("实验设计")
-        st.write("旧评分、修复、趋势、均衡、自适应五模型同场")
-        st.write("最终同时比较普通Top3与申万二级行业分散Top3")
-        use_cache = st.checkbox("使用逐股票缓存", value=True)
-        api_pause = st.number_input(
-            "每次API调用后暂停(秒)", min_value=0.0, max_value=3.0,
-            value=0.12, step=0.05,
-        )
+        st.header("正式评价区间")
+        eval_date = st.date_input("评价开始", value=date(2023, 6, 5))
+        end_date = st.date_input("信号截止", value=date(2026, 6, 5))
+        obs_date = st.date_input("行情观察截止", value=date.today(), max_value=date.today())
+        view = st.radio("界面重点查看", [AUTO, "固定趋势", "固定修复"], index=0)
+        st.header("冻结规则"); st.write("最近26个成熟周；13周权重减半")
+        st.write("精确完成40个市场交易日后才能使用结果"); st.write("连续领先两周切换，不设锁定期")
+        st.write("优势>0选Top2，否则Top1；不强制第三仓")
+        st.caption("自动增加约20个月训练预热期，不计入正式评价。")
+        cache = st.checkbox("使用逐股票缓存", value=True)
+        pause = st.number_input("每次API调用后暂停(秒)", 0.0, 3.0, 0.12, 0.05)
         if st.button("清除本程序缓存"):
-            if os.path.isdir(CACHE_DIR):
-                shutil.rmtree(CACHE_DIR)
+            if os.path.isdir(CACHE_DIR): shutil.rmtree(CACHE_DIR)
             st.success("缓存已清除")
-
     token = st.text_input("Tushare Token", type="password")
-    if not token:
-        st.info("请输入Tushare Token。")
+    if not token: st.info("请输入Tushare Token。"); return
+    key = "dynamic_experts_v21_zip"
+    if not st.button("开始滚动专家验证", type="primary"):
+        if key in st.session_state:
+            st.download_button("下载上一次全部结果ZIP", st.session_state[key],
+                               file_name="weekly_macd_dynamic_experts_v2_1_all_results.zip", mime="application/zip")
         return
-    session_key = "weekly_macd_scoring_lab_v2_0_zip"
-    run_requested = st.button("开始多模型评分实验", type="primary")
-    if not run_requested:
-        if session_key in st.session_state:
-            st.success("上一次结果仍在，可直接下载。")
-            st.download_button(
-                "下载上一次全部结果ZIP", st.session_state[session_key],
-                file_name="weekly_macd_scoring_lab_v2_0_all_results.zip",
-                mime="application/zip", type="primary", on_click="ignore",
-            )
-        else:
-            st.info("建议一次运行完整的2023-06至2026-06，才能直接观察模型跨阶段切换。")
-        return
-    date_error = validate_research_dates(
-        signal_start_date, signal_end_date, observation_end_date
-    )
-    if date_error:
-        st.error(date_error)
-        return
-
-    API_ERRORS = []
-    ts.set_token(token)
-    pro = ts.pro_api()
-    signal_start = signal_start_date.strftime("%Y%m%d")
-    signal_end = signal_end_date.strftime("%Y%m%d")
-    observation_end = observation_end_date.strftime("%Y%m%d")
-    preload_start = (signal_start_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
-    calendar_tail = (observation_end_date + timedelta(days=7)).strftime("%Y%m%d")
-    config = {
-        "signal_start": signal_start, "signal_end": signal_end,
-        "market_end": observation_end, "preload_start": preload_start,
-        "min_price": 10.0, "min_mv": 100.0, "max_mv": 1_000_000_000.0,
-        "price_tolerance_pct": 3.0, "stop_threshold_pct": 10.0,
-        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
-        "sample_per_board": 0, "sample_seed": DEFAULT_SAMPLE_SEED,
-        "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
-        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
-        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
-    }
+    if eval_date >= end_date or end_date > obs_date: st.error("日期关系不正确。"); return
+    API_ERRORS = []; ts.set_token(token); pro = ts.pro_api()
+    eval_start = pd.Timestamp(eval_date); research_date = eval_date - timedelta(days=WARMUP_DAYS)
+    research, end, obs = research_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), obs_date.strftime("%Y%m%d")
+    preload = (research_date - timedelta(days=3*365)).strftime("%Y%m%d")
+    config = {"signal_start": research, "signal_end": end, "market_end": obs, "preload_start": preload,
+              "min_price":10.0, "min_mv":100.0, "max_mv":1_000_000_000.0, "price_tolerance_pct":3.0,
+              "stop_threshold_pct":10.0, "buy_slippage_pct":0.20, "sell_slippage_pct":0.20,
+              "sample_per_board":0, "sample_seed":DEFAULT_SAMPLE_SEED,
+              "long_cycle_min_weeks":DEFAULT_LONG_CYCLE_MIN_WEEKS,
+              "material_hist_change_pct":DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+              "short_strength_ratio":DEFAULT_SHORT_STRENGTH_RATIO}
     try:
-        with st.spinner("加载交易日历、历史科技股票池、申万成分和三类板块指数..."):
-            open_dates = load_trade_calendar(preload_start, observation_end)
-            full_calendar = load_trade_calendar(preload_start, calendar_tail)
-            stock_basic = load_stock_basic()
-            memberships = load_sw_tech_memberships(float(api_pause))
-            week_last_map = complete_week_last_dates(full_calendar)
-            board_weeklies: dict[str, pd.DataFrame] = {}
-            for board_code in sorted(set(BOARD_INDEX.values())):
-                index_daily = fetch_index_history(
-                    board_code, preload_start, observation_end,
-                    bool(use_cache), float(api_pause),
-                )
-                if not index_daily.empty:
-                    board_weeklies[board_code] = build_weekly(index_daily, week_last_map)
-    except Exception as exc:
-        st.error(f"基础数据加载失败：{exc}")
-        return
-
-    period_index = build_period_index(memberships)
-    universe_codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
-    universe = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
-    stocks, sample_audit, population_summary = build_stratified_sample(
-        stocks=universe, period_index=period_index, reference_date=signal_end,
-        per_board=0, seed=DEFAULT_SAMPLE_SEED,
-    )
-    list_dates = stocks["list_date"].apply(lambda x: normalize_date(x, "19000101"))
-    delist_dates = stocks["delist_date"].apply(lambda x: normalize_date(x, "99991231"))
-    stocks_to_fetch = stocks[
-        ~list_dates.gt(signal_end) & ~delist_dates.lt(preload_start)
-    ].copy().reset_index(drop=True)
-    st.write(
-        f"历史科技池{len(universe)}只；实际读取{len(stocks_to_fetch)}只；"
-        f"信号{signal_start}—{signal_end}；行情观察至{observation_end}。"
-    )
-
-    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
-    all_records: list[dict[str, Any]] = []
-    daily_histories: dict[str, pd.DataFrame] = {}
-    reject_totals: dict[str, int] = {}
-    cache_hits = data_failures = 0
-    progress = st.progress(0.0, text="逐股票生成首红柱及第二周事件...")
-    status = st.empty()
-    for idx, stock in stocks_to_fetch.iterrows():
-        code = str(stock["ts_code"])
-        progress.progress(
-            (idx + 1) / len(stocks_to_fetch),
-            text=f"{idx + 1}/{len(stocks_to_fetch)} {code}",
-        )
-        status.caption(
-            f"底层事件{len(all_records)}；缓存命中{cache_hits}；行情失败{data_failures}"
-        )
-        daily, basic, cache_hit = fetch_stock_history(
-            code, preload_start, observation_end, bool(use_cache), float(api_pause)
-        )
-        cache_hits += int(cache_hit)
-        if daily.empty:
-            data_failures += 1
-            continue
-        records, rejects, _ = analyze_stock(
-            stock=stock, periods=period_index.get(code, []), daily=daily, basic=basic,
-            week_last_map=week_last_map, open_dates=open_dates, open_pos=open_pos,
-            config=config,
-        )
-        all_records.extend(records)
-        if records:
-            daily_histories[code] = daily.copy()
-        for reason, count in rejects.items():
-            reject_totals[reason] = reject_totals.get(reason, 0) + count
-    progress.empty()
-    status.empty()
-    if not all_records:
-        st.error("没有生成有效事件，请检查日期、Token权限和价格市值条件。")
-        return
-
-    events = pd.DataFrame(all_records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
-    with st.spinner("计算第二周独立买入结果、五套评分、行业分散排名和同周基准..."):
-        opportunities = build_cycle_opportunities(
-            events, daily_histories, observation_end, config["sell_slippage_pct"]
-        )
-        scored = add_scoring_models(opportunities, board_weeklies)
-        rankings = build_rankings(scored)
-        if rankings.empty:
-            st.error("严格扩张候选池为空，请检查第二周数据和日期区间。")
-            return
-        strategy_summary = build_strategy_summary(rankings)
-        half_year_summary = build_half_year_summary(rankings)
-        weekly_selection = build_weekly_selection(rankings)
-        agreement = build_model_agreement(rankings)
-
-    strict_candidates = rankings[rankings["评分模型"].eq(MODEL_OLD)].copy()
-    valid = scored[scored["Opportunity_Valid"].map(bool_value)].copy()
-    unresolved = valid[valid["Research_Family"].eq("未决")].copy()
-    reject_frame = pd.DataFrame([
-        {"剔除原因": reason, "次数": count} for reason, count in reject_totals.items()
-    ]).sort_values("次数", ascending=False) if reject_totals else pd.DataFrame(
-        columns=["剔除原因", "次数"]
-    )
-    top3 = strategy_summary[strategy_summary["选择范围"].eq("Top3")].copy()
-    run_summary = pd.DataFrame([{
-        "程序": TITLE, "版本": VERSION,
-        "信号开始": signal_start, "信号截止": signal_end, "观察截止": observation_end,
-        "首红柱事件": int(len(scored)), "严格扩张候选": int(len(strict_candidates)),
-        "严格扩张不同股票": int(strict_candidates["ts_code"].nunique()),
-        "候选非空周": int(strict_candidates["Selection_Date"].nunique()),
-        "未决事件": int(len(unresolved)), "评分模型数": len(MODELS),
-        "第二周独立买入口径": "确认后下一交易日开盘×1.002，观察40个市场交易日",
-        "真实行情失败": int(data_failures), "缓存命中": int(cache_hits),
-    }])
-    metadata = pd.DataFrame([
-        {"项目": "程序", "值": TITLE},
-        {"项目": "硬条件", "值": "科技池、股价≥10元、流通市值≥100亿元、可交易、第二根完整红柱严格扩张"},
-        {"项目": "重要修正", "值": "排名发生在第二周，因此收益统一使用第二周确认后下一交易日独立买入的未来40日结果"},
-        {"项目": "评分方法", "值": "所有连续因子均在同一确认周候选之间计算百分位；缺失按中性50%"},
-        {"项目": "量价", "值": "用第二周成交量相对此前20周中位数及相对第一周变化；奖励约1.5倍附近的确认量，极端放量不继续加分"},
-        {"项目": "市场环境", "值": "按股票所属主板/创业板/科创板指数的13周收益与MA20四周斜率切换修复和趋势权重"},
-        {"项目": "行业分散Top3", "值": "优先选择不同申万二级行业；不足3只时再按原排名补足"},
-        {"项目": "核心判据", "值": "C1C2比例仅作周期标签；主判据为第二周买入后20%先于-10%、8周收益与MAE"},
-        {"项目": "同周基准", "值": "先计算每周入选组与当周全部候选表现，再跨周等权平均，避免候选多的周支配结论"},
-        {"项目": "禁止解释", "值": "本版仍不是三仓资金曲线；不能把MFE当作实际卖出收益"},
-    ])
-    definitions = model_definition()
-    files = {
-        "01_run_summary_scoring_lab_v2_0.csv": run_summary,
-        "02_model_top_summary_scoring_lab_v2_0.csv": strategy_summary,
-        "03_half_year_robustness_scoring_lab_v2_0.csv": half_year_summary,
-        "04_weekly_top5_selection_scoring_lab_v2_0.csv": weekly_selection,
-        "05_model_agreement_scoring_lab_v2_0.csv": agreement,
-        "06_model_definition_scoring_lab_v2_0.csv": definitions,
-        "07_strict_candidate_scores_scoring_lab_v2_0.csv": strict_candidates,
-        "08_all_model_rankings_scoring_lab_v2_0.csv": rankings,
-        "09_all_event_features_scoring_lab_v2_0.csv": scored,
-        "10_unresolved_events_scoring_lab_v2_0.csv": unresolved,
-        "11_full_tech_universe_scoring_lab_v2_0.csv": sample_audit,
-        "12_population_scoring_lab_v2_0.csv": population_summary,
-        "13_rejection_audit_scoring_lab_v2_0.csv": reject_frame,
-        "14_metadata_scoring_lab_v2_0.csv": metadata,
-    }
-    result_zip = make_result_zip(files)
-    st.session_state[session_key] = result_zip
-
-    best_barrier = top3.sort_values("20%先于-10_同周提升(百分点)", ascending=False).iloc[0]
-    st.success(
-        f"实验完成：严格候选{len(strict_candidates)}个，覆盖"
-        f"{strict_candidates['Selection_Date'].nunique()}个确认周。"
-        f"本期Top3中，20%先于-10%的同周提升最高为“{best_barrier['评分模型']}”"
-        f"（{best_barrier['20%先于-10_同周提升(百分点)']:.2f}个百分点）。"
-    )
-    display_top3 = top3[[
-        "评分模型", "入选事件", "C1C2同周提升(百分点)",
-        "第二周买入8周收益中位数(%)", "第二周买入MAE中位数(%)",
-        "达到20_同周提升(百分点)", "20%先于-10_同周提升(百分点)",
-        "触及-10%(%)", "空窗周",
-    ]]
-    st.subheader("五模型Top3直接比较")
-    st.dataframe(display_top3, use_container_width=True, hide_index=True)
-    st.subheader("分半年稳定性")
-    st.dataframe(
-        half_year_summary[half_year_summary["选择范围"].isin(["Top3", "行业分散Top3"])],
-        use_container_width=True, hide_index=True,
-    )
-    with st.expander("模型定义、完整总表和模型一致性"):
-        st.dataframe(definitions, use_container_width=True, hide_index=True)
-        st.dataframe(strategy_summary, use_container_width=True, hide_index=True)
-        st.dataframe(agreement, use_container_width=True, hide_index=True)
-
-    st.subheader("下载结果")
-    st.download_button(
-        "下载1号：全部结果ZIP", result_zip,
-        file_name="weekly_macd_scoring_lab_v2_0_all_results.zip",
-        mime="application/zip", type="primary", on_click="ignore",
-    )
-    labels = [
-        "2号：运行总表", "3号：模型总比较", "4号：半年稳定性", "5号：每周Top5明细",
-        "6号：模型一致性", "7号：模型定义", "8号：候选评分", "9号：全部模型排名",
-        "10号：全部事件", "11号：未决事件", "12号：科技股票池", "13号：板块数量",
-        "14号：剔除审计", "15号：验证口径",
-    ]
-    columns = st.columns(4)
-    for idx, (filename, frame) in enumerate(files.items()):
-        with columns[idx % 4]:
-            st.download_button(
-                labels[idx], csv_bytes(frame), file_name=filename,
-                mime="text/csv", key=f"lab_{filename}", on_click="ignore",
-            )
-    st.warning(
-        "先看分半年同周提升是否稳定，不能只看全期冠军。若某模型只在一个半年大幅领先，"
-        "它仍属于阶段性模型，不能直接进入实盘。"
-    )
+        with st.spinner("加载基础数据和板块指数..."):
+            opens=load_trade_calendar(preload,obs); full=load_trade_calendar(preload,(obs_date+timedelta(days=7)).strftime("%Y%m%d"))
+            basic=load_stock_basic(); memberships=load_sw_tech_memberships(float(pause)); week_map=complete_week_last_dates(full)
+            boards={}
+            for code in sorted(set(BOARD_INDEX.values())):
+                d=fetch_index_history(code,preload,obs,bool(cache),float(pause))
+                if not d.empty: boards[code]=build_weekly(d,week_map)
+    except Exception as exc: st.error(f"基础数据加载失败：{exc}"); return
+    periods=build_period_index(memberships); codes=sorted(set(periods)&set(basic.ts_code.astype(str)))
+    universe=basic[basic.ts_code.isin(codes)].copy(); stocks,audit,pop=build_stratified_sample(universe,periods,end,0,DEFAULT_SAMPLE_SEED)
+    listed=stocks.list_date.apply(lambda x:normalize_date(x,"19000101")); delisted=stocks.delist_date.apply(lambda x:normalize_date(x,"99991231"))
+    stocks=stocks[~listed.gt(end)&~delisted.lt(preload)].reset_index(drop=True)
+    pos={d:i for i,d in enumerate(opens)}; records=[]; histories={}; rejects={}; hits=fails=0
+    bar=st.progress(0.0); status=st.empty()
+    for i,stock in stocks.iterrows():
+        code=str(stock.ts_code); bar.progress((i+1)/len(stocks),text=f"{i+1}/{len(stocks)} {code}")
+        status.caption(f"事件{len(records)}；缓存{hits}；失败{fails}")
+        daily,db,hit=fetch_stock_history(code,preload,obs,bool(cache),float(pause)); hits+=int(hit)
+        if daily.empty: fails+=1; continue
+        rr,rj,_=analyze_stock(stock,periods.get(code,[]),daily,db,week_map,opens,pos,config); records.extend(rr)
+        if rr: histories[code]=daily.copy()
+        for reason,n in rj.items(): rejects[reason]=rejects.get(reason,0)+n
+    bar.empty(); status.empty()
+    if not records: st.error("没有生成事件。"); return
+    with st.spinner("滚动训练专家并模拟切换..."):
+        events=pd.DataFrame(records).sort_values(["Signal_Date","ts_code","Event_Type"])
+        opp=build_cycle_opportunities(events,histories,obs,config["sell_slippage_pct"])
+        featured=prepare_features(opp,boards); candidates=featured[featured.Strict_Eligible.map(bool_value)].copy()
+        rankings,auto,modes,switches,coefs=walk_forward(candidates,eval_start); summary=make_summary(rankings,auto,eval_start)
+    ec=candidates[candidates.Selection_Date_dt.ge(eval_start)]; er=rankings[rankings.Selection_Date_dt.ge(eval_start)]
+    ea=auto[auto.Selection_Date_dt.ge(eval_start)]; em=modes[pd.to_datetime(modes.确认日期).ge(eval_start)]
+    es=switches[pd.to_datetime(switches.切换日期).ge(eval_start)] if not switches.empty else switches
+    reject=pd.DataFrame([{"剔除原因":k,"次数":v} for k,v in rejects.items()])
+    total=summary[(summary.统计期=="全部")&(summary.方案==AUTO)].iloc[0]; latest=em.iloc[-1].自动模式 if len(em) else "预热期"
+    run=pd.DataFrame([{"程序":TITLE,"版本":VERSION,"评价开始":eval_date.strftime("%Y%m%d"),"预热开始":research,
+                       "信号截止":end,"观察截止":obs,"评价候选":len(ec),"候选周":ec.Selection_Date.nunique(),
+                       "自动入选":len(ea),"切换次数":len(es),"截止模式":latest,"自动效用均值":total.交易效用均值,
+                       "自动8周收益中位数(%)":total["8周收益中位数(%)"],"行情失败":fails,"缓存命中":hits}])
+    meta=pd.DataFrame([
+        ("程序",TITLE),("硬条件","科技池、价≥10元、流通市值≥100亿元、第二根完整红柱严格扩张"),
+        ("专家训练","最近26个已成熟周指数加权岭回归；13周权重减半"),
+        ("训练目标","20%先到+20；-10%先到-10；其余用8周期末收益并截断[-10,+20]"),
+        ("未来隔离","第二周买入后40个市场交易日精确终点未到，禁止训练和模式评价"),
+        ("切换","挑战者连续领先两周；无强制锁定期"),("选择数量","模式优势>0选Top2，否则Top1；不强制第三仓"),
+        ("风险","ATR和换手不混入Alpha，留给后续仓位模块")],columns=["项目","值"])
+    files={"01_run_summary_dynamic_experts_v2_1.csv":run,
+           "02_strategy_year_comparison_dynamic_experts_v2_1.csv":summary,
+           "03_mode_switch_log_dynamic_experts_v2_1.csv":es,
+           "04_weekly_mode_state_dynamic_experts_v2_1.csv":em,
+           "05_auto_selection_dynamic_experts_v2_1.csv":ea,
+           "06_expert_top3_rankings_dynamic_experts_v2_1.csv":er[er.Expert_Rank.le(3)],
+           "07_expert_coefficient_history_dynamic_experts_v2_1.csv":coefs,
+           "08_expert_feature_dictionary_dynamic_experts_v2_1.csv":feature_dict(),
+           "09_all_evaluation_rankings_dynamic_experts_v2_1.csv":er,
+           "10_evaluation_candidate_features_dynamic_experts_v2_1.csv":ec,
+           "11_all_event_features_including_warmup_v2_1.csv":featured,
+           "12_full_tech_universe_dynamic_experts_v2_1.csv":audit,
+           "13_population_dynamic_experts_v2_1.csv":pop,
+           "14_rejection_audit_dynamic_experts_v2_1.csv":reject,
+           "15_metadata_dynamic_experts_v2_1.csv":meta}
+    z=make_result_zip(files); st.session_state[key]=z
+    st.success(f"完成：评价候选{len(ec)}个，切换{len(es)}次，截止模式{latest}。")
+    table=summary[summary.统计期.eq("全部")]
+    table=table[table.方案.eq(AUTO if view==AUTO else (TREND if view=="固定趋势" else REPAIR))]
+    st.dataframe(table,use_container_width=True,hide_index=True); st.subheader("模式切换"); st.dataframe(es,use_container_width=True,hide_index=True)
+    st.subheader("年度比较"); st.dataframe(summary[summary.统计期.ne("全部")],use_container_width=True,hide_index=True)
+    st.download_button("下载全部结果ZIP",z,file_name="weekly_macd_dynamic_experts_v2_1_all_results.zip",mime="application/zip",type="primary")
+    st.warning("本版验证滚动学习和模式切换，不是最终三仓资金曲线。")
 
 
 if __name__ == "__main__":
