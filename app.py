@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD第二周确认法配对验证器 V1.1
-=====================================
+科技股周线MACD第二周持有退出验证器 V1.0
+===================================
 
-本程序只验证一个底层事实：第一根真正周线红柱确认后，于下一交易日开盘
-买入，在第一根完整绿柱确认以前，价格曾经提供过多大的最高利润空间。
-它不设置八周上限、不止损、不止盈、不评分、不做资金组合，也不把最高价
-伪装成可实现卖价。最高价只作为事后机会空间上限，为后续识别弱反弹、
-持续强势和止盈研究提供依据。
+本程序固定在第一根真正周线红柱确认后的下一交易日开盘买入。第二根完整
+周线红柱若严格长于第一根则继续持有；若缩短、持平或翻绿，则在第二周
+确认后的下一可交易日开盘退出。它验证提前退出减少了多少弱周期损失、
+误杀了多少长周期，以及退出后还剩多少上涨空间。继续持有组仍只统计至
+第一根完整绿柱前的机会空间，不把最高价伪装成可实现卖价。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30% 的概率。
@@ -55,7 +55,7 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V1.1-WEEK2-CONFIRMATION-PAIRED"
+VERSION = "V1.0-WEEK2-HOLD-EXIT"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
@@ -85,7 +85,7 @@ DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
 
-TITLE = "科技股周线MACD第二周确认法配对验证器 V1.1"
+TITLE = "科技股周线MACD第二周持有退出验证器 V1.0"
 INITIAL_CAPITAL = 300_000.0
 MAX_POSITIONS = 3
 POSITION_BUDGET = 100_000.0
@@ -3973,5 +3973,611 @@ def week2_confirmation_main() -> None:
     )
 
 
+def w2_exact_expansion(event: pd.Series) -> bool:
+    """第二根完整柱严格长于第一根；不使用10%或其他幅度门槛。"""
+    first_hist = finite_num(event.get("Hist"))
+    second_hist = finite_num(event.get("CP_W2_Hist"))
+    return bool(
+        math.isfinite(first_hist)
+        and math.isfinite(second_hist)
+        and first_hist > 0
+        and second_hist > first_hist
+    )
+
+
+def empty_w2_exit_result(reason: str = "") -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "W2_Decision_Valid": False,
+        "W2_Decision_Action": "",
+        "W2_Exact_Expansion": False,
+        "W2_Expansion_pct": np.nan,
+        "W2_Exit_Required": False,
+        "W2_Exit_Executable": False,
+        "W2_Exit_Invalid_Reason": reason,
+        "W2_Exit_Scheduled_Date": "",
+        "W2_Exit_Date": "",
+        "W2_Exit_Delay_Market_Days": np.nan,
+        "W2_Exit_Raw_Open": np.nan,
+        "W2_Exit_Net_Price": np.nan,
+        "W2_Exit_Return_pct": np.nan,
+        "W2_Holding_Market_Days": np.nan,
+        "W2_PreExit_MFE_pct": np.nan,
+        "W2_PreExit_MAE_pct": np.nan,
+        "W2_Exit_vs_Cycle_End_Close_pct_points": np.nan,
+        "W2_Full_MFE_minus_Exit_Return_pct_points": np.nan,
+        "W2_PostExit_Path_Exists": False,
+        "W2_PostExit_Peak_Date": "",
+        "W2_PostExit_Peak_From_W1_pct": np.nan,
+        "W2_PostExit_Peak_From_Exit_Open_pct": np.nan,
+        "W2_PostExit_Trough_From_Exit_Open_pct": np.nan,
+    }
+    for target in OPPORTUNITY_TARGETS:
+        output[f"W2_PostExit_Reached_{target}_From_W1"] = False
+    return output
+
+
+def evaluate_w2_exit(
+    event: pd.Series,
+    daily: pd.DataFrame,
+    open_dates: list[str],
+    open_pos: dict[str, int],
+    sell_slippage_pct: float,
+) -> dict[str, Any]:
+    """第二周不扩张时，在下一市场交易日起寻找首个可交易开盘并卖出。"""
+    output = empty_w2_exit_result()
+    first_hist = finite_num(event.get("Hist"))
+    second_hist = finite_num(event.get("CP_W2_Hist"))
+    w2_date = normalize_date(event.get("CP_W2_Date"))
+    expands = w2_exact_expansion(event)
+    output.update({
+        "W2_Decision_Valid": bool(
+            w2_date and math.isfinite(first_hist) and math.isfinite(second_hist)
+        ),
+        "W2_Decision_Action": "继续持有" if expands else "退出",
+        "W2_Exact_Expansion": expands,
+        "W2_Expansion_pct": (
+            (second_hist / first_hist - 1.0) * 100.0
+            if math.isfinite(first_hist) and first_hist != 0 and math.isfinite(second_hist)
+            else np.nan
+        ),
+        "W2_Exit_Required": not expands,
+    })
+    if not output["W2_Decision_Valid"]:
+        output["W2_Exit_Invalid_Reason"] = "缺少第二根完整周线或柱值"
+        return output
+    if expands:
+        return output
+    if w2_date not in open_pos:
+        output["W2_Exit_Invalid_Reason"] = "第二周确认日不在市场交易日历"
+        return output
+    scheduled_pos = open_pos[w2_date] + 1
+    if scheduled_pos >= len(open_dates):
+        output["W2_Exit_Invalid_Reason"] = "第二周确认后无下一市场交易日"
+        return output
+    scheduled_date = open_dates[scheduled_pos]
+    output["W2_Exit_Scheduled_Date"] = scheduled_date
+    if daily.empty:
+        output["W2_Exit_Invalid_Reason"] = "个股日线不存在"
+        return output
+
+    daily_work = daily.copy()
+    daily_work["trade_date"] = daily_work["trade_date"].astype(str)
+    candidates = daily_work[daily_work["trade_date"].ge(scheduled_date)].copy()
+    candidates["open"] = pd.to_numeric(candidates["open"], errors="coerce")
+    candidates = candidates[candidates["open"].gt(0)].sort_values("trade_date")
+    if candidates.empty:
+        output["W2_Exit_Invalid_Reason"] = "确认后没有可交易开盘"
+        return output
+    exit_row = candidates.iloc[0]
+    exit_date = str(exit_row["trade_date"])
+    raw_open = float(exit_row["open"])
+    net_exit = raw_open * (1.0 - sell_slippage_pct / 100.0)
+    entry_date = normalize_date(event.get("Entry_Date"))
+    entry_price = finite_num(event.get("Entry_Price"))
+    if not entry_date or not math.isfinite(entry_price) or entry_price <= 0:
+        output["W2_Exit_Invalid_Reason"] = "首红柱买入价无效"
+        return output
+
+    before = daily_work[
+        daily_work["trade_date"].ge(entry_date)
+        & daily_work["trade_date"].lt(exit_date)
+    ].copy()
+    for column in ("high", "low"):
+        before[column] = pd.to_numeric(before[column], errors="coerce")
+    peak_candidates = [raw_open]
+    trough_candidates = [raw_open]
+    if not before.empty:
+        if before["high"].notna().any():
+            peak_candidates.append(float(before["high"].max()))
+        if before["low"].notna().any():
+            trough_candidates.append(float(before["low"].min()))
+
+    full_mfe = finite_num(event.get("Peak_MFE_pct"))
+    end_close_return = finite_num(event.get("End_Close_Return_pct"))
+    exit_return = (net_exit / entry_price - 1.0) * 100.0
+    delay_days = (
+        open_pos.get(exit_date, scheduled_pos) - scheduled_pos
+        if exit_date in open_pos else np.nan
+    )
+    holding_days = (
+        open_pos[exit_date] - open_pos[entry_date] + 1
+        if exit_date in open_pos and entry_date in open_pos else np.nan
+    )
+    output.update({
+        "W2_Exit_Executable": True,
+        "W2_Exit_Invalid_Reason": "",
+        "W2_Exit_Date": exit_date,
+        "W2_Exit_Delay_Market_Days": delay_days,
+        "W2_Exit_Raw_Open": raw_open,
+        "W2_Exit_Net_Price": net_exit,
+        "W2_Exit_Return_pct": exit_return,
+        "W2_Holding_Market_Days": holding_days,
+        "W2_PreExit_MFE_pct": (max(peak_candidates) / entry_price - 1.0) * 100.0,
+        "W2_PreExit_MAE_pct": (min(trough_candidates) / entry_price - 1.0) * 100.0,
+        "W2_Exit_vs_Cycle_End_Close_pct_points": (
+            exit_return - end_close_return if math.isfinite(end_close_return) else np.nan
+        ),
+        "W2_Full_MFE_minus_Exit_Return_pct_points": (
+            full_mfe - exit_return if math.isfinite(full_mfe) else np.nan
+        ),
+    })
+
+    cycle_end = normalize_date(event.get("Observation_End_Date"))
+    if cycle_end and cycle_end >= exit_date:
+        post = daily_work[
+            daily_work["trade_date"].ge(exit_date)
+            & daily_work["trade_date"].le(cycle_end)
+        ].copy().sort_values("trade_date").reset_index(drop=True)
+        for column in ("high", "low"):
+            post[column] = pd.to_numeric(post[column], errors="coerce")
+        post = post.dropna(subset=["high", "low"])
+        if not post.empty:
+            peak_pos = int(post["high"].idxmax())
+            peak_price = float(post.loc[peak_pos, "high"])
+            trough_price = float(post["low"].min())
+            output.update({
+                "W2_PostExit_Path_Exists": True,
+                "W2_PostExit_Peak_Date": str(post.loc[peak_pos, "trade_date"]),
+                "W2_PostExit_Peak_From_W1_pct": (peak_price / entry_price - 1.0) * 100.0,
+                "W2_PostExit_Peak_From_Exit_Open_pct": (peak_price / raw_open - 1.0) * 100.0,
+                "W2_PostExit_Trough_From_Exit_Open_pct": (trough_price / raw_open - 1.0) * 100.0,
+            })
+            for target in OPPORTUNITY_TARGETS:
+                output[f"W2_PostExit_Reached_{target}_From_W1"] = bool(
+                    peak_price >= entry_price * (1.0 + target / 100.0)
+                )
+    return output
+
+
+def build_week2_hold_exit_results(
+    opportunities: pd.DataFrame,
+    daily_histories: dict[str, pd.DataFrame],
+    open_dates: list[str],
+    sell_slippage_pct: float,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
+    for _, event in opportunities.iterrows():
+        row = event.to_dict()
+        row["Cycle_Family"] = cycle_family(event.get("Cycle_Type"))
+        row.update(evaluate_w2_exit(
+            event=event,
+            daily=daily_histories.get(str(event.get("ts_code", "")), pd.DataFrame()),
+            open_dates=open_dates,
+            open_pos=open_pos,
+            sell_slippage_pct=sell_slippage_pct,
+        ))
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
+
+
+def complete_decision_events(results: pd.DataFrame) -> pd.DataFrame:
+    return results[
+        results["Opportunity_Valid"].map(to_bool)
+        & results["Cycle_Completed"].map(to_bool)
+        & results["W2_Decision_Valid"].map(to_bool)
+    ].copy()
+
+
+def build_decision_matrix(results: pd.DataFrame) -> pd.DataFrame:
+    complete = complete_decision_events(results)
+    matrix = pd.crosstab(
+        complete["W2_Decision_Action"], complete["Cycle_Family"], margins=True
+    ).reset_index()
+    strong = complete["Cycle_Family"].eq("C1C2_长周期")
+    weak = complete["Cycle_Family"].eq("AB_弱或短周期")
+    exit_mask = complete["W2_Decision_Action"].eq("退出")
+    audit = pd.DataFrame([{
+        "完整可判断周期": int(len(complete)),
+        "继续持有": int((~exit_mask).sum()),
+        "提前退出": int(exit_mask.sum()),
+        "正确退出AB": int((exit_mask & weak).sum()),
+        "误退出C1C2": int((exit_mask & strong).sum()),
+        "仍持有AB": int((~exit_mask & weak).sum()),
+        "仍持有C1C2": int((~exit_mask & strong).sum()),
+        "退出组AB纯度(%)": pct_mean(weak[exit_mask]),
+        "AB提前退出率(%)": pct_mean(exit_mask[weak]),
+        "C1C2误退出率(%)": pct_mean(exit_mask[strong]),
+        "继续持有组C1C2比例(%)": pct_mean(strong[~exit_mask]),
+    }])
+    return audit, matrix
+
+
+def build_early_exit_summary(results: pd.DataFrame) -> pd.DataFrame:
+    complete = complete_decision_events(results)
+    exited = complete[
+        complete["W2_Decision_Action"].eq("退出")
+        & complete["W2_Exit_Executable"].map(to_bool)
+    ].copy()
+    definitions: list[tuple[str, pd.Series]] = [
+        ("全部提前退出", pd.Series(True, index=exited.index)),
+        ("提前退出_AB", exited["Cycle_Family"].eq("AB_弱或短周期")),
+        ("提前退出_C1C2", exited["Cycle_Family"].eq("C1C2_长周期")),
+    ]
+    for state in sorted(exited["CP_W2_State"].dropna().astype(str).unique()):
+        definitions.append((f"第二周状态_{state}", exited["CP_W2_State"].astype(str).eq(state)))
+    rows: list[dict[str, Any]] = []
+    for name, mask in definitions:
+        group = exited[mask].copy()
+        exit_return = pd.to_numeric(group["W2_Exit_Return_pct"], errors="coerce")
+        row = {
+            "分组": name,
+            "可执行退出周期": int(len(group)),
+            "C1C2比例(%)": pct_mean(group["Cycle_Family"].eq("C1C2_长周期")),
+            "退出收益均值(%)": exit_return.mean(),
+            "退出收益中位数(%)": exit_return.median(),
+            "退出收益P25(%)": exit_return.quantile(0.25),
+            "退出收益P75(%)": exit_return.quantile(0.75),
+            "退出盈利比例(%)": pct_mean(exit_return.gt(0)),
+            "退出亏损不超过-5%(%)": pct_mean(exit_return.le(-5)),
+            "退出亏损不超过-10%(%)": pct_mean(exit_return.le(-10)),
+            "退出前最高浮盈中位数(%)": pd.to_numeric(
+                group["W2_PreExit_MFE_pct"], errors="coerce"
+            ).median(),
+            "退出前最大浮亏中位数(%)": pd.to_numeric(
+                group["W2_PreExit_MAE_pct"], errors="coerce"
+            ).median(),
+            "若持有至周期结束收盘收益中位数(%)": pd.to_numeric(
+                group["End_Close_Return_pct"], errors="coerce"
+            ).median(),
+            "提前退出相对周期结束改善中位数(百分点)": pd.to_numeric(
+                group["W2_Exit_vs_Cycle_End_Close_pct_points"], errors="coerce"
+            ).median(),
+            "退出后周期内最高涨幅_相对首买价中位数(%)": pd.to_numeric(
+                group["W2_PostExit_Peak_From_W1_pct"], errors="coerce"
+            ).median(),
+            "退出后周期内最高涨幅_相对退出开盘中位数(%)": pd.to_numeric(
+                group["W2_PostExit_Peak_From_Exit_Open_pct"], errors="coerce"
+            ).median(),
+            "完整机会最高涨幅减退出收益中位数(百分点)": pd.to_numeric(
+                group["W2_Full_MFE_minus_Exit_Return_pct_points"], errors="coerce"
+            ).median(),
+        }
+        for target in (10, 20, 30):
+            valid_future = group[group["W2_PostExit_Path_Exists"].map(to_bool)]
+            row[f"退出后仍曾达到{target}%_占有后续路径比例(%)"] = pct_mean(
+                valid_future[f"W2_PostExit_Reached_{target}_From_W1"].map(to_bool)
+            ) if len(valid_future) else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_held_opportunity_summary(results: pd.DataFrame) -> pd.DataFrame:
+    complete = complete_decision_events(results)
+    held = complete[complete["W2_Decision_Action"].eq("继续持有")].copy()
+    definitions = [
+        ("全部继续持有", pd.Series(True, index=held.index)),
+        ("继续持有_C1C2", held["Cycle_Family"].eq("C1C2_长周期")),
+        ("继续持有_AB", held["Cycle_Family"].eq("AB_弱或短周期")),
+    ]
+    rows: list[dict[str, Any]] = []
+    for name, mask in definitions:
+        group = held[mask].copy()
+        mfe = pd.to_numeric(group["Peak_MFE_pct"], errors="coerce")
+        row = {
+            "分组": name,
+            "周期数": int(len(group)),
+            "C1C2比例(%)": pct_mean(group["Cycle_Family"].eq("C1C2_长周期")),
+            "机会最高涨幅均值(%)": mfe.mean(),
+            "机会最高涨幅中位数(%)": mfe.median(),
+            "机会最高涨幅P25(%)": mfe.quantile(0.25),
+            "机会最高涨幅P75(%)": mfe.quantile(0.75),
+            "全周期最大浮亏中位数(%)": pd.to_numeric(
+                group["Path_MAE_pct"], errors="coerce"
+            ).median(),
+            "周期结束收盘收益中位数(%)": pd.to_numeric(
+                group["End_Close_Return_pct"], errors="coerce"
+            ).median(),
+        }
+        for target in OPPORTUNITY_TARGETS:
+            row[f"曾达到{target}%(%)"] = pct_mean(group[f"Reached_{target}_pct"].map(to_bool))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_hold_exit_year_summary(results: pd.DataFrame) -> pd.DataFrame:
+    complete = complete_decision_events(results)
+    complete["Signal_Year"] = complete["Signal_Date"].astype(str).str[:4]
+    rows: list[dict[str, Any]] = []
+    for year, group in complete.groupby("Signal_Year", sort=True):
+        strong = group["Cycle_Family"].eq("C1C2_长周期")
+        weak = group["Cycle_Family"].eq("AB_弱或短周期")
+        exit_mask = group["W2_Decision_Action"].eq("退出")
+        held = group[~exit_mask]
+        exited = group[exit_mask & group["W2_Exit_Executable"].map(to_bool)]
+        rows.append({
+            "年份": year,
+            "完整可判断周期": int(len(group)),
+            "提前退出": int(exit_mask.sum()),
+            "继续持有": int((~exit_mask).sum()),
+            "AB提前退出率(%)": pct_mean(exit_mask[weak]),
+            "C1C2误退出率(%)": pct_mean(exit_mask[strong]),
+            "继续持有组C1C2比例(%)": pct_mean(strong[~exit_mask]),
+            "提前退出收益中位数(%)": pd.to_numeric(
+                exited["W2_Exit_Return_pct"], errors="coerce"
+            ).median(),
+            "继续持有组最高涨幅中位数(%)": pd.to_numeric(
+                held["Peak_MFE_pct"], errors="coerce"
+            ).median(),
+            "继续持有组曾达到20%(%)": pct_mean(held["Reached_20_pct"].map(to_bool)),
+            "继续持有组曾达到30%(%)": pct_mean(held["Reached_30_pct"].map(to_bool)),
+        })
+    return pd.DataFrame(rows)
+
+
+def week2_hold_exit_main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption(
+        "固定首红柱后次日开盘买入。第二根完整红柱严格长于第一根则继续持有；"
+        "缩短、持平或翻绿则在下一可交易日开盘退出。无10%扩张门槛。"
+    )
+
+    with st.sidebar:
+        st.header("信号与观察区间")
+        signal_start_date = st.date_input("首红柱信号开始日期", value=date(2022, 6, 5))
+        signal_end_date = st.date_input("首红柱信号截止日期", value=date(2023, 6, 5))
+        suggested_end = min(date.today(), signal_end_date + timedelta(days=550))
+        observation_end_date = st.date_input(
+            "周期观察截止日期", value=suggested_end, max_value=date.today()
+        )
+        st.header("固定研究口径")
+        st.write("历史科技板块全量；信号日股价≥10元、流通市值≥100亿元")
+        st.write("第一根完整红柱后下一交易日开盘买入，计0.2%滑点")
+        st.write("第二根柱严格长于第一根：继续持有")
+        st.write("第二根缩短、持平或翻绿：下一可交易日开盘退出，计0.2%滑点")
+        use_cache = st.checkbox("使用逐股票缓存", value=True)
+        api_pause = st.number_input(
+            "每次API调用后暂停(秒)", min_value=0.0, max_value=3.0,
+            value=0.12, step=0.05,
+        )
+        if st.button("清除本程序缓存"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("缓存已清除")
+
+    token = st.text_input("Tushare Token", type="password")
+    if not token:
+        st.info("请输入Tushare Token。")
+        return
+    run_requested = st.button("开始第二周持有退出验证", type="primary")
+    session_key = "week2_hold_exit_v1_0_zip"
+    if not run_requested:
+        if session_key in st.session_state:
+            st.success("上一次结果仍在，可直接下载。")
+            st.download_button(
+                "下载1号：上一次全部结果ZIP", st.session_state[session_key],
+                file_name="weekly_macd_week2_hold_exit_v1_0_all_results.zip",
+                mime="application/zip", type="primary", on_click="ignore",
+            )
+        else:
+            st.info("重点看：AB提前退出率、C1/C2误退出率、退出收益及退出后的剩余上涨空间。")
+        return
+    if signal_start_date >= signal_end_date:
+        st.error("信号开始日期必须早于截止日期。")
+        return
+    if observation_end_date <= signal_end_date:
+        st.error("观察截止日期必须晚于信号截止日期。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    signal_start = signal_start_date.strftime("%Y%m%d")
+    signal_end = signal_end_date.strftime("%Y%m%d")
+    observation_end = observation_end_date.strftime("%Y%m%d")
+    preload_start = (signal_start_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    calendar_tail = (observation_end_date + timedelta(days=7)).strftime("%Y%m%d")
+    config = {
+        "signal_start": signal_start, "signal_end": signal_end,
+        "market_end": observation_end, "preload_start": preload_start,
+        "min_price": 10.0, "min_mv": 100.0, "max_mv": 1_000_000_000.0,
+        "price_tolerance_pct": 3.0, "stop_threshold_pct": 10.0,
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "sample_per_board": 0, "sample_seed": DEFAULT_SAMPLE_SEED,
+        "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+    }
+    try:
+        with st.spinner("加载交易日历、历史科技股票池和申万历史成分..."):
+            open_dates = load_trade_calendar(preload_start, observation_end)
+            full_calendar = load_trade_calendar(preload_start, calendar_tail)
+            stock_basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(api_pause))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+
+    week_last_map = complete_week_last_dates(full_calendar)
+    period_index = build_period_index(memberships)
+    universe_codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
+    universe = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
+    stocks, sample_audit, population_summary = build_stratified_sample(
+        stocks=universe, period_index=period_index, reference_date=signal_end,
+        per_board=0, seed=DEFAULT_SAMPLE_SEED,
+    )
+    list_dates = stocks["list_date"].apply(lambda x: normalize_date(x, "19000101"))
+    delist_dates = stocks["delist_date"].apply(lambda x: normalize_date(x, "99991231"))
+    stocks_to_fetch = stocks[
+        ~list_dates.gt(signal_end) & ~delist_dates.lt(preload_start)
+    ].copy().reset_index(drop=True)
+    st.write(
+        f"历史科技池{len(universe)}只；实际读取{len(stocks_to_fetch)}只；"
+        f"首红柱区间{signal_start}—{signal_end}；观察至{observation_end}。"
+    )
+
+    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
+    all_records: list[dict[str, Any]] = []
+    daily_histories: dict[str, pd.DataFrame] = {}
+    reject_totals: dict[str, int] = {}
+    cache_hits = data_failures = 0
+    progress = st.progress(0.0, text="逐股票生成真正周线首红柱事件...")
+    status = st.empty()
+    for idx, stock in stocks_to_fetch.iterrows():
+        code = str(stock["ts_code"])
+        progress.progress((idx + 1) / len(stocks_to_fetch), text=f"{idx + 1}/{len(stocks_to_fetch)} {code}")
+        status.caption(f"底层事件{len(all_records)}；缓存命中{cache_hits}；行情失败{data_failures}")
+        daily, basic, cache_hit = fetch_stock_history(
+            code, preload_start, observation_end, bool(use_cache), float(api_pause)
+        )
+        cache_hits += int(cache_hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        records, rejects, _ = analyze_stock(
+            stock=stock, periods=period_index.get(code, []), daily=daily, basic=basic,
+            week_last_map=week_last_map, open_dates=open_dates, open_pos=open_pos,
+            config=config,
+        )
+        all_records.extend(records)
+        if records:
+            daily_histories[code] = daily.copy()
+        for reason, count in rejects.items():
+            reject_totals[reason] = reject_totals.get(reason, 0) + count
+    progress.empty()
+    status.empty()
+    if not all_records:
+        st.error("没有生成有效事件，请检查日期、Token权限和价格市值条件。")
+        return
+
+    events = pd.DataFrame(all_records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+    with st.spinner("计算第二周持有或退出及退出后的完整路径..."):
+        opportunities = build_cycle_opportunities(
+            events, daily_histories, observation_end, config["sell_slippage_pct"]
+        )
+        results = build_week2_hold_exit_results(
+            opportunities, daily_histories, open_dates, config["sell_slippage_pct"]
+        )
+        decision_audit, decision_matrix = build_decision_matrix(results)
+        exit_summary = build_early_exit_summary(results)
+        held_summary = build_held_opportunity_summary(results)
+        year_summary = build_hold_exit_year_summary(results)
+
+    complete = complete_decision_events(results)
+    if complete.empty:
+        st.error("没有完整可判断周期，请延长观察截止日期。")
+        return
+    exit_required = complete[complete["W2_Exit_Required"].map(to_bool)]
+    invalid_exit = exit_required[~exit_required["W2_Exit_Executable"].map(to_bool)].copy()
+    censored = results[
+        results["Opportunity_Valid"].map(to_bool)
+        & ~results["Cycle_Completed"].map(to_bool)
+    ].copy()
+    reject_frame = pd.DataFrame([
+        {"剔除原因": reason, "次数": count} for reason, count in reject_totals.items()
+    ]).sort_values("次数", ascending=False) if reject_totals else pd.DataFrame(
+        columns=["剔除原因", "次数"]
+    )
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "信号开始": signal_start, "信号截止": signal_end,
+        "观察截止": observation_end, "首红柱事件": len(results),
+        "完整可判断周期": len(complete),
+        "继续持有": int(complete["W2_Decision_Action"].eq("继续持有").sum()),
+        "提前退出": int(complete["W2_Decision_Action"].eq("退出").sum()),
+        "退出不可执行": len(invalid_exit),
+        "涉及股票": results["ts_code"].nunique(), "真实行情失败": data_failures,
+        "缓存命中": cache_hits,
+    }])
+    metadata = pd.DataFrame([
+        {"项目": "程序", "值": TITLE},
+        {"项目": "买入", "值": "第一根完整红柱确认后的下一交易日开盘×1.002"},
+        {"项目": "继续持有", "值": "第二根完整红柱柱值严格大于第一根；无10%扩张门槛"},
+        {"项目": "提前退出", "值": "第二根柱缩短、持平或翻绿；确认后的下一可交易日开盘×0.998"},
+        {"项目": "停牌处理", "值": "计划退出日无个股行情时，顺延至首次存在有效开盘价的交易日"},
+        {"项目": "继续持有组终点", "值": "第一根完整绿柱确认日（含该日），仅统计机会空间"},
+        {"项目": "C1C2用途", "值": "仅作事后审查标签，绝不参与第二周决策"},
+        {"项目": "明确不包含", "值": "无固定止损、无最终止盈、无资金组合、无最高价卖出假设"},
+        {"项目": "股票池", "值": "历史科技板块全量；信号日价≥10元、流通市值≥100亿元"},
+    ])
+    files = {
+        "01_run_summary_week2_hold_exit_v1_0.csv": run_summary,
+        "02_decision_audit_week2_hold_exit_v1_0.csv": decision_audit,
+        "03_decision_matrix_week2_hold_exit_v1_0.csv": decision_matrix,
+        "04_early_exit_outcome_week2_hold_exit_v1_0.csv": exit_summary,
+        "05_held_opportunity_week2_hold_exit_v1_0.csv": held_summary,
+        "06_year_robustness_week2_hold_exit_v1_0.csv": year_summary,
+        "07_complete_decision_events_week2_hold_exit_v1_0.csv": complete,
+        "08_all_events_week2_hold_exit_v1_0.csv": results,
+        "09_exit_invalid_week2_hold_exit_v1_0.csv": invalid_exit,
+        "10_censored_cycles_week2_hold_exit_v1_0.csv": censored,
+        "11_full_tech_universe_week2_hold_exit_v1_0.csv": sample_audit,
+        "12_population_week2_hold_exit_v1_0.csv": population_summary,
+        "13_rejection_audit_week2_hold_exit_v1_0.csv": reject_frame,
+        "14_metadata_week2_hold_exit_v1_0.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state[session_key] = result_zip
+
+    audit = decision_audit.iloc[0]
+    all_exit = exit_summary[exit_summary["分组"].eq("全部提前退出")].iloc[0]
+    st.success(
+        f"验证完成：完整可判断{len(complete)}个；提前退出{int(audit['提前退出'])}个；"
+        f"其中正确退出AB {int(audit['正确退出AB'])}个，误退出C1C2 {int(audit['误退出C1C2'])}个。"
+    )
+    metrics = st.columns(6)
+    metrics[0].metric("AB提前退出率", f"{audit['AB提前退出率(%)']:.2f}%")
+    metrics[1].metric("C1C2误退出率", f"{audit['C1C2误退出率(%)']:.2f}%")
+    metrics[2].metric("退出组AB纯度", f"{audit['退出组AB纯度(%)']:.2f}%")
+    metrics[3].metric("退出收益中位数", f"{all_exit['退出收益中位数(%)']:.2f}%")
+    metrics[4].metric("退出盈利比例", f"{all_exit['退出盈利比例(%)']:.2f}%")
+    metrics[5].metric("持有组C1C2比例", f"{audit['继续持有组C1C2比例(%)']:.2f}%")
+
+    st.subheader("第二周决策效果")
+    st.dataframe(decision_audit, use_container_width=True, hide_index=True)
+    st.dataframe(decision_matrix, use_container_width=True, hide_index=True)
+    st.subheader("提前退出后的实际结果与后来走势")
+    st.dataframe(exit_summary, use_container_width=True, hide_index=True)
+    st.subheader("第二周扩张后继续持有组的机会空间")
+    st.dataframe(held_summary, use_container_width=True, hide_index=True)
+    with st.expander("年度稳定性"):
+        st.dataframe(year_summary, use_container_width=True, hide_index=True)
+
+    st.subheader("下载结果")
+    st.download_button(
+        "下载1号：全部结果ZIP", result_zip,
+        file_name="weekly_macd_week2_hold_exit_v1_0_all_results.zip",
+        mime="application/zip", type="primary", on_click="ignore",
+    )
+    labels = [
+        "2号：运行总表", "3号：决策审计", "4号：决策矩阵", "5号：提前退出结果",
+        "6号：继续持有机会", "7号：年度稳健性", "8号：完整决策明细", "9号：全部事件",
+        "10号：退出无效", "11号：未翻绿周期", "12号：科技股票池", "13号：板块数量",
+        "14号：剔除审计", "15号：验证口径",
+    ]
+    columns = st.columns(4)
+    for index, (filename, frame) in enumerate(files.items()):
+        with columns[index % 4]:
+            st.download_button(
+                labels[index], csv_bytes(frame), file_name=filename,
+                mime="text/csv", key=f"w2_hold_exit_{filename}", on_click="ignore",
+            )
+    st.warning(
+        "提前退出组使用真实开盘卖价计算；继续持有组尚未设计最终止盈，只统计红柱周期内机会空间。"
+        "两者不能混合解释为完整策略收益。"
+    )
+
+
 if __name__ == "__main__":
-    week2_confirmation_main()
+    week2_hold_exit_main()
