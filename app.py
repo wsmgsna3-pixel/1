@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD首红柱周期最高利润验证器 V1.0
-======================================
+科技股周线MACD第二周确认法配对验证器 V1.1
+=====================================
 
 本程序只验证一个底层事实：第一根真正周线红柱确认后，于下一交易日开盘
 买入，在第一根完整绿柱确认以前，价格曾经提供过多大的最高利润空间。
@@ -55,9 +55,9 @@ import streamlit as st
 import tushare as ts
 
 
-VERSION = "V1.0-FIRST-RED-CYCLE-OPPORTUNITY"
+VERSION = "V1.1-WEEK2-CONFIRMATION-PAIRED"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1")
+CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 OUTPUT_DIR = os.path.join(APP_DIR, "weekly_macd_validation_outputs")
 
 HOLD_WEEKS = 8
@@ -85,7 +85,7 @@ DEFAULT_MATERIAL_HIST_CHANGE_PCT = 10.0
 DEFAULT_SHORT_STRENGTH_RATIO = 0.50
 CHECKPOINT_WEEKS = (2, 3, 4, 5)
 
-TITLE = "科技股周线MACD首红柱周期最高利润验证器 V1.0"
+TITLE = "科技股周线MACD第二周确认法配对验证器 V1.1"
 INITIAL_CAPITAL = 300_000.0
 MAX_POSITIONS = 3
 POSITION_BUDGET = 100_000.0
@@ -2480,7 +2480,8 @@ def build_cycle_opportunities(
         "Red_Hist_Sequence", "Peak_Red_Hist", "Peak_Red_Week", "Red_Hist_Area",
         "PreGreen_Abs_Peak_Hist", "Peak_Red_to_PreGreen_Peak_Ratio",
         "First_Material_Shrink_Week", "Material_Shrink_Count", "ReExpansion_Count",
-        "CP_W2_State", "CP_W2_Hist_vs_W1_pct", "CP_W2_Weak_Candidate",
+        "CP_W2_Date", "CP_W2_State", "CP_W2_Hist", "CP_W2_Hist_vs_W1_pct",
+        "CP_W2_Weak_Candidate",
     ]
 
     for _, event in first.iterrows():
@@ -3447,5 +3448,530 @@ def opportunity_main() -> None:
     )
 
 
+W2_LOOSE_STATES = {"持续扩张", "红柱平缓延续", "缩短未再扩张", "缩短后再扩张"}
+
+
+def cycle_family(value: Any) -> str:
+    text_value = str(value)
+    if text_value.startswith(("C1_", "C2_")):
+        return "C1C2_长周期"
+    if text_value.startswith(("A_", "B_")):
+        return "AB_弱或短周期"
+    return "其他或未完成"
+
+
+def delayed_cycle_path(
+    event: pd.Series,
+    daily: pd.DataFrame,
+    open_dates: list[str],
+    open_pos: dict[str, int],
+    observation_end: str,
+    buy_slippage_pct: float,
+) -> dict[str, Any]:
+    """第二根完整周线确认后，于下一市场交易日开盘买入并观察至首根完整绿柱。"""
+    output: dict[str, Any] = {
+        "W2_Delayed_Tradable": False,
+        "W2_Delayed_Invalid_Reason": "",
+        "W2_Delayed_Entry_Date": "",
+        "W2_Delayed_Entry_Price": np.nan,
+        "W2_Entry_Cost_vs_W1_pct": np.nan,
+        "W2_Observation_End_Date": "",
+        "W2_Observation_Trading_Days": np.nan,
+        "W2_Peak_Date": "",
+        "W2_Peak_MFE_pct": np.nan,
+        "W2_Path_MAE_pct": np.nan,
+        "W2_End_Close_Return_pct": np.nan,
+        "W2_Trading_Days_To_Peak": np.nan,
+        "W2_Lost_MFE_vs_W1_pct_points": np.nan,
+    }
+    for target in OPPORTUNITY_TARGETS:
+        output[f"W2_Reached_{target}_pct"] = False
+        output[f"W2_First_{target}_Date"] = ""
+        output[f"W2_Trading_Days_To_{target}"] = np.nan
+
+    w2_date = normalize_date(event.get("CP_W2_Date"))
+    baseline_entry = finite_num(event.get("Entry_Price"))
+    completed = to_bool(event.get("Cycle_Completed"))
+    first_green = normalize_date(event.get("First_Green_Date"))
+    end_date = first_green if completed and first_green else observation_end
+    output["W2_Observation_End_Date"] = end_date
+
+    if not w2_date or w2_date not in open_pos:
+        output["W2_Delayed_Invalid_Reason"] = "缺少第二根完整周线日期"
+        return output
+    next_pos = open_pos[w2_date] + 1
+    if next_pos >= len(open_dates):
+        output["W2_Delayed_Invalid_Reason"] = "第二周确认后无下一市场交易日"
+        return output
+    entry_date = open_dates[next_pos]
+    if entry_date > end_date:
+        output["W2_Delayed_Invalid_Reason"] = "确认后的买入日已晚于观察终点"
+        return output
+    if daily.empty:
+        output["W2_Delayed_Invalid_Reason"] = "个股日线不存在"
+        return output
+    entry_row = daily[daily["trade_date"].astype(str).eq(entry_date)]
+    if entry_row.empty:
+        output["W2_Delayed_Invalid_Reason"] = "确认后下一市场交易日停牌或无行情"
+        return output
+    raw_open = finite_num(entry_row.iloc[-1].get("open"))
+    if not math.isfinite(raw_open) or raw_open <= 0:
+        output["W2_Delayed_Invalid_Reason"] = "确认后买入日开盘价无效"
+        return output
+    entry_price = raw_open * (1.0 + buy_slippage_pct / 100.0)
+    path = daily[
+        daily["trade_date"].astype(str).ge(entry_date)
+        & daily["trade_date"].astype(str).le(end_date)
+    ].copy().sort_values("trade_date").reset_index(drop=True)
+    for column in ("high", "low", "close"):
+        path[column] = pd.to_numeric(path[column], errors="coerce")
+    path = path.dropna(subset=["high", "low", "close"]).reset_index(drop=True)
+    if path.empty:
+        output["W2_Delayed_Invalid_Reason"] = "确认买入日至观察终点无行情"
+        return output
+
+    peak_pos = int(path["high"].idxmax())
+    peak_price = float(path.loc[peak_pos, "high"])
+    peak_mfe = (peak_price / entry_price - 1.0) * 100.0
+    w1_mfe = finite_num(event.get("Peak_MFE_pct"))
+    output.update({
+        "W2_Delayed_Tradable": True,
+        "W2_Delayed_Invalid_Reason": "",
+        "W2_Delayed_Entry_Date": entry_date,
+        "W2_Delayed_Entry_Price": entry_price,
+        "W2_Entry_Cost_vs_W1_pct": (
+            (entry_price / baseline_entry - 1.0) * 100.0
+            if math.isfinite(baseline_entry) and baseline_entry > 0 else np.nan
+        ),
+        "W2_Observation_Trading_Days": int(len(path)),
+        "W2_Peak_Date": str(path.loc[peak_pos, "trade_date"]),
+        "W2_Peak_MFE_pct": peak_mfe,
+        "W2_Path_MAE_pct": (float(path["low"].min()) / entry_price - 1.0) * 100.0,
+        "W2_End_Close_Return_pct": (
+            float(path.iloc[-1]["close"]) / entry_price - 1.0
+        ) * 100.0,
+        "W2_Trading_Days_To_Peak": int(peak_pos + 1),
+        "W2_Lost_MFE_vs_W1_pct_points": w1_mfe - peak_mfe if math.isfinite(w1_mfe) else np.nan,
+    })
+    for target in OPPORTUNITY_TARGETS:
+        hit = path[path["high"].ge(entry_price * (1.0 + target / 100.0))]
+        if not hit.empty:
+            first_pos = int(hit.index[0])
+            output[f"W2_Reached_{target}_pct"] = True
+            output[f"W2_First_{target}_Date"] = str(path.loc[first_pos, "trade_date"])
+            output[f"W2_Trading_Days_To_{target}"] = int(first_pos + 1)
+    return output
+
+
+def build_week2_paired_results(
+    opportunities: pd.DataFrame,
+    daily_histories: dict[str, pd.DataFrame],
+    open_dates: list[str],
+    observation_end: str,
+    buy_slippage_pct: float,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
+    for _, event in opportunities.iterrows():
+        row = event.to_dict()
+        state = str(event.get("CP_W2_State", ""))
+        row["Cycle_Family"] = cycle_family(event.get("Cycle_Type"))
+        row["W2_Loose_Eligible"] = state in W2_LOOSE_STATES
+        row["W2_Expansion_Eligible"] = state == "持续扩张"
+        if row["W2_Loose_Eligible"]:
+            row.update(delayed_cycle_path(
+                event=event,
+                daily=daily_histories.get(str(event.get("ts_code", "")), pd.DataFrame()),
+                open_dates=open_dates,
+                open_pos=open_pos,
+                observation_end=observation_end,
+                buy_slippage_pct=buy_slippage_pct,
+            ))
+        else:
+            row.update(delayed_cycle_path(
+                event=pd.Series({}), daily=pd.DataFrame(), open_dates=open_dates,
+                open_pos=open_pos, observation_end=observation_end,
+                buy_slippage_pct=buy_slippage_pct,
+            ))
+            row["W2_Delayed_Invalid_Reason"] = "第二周未保持红柱"
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
+
+
+def confirmation_summary(paired: pd.DataFrame) -> pd.DataFrame:
+    complete = paired[
+        paired["Opportunity_Valid"].map(to_bool)
+        & paired["Cycle_Completed"].map(to_bool)
+    ].copy()
+    strong_total = int(complete["Cycle_Family"].eq("C1C2_长周期").sum())
+    weak_total = int(complete["Cycle_Family"].eq("AB_弱或短周期").sum())
+    definitions = [
+        ("首红柱立即买入_全部", pd.Series(True, index=complete.index), False),
+        ("第二周仍红后买入_宽松确认", complete["W2_Loose_Eligible"].map(to_bool), True),
+        ("第二周扩张后买入_核心方案", complete["W2_Expansion_Eligible"].map(to_bool), True),
+    ]
+    rows: list[dict[str, Any]] = []
+    for name, eligible_mask, delayed in definitions:
+        selected = complete[eligible_mask].copy()
+        if delayed:
+            selected = selected[selected["W2_Delayed_Tradable"].map(to_bool)].copy()
+            mfe_col, mae_col, days_col, hit_prefix = (
+                "W2_Peak_MFE_pct", "W2_Path_MAE_pct", "W2_Trading_Days_To_Peak", "W2_Reached_"
+            )
+        else:
+            mfe_col, mae_col, days_col, hit_prefix = (
+                "Peak_MFE_pct", "Path_MAE_pct", "Trading_Days_To_Peak", "Reached_"
+            )
+        strong = int(selected["Cycle_Family"].eq("C1C2_长周期").sum())
+        weak = int(selected["Cycle_Family"].eq("AB_弱或短周期").sum())
+        mfe = pd.to_numeric(selected[mfe_col], errors="coerce")
+        row = {
+            "方案": name,
+            "完整可执行周期": int(len(selected)),
+            "占全部首红柱周期(%)": len(selected) / len(complete) * 100.0 if len(complete) else np.nan,
+            "C1C2数量": strong,
+            "AB数量": weak,
+            "C1C2占入选比例(%)": strong / len(selected) * 100.0 if len(selected) else np.nan,
+            "C1C2保留率(%)": strong / strong_total * 100.0 if strong_total else np.nan,
+            "AB保留率(%)": weak / weak_total * 100.0 if weak_total else np.nan,
+            "机会最高涨幅均值(%)": mfe.mean(),
+            "机会最高涨幅中位数(%)": mfe.median(),
+            "机会最高涨幅P25(%)": mfe.quantile(0.25),
+            "机会最高涨幅P75(%)": mfe.quantile(0.75),
+            "最大浮亏中位数(%)": pd.to_numeric(selected[mae_col], errors="coerce").median(),
+            "到峰值交易日中位数": pd.to_numeric(selected[days_col], errors="coerce").median(),
+            "追高成本中位数(%)": (
+                pd.to_numeric(selected["W2_Entry_Cost_vs_W1_pct"], errors="coerce").median()
+                if delayed else 0.0
+            ),
+            "损失最高利润中位数(百分点)": (
+                pd.to_numeric(selected["W2_Lost_MFE_vs_W1_pct_points"], errors="coerce").median()
+                if delayed else 0.0
+            ),
+        }
+        for target in OPPORTUNITY_TARGETS:
+            row[f"曾达到{target}%(%)"] = pct_mean(selected[f"{hit_prefix}{target}_pct"].map(to_bool))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def selection_effect_summary(paired: pd.DataFrame) -> pd.DataFrame:
+    """用所有方案共同的首红柱买价，只检查筛选质量，不混入延迟买入成本。"""
+    complete = paired[
+        paired["Opportunity_Valid"].map(to_bool)
+        & paired["Cycle_Completed"].map(to_bool)
+    ].copy()
+    definitions = [
+        ("全部首红柱", pd.Series(True, index=complete.index)),
+        ("第二周仍红所保留的周期", complete["W2_Loose_Eligible"].map(to_bool)),
+        ("第二周扩张所保留的周期", complete["W2_Expansion_Eligible"].map(to_bool)),
+        ("第二周未扩张而被核心方案过滤", ~complete["W2_Expansion_Eligible"].map(to_bool)),
+    ]
+    rows = []
+    for name, mask in definitions:
+        group = complete[mask].copy()
+        mfe = pd.to_numeric(group["Peak_MFE_pct"], errors="coerce")
+        strong = group["Cycle_Family"].eq("C1C2_长周期")
+        row = {
+            "分组": name, "周期数": len(group),
+            "C1C2比例(%)": pct_mean(strong),
+            "按首红柱买价的最高涨幅均值(%)": mfe.mean(),
+            "按首红柱买价的最高涨幅中位数(%)": mfe.median(),
+            "按首红柱买价的最大浮亏中位数(%)": pd.to_numeric(
+                group["Path_MAE_pct"], errors="coerce"
+            ).median(),
+        }
+        for target in OPPORTUNITY_TARGETS:
+            row[f"按首红柱买价曾达到{target}%(%)"] = pct_mean(
+                group[f"Reached_{target}_pct"].map(to_bool)
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def paired_year_summary(paired: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    complete = paired[
+        paired["Opportunity_Valid"].map(to_bool)
+        & paired["Cycle_Completed"].map(to_bool)
+    ].copy()
+    complete["Signal_Year"] = complete["Signal_Date"].astype(str).str[:4]
+    for year, year_frame in complete.groupby("Signal_Year", sort=True):
+        for scheme, mask in [
+            ("首红柱立即买入", pd.Series(True, index=year_frame.index)),
+            ("第二周仍红后买入", year_frame["W2_Loose_Eligible"].map(to_bool)),
+            ("第二周扩张后买入", year_frame["W2_Expansion_Eligible"].map(to_bool)),
+        ]:
+            group = year_frame[mask].copy()
+            delayed = scheme != "首红柱立即买入"
+            if delayed:
+                group = group[group["W2_Delayed_Tradable"].map(to_bool)]
+            mfe_col = "W2_Peak_MFE_pct" if delayed else "Peak_MFE_pct"
+            hit_prefix = "W2_Reached_" if delayed else "Reached_"
+            rows.append({
+                "年份": year, "方案": scheme, "周期数": len(group),
+                "C1C2比例(%)": pct_mean(group["Cycle_Family"].eq("C1C2_长周期")),
+                "最高涨幅中位数(%)": pd.to_numeric(group[mfe_col], errors="coerce").median(),
+                "曾达到10%(%)": pct_mean(group[f"{hit_prefix}10_pct"].map(to_bool)),
+                "曾达到20%(%)": pct_mean(group[f"{hit_prefix}20_pct"].map(to_bool)),
+                "曾达到30%(%)": pct_mean(group[f"{hit_prefix}30_pct"].map(to_bool)),
+            })
+    return pd.DataFrame(rows)
+
+
+def week2_confirmation_main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption(
+        "同一批首红柱周期做一对一配对：基准在第一根红柱确认后买入；第二周方案等待"
+        "第二根完整周线确认，再于下一交易日开盘买入。只比较周期机会空间，不设置止盈止损。"
+    )
+
+    with st.sidebar:
+        st.header("信号与观察区间")
+        signal_start_date = st.date_input("首红柱信号开始日期", value=date(2022, 6, 5))
+        signal_end_date = st.date_input("首红柱信号截止日期", value=date(2023, 6, 5))
+        suggested_end = min(date.today(), signal_end_date + timedelta(days=550))
+        observation_end_date = st.date_input(
+            "周期观察截止日期", value=suggested_end, max_value=date.today()
+        )
+        st.header("固定研究口径")
+        st.write("历史科技板块全量检查，不抽样")
+        st.write("信号日股价≥10元、流通市值≥100亿元")
+        st.write("真正完整周MACD(12,26,9)")
+        st.write("核心确认：第二周红柱比第一周至少增加10%")
+        st.write("买入价均计0.2%滑点")
+        use_cache = st.checkbox("使用逐股票缓存", value=True)
+        api_pause = st.number_input(
+            "每次API调用后暂停(秒)", min_value=0.0, max_value=3.0,
+            value=0.12, step=0.05,
+        )
+        if st.button("清除本程序缓存"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("缓存已清除")
+
+    token = st.text_input("Tushare Token", type="password")
+    if not token:
+        st.info("请输入Tushare Token。")
+        return
+    run_requested = st.button("开始第二周确认法配对验证", type="primary")
+    if not run_requested:
+        if "week2_confirmation_v1_1_zip" in st.session_state:
+            st.success("上一次结果仍在，可直接下载。")
+            st.download_button(
+                "下载1号：上一次全部结果ZIP",
+                st.session_state["week2_confirmation_v1_1_zip"],
+                file_name="weekly_macd_week2_confirmation_v1_1_all_results.zip",
+                mime="application/zip", type="primary", on_click="ignore",
+            )
+        else:
+            st.info(
+                "重点看三项：C1C2占比提高多少、第二周确认的追高成本、确认后仍能达到20%/30%的比例。"
+            )
+        return
+    if signal_start_date >= signal_end_date:
+        st.error("信号开始日期必须早于截止日期。")
+        return
+    if observation_end_date <= signal_end_date:
+        st.error("观察截止日期必须晚于信号截止日期。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    signal_start = signal_start_date.strftime("%Y%m%d")
+    signal_end = signal_end_date.strftime("%Y%m%d")
+    observation_end = observation_end_date.strftime("%Y%m%d")
+    preload_start = (signal_start_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    calendar_tail = (observation_end_date + timedelta(days=7)).strftime("%Y%m%d")
+    config = {
+        "signal_start": signal_start, "signal_end": signal_end,
+        "market_end": observation_end, "preload_start": preload_start,
+        "min_price": 10.0, "min_mv": 100.0, "max_mv": 1_000_000_000.0,
+        "price_tolerance_pct": 3.0, "stop_threshold_pct": 10.0,
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "sample_per_board": 0, "sample_seed": DEFAULT_SAMPLE_SEED,
+        "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+    }
+    try:
+        with st.spinner("加载交易日历、历史科技股票池和申万历史成分..."):
+            open_dates = load_trade_calendar(preload_start, observation_end)
+            full_calendar = load_trade_calendar(preload_start, calendar_tail)
+            stock_basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(api_pause))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+
+    week_last_map = complete_week_last_dates(full_calendar)
+    period_index = build_period_index(memberships)
+    universe_codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
+    universe = stock_basic[stock_basic["ts_code"].isin(universe_codes)].copy()
+    stocks, sample_audit, population_summary = build_stratified_sample(
+        stocks=universe, period_index=period_index, reference_date=signal_end,
+        per_board=0, seed=DEFAULT_SAMPLE_SEED,
+    )
+    list_dates = stocks["list_date"].apply(lambda x: normalize_date(x, "19000101"))
+    delist_dates = stocks["delist_date"].apply(lambda x: normalize_date(x, "99991231"))
+    stocks_to_fetch = stocks[
+        ~list_dates.gt(signal_end) & ~delist_dates.lt(preload_start)
+    ].copy().reset_index(drop=True)
+    st.write(
+        f"历史科技池{len(universe)}只；实际读取{len(stocks_to_fetch)}只；"
+        f"首红柱区间{signal_start}—{signal_end}；观察至{observation_end}。"
+    )
+
+    open_pos = {trade_date: position for position, trade_date in enumerate(open_dates)}
+    all_records: list[dict[str, Any]] = []
+    daily_histories: dict[str, pd.DataFrame] = {}
+    reject_totals: dict[str, int] = {}
+    cache_hits = data_failures = 0
+    progress = st.progress(0.0, text="逐股票生成真正周线首红柱事件...")
+    status = st.empty()
+    for idx, stock in stocks_to_fetch.iterrows():
+        code = str(stock["ts_code"])
+        progress.progress((idx + 1) / len(stocks_to_fetch), text=f"{idx + 1}/{len(stocks_to_fetch)} {code}")
+        status.caption(f"底层事件{len(all_records)}；缓存命中{cache_hits}；行情失败{data_failures}")
+        daily, basic, cache_hit = fetch_stock_history(
+            code, preload_start, observation_end, bool(use_cache), float(api_pause)
+        )
+        cache_hits += int(cache_hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        records, rejects, _ = analyze_stock(
+            stock=stock, periods=period_index.get(code, []), daily=daily, basic=basic,
+            week_last_map=week_last_map, open_dates=open_dates, open_pos=open_pos,
+            config=config,
+        )
+        all_records.extend(records)
+        if records:
+            daily_histories[code] = daily.copy()
+        for reason, count in rejects.items():
+            reject_totals[reason] = reject_totals.get(reason, 0) + count
+    progress.empty()
+    status.empty()
+    if not all_records:
+        st.error("没有生成有效事件，请检查日期、Token权限和价格市值条件。")
+        return
+
+    events = pd.DataFrame(all_records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+    with st.spinner("计算首红柱基准机会与第二周确认后的剩余机会..."):
+        opportunities = build_cycle_opportunities(
+            events, daily_histories, observation_end, config["sell_slippage_pct"]
+        )
+        paired = build_week2_paired_results(
+            opportunities, daily_histories, open_dates, observation_end,
+            config["buy_slippage_pct"],
+        )
+        scheme_summary = confirmation_summary(paired)
+        selection_summary = selection_effect_summary(paired)
+        year_summary = paired_year_summary(paired)
+
+    complete = paired[
+        paired["Opportunity_Valid"].map(to_bool)
+        & paired["Cycle_Completed"].map(to_bool)
+    ].copy()
+    if complete.empty:
+        st.error("没有完整可计算周期，请延长观察截止日期。")
+        return
+    class_table = pd.crosstab(
+        complete["CP_W2_State"], complete["Cycle_Family"], margins=True
+    ).reset_index()
+    w2_invalid = complete[
+        complete["W2_Loose_Eligible"].map(to_bool)
+        & ~complete["W2_Delayed_Tradable"].map(to_bool)
+    ].copy()
+    reject_frame = pd.DataFrame([
+        {"剔除原因": reason, "次数": count} for reason, count in reject_totals.items()
+    ]).sort_values("次数", ascending=False) if reject_totals else pd.DataFrame(
+        columns=["剔除原因", "次数"]
+    )
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "信号开始": signal_start, "信号截止": signal_end,
+        "观察截止": observation_end, "首红柱事件": len(paired),
+        "完整可计算周期": len(complete),
+        "第二周仍红": int(complete["W2_Loose_Eligible"].map(to_bool).sum()),
+        "第二周扩张": int(complete["W2_Expansion_Eligible"].map(to_bool).sum()),
+        "涉及股票": paired["ts_code"].nunique(), "真实行情失败": data_failures,
+        "缓存命中": cache_hits,
+    }])
+    metadata = pd.DataFrame([
+        {"项目": "程序", "值": TITLE},
+        {"项目": "基准买点", "值": "第一根完整红柱确认后的下一交易日开盘×1.002"},
+        {"项目": "宽松确认", "值": "第二根完整周线仍为红柱，确认后的下一交易日开盘×1.002"},
+        {"项目": "核心确认", "值": "第二根红柱≥第一根红柱×1.10，确认后的下一交易日开盘×1.002"},
+        {"项目": "机会终点", "值": "第一根完整绿柱确认日（含该日）；未翻绿样本单列，不进入核心汇总"},
+        {"项目": "C1C2用途", "值": "仅作事后审查标签，绝不参与第二周选股"},
+        {"项目": "明确不包含", "值": "无止盈、无止损、无资金组合、无最高价卖出假设"},
+        {"项目": "股票池", "值": "历史科技板块全量；信号日价≥10元、流通市值≥100亿元"},
+    ])
+    files = {
+        "01_run_summary_week2_v1_1.csv": run_summary,
+        "02_scheme_result_summary_week2_v1_1.csv": scheme_summary,
+        "03_selection_effect_week2_v1_1.csv": selection_summary,
+        "04_year_robustness_week2_v1_1.csv": year_summary,
+        "05_week2_state_vs_cycle_class_v1_1.csv": class_table,
+        "06_complete_paired_events_week2_v1_1.csv": complete,
+        "07_all_paired_events_week2_v1_1.csv": paired,
+        "08_delayed_entry_invalid_week2_v1_1.csv": w2_invalid,
+        "09_full_tech_universe_week2_v1_1.csv": sample_audit,
+        "10_population_week2_v1_1.csv": population_summary,
+        "11_rejection_audit_week2_v1_1.csv": reject_frame,
+        "12_metadata_week2_v1_1.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state["week2_confirmation_v1_1_zip"] = result_zip
+
+    core = scheme_summary[scheme_summary["方案"].eq("第二周扩张后买入_核心方案")].iloc[0]
+    st.success(
+        f"验证完成：完整周期{len(complete)}个；核心方案可执行{int(core['完整可执行周期'])}个；"
+        f"其中C1C2占{core['C1C2占入选比例(%)']:.2f}%。"
+    )
+    metrics = st.columns(6)
+    metrics[0].metric("核心入选周期", f"{int(core['完整可执行周期'])}")
+    metrics[1].metric("C1C2比例", f"{core['C1C2占入选比例(%)']:.2f}%")
+    metrics[2].metric("C1C2保留率", f"{core['C1C2保留率(%)']:.2f}%")
+    metrics[3].metric("追高成本中位数", f"{core['追高成本中位数(%)']:.2f}%")
+    metrics[4].metric("剩余最高涨幅中位数", f"{core['机会最高涨幅中位数(%)']:.2f}%")
+    metrics[5].metric("确认后曾达到30%", f"{core['曾达到30%(%)']:.2f}%")
+
+    st.subheader("核心比较：实际按各自买点计算")
+    st.dataframe(scheme_summary, use_container_width=True, hide_index=True)
+    st.subheader("拆分筛选效果：全部改用首红柱买价，暂时不计算追高成本")
+    st.dataframe(selection_summary, use_container_width=True, hide_index=True)
+    with st.expander("年度稳定性与第二周状态×周期类型"):
+        st.dataframe(year_summary, use_container_width=True, hide_index=True)
+        st.dataframe(class_table, use_container_width=True, hide_index=True)
+
+    st.subheader("下载结果")
+    st.download_button(
+        "下载1号：全部结果ZIP", result_zip,
+        file_name="weekly_macd_week2_confirmation_v1_1_all_results.zip",
+        mime="application/zip", type="primary", on_click="ignore",
+    )
+    labels = [
+        "2号：运行总表", "3号：三方案实际结果", "4号：纯筛选效果", "5号：年度稳健性",
+        "6号：第二周状态与周期类型", "7号：完整周期配对明细", "8号：全部配对明细",
+        "9号：延迟买入无效", "10号：科技股票池", "11号：板块数量",
+        "12号：剔除审计", "13号：验证口径",
+    ]
+    columns = st.columns(4)
+    for index, (filename, frame) in enumerate(files.items()):
+        with columns[index % 4]:
+            st.download_button(
+                labels[index], csv_bytes(frame), file_name=filename,
+                mime="text/csv", key=f"w2_v11_{filename}", on_click="ignore",
+            )
+    st.warning(
+        "第二周确认只使用当时可见信息；C1/C2和周期最高价只用于事后验证。"
+        "本程序比较机会空间，不等于已经解决止盈问题。"
+    )
+
+
 if __name__ == "__main__":
-    opportunity_main()
+    week2_confirmation_main()
