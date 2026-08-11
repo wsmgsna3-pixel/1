@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD硬条件＋周内评分排名验证器 V1.0
-==========================================
+科技股周线MACD定向大涨专家验证器 V2.2（单文件版）
+================================================
 
-本程序固定少量硬条件，把极端超跌条件改为连续评分，并在每个第二周确认日
-分别比较全部候选、Top1、Top3和Top5。严格池只纳入第二根红柱严格扩张；
-宽容池只淘汰第二周直接翻绿，对仍红但不扩张固定扣25分。评分只使用当时
-已经可见的信息；周期类型与未来利润只用于事后检验。
+本程序在第二根完整红柱严格扩张候选中，由趋势延续与超跌修复两个专家分别
+排序。专家使用不同特征组、固定方向和季度慢更新；最近26个成熟周仅评价
+哪个专家近期更有效。训练目标以20%和30%先于-10%止损为主体，50%仅小幅
+加分，翻倍事件只做影子审计，避免极少数牛股控制评分。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
-2. 两类趋势中，未来八周触及 +10%/+20%/+30% 的概率。
+2. 两类趋势中，未来八周触及 +10%/+20%/+30%/+50%/+100% 的概率。
 3. 第一根红柱买入 vs 同一红柱周期第一次红柱缩短买入。
 4. 第一根红柱后一周立即翻绿的比例。
 5. DIF、DEA 位于零轴上方/下方的差异。
 6. 第一根红柱前回调深度对未来八周表现的影响。
 7. 不随机抽样，研究期历史科技股票池中符合价格、市值条件的事件全部纳入。
 8. 对基准组、上升趋势组、回调<30%组及红柱缩短组做稳健性比较。
-9. 模拟 +10%/+20%/+30% 止盈与统一止损后的实际退出收益。
+9. 区分评分验证与实际退出；达到20%后仍继续记录完整40交易日影子路径。
 10. 将第一根红柱后的完整周期事后划分为 A/B/C1/C2，验证哪类利润最大。
 11. 只用当时已知数据记录第2—5周状态，检验能否提前识别弱反弹。
 12. 信号截止日与行情截止日分离：股票池和信号严格停在前者，后者仅用于观察未来结果。
@@ -31,7 +31,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run app.py
+    streamlit run weekly_macd_targeted_experts_v2_2_single.py
 """
 
 from __future__ import annotations
@@ -1013,7 +1013,7 @@ def build_checkpoint_features(
             f"{prefix}_Delayed_Return_8W_pct": np.nan,
             f"{prefix}_Delayed_Hit_Stop_8W": np.nan,
         }
-        for target in (10, 20, 30):
+        for target in (10, 20, 30, 50, 100):
             defaults[f"{prefix}_T{target}_Still_Open"] = np.nan
             defaults[f"{prefix}_T{target}_Future_Result"] = ""
             defaults[f"{prefix}_T{target}_Future_Target_First"] = np.nan
@@ -1126,7 +1126,7 @@ def build_checkpoint_features(
                         float(delayed_path["low"].min()) <= delayed_stop_price
                     ),
                 })
-                for target in (10, 20, 30):
+                for target in (10, 20, 30, 50, 100):
                     output[f"{prefix}_Delayed_Hit_{target}_8W"] = bool(
                         float(delayed_path["high"].max())
                         >= delayed_entry_price * (1.0 + target / 100.0)
@@ -1166,7 +1166,7 @@ def build_checkpoint_features(
                 float(remaining["low"].min()) <= stop_price
             )
 
-        for target in (10, 20, 30):
+        for target in (10, 20, 30, 50, 100):
             prior_result, _, _ = first_hit_result(
                 history, entry_price, float(target), float(stop_threshold_pct)
             ) if not history.empty else ("八周均未触发", "", np.nan)
@@ -2555,8 +2555,10 @@ def build_cycle_opportunities(
         "CP_W2_Delayed_MFE_8W_pct", "CP_W2_Delayed_MAE_8W_pct",
         "CP_W2_Delayed_Return_8W_pct", "CP_W2_Delayed_Hit_Stop_8W",
         "CP_W2_Delayed_Hit_10_8W", "CP_W2_Delayed_Hit_20_8W",
-        "CP_W2_Delayed_Hit_30_8W", "CP_W2_Delayed_First_10_vs_Stop",
+        "CP_W2_Delayed_Hit_30_8W", "CP_W2_Delayed_Hit_50_8W",
+        "CP_W2_Delayed_Hit_100_8W", "CP_W2_Delayed_First_10_vs_Stop",
         "CP_W2_Delayed_First_20_vs_Stop", "CP_W2_Delayed_First_30_vs_Stop",
+        "CP_W2_Delayed_First_50_vs_Stop", "CP_W2_Delayed_First_100_vs_Stop",
     ]
 
     for _, event in first.iterrows():
@@ -5912,14 +5914,17 @@ def weekly_score_rank_main() -> None:
         "资金占用和收益复利；只有评分稳定后才应进入组合回测。"
     )
 
-# ===== V2.1 rolling dynamic experts (single file) =====
-TITLE = "科技股周线MACD滚动专家自适应评分验证器 V2.1"
-VERSION = "V2.1-ROLLING-DYNAMIC-EXPERTS"
+# ===== V2.2 targeted stable experts (single file) =====
+TITLE = "科技股周线MACD定向大涨专家验证器 V2.2"
+VERSION = "V2.2-TARGETED-STABLE-EXPERTS"
 TREND, REPAIR, AUTO = "趋势延续", "超跌修复", "自动选择"
-TRAIN_WEEKS = PERF_WEEKS = 26
-HALF_LIFE = 13.0
-MIN_WEEKS, MIN_ROWS, RIDGE = 13, 120, 8.0
+TRAIN_WEEKS, PERF_WEEKS = 52, 26
+TRAIN_HALF_LIFE, PERF_HALF_LIFE = 26.0, 13.0
+REFIT_EVERY_WEEKS = 13
+MIN_WEEKS, MIN_ROWS, RIDGE = 26, 180, 12.0
+LEARNED_WEIGHT = 0.35
 WARMUP_DAYS = 600
+BIG_MOVE_TARGETS = (20, 30, 50, 100)
 TREND_FEATURES = (
     "TF_Return13", "TF_Return26", "TF_MA20Slope", "TF_W2Return",
     "TF_CloseLocation", "TF_BoardRS", "TF_Volume", "TF_W2Expansion",
@@ -5929,6 +5934,8 @@ REPAIR_FEATURES = (
     "RF_DEAImprove", "RF_ReclaimMA20", "RF_W2Return", "RF_CloseLocation",
     "RF_BoardRS", "RF_Volume", "RF_RepairConfirmation",
 )
+TREND_PRIOR = np.array([0.18, 0.10, 0.18, 0.08, 0.08, 0.16, 0.08, 0.14], dtype=float)
+REPAIR_PRIOR = np.array([0.10, 0.08, 0.06, 0.14, 0.14, 0.12, 0.08, 0.06, 0.10, 0.05, 0.07], dtype=float)
 
 
 def num(v: Any, index: pd.Index | None = None) -> pd.Series:
@@ -5943,9 +5950,9 @@ def rate(v: pd.Series) -> float:
     return float(v.astype(bool).mean() * 100.0) if len(v) else np.nan
 
 
-def exp_weights(dates: pd.Series, current: pd.Timestamp) -> np.ndarray:
+def exp_weights(dates: pd.Series, current: pd.Timestamp, half_life: float) -> np.ndarray:
     age = (current - pd.to_datetime(dates)).dt.days.to_numpy(float) / 7.0
-    return np.power(0.5, np.maximum(age, 0.0) / HALF_LIFE)
+    return np.power(0.5, np.maximum(age, 0.0) / half_life)
 
 
 def wmean(values: np.ndarray, weights: np.ndarray) -> float:
@@ -5985,6 +5992,27 @@ def utility(frame: pd.DataFrame) -> pd.Series:
     return pd.Series(np.select(
         [state.eq("目标先到"), state.isin(["止损先到", "同日不确定_按止损"])],
         [20.0, -10.0], default=ending), index=frame.index, dtype=float)
+
+
+def target_first(frame: pd.DataFrame, target: int) -> pd.Series:
+    column = f"CP_W2_Delayed_First_{target}_vs_Stop"
+    if column not in frame:
+        return pd.Series(False, index=frame.index)
+    return frame[column].fillna("").astype(str).eq("目标先到")
+
+
+def big_move_target(frame: pd.DataFrame) -> pd.Series:
+    """有界分层目标：20/30是主体，50仅小幅加分，翻倍只审计不额外加权。"""
+    win20 = target_first(frame, 20)
+    win30 = target_first(frame, 30)
+    win50 = target_first(frame, 50)
+    state20 = frame["CP_W2_Delayed_First_20_vs_Stop"].fillna("").astype(str)
+    stopped = state20.isin(["止损先到", "同日不确定_按止损"])
+    ending = num(frame["CP_W2_Delayed_Return_8W_pct"]).clip(-10, 20).fillna(0.0)
+    fallback = ending * 0.5
+    layered = 60.0 * win20.astype(float) + 25.0 * win30.astype(float) + 15.0 * win50.astype(float)
+    return pd.Series(np.select([win20, stopped], [layered, -40.0], default=fallback),
+                     index=frame.index, dtype=float)
 
 
 def prepare_features(opportunities: pd.DataFrame, board_weeklies: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -6034,53 +6062,79 @@ def prepare_features(opportunities: pd.DataFrame, board_weeklies: dict[str, pd.D
     maturity = pd.to_datetime(maturity_source.astype(str), format="%Y%m%d", errors="coerce")
     x["Outcome_Maturity_Date_dt"] = maturity.fillna(x["Selection_Date_dt"] + pd.Timedelta(days=56))
     x["Realised_Utility"] = utility(x)
+    for target in BIG_MOVE_TARGETS:
+        x[f"Win{target}BeforeStop"] = target_first(x, target)
+    x["BigMove_Target"] = big_move_target(x)
     new = ["Board_RS", "Slope_Improve", "DEA_Improve", *TREND_FEATURES, *REPAIR_FEATURES,
-           "Outcome_Mature", "Outcome_Maturity_Date_dt", "Realised_Utility"]
+           "Outcome_Mature", "Outcome_Maturity_Date_dt", "Realised_Utility", "BigMove_Target",
+           *[f"Win{target}BeforeStop" for target in BIG_MOVE_TARGETS]]
     for c in new:
-        frame[c] = False if c == "Outcome_Mature" else (pd.NaT if c == "Outcome_Maturity_Date_dt" else np.nan)
+        frame[c] = False if c == "Outcome_Mature" or c.startswith("Win") else (
+            pd.NaT if c == "Outcome_Maturity_Date_dt" else np.nan)
         frame.loc[x.index, c] = x[c]
     return frame
 
 
-def fit_ridge(train: pd.DataFrame, features: tuple[str, ...], current: pd.Timestamp) -> dict[str, Any]:
-    if len(train) < MIN_ROWS:
-        return {"ready": False}
+def fit_stable_expert(
+    train: pd.DataFrame,
+    features: tuple[str, ...],
+    prior: np.ndarray,
+    current: pd.Timestamp,
+) -> dict[str, Any]:
+    """季度慢更新、非负方向、先验锚定；极少数翻倍股不会得到额外权重。"""
+    prior = np.asarray(prior, dtype=float)
+    prior = prior / prior.sum()
+    base = {"ready": False, "features": features, "weights": prior,
+            "rows": len(train), "r2": np.nan, "fit_date": current}
+    if len(train) < MIN_ROWS or train.Selection_Date_dt.nunique() < MIN_WEEKS:
+        return base
     X = train.loc[:, features].apply(pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(float)
-    y = num(train["Realised_Utility"]).to_numpy(float)
-    w = exp_weights(train["Selection_Date_dt"], current)
+    y = num(train["BigMove_Target"]).to_numpy(float)
+    w = exp_weights(train["Selection_Date_dt"], current, TRAIN_HALF_LIFE)
     ok = np.isfinite(y) & np.isfinite(w)
     X, y, w = X[ok], y[ok], w[ok]
     if len(y) < MIN_ROWS:
-        return {"ready": False}
+        return base
     mu = (X * w[:, None]).sum(0) / w.sum()
     scale = np.sqrt(np.maximum((((X - mu) ** 2) * w[:, None]).sum(0) / w.sum(), 1e-8))
     Z = (X - mu) / scale
     D = np.column_stack([np.ones(len(Z)), Z])
     Dw, yw = D * np.sqrt(w[:, None]), y * np.sqrt(w)
-    P = np.eye(D.shape[1]) * RIDGE; P[0, 0] = 0
-    beta = np.linalg.pinv(Dw.T @ Dw + P) @ (Dw.T @ yw)
-    fitted = D @ beta
-    denom = np.sum(w * (y - wmean(y, w)) ** 2)
-    r2 = 1 - np.sum(w * (y - fitted) ** 2) / denom if denom > 0 else np.nan
-    return {"ready": True, "features": features, "mu": mu, "scale": scale,
-            "beta": beta, "rows": len(y), "r2": r2}
+    penalty = np.eye(D.shape[1]) * RIDGE
+    penalty[0, 0] = 0.0
+    beta = np.linalg.pinv(Dw.T @ Dw + penalty) @ (Dw.T @ yw)
+    learned = np.maximum(beta[1:], 0.0)
+    learned = learned / learned.sum() if learned.sum() > 1e-12 else prior.copy()
+    final_weights = (1.0 - LEARNED_WEIGHT) * prior + LEARNED_WEIGHT * learned
+    final_weights = final_weights / final_weights.sum()
+    raw_score = X @ final_weights
+    weighted_mean_y = wmean(y, w)
+    weighted_mean_s = wmean(raw_score, w)
+    cov = wmean((raw_score - weighted_mean_s) * (y - weighted_mean_y), w)
+    var = wmean((raw_score - weighted_mean_s) ** 2, w)
+    slope = max(cov / var, 0.0) if math.isfinite(cov) and math.isfinite(var) and var > 1e-12 else 0.0
+    fitted = weighted_mean_y + slope * (raw_score - weighted_mean_s)
+    denom = np.sum(w * (y - weighted_mean_y) ** 2)
+    r2 = 1.0 - np.sum(w * (y - fitted) ** 2) / denom if denom > 0 else np.nan
+    return {"ready": True, "features": features, "weights": final_weights,
+            "learned_weights": learned, "rows": len(y), "r2": r2,
+            "fit_date": current, "train_mean_target": weighted_mean_y}
 
 
 def predict(frame: pd.DataFrame, features: tuple[str, ...], state: dict[str, Any]) -> np.ndarray:
     X = frame.loc[:, features].apply(pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(float)
-    if not state.get("ready"):
-        return X.mean(1) * 100
-    return state["beta"][0] + ((X - state["mu"]) / state["scale"]) @ state["beta"][1:]
+    return (X @ np.asarray(state["weights"], dtype=float)) * 100.0
 
 
 def coefficient_rows(dt: pd.Timestamp, model: str, state: dict[str, Any], train: pd.DataFrame) -> list[dict[str, Any]]:
-    base = {"确认日期": dt.strftime("%Y%m%d"), "专家模型": model,
+    base = {"生效日期": dt.strftime("%Y%m%d"), "专家模型": model,
             "训练完成": bool(state.get("ready")), "训练周数": train.Selection_Date.nunique(),
             "训练候选": len(train), "训练开始": train.Selection_Date.min() if len(train) else "",
             "训练截止": train.Selection_Date.max() if len(train) else "", "加权R2": state.get("r2", np.nan)}
-    if not state.get("ready"):
-        return [{**base, "特征": "预热期等权先验", "标准化系数": np.nan}]
-    return [{**base, "特征": f, "标准化系数": float(b)} for f, b in zip(state["features"], state["beta"][1:])]
+    learned = state.get("learned_weights", np.full(len(state["features"]), np.nan))
+    return [{**base, "特征": feature, "最终权重(%)": float(weight * 100.0),
+             "纯数据权重(%)": float(data_weight * 100.0) if math.isfinite(data_weight) else np.nan}
+            for feature, weight, data_weight in zip(state["features"], state["weights"], learned)]
 
 
 def recent_edges(history: list[dict[str, Any]], current: pd.Timestamp) -> tuple[dict[str, float], int, str, str]:
@@ -6093,7 +6147,7 @@ def recent_edges(history: list[dict[str, Any]], current: pd.Timestamp) -> tuple[
     h = h[h.Date_dt.isin(dates)]
     if len(dates) < MIN_WEEKS:
         return empty, len(dates), "", ""
-    wd = pd.Series(exp_weights(pd.Series(dates), current), index=dates.to_numpy())
+    wd = pd.Series(exp_weights(pd.Series(dates), current, PERF_HALF_LIFE), index=dates.to_numpy())
     edges = {}
     for model in (TREND, REPAIR):
         g = h[h["专家模型"].eq(model)]
@@ -6104,31 +6158,49 @@ def recent_edges(history: list[dict[str, Any]], current: pd.Timestamp) -> tuple[
 def walk_forward(candidates: pd.DataFrame, eval_start: pd.Timestamp):
     candidates = candidates.sort_values(["Selection_Date_dt", "ts_code"]).copy()
     ranks, auto_parts, perf, coefs, modes, switches = [], [], [], [], [], []
-    active = challenger = None; streak = 0
-    for raw_dt in sorted(candidates.Selection_Date_dt.dropna().unique()):
+    active = challenger = None
+    streak = 0
+    states: dict[str, dict[str, Any]] = {}
+    last_refit_index: dict[str, int] = {}
+    specs = ((TREND, TREND_FEATURES, TREND_PRIOR), (REPAIR, REPAIR_FEATURES, REPAIR_PRIOR))
+    for week_index, raw_dt in enumerate(sorted(candidates.Selection_Date_dt.dropna().unique())):
         dt = pd.Timestamp(raw_dt); week = candidates[candidates.Selection_Date_dt.eq(dt)].copy()
         matured = candidates[candidates.Outcome_Mature.map(bool_value) & candidates.Outcome_Maturity_Date_dt.lt(dt)]
         train_dates = matured.Selection_Date_dt.drop_duplicates().sort_values().tail(TRAIN_WEEKS)
         train = matured[matured.Selection_Date_dt.isin(train_dates)]
         model_rankings = {}
-        for model, features in ((TREND, TREND_FEATURES), (REPAIR, REPAIR_FEATURES)):
-            state = fit_ridge(train, features, dt) if len(train_dates) >= MIN_WEEKS else {"ready": False}
-            coefs.extend(coefficient_rows(dt, model, state, train))
-            g = week.copy(); g["专家模型"] = model; g["Predicted_Utility"] = predict(g, features, state)
-            g = g.sort_values(["Predicted_Utility", "CP_W2_Hist_vs_W1_pct", "ts_code"], ascending=[False, False, True])
+        for model, features, prior in specs:
+            refit_due = model not in states or week_index - last_refit_index.get(model, -999) >= REFIT_EVERY_WEEKS
+            if refit_due:
+                state = fit_stable_expert(train, features, prior, dt)
+                state["train_weeks"] = len(train_dates)
+                state["train_rows"] = len(train)
+                state["train_start"] = train.Selection_Date.min() if len(train) else ""
+                state["train_end"] = train.Selection_Date.max() if len(train) else ""
+                states[model] = state
+                last_refit_index[model] = week_index
+                coefs.extend(coefficient_rows(dt, model, state, train))
+            state = states[model]
+            g = week.copy(); g["专家模型"] = model
+            g["Expert_Score"] = predict(g, features, state)
+            g["Predicted_BigMove_Score"] = g["Expert_Score"]
+            g["Predicted_Utility"] = g["Expert_Score"]
+            g["Expert_Weight_Date"] = pd.Timestamp(state["fit_date"]).strftime("%Y%m%d")
+            g = g.sort_values(["Expert_Score", "CP_W2_Hist_vs_W1_pct", "ts_code"], ascending=[False, False, True])
             g["Expert_Rank"] = np.arange(1, len(g) + 1)
             for n in (1, 2, 3): g[f"Selected_Top{n}"] = g.Expert_Rank.le(n)
             ranks.append(g); model_rankings[model] = g
             top2 = g[g.Expert_Rank.le(2) & g.Outcome_Mature.map(bool_value)]
             pool = week[week.Outcome_Mature.map(bool_value)]
-            mu, base = num(top2.Realised_Utility).mean(), num(pool.Realised_Utility).mean()
+            mu, base = num(top2.BigMove_Target).mean(), num(pool.BigMove_Target).mean()
             perf.append({"Date_dt": dt, "Maturity_Date_dt": week.Outcome_Maturity_Date_dt.max(),
                          "确认日期": dt.strftime("%Y%m%d"), "专家模型": model,
-                         "Top2效用": mu, "候选池效用": base, "相对候选效用": mu - base})
+                         "Top2大涨目标": mu, "候选池大涨目标": base, "相对候选效用": mu - base})
         edges, nperf, pstart, pend = recent_edges(perf, dt)
-        lead = TREND if math.isfinite(edges[TREND]) and math.isfinite(edges[REPAIR]) and edges[TREND] > edges[REPAIR] else (
-            REPAIR if math.isfinite(edges[TREND]) and math.isfinite(edges[REPAIR]) else "")
-        action = "维持"; previous = active or ""
+        both_known = math.isfinite(edges[TREND]) and math.isfinite(edges[REPAIR])
+        best = TREND if both_known and edges[TREND] >= edges[REPAIR] else (REPAIR if both_known else "")
+        lead = best if best and edges[best] > 0 else ""
+        action = "维持"
         if lead:
             if active is None or lead != active:
                 if challenger == lead: streak += 1
@@ -6138,10 +6210,13 @@ def walk_forward(candidates: pd.DataFrame, eval_start: pd.Timestamp):
                     old = active or "预热期"; active = lead; challenger = None; streak = 0
                     action = f"切换至{active}" if old != "预热期" else f"自动启动{active}"
                     switches.append({"切换日期": dt.strftime("%Y%m%d"), "切换前": old, "切换后": active,
-                                     "趋势近期优势": edges[TREND], "修复近期优势": edges[REPAIR], "依据": "连续两个确认周领先"})
+                                     "趋势近期优势": edges[TREND], "修复近期优势": edges[REPAIR],
+                                     "依据": "挑战者自身优势>0且连续两个确认周领先"})
             else:
                 challenger = None; streak = 0
-        elif active is None: action = "表现预热中"
+        else:
+            challenger = None; streak = 0
+            action = "表现预热中" if active is None else "两专家均无正优势，保持原模式"
         positions = 0
         if active:
             edge = edges.get(active, np.nan); positions = 2 if math.isfinite(edge) and edge > 0 else 1
@@ -6156,7 +6231,9 @@ def walk_forward(candidates: pd.DataFrame, eval_start: pd.Timestamp):
                       "连续领先周数": streak, "本周动作": action, "自动计划持仓数": positions,
                       "训练成熟周数": len(train_dates), "训练候选数": len(train),
                       "训练结果截止": train.Selection_Date.max() if len(train) else "",
-                      "训练结果成熟截止": train.Outcome_Maturity_Date_dt.max().strftime("%Y%m%d") if len(train) else ""})
+                      "训练结果成熟截止": train.Outcome_Maturity_Date_dt.max().strftime("%Y%m%d") if len(train) else "",
+                      "趋势权重生效日": pd.Timestamp(states[TREND]["fit_date"]).strftime("%Y%m%d"),
+                      "修复权重生效日": pd.Timestamp(states[REPAIR]["fit_date"]).strftime("%Y%m%d")})
     rankings = pd.concat(ranks, ignore_index=True)
     if auto_parts: auto = pd.concat(auto_parts, ignore_index=True)
     else:
@@ -6168,14 +6245,23 @@ def walk_forward(candidates: pd.DataFrame, eval_start: pd.Timestamp):
 def summary_row(frame: pd.DataFrame, plan: str, scope: str, period: str) -> dict[str, Any]:
     m = frame[frame.Outcome_Mature.map(bool_value)].copy(); ret = num(m.CP_W2_Delayed_Return_8W_pct)
     resolved = m[m.Research_Family.ne("未决")]
+    ordered = m.assign(_mfe=num(m.CP_W2_Delayed_MFE_8W_pct)).sort_values("_mfe", ascending=False)
+    without3 = ordered.iloc[min(3, len(ordered)):]
+    without5 = ordered.iloc[min(5, len(ordered)):]
     return {"统计期": period, "方案": plan, "选择范围": scope, "入选事件": len(frame),
             "入选周数": frame.Selection_Date.nunique(), "不同股票": frame.ts_code.nunique(), "成熟结果": len(m),
+            "大涨目标均值": num(m.BigMove_Target).mean(),
             "交易效用均值": num(m.Realised_Utility).mean(), "交易效用中位数": num(m.Realised_Utility).median(),
             "8周收益均值(%)": ret.mean(), "8周收益中位数(%)": ret.median(), "盈利比例(%)": rate(ret.gt(0)),
             "20%先于-10%(%)": rate(m.CP_W2_Delayed_First_20_vs_Stop.astype(str).eq("目标先到")),
+            "30%先于-10%(%)": rate(target_first(m, 30)),
+            "50%先于-10%(%)": rate(target_first(m, 50)),
+            "100%先于-10%(%)": rate(target_first(m, 100)),
             "触及-10%(%)": rate(m.CP_W2_Delayed_Hit_Stop_8W.map(bool_value)),
             "MFE中位数(%)": num(m.CP_W2_Delayed_MFE_8W_pct).median(),
             "MAE中位数(%)": num(m.CP_W2_Delayed_MAE_8W_pct).median(),
+            "删除最高3只后大涨目标均值": num(without3.BigMove_Target).mean(),
+            "删除最高5只后大涨目标均值": num(without5.BigMove_Target).mean(),
             "C1C2比例(%)": rate(resolved.Research_Family.eq("C1C2_长周期"))}
 
 
@@ -6192,30 +6278,74 @@ def make_summary(rankings: pd.DataFrame, auto: pd.DataFrame, start: pd.Timestamp
     return pd.DataFrame(rows)
 
 
+def feature_commonality_audit(candidates: pd.DataFrame, start: pd.Timestamp) -> pd.DataFrame:
+    """用中位数、分位组成功率和年度方向检查共同点，避免均值被少数牛股主导。"""
+    m = candidates[candidates.Selection_Date_dt.ge(start) & candidates.Outcome_Mature.map(bool_value)].copy()
+    if m.empty:
+        return pd.DataFrame()
+    rows = []
+    for model, features in ((TREND, TREND_FEATURES), (REPAIR, REPAIR_FEATURES)):
+        for feature in features:
+            values = num(m[feature])
+            win20 = target_first(m, 20)
+            win30 = target_first(m, 30)
+            fail20 = ~win20
+            trimmed = m.assign(_mfe=num(m.CP_W2_Delayed_MFE_8W_pct)).sort_values("_mfe", ascending=False).iloc[min(5, len(m)):]
+            trimmed_win = target_first(trimmed, 20)
+            yearly_positive = yearly_comparable = 0
+            for _, group in m.groupby("Selection_Year"):
+                yw = target_first(group, 20)
+                if int(yw.sum()) >= 5 and int((~yw).sum()) >= 5:
+                    yearly_comparable += 1
+                    yearly_positive += int(num(group.loc[yw, feature]).median() > num(group.loc[~yw, feature]).median())
+            top_quartile = values.ge(0.75)
+            bottom_quartile = values.le(0.25)
+            rows.append({
+                "专家模型": model, "特征": feature, "成熟样本": len(m),
+                "20%成功数": int(win20.sum()), "30%成功数": int(win30.sum()),
+                "20%成功组中位数": num(m.loc[win20, feature]).median(),
+                "非20%组中位数": num(m.loc[fail20, feature]).median(),
+                "20%组中位数差": num(m.loc[win20, feature]).median() - num(m.loc[fail20, feature]).median(),
+                "30%成功组中位数": num(m.loc[win30, feature]).median(),
+                "最高四分位20%成功率(%)": rate(win20.loc[top_quartile]),
+                "最低四分位20%成功率(%)": rate(win20.loc[bottom_quartile]),
+                "删除MFE最高5只后中位数差": (
+                    num(trimmed.loc[trimmed_win, feature]).median()
+                    - num(trimmed.loc[~trimmed_win, feature]).median()),
+                "年度同方向数": yearly_positive, "年度可比较数": yearly_comparable,
+            })
+    return pd.DataFrame(rows).sort_values(["专家模型", "20%组中位数差"], ascending=[True, False])
+
+
 def feature_dict() -> pd.DataFrame:
     return pd.DataFrame([
         (TREND, "TF_Return13/26", "中期趋势"), (TREND, "TF_MA20Slope", "均线趋势"),
         (TREND, "TF_W2Return/CloseLocation", "第二周价格确认"), (TREND, "TF_BoardRS", "相对板块强度"),
-        (TREND, "TF_Volume/W2Expansion", "量价与红柱扩张；系数允许为负"),
+        (TREND, "TF_Volume/W2Expansion", "量价与红柱扩张；权重只允许非负"),
         (REPAIR, "RF_DEADepth/Pullback/PriorLoss", "深跌背景"),
         (REPAIR, "RF_SlopeImprove/DEAImprove", "修复速度"),
         (REPAIR, "RF_ReclaimMA20/W2Return", "重新转强确认"),
         (REPAIR, "RF_BoardRS/Volume/Confirmation", "相对强度、成交量及深度×改善交互"),
+        ("共同目标", "20/30/50分层", "20%成功为主体、30%强化、50%小幅加分；100%只审计不训练"),
+        ("稳定机制", "固定方向＋季度慢更新", "65%专家先验＋35%历史学习；每13个候选周更新一次"),
     ], columns=["专家模型", "特征组", "含义"])
 
 
 def main() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide"); st.title(TITLE)
-    st.caption("两个专家每周仅用当时已成熟结果学习；最近26周、13周半衰期，挑战者连续领先两周切换。")
+    st.caption("趋势与修复专家定向寻找大涨机会；固定方向、季度慢更新，最近26个成熟周只负责环境切换。")
     with st.sidebar:
         st.header("正式评价区间")
         eval_date = st.date_input("评价开始", value=date(2023, 6, 5))
         end_date = st.date_input("信号截止", value=date(2026, 6, 5))
         obs_date = st.date_input("行情观察截止", value=date.today(), max_value=date.today())
         view = st.radio("界面重点查看", [AUTO, "固定趋势", "固定修复"], index=0)
-        st.header("冻结规则"); st.write("最近26个成熟周；13周权重减半")
-        st.write("精确完成40个市场交易日后才能使用结果"); st.write("连续领先两周切换，不设锁定期")
+        st.header("冻结规则"); st.write("专家训练52个成熟周；每13个候选周最多更新一次")
+        st.write("专家权重方向固定：65%先验＋35%学习")
+        st.write("环境评价26个成熟周；13周权重减半")
+        st.write("精确完成40个市场交易日后才能使用结果")
+        st.write("挑战者优势>0且连续领先两周才切换")
         st.write("优势>0选Top2，否则Top1；不强制第三仓")
         st.caption("自动增加约20个月训练预热期，不计入正式评价。")
         cache = st.checkbox("使用逐股票缓存", value=True)
@@ -6225,11 +6355,11 @@ def main() -> None:
             st.success("缓存已清除")
     token = st.text_input("Tushare Token", type="password")
     if not token: st.info("请输入Tushare Token。"); return
-    key = "dynamic_experts_v21_zip"
-    if not st.button("开始滚动专家验证", type="primary"):
+    key = "targeted_experts_v22_zip"
+    if not st.button("开始V2.2定向专家验证", type="primary"):
         if key in st.session_state:
             st.download_button("下载上一次全部结果ZIP", st.session_state[key],
-                               file_name="weekly_macd_dynamic_experts_v2_1_all_results.zip", mime="application/zip")
+                               file_name="weekly_macd_targeted_experts_v2_2_all_results.zip", mime="application/zip")
         return
     if eval_date >= end_date or end_date > obs_date: st.error("日期关系不正确。"); return
     API_ERRORS = []; ts.set_token(token); pro = ts.pro_api()
@@ -6268,7 +6398,7 @@ def main() -> None:
         for reason,n in rj.items(): rejects[reason]=rejects.get(reason,0)+n
     bar.empty(); status.empty()
     if not records: st.error("没有生成事件。"); return
-    with st.spinner("滚动训练专家并模拟切换..."):
+    with st.spinner("慢速更新定向专家并模拟环境切换..."):
         events=pd.DataFrame(records).sort_values(["Signal_Date","ts_code","Event_Type"])
         opp=build_cycle_opportunities(events,histories,obs,config["sell_slippage_pct"])
         featured=prepare_features(opp,boards); candidates=featured[featured.Strict_Eligible.map(bool_value)].copy()
@@ -6276,42 +6406,52 @@ def main() -> None:
     ec=candidates[candidates.Selection_Date_dt.ge(eval_start)]; er=rankings[rankings.Selection_Date_dt.ge(eval_start)]
     ea=auto[auto.Selection_Date_dt.ge(eval_start)]; em=modes[pd.to_datetime(modes.确认日期).ge(eval_start)]
     es=switches[pd.to_datetime(switches.切换日期).ge(eval_start)] if not switches.empty else switches
+    commonality=feature_commonality_audit(candidates,eval_start)
+    tail=ea[ea.Outcome_Mature.map(bool_value) & num(ea.CP_W2_Delayed_MFE_8W_pct).ge(50)].copy()
+    tail=tail.sort_values("CP_W2_Delayed_MFE_8W_pct",ascending=False)
     reject=pd.DataFrame([{"剔除原因":k,"次数":v} for k,v in rejects.items()])
     total=summary[(summary.统计期=="全部")&(summary.方案==AUTO)].iloc[0]; latest=em.iloc[-1].自动模式 if len(em) else "预热期"
     run=pd.DataFrame([{"程序":TITLE,"版本":VERSION,"评价开始":eval_date.strftime("%Y%m%d"),"预热开始":research,
                        "信号截止":end,"观察截止":obs,"评价候选":len(ec),"候选周":ec.Selection_Date.nunique(),
-                       "自动入选":len(ea),"切换次数":len(es),"截止模式":latest,"自动效用均值":total.交易效用均值,
+                       "自动入选":len(ea),"切换次数":len(es),"截止模式":latest,
+                       "自动大涨目标均值":total.大涨目标均值,"自动效用均值":total.交易效用均值,
                        "自动8周收益中位数(%)":total["8周收益中位数(%)"],"行情失败":fails,"缓存命中":hits}])
     meta=pd.DataFrame([
         ("程序",TITLE),("硬条件","科技池、价≥10元、流通市值≥100亿元、第二根完整红柱严格扩张"),
-        ("专家训练","最近26个已成熟周指数加权岭回归；13周权重减半"),
-        ("训练目标","20%先到+20；-10%先到-10；其余用8周期末收益并截断[-10,+20]"),
+        ("专家身份","趋势和修复使用不同特征组；所有特征方向固定为非负"),
+        ("专家训练","最近52个成熟周；26周半衰期；每13个候选周最多更新一次；65%先验＋35%学习"),
+        ("训练目标","20%先于止损记60；30%再加25；50%再加15；翻倍只审计、不额外加权；止损先到-40"),
         ("未来隔离","第二周买入后40个市场交易日精确终点未到，禁止训练和模式评价"),
-        ("切换","挑战者连续领先两周；无强制锁定期"),("选择数量","模式优势>0选Top2，否则Top1；不强制第三仓"),
-        ("风险","ATR和换手不混入Alpha，留给后续仓位模块")],columns=["项目","值"])
-    files={"01_run_summary_dynamic_experts_v2_1.csv":run,
-           "02_strategy_year_comparison_dynamic_experts_v2_1.csv":summary,
-           "03_mode_switch_log_dynamic_experts_v2_1.csv":es,
-           "04_weekly_mode_state_dynamic_experts_v2_1.csv":em,
-           "05_auto_selection_dynamic_experts_v2_1.csv":ea,
-           "06_expert_top3_rankings_dynamic_experts_v2_1.csv":er[er.Expert_Rank.le(3)],
-           "07_expert_coefficient_history_dynamic_experts_v2_1.csv":coefs,
-           "08_expert_feature_dictionary_dynamic_experts_v2_1.csv":feature_dict(),
-           "09_all_evaluation_rankings_dynamic_experts_v2_1.csv":er,
-           "10_evaluation_candidate_features_dynamic_experts_v2_1.csv":ec,
-           "11_all_event_features_including_warmup_v2_1.csv":featured,
-           "12_full_tech_universe_dynamic_experts_v2_1.csv":audit,
-           "13_population_dynamic_experts_v2_1.csv":pop,
-           "14_rejection_audit_dynamic_experts_v2_1.csv":reject,
-           "15_metadata_dynamic_experts_v2_1.csv":meta}
+        ("切换","挑战者自身优势必须>0且连续领先两周；无强制锁定期"),
+        ("选择数量","当前模式优势>0选Top2，否则Top1；不强制第三仓"),
+        ("影子观察","不在20%停止读取行情；同时记录20/30/50/100先于止损及8周MFE"),
+        ("风险","ATR不混入Alpha；成交量进入两专家评分；换手率保留给后续仓位模块")],columns=["项目","值"])
+    files={"01_run_summary_targeted_experts_v2_2.csv":run,
+           "02_strategy_year_comparison_targeted_experts_v2_2.csv":summary,
+           "03_mode_switch_log_targeted_experts_v2_2.csv":es,
+           "04_weekly_mode_state_targeted_experts_v2_2.csv":em,
+           "05_auto_selection_targeted_experts_v2_2.csv":ea,
+           "06_expert_top3_rankings_targeted_experts_v2_2.csv":er[er.Expert_Rank.le(3)],
+           "07_expert_weight_history_targeted_experts_v2_2.csv":coefs,
+           "08_expert_feature_dictionary_targeted_experts_v2_2.csv":feature_dict(),
+           "09_feature_commonality_audit_targeted_experts_v2_2.csv":commonality,
+           "10_auto_tail_capture_50plus_targeted_experts_v2_2.csv":tail,
+           "11_all_evaluation_rankings_targeted_experts_v2_2.csv":er,
+           "12_evaluation_candidate_features_targeted_experts_v2_2.csv":ec,
+           "13_all_event_features_including_warmup_v2_2.csv":featured,
+           "14_full_tech_universe_targeted_experts_v2_2.csv":audit,
+           "15_population_targeted_experts_v2_2.csv":pop,
+           "16_rejection_audit_targeted_experts_v2_2.csv":reject,
+           "17_metadata_targeted_experts_v2_2.csv":meta}
     z=make_result_zip(files); st.session_state[key]=z
     st.success(f"完成：评价候选{len(ec)}个，切换{len(es)}次，截止模式{latest}。")
     table=summary[summary.统计期.eq("全部")]
     table=table[table.方案.eq(AUTO if view==AUTO else (TREND if view=="固定趋势" else REPAIR))]
     st.dataframe(table,use_container_width=True,hide_index=True); st.subheader("模式切换"); st.dataframe(es,use_container_width=True,hide_index=True)
     st.subheader("年度比较"); st.dataframe(summary[summary.统计期.ne("全部")],use_container_width=True,hide_index=True)
-    st.download_button("下载全部结果ZIP",z,file_name="weekly_macd_dynamic_experts_v2_1_all_results.zip",mime="application/zip",type="primary")
-    st.warning("本版验证滚动学习和模式切换，不是最终三仓资金曲线。")
+    st.subheader("大涨共同特征审计"); st.dataframe(commonality,use_container_width=True,hide_index=True)
+    st.download_button("下载全部结果ZIP",z,file_name="weekly_macd_targeted_experts_v2_2_all_results.zip",mime="application/zip",type="primary")
+    st.warning("本版验证专家排序与影子涨幅，不是最终三仓资金曲线；MFE是机会空间，不等于可实现卖出收益。")
 
 
 if __name__ == "__main__":
