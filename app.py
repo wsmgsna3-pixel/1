@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD双专家非线性评分实验器 V2.3（单文件版）
-==================================================
+科技股周线MACD三形态五结果组特征挖掘实验器 V2.4（单文件版）
+========================================================
 
-本程序在第二根完整红柱严格扩张候选中，由趋势延续与超跌修复两个专家分别
-进行透明的非线性分段评分。取消季度机器学习和自动模式切换，专门验证第一名
-能否稳定优于第二、第三名。训练目标仍以20%和30%先于-10%止损为主体，50%
-仅小幅加分，翻倍事件只做影子审计。
+本程序在第二根完整红柱严格扩张候选中，先按红柱出现时的周线状态互斥分成
+上升趋势、中性趋势、下降趋势，再按未来八周最高涨幅和既有交易效用分成五个
+结果组。程序只挖掘区别特征、覆盖率、误选率、跨年稳定性和上涨路径，不生成
+评分、不选Top3、不进行模式切换。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30%/+50%/+100% 的概率。
@@ -31,7 +31,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_nonlinear_experts_v2_3_single.py
+    streamlit run weekly_macd_three_state_feature_mining_v2_4_single.py
 """
 
 from __future__ import annotations
@@ -6516,6 +6516,630 @@ def main() -> None:
     st.subheader("并行候选组合诊断"); st.dataframe(allocation,use_container_width=True,hide_index=True)
     st.download_button("下载全部结果ZIP",z,file_name="weekly_macd_nonlinear_experts_v2_3_all_results.zip",mime="application/zip",type="primary")
     st.warning("本版只验证评分顺序，不决定实盘模式；4周/8周影子切换器将在评分通过后单独验证。")
+
+
+# ===== V2.4 three-state / five-outcome feature mining lab (single file) =====
+TITLE = "科技股周线MACD三形态五结果组特征挖掘实验器 V2.4"
+VERSION = "V2.4-THREE-STATE-FIVE-GROUP-FEATURE-MINING"
+
+STATE_ORDER = ("上升趋势", "中性趋势", "下降趋势")
+LOSS_GROUP = "亏损且最高涨幅<30%"
+LOW_PROFIT_GROUP = "盈利但最高涨幅<30%"
+MID_GROUP = "30%～50%"
+HIGH_GROUP = "50%～100%"
+DOUBLE_GROUP = "翻倍以上"
+GROUP_ORDER = (LOSS_GROUP, LOW_PROFIT_GROUP, MID_GROUP, HIGH_GROUP, DOUBLE_GROUP)
+
+NUMERIC_MINING_FEATURES = {
+    "流通市值(亿元)": "Circ_MV_Billion",
+    "换手率(%)": "Turnover_Rate",
+    "第一红柱前回调深度(%)": "Pullback_Depth_pct",
+    "第一周涨幅(%)": "W1_Week_Return_pct",
+    "第一周量比20": "W1_Volume_Ratio20",
+    "第一周ATR14(%)": "W1_ATR14_pct",
+    "第一周收盘位置": "W1_Close_Location",
+    "第二红柱/第一红柱增幅(%)": "CP_W2_Hist_vs_W1_pct",
+    "第二周DIF/价格(%)": "CP_W2_DIF_to_Price_pct",
+    "第二周DEA/价格(%)": "CP_W2_DEA_to_Price_pct",
+    "第二周MA20四周斜率(%)": "CP_W2_MA20_Slope4_pct",
+    "第二周前13周涨幅(%)": "CP_W2_Return_13W_pct",
+    "第二周前26周涨幅(%)": "CP_W2_Return_26W_pct",
+    "第二周收盘/MA20(%)": "CP_W2_Close_vs_MA20_pct",
+    "第二周涨幅(%)": "CP_W2_Week_Return_pct",
+    "第二周量比20": "CP_W2_Volume_Ratio20",
+    "第二周ATR14(%)": "CP_W2_ATR14_pct",
+    "第二周收盘位置": "CP_W2_Close_Location",
+    "第二周确认时浮盈(%)": "CP_W2_Return_From_Entry_pct",
+    "板块13周涨幅(%)": "Board_Return_13W_pct",
+    "板块MA20四周斜率(%)": "Board_MA20_Slope4_pct",
+    "个股相对板块强度": "Board_RS",
+    "MA20斜率改善": "Slope_Improve",
+    "DEA位置改善": "DEA_Improve",
+}
+
+CATEGORICAL_MINING_FEATURES = {
+    "上市板块": "Sample_Board",
+    "零轴位置": "Zero_Axis",
+    "申万一级行业": "SW_L1",
+    "申万二级行业": "SW_L2",
+}
+
+CORE_COMPARISONS = (
+    (MID_GROUP, LOSS_GROUP), (MID_GROUP, LOW_PROFIT_GROUP),
+    (HIGH_GROUP, LOSS_GROUP), (HIGH_GROUP, LOW_PROFIT_GROUP),
+    (DOUBLE_GROUP, LOSS_GROUP), (DOUBLE_GROUP, LOW_PROFIT_GROUP),
+)
+
+ADJACENT_COMPARISONS = (
+    (MID_GROUP, LOW_PROFIT_GROUP),
+    (HIGH_GROUP, MID_GROUP),
+    (DOUBLE_GROUP, HIGH_GROUP),
+)
+
+RISK_COMPARISONS = ((LOSS_GROUP, LOW_PROFIT_GROUP),)
+
+
+def assign_five_outcome_groups(frame: pd.DataFrame) -> pd.DataFrame:
+    """严格复现已确认口径：高涨幅按8周MFE分层，MFE<30再按交易效用分亏损/盈利。"""
+    out = frame.copy()
+    mfe = num(out.get("CP_W2_Delayed_MFE_8W_pct"), out.index)
+    realised = num(out.get("Realised_Utility"), out.index)
+    conditions = [
+        mfe.lt(30) & realised.le(0),
+        mfe.lt(30) & realised.gt(0),
+        mfe.ge(30) & mfe.lt(50),
+        mfe.ge(50) & mfe.lt(100),
+        mfe.ge(100),
+    ]
+    out["结果组"] = np.select(conditions, GROUP_ORDER, default="未分组")
+    out["结果组顺序"] = out["结果组"].map({name: i + 1 for i, name in enumerate(GROUP_ORDER)})
+    out["三形态有效"] = out["Weekly_Trend"].isin(STATE_ORDER)
+    return out
+
+
+def _safe_ratio(a: float, b: float) -> float:
+    return float(a / b) if math.isfinite(a) and math.isfinite(b) and abs(b) > 1e-12 else np.nan
+
+
+def _auc(values: pd.Series, labels: pd.Series) -> float:
+    x = pd.to_numeric(values, errors="coerce")
+    y = labels.astype(bool)
+    ok = x.notna() & y.notna()
+    x, y = x.loc[ok], y.loc[ok]
+    n1, n0 = int(y.sum()), int((~y).sum())
+    if n1 == 0 or n0 == 0:
+        return np.nan
+    ranks = x.rank(method="average")
+    return float((ranks.loc[y].sum() - n1 * (n1 + 1) / 2.0) / (n1 * n0))
+
+
+def _effect_size(target: pd.Series, control: pd.Series) -> float:
+    a = pd.to_numeric(target, errors="coerce").dropna()
+    b = pd.to_numeric(control, errors="coerce").dropna()
+    if len(a) < 2 or len(b) < 2:
+        return np.nan
+    pooled = math.sqrt(((len(a) - 1) * a.var(ddof=1) + (len(b) - 1) * b.var(ddof=1)) /
+                       max(len(a) + len(b) - 2, 1))
+    return float((a.mean() - b.mean()) / pooled) if pooled > 1e-12 else np.nan
+
+
+def _year_direction(frame: pd.DataFrame, feature: str, target_group: str,
+                    control_group: str, full_direction: int) -> tuple[int, int]:
+    same = comparable = 0
+    for _, year in frame.groupby("Selection_Year"):
+        a = num(year.loc[year["结果组"].eq(target_group), feature]).dropna()
+        b = num(year.loc[year["结果组"].eq(control_group), feature]).dropna()
+        if len(a) < 5 or len(b) < 5:
+            continue
+        diff = a.median() - b.median()
+        if not math.isfinite(diff) or abs(diff) < 1e-12:
+            continue
+        comparable += 1
+        same += int((1 if diff > 0 else -1) == full_direction)
+    return same, comparable
+
+
+def numeric_feature_comparisons(frame: pd.DataFrame,
+                                comparisons: tuple[tuple[str, str], ...],
+                                comparison_set: str) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for state in STATE_ORDER:
+        state_frame = frame[frame["Weekly_Trend"].eq(state)].copy()
+        for target_group, control_group in comparisons:
+            target = state_frame[state_frame["结果组"].eq(target_group)]
+            control = state_frame[state_frame["结果组"].eq(control_group)]
+            for label, feature in NUMERIC_MINING_FEATURES.items():
+                if feature not in state_frame:
+                    continue
+                a = num(target[feature]).dropna()
+                b = num(control[feature]).dropna()
+                if len(a) < 2 or len(b) < 2:
+                    continue
+                median_diff = float(a.median() - b.median())
+                direction = 1 if median_diff >= 0 else -1
+                combined = pd.concat([a, b], ignore_index=True)
+                threshold = float(combined.quantile(0.75 if direction > 0 else 0.25))
+                a_hit = a.ge(threshold) if direction > 0 else a.le(threshold)
+                b_hit = b.ge(threshold) if direction > 0 else b.le(threshold)
+                coverage = float(a_hit.mean())
+                false_positive = float(b_hit.mean())
+                precision = _safe_ratio(float(a_hit.sum()), float(a_hit.sum() + b_hit.sum()))
+                raw_auc = _auc(pd.concat([a, b], ignore_index=True),
+                               pd.Series([True] * len(a) + [False] * len(b)))
+                oriented_auc = raw_auc if direction > 0 else (1.0 - raw_auc)
+                same, comparable = _year_direction(
+                    state_frame, feature, target_group, control_group, direction
+                )
+                if min(len(a), len(b)) >= 30 and comparable >= 2 and same == comparable:
+                    reliability = "较高"
+                elif min(len(a), len(b)) >= 15 and (comparable == 0 or same >= max(1, comparable - 1)):
+                    reliability = "中等"
+                elif min(len(a), len(b)) >= 5:
+                    reliability = "探索"
+                else:
+                    reliability = "案例"
+                rows.append({
+                    "对比集合": comparison_set, "红柱形态": state,
+                    "目标组": target_group, "对照组": control_group,
+                    "特征": label, "字段": feature,
+                    "目标样本": len(a), "对照样本": len(b),
+                    "目标中位数": a.median(), "对照中位数": b.median(),
+                    "中位数差": median_diff, "有利方向": "较高" if direction > 0 else "较低",
+                    "标准化效应": _effect_size(a, b), "方向化AUC": oriented_auc,
+                    "固定分位阈值": threshold, "目标覆盖率(%)": coverage * 100.0,
+                    "对照误入率(%)": false_positive * 100.0,
+                    "阈值命中精度(%)": precision * 100.0 if math.isfinite(precision) else np.nan,
+                    "覆盖/误入倍数": _safe_ratio(coverage, false_positive),
+                    "年度同方向数": same, "年度可比较数": comparable,
+                    "证据等级": reliability,
+                })
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    return result.sort_values(
+        ["红柱形态", "目标组", "对照组", "方向化AUC", "目标覆盖率(%)"],
+        ascending=[True, True, True, False, False],
+    )
+
+
+def categorical_feature_comparisons(frame: pd.DataFrame,
+                                    comparisons: tuple[tuple[str, str], ...],
+                                    comparison_set: str) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for state in STATE_ORDER:
+        sf = frame[frame["Weekly_Trend"].eq(state)].copy()
+        for target_group, control_group in comparisons:
+            a = sf[sf["结果组"].eq(target_group)]
+            b = sf[sf["结果组"].eq(control_group)]
+            for label, feature in CATEGORICAL_MINING_FEATURES.items():
+                if feature not in sf:
+                    continue
+                av = a[feature].fillna("未知").astype(str)
+                bv = b[feature].fillna("未知").astype(str)
+                levels = sorted(set(av) | set(bv))
+                for level in levels:
+                    ah, bh = int(av.eq(level).sum()), int(bv.eq(level).sum())
+                    if ah + bh < 5:
+                        continue
+                    ar = ah / len(av) if len(av) else np.nan
+                    br = bh / len(bv) if len(bv) else np.nan
+                    precision = _safe_ratio(float(ah), float(ah + bh))
+                    full_sign = 1 if ar >= br else -1
+                    same = comparable = 0
+                    for _, year in sf.groupby("Selection_Year"):
+                        ya = year[year["结果组"].eq(target_group)]
+                        yb = year[year["结果组"].eq(control_group)]
+                        if len(ya) < 5 or len(yb) < 5:
+                            continue
+                        yar = ya[feature].fillna("未知").astype(str).eq(level).mean()
+                        ybr = yb[feature].fillna("未知").astype(str).eq(level).mean()
+                        if abs(yar - ybr) < 1e-12:
+                            continue
+                        comparable += 1
+                        same += int((1 if yar > ybr else -1) == full_sign)
+                    if min(len(av), len(bv)) >= 30 and comparable >= 2 and same == comparable:
+                        reliability = "较高"
+                    elif min(len(av), len(bv)) >= 15 and (comparable == 0 or same >= max(1, comparable - 1)):
+                        reliability = "中等"
+                    elif min(len(av), len(bv)) >= 5:
+                        reliability = "探索"
+                    else:
+                        reliability = "案例"
+                    rows.append({
+                        "对比集合": comparison_set, "红柱形态": state,
+                        "目标组": target_group, "对照组": control_group,
+                        "特征": label, "字段": feature, "类别": level,
+                        "目标样本": len(av), "对照样本": len(bv),
+                        "目标类别数": ah, "对照类别数": bh,
+                        "目标覆盖率(%)": ar * 100.0, "对照误入率(%)": br * 100.0,
+                        "阈值命中精度(%)": precision * 100.0 if math.isfinite(precision) else np.nan,
+                        "覆盖/误入倍数": _safe_ratio(ar, br),
+                        "年度同方向数": same, "年度可比较数": comparable,
+                        "证据等级": reliability,
+                    })
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    return result.sort_values(
+        ["红柱形态", "目标组", "对照组", "覆盖/误入倍数", "目标覆盖率(%)"],
+        ascending=[True, True, True, False, False],
+    )
+
+
+def five_group_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for state in STATE_ORDER:
+        sf = frame[frame["Weekly_Trend"].eq(state)]
+        for group_name in GROUP_ORDER:
+            g = sf[sf["结果组"].eq(group_name)]
+            mfe = num(g.get("CP_W2_Delayed_MFE_8W_pct"), g.index)
+            mae = num(g.get("CP_W2_Delayed_MAE_8W_pct"), g.index)
+            ending = num(g.get("CP_W2_Delayed_Return_8W_pct"), g.index)
+            rows.append({
+                "红柱形态": state, "结果组": group_name, "样本数": len(g),
+                "不同股票": g.ts_code.nunique() if "ts_code" in g else np.nan,
+                "涉及周数": g.Selection_Date.nunique() if "Selection_Date" in g else np.nan,
+                "MFE均值(%)": mfe.mean(), "MFE中位数(%)": mfe.median(),
+                "MAE均值(%)": mae.mean(), "MAE中位数(%)": mae.median(),
+                "8周末收益均值(%)": ending.mean(), "8周末收益中位数(%)": ending.median(),
+                "8周末盈利率(%)": rate(ending.gt(0)),
+                "触及-10%(%)": rate(g.CP_W2_Delayed_Hit_Stop_8W.map(bool_value)) if len(g) else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def year_group_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for year in sorted(frame.Selection_Year.dropna().unique()):
+        yf = frame[frame.Selection_Year.eq(year)]
+        for state in STATE_ORDER:
+            sf = yf[yf.Weekly_Trend.eq(state)]
+            for group_name in GROUP_ORDER:
+                g = sf[sf["结果组"].eq(group_name)]
+                rows.append({
+                    "年份": year, "红柱形态": state, "结果组": group_name,
+                    "样本数": len(g), "不同股票": g.ts_code.nunique() if len(g) else 0,
+                    "占该形态比例(%)": len(g) / len(sf) * 100.0 if len(sf) else np.nan,
+                    "MFE中位数(%)": num(g.get("CP_W2_Delayed_MFE_8W_pct"), g.index).median(),
+                    "8周末收益中位数(%)": num(g.get("CP_W2_Delayed_Return_8W_pct"), g.index).median(),
+                })
+    return pd.DataFrame(rows)
+
+
+def path_audit(frame: pd.DataFrame) -> pd.DataFrame:
+    target_by_group = {MID_GROUP: 30, HIGH_GROUP: 50, DOUBLE_GROUP: 100}
+    rows = []
+    for state in STATE_ORDER:
+        for group_name, target in target_by_group.items():
+            g = frame[frame.Weekly_Trend.eq(state) & frame["结果组"].eq(group_name)]
+            status = g.get(f"CP_W2_Delayed_First_{target}_vs_Stop", pd.Series("", index=g.index)).astype(str)
+            target_first_mask = status.eq("目标先到")
+            stop_first_mask = status.isin(["止损先到", "同日不确定_按止损"])
+            rows.append({
+                "红柱形态": state, "结果组": group_name, "目标涨幅(%)": target,
+                "样本数": len(g), "目标先到数": int(target_first_mask.sum()),
+                "目标先到比例(%)": rate(target_first_mask),
+                "止损先到后来达到数": int(stop_first_mask.sum()),
+                "止损先到后来达到比例(%)": rate(stop_first_mask),
+                "MFE中位数(%)": num(g.get("CP_W2_Delayed_MFE_8W_pct"), g.index).median(),
+                "MAE中位数(%)": num(g.get("CP_W2_Delayed_MAE_8W_pct"), g.index).median(),
+            })
+    return pd.DataFrame(rows)
+
+
+def feature_gradient_table(frame: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for state in STATE_ORDER:
+        sf = frame[frame.Weekly_Trend.eq(state)].copy()
+        for label, feature in NUMERIC_MINING_FEATURES.items():
+            values = num(sf.get(feature), sf.index)
+            valid = values.notna()
+            if valid.sum() < 20 or values.loc[valid].nunique() < 5:
+                continue
+            try:
+                bins = pd.qcut(values.loc[valid], q=5, labels=False, duplicates="drop")
+            except ValueError:
+                continue
+            work = sf.loc[valid].copy()
+            work["特征分位组"] = bins.astype(int) + 1
+            for bucket, g in work.groupby("特征分位组"):
+                rows.append({
+                    "红柱形态": state, "特征": label, "字段": feature,
+                    "特征分位组": int(bucket), "样本数": len(g),
+                    "特征最小值": num(g[feature]).min(), "特征最大值": num(g[feature]).max(),
+                    "亏损比例(%)": rate(g["结果组"].eq(LOSS_GROUP)),
+                    "盈利不足30%比例(%)": rate(g["结果组"].eq(LOW_PROFIT_GROUP)),
+                    "30%～50%比例(%)": rate(g["结果组"].eq(MID_GROUP)),
+                    "50%～100%比例(%)": rate(g["结果组"].eq(HIGH_GROUP)),
+                    "翻倍比例(%)": rate(g["结果组"].eq(DOUBLE_GROUP)),
+                    "50%以上比例(%)": rate(g["结果组"].isin([HIGH_GROUP, DOUBLE_GROUP])),
+                    "MFE中位数(%)": num(g.CP_W2_Delayed_MFE_8W_pct).median(),
+                })
+    return pd.DataFrame(rows)
+
+
+def candidate_distinguishers(numeric_core: pd.DataFrame,
+                             numeric_adjacent: pd.DataFrame,
+                             categorical_core: pd.DataFrame,
+                             categorical_adjacent: pd.DataFrame) -> pd.DataFrame:
+    numeric = pd.concat([numeric_core, numeric_adjacent], ignore_index=True)
+    if not numeric.empty:
+        numeric = numeric.copy()
+        numeric["候选证据分"] = (
+            (num(numeric["方向化AUC"]) - 0.5).clip(lower=0) * 100.0
+            + (num(numeric["目标覆盖率(%)"]) - num(numeric["对照误入率(%)"])).clip(lower=0)
+        )
+        numeric["类别"] = ""
+        numeric["证据类型"] = "数值"
+    categorical = pd.concat([categorical_core, categorical_adjacent], ignore_index=True)
+    if not categorical.empty:
+        categorical = categorical.copy()
+        categorical["候选证据分"] = (
+            num(categorical["目标覆盖率(%)"]) - num(categorical["对照误入率(%)"])
+        ).clip(lower=0)
+        categorical["证据类型"] = "类别"
+        categorical["有利方向"] = "属于该类别"
+    common = ["对比集合", "红柱形态", "目标组", "对照组", "特征", "字段", "类别",
+              "证据类型", "目标样本", "对照样本", "有利方向", "目标覆盖率(%)",
+              "对照误入率(%)", "阈值命中精度(%)", "覆盖/误入倍数",
+              "年度同方向数", "年度可比较数", "证据等级", "候选证据分"]
+    parts = []
+    for data in (numeric, categorical):
+        if data.empty:
+            continue
+        for col in common:
+            if col not in data:
+                data[col] = np.nan
+        parts.append(data[common])
+    if not parts:
+        return pd.DataFrame(columns=common)
+    result = pd.concat(parts, ignore_index=True)
+    result = result[result["候选证据分"].gt(0)].copy()
+    result["组内审计排名"] = result.groupby(
+        ["对比集合", "红柱形态", "目标组", "对照组"]
+    )["候选证据分"].rank(method="first", ascending=False)
+    return result.sort_values(
+        ["对比集合", "红柱形态", "目标组", "对照组", "组内审计排名"]
+    )
+
+
+def mining_feature_dictionary() -> pd.DataFrame:
+    rows = []
+    for label, field in NUMERIC_MINING_FEATURES.items():
+        rows.append({"特征类型": "数值", "特征": label, "字段": field,
+                     "使用时点": "第二根完整红柱确认时已知", "是否参与评分": "否"})
+    for label, field in CATEGORICAL_MINING_FEATURES.items():
+        rows.append({"特征类型": "类别", "特征": label, "字段": field,
+                     "使用时点": "第二根完整红柱确认时已知", "是否参与评分": "否"})
+    return pd.DataFrame(rows)
+
+
+def main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption("只挖掘区别特征，不评分、不排名、不切换模式。严格复现三形态、五结果组和8周路径审计口径。")
+    with st.sidebar:
+        st.header("正式评价区间")
+        eval_date = st.date_input("评价开始", value=date(2023, 6, 5), key="v24_eval")
+        end_date = st.date_input("信号截止", value=date(2026, 6, 5), key="v24_end")
+        obs_date = st.date_input("行情观察截止", value=date.today(), max_value=date.today(), key="v24_obs")
+        st.header("冻结研究口径")
+        st.write("上涨、下降、中性三种形态分别研究")
+        st.write("未来8周最高涨幅分为30～50、50～100、翻倍以上")
+        st.write("MFE<30再分亏损组和盈利不足30%组")
+        st.write("保留-10%目标/止损先后路径审计")
+        st.write("本版不生成任何选股分数")
+        cache = st.checkbox("使用逐股票缓存", value=True, key="v24_cache")
+        pause = st.number_input("每次API调用后暂停(秒)", 0.0, 3.0, 0.12, 0.05, key="v24_pause")
+        if st.button("清除本程序缓存", key="v24_clear"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("缓存已清除")
+    token = st.text_input("Tushare Token", type="password", key="v24_token")
+    if not token:
+        st.info("请输入Tushare Token。")
+        return
+    session_key = "three_state_feature_mining_v24_zip"
+    if not st.button("开始V2.4三形态五组特征挖掘", type="primary", key="v24_run"):
+        if session_key in st.session_state:
+            st.download_button(
+                "下载上一次全部结果ZIP", st.session_state[session_key],
+                file_name="weekly_macd_three_state_feature_mining_v2_4_all_results.zip",
+                mime="application/zip", key="v24_previous_download",
+            )
+        return
+    if eval_date >= end_date or end_date > obs_date:
+        st.error("日期关系不正确。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    eval_start = pd.Timestamp(eval_date)
+    research = eval_date.strftime("%Y%m%d")
+    end = end_date.strftime("%Y%m%d")
+    obs = obs_date.strftime("%Y%m%d")
+    preload = (eval_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    config = {
+        "signal_start": research, "signal_end": end, "market_end": obs,
+        "preload_start": preload, "min_price": 10.0, "min_mv": 100.0,
+        "max_mv": 1_000_000_000.0, "price_tolerance_pct": 3.0,
+        "stop_threshold_pct": 10.0, "buy_slippage_pct": 0.20,
+        "sell_slippage_pct": 0.20, "sample_per_board": 0,
+        "sample_seed": DEFAULT_SAMPLE_SEED,
+        "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+    }
+    try:
+        with st.spinner("加载基础数据和板块指数..."):
+            opens = load_trade_calendar(preload, obs)
+            full = load_trade_calendar(preload, (obs_date + timedelta(days=7)).strftime("%Y%m%d"))
+            basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(pause))
+            week_map = complete_week_last_dates(full)
+            boards = {}
+            for code in sorted(set(BOARD_INDEX.values())):
+                board_daily = fetch_index_history(code, preload, obs, bool(cache), float(pause))
+                if not board_daily.empty:
+                    boards[code] = build_weekly(board_daily, week_map)
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+
+    periods = build_period_index(memberships)
+    codes = sorted(set(periods) & set(basic.ts_code.astype(str)))
+    universe = basic[basic.ts_code.isin(codes)].copy()
+    stocks, universe_audit, population = build_stratified_sample(
+        universe, periods, end, 0, DEFAULT_SAMPLE_SEED
+    )
+    listed = stocks.list_date.apply(lambda x: normalize_date(x, "19000101"))
+    delisted = stocks.delist_date.apply(lambda x: normalize_date(x, "99991231"))
+    stocks = stocks[~listed.gt(end) & ~delisted.lt(preload)].reset_index(drop=True)
+
+    open_pos = {trade_date: i for i, trade_date in enumerate(opens)}
+    records: list[dict[str, Any]] = []
+    histories: dict[str, pd.DataFrame] = {}
+    rejects: dict[str, int] = {}
+    cache_hits = data_failures = 0
+    progress = st.progress(0.0)
+    status = st.empty()
+    for i, stock in stocks.iterrows():
+        code = str(stock.ts_code)
+        progress.progress((i + 1) / len(stocks), text=f"{i + 1}/{len(stocks)} {code}")
+        status.caption(f"事件{len(records)}；缓存{cache_hits}；失败{data_failures}")
+        daily, daily_basic, hit = fetch_stock_history(
+            code, preload, obs, bool(cache), float(pause)
+        )
+        cache_hits += int(hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        stock_records, stock_rejects, _ = analyze_stock(
+            stock, periods.get(code, []), daily, daily_basic,
+            week_map, opens, open_pos, config,
+        )
+        records.extend(stock_records)
+        if stock_records:
+            histories[code] = daily.copy()
+        for reason, count in stock_rejects.items():
+            rejects[reason] = rejects.get(reason, 0) + count
+    progress.empty()
+    status.empty()
+    if not records:
+        st.error("没有生成事件。")
+        return
+
+    with st.spinner("建立三形态五结果组并完成特征对比..."):
+        events = pd.DataFrame(records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+        opportunities = build_cycle_opportunities(
+            events, histories, obs, config["sell_slippage_pct"]
+        )
+        featured = prepare_features(opportunities, boards)
+        candidates = featured[
+            featured.Strict_Eligible.map(bool_value)
+            & featured.Outcome_Mature.map(bool_value)
+            & featured.Selection_Date_dt.ge(eval_start)
+        ].copy()
+        candidates = assign_five_outcome_groups(candidates)
+        candidates = candidates[
+            candidates["三形态有效"] & candidates["结果组"].isin(GROUP_ORDER)
+        ].copy()
+        core_numeric = numeric_feature_comparisons(candidates, CORE_COMPARISONS, "核心18组")
+        core_categorical = categorical_feature_comparisons(candidates, CORE_COMPARISONS, "核心18组")
+        risk_numeric = numeric_feature_comparisons(candidates, RISK_COMPARISONS, "亏损风险")
+        risk_categorical = categorical_feature_comparisons(candidates, RISK_COMPARISONS, "亏损风险")
+        adjacent_numeric = numeric_feature_comparisons(candidates, ADJACENT_COMPARISONS, "相邻层级")
+        adjacent_categorical = categorical_feature_comparisons(candidates, ADJACENT_COMPARISONS, "相邻层级")
+        group_summary = five_group_summary(candidates)
+        yearly = year_group_summary(candidates)
+        paths = path_audit(candidates)
+        gradients = feature_gradient_table(candidates)
+        distinguishers = candidate_distinguishers(
+            core_numeric, pd.concat([risk_numeric, adjacent_numeric], ignore_index=True),
+            core_categorical, pd.concat([risk_categorical, adjacent_categorical], ignore_index=True)
+        )
+
+    expected_counts = candidates["结果组"].value_counts().reindex(GROUP_ORDER, fill_value=0)
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "版本": VERSION, "评价开始": research,
+        "信号截止": end, "观察截止": obs, "成熟候选": len(candidates),
+        "候选周": candidates.Selection_Date.nunique(),
+        "不同股票": candidates.ts_code.nunique(),
+        "上升趋势": int(candidates.Weekly_Trend.eq("上升趋势").sum()),
+        "中性趋势": int(candidates.Weekly_Trend.eq("中性趋势").sum()),
+        "下降趋势": int(candidates.Weekly_Trend.eq("下降趋势").sum()),
+        "亏损且MFE<30": int(expected_counts[LOSS_GROUP]),
+        "盈利且MFE<30": int(expected_counts[LOW_PROFIT_GROUP]),
+        "MFE30至50": int(expected_counts[MID_GROUP]),
+        "MFE50至100": int(expected_counts[HIGH_GROUP]),
+        "MFE翻倍": int(expected_counts[DOUBLE_GROUP]),
+        "行情失败": data_failures, "缓存命中": cache_hits,
+    }])
+    reject_frame = pd.DataFrame([{"剔除原因": k, "次数": v} for k, v in rejects.items()])
+    metadata = pd.DataFrame([
+        ("程序定位", "三形态五结果组特征挖掘；不评分、不排名、不切换模式"),
+        ("硬条件", "科技池、价≥10元、流通市值≥100亿元、第二根完整红柱严格扩张"),
+        ("三种形态", "上升趋势、中性趋势、下降趋势，互斥且覆盖全部候选"),
+        ("高涨幅分组", "第二根红柱确认后次日开盘买入，未来40个市场交易日MFE分30～50、50～100、翻倍以上"),
+        ("低涨幅分组", "MFE<30后按既有Realised_Utility分为亏损与盈利；严格复现已确认的2371样本口径"),
+        ("路径审计", "-10%只用于目标先到/止损先到审计，不改变高涨幅MFE分组"),
+        ("核心比较", "三形态×三个高涨幅组×亏损/低盈利两个对照组＝18组"),
+        ("相邻比较", "盈利不足30→30～50→50～100→翻倍，识别基础、强化和超级行情特征"),
+        ("未来信息隔离", "特征只使用第二根完整红柱确认时已知数据；未来8周字段只作结果标签"),
+        ("本版禁止", "不产生分数、不选Top3、不用结果反向修改硬条件"),
+    ], columns=["项目", "值"])
+
+    detail_columns = [
+        "Cycle_ID", "Selection_Date", "Selection_Year", "ts_code", "name",
+        "Sample_Board", "SW_L1", "SW_L2", "Weekly_Trend", "结果组",
+        "CP_W2_Delayed_MFE_8W_pct", "CP_W2_Delayed_MAE_8W_pct",
+        "CP_W2_Delayed_Return_8W_pct", "Realised_Utility",
+        "CP_W2_Delayed_First_30_vs_Stop", "CP_W2_Delayed_First_50_vs_Stop",
+        "CP_W2_Delayed_First_100_vs_Stop", *NUMERIC_MINING_FEATURES.values(),
+    ]
+    detail_columns = list(dict.fromkeys(c for c in detail_columns if c in candidates.columns))
+    files = {
+        "01_run_summary_three_state_feature_mining_v2_4.csv": run_summary,
+        "02_five_group_summary_three_state_feature_mining_v2_4.csv": group_summary,
+        "03_year_five_group_summary_three_state_feature_mining_v2_4.csv": yearly,
+        "04_core_18_numeric_comparisons_three_state_feature_mining_v2_4.csv": core_numeric,
+        "05_core_18_categorical_comparisons_three_state_feature_mining_v2_4.csv": core_categorical,
+        "06_loss_vs_low_profit_numeric_three_state_feature_mining_v2_4.csv": risk_numeric,
+        "07_loss_vs_low_profit_categorical_three_state_feature_mining_v2_4.csv": risk_categorical,
+        "08_adjacent_numeric_comparisons_three_state_feature_mining_v2_4.csv": adjacent_numeric,
+        "09_adjacent_categorical_comparisons_three_state_feature_mining_v2_4.csv": adjacent_categorical,
+        "10_target_stop_path_audit_three_state_feature_mining_v2_4.csv": paths,
+        "11_feature_gradient_quintiles_three_state_feature_mining_v2_4.csv": gradients,
+        "12_candidate_distinguishers_three_state_feature_mining_v2_4.csv": distinguishers,
+        "13_all_group_candidate_detail_three_state_feature_mining_v2_4.csv": candidates[detail_columns],
+        "14_feature_dictionary_three_state_feature_mining_v2_4.csv": mining_feature_dictionary(),
+        "15_all_evaluation_candidate_features_three_state_feature_mining_v2_4.csv": candidates,
+        "16_all_event_features_three_state_feature_mining_v2_4.csv": featured,
+        "17_full_tech_universe_three_state_feature_mining_v2_4.csv": universe_audit,
+        "18_population_three_state_feature_mining_v2_4.csv": population,
+        "19_rejection_audit_three_state_feature_mining_v2_4.csv": reject_frame,
+        "20_metadata_three_state_feature_mining_v2_4.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state[session_key] = result_zip
+    st.success(
+        f"完成：{len(candidates)}个成熟候选；三形态五组、18组核心对比和相邻层级对比已生成。"
+    )
+    st.subheader("三形态五结果组")
+    st.dataframe(group_summary, use_container_width=True, hide_index=True)
+    st.subheader("30%～50%组目标先到路径核对")
+    st.dataframe(paths[paths["结果组"].eq(MID_GROUP)], use_container_width=True, hide_index=True)
+    st.subheader("候选区别特征（仅审计，不是评分）")
+    st.dataframe(distinguishers[distinguishers["组内审计排名"].le(10)],
+                 use_container_width=True, hide_index=True)
+    st.download_button(
+        "下载全部结果ZIP", result_zip,
+        file_name="weekly_macd_three_state_feature_mining_v2_4_all_results.zip",
+        mime="application/zip", type="primary", key="v24_download",
+    )
+    st.warning("本版只发现区别特征。任何特征进入评分前，必须等待跨年稳定性、覆盖率和误选率审查。")
 
 
 if __name__ == "__main__":
