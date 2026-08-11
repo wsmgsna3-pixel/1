@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD三形态五结果组特征挖掘实验器 V2.4（单文件版）
-========================================================
+科技股周线MACD三形态双特征跨年验证器 V2.5（单文件版）
+====================================================
 
 本程序在第二根完整红柱严格扩张候选中，先按红柱出现时的周线状态互斥分成
 上升趋势、中性趋势、下降趋势，再按未来八周最高涨幅和既有交易效用分成五个
-结果组。程序只挖掘区别特征、覆盖率、误选率、跨年稳定性和上涨路径，不生成
-评分、不选Top3、不进行模式切换。
+结果组。程序在每一个留出年份中，只使用其他年份学习单特征形状、阈值和双特征
+组合，再由留出年份独立判卷。程序不生成最终评分、不选Top3、不进行模式切换。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30%/+50%/+100% 的概率。
@@ -31,7 +31,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_three_state_feature_mining_v2_4_single.py
+    streamlit run weekly_macd_two_feature_oos_v2_5_single.py
 """
 
 from __future__ import annotations
@@ -2710,9 +2710,9 @@ def opportunity_summary(frame: pd.DataFrame, group_columns: list[str] | None = N
 
 
 # -----------------------------------------------------------------------------
-# Streamlit 页面
+# Streamlit 页面（旧基线，V2.5不调用）
 # -----------------------------------------------------------------------------
-def main() -> None:
+def v10_main_legacy() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
@@ -6381,7 +6381,7 @@ def feature_dict() -> pd.DataFrame:
     ], columns=["专家模型", "特征组", "含义"])
 
 
-def main() -> None:
+def v23_main_legacy() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide"); st.title(TITLE)
     st.caption("本版只验证评分顺序：固定候选池、关闭学习、取消模式切换，比较透明非线性评分和两档过热惩罚。")
@@ -6518,9 +6518,9 @@ def main() -> None:
     st.warning("本版只验证评分顺序，不决定实盘模式；4周/8周影子切换器将在评分通过后单独验证。")
 
 
-# ===== V2.4 three-state / five-outcome feature mining lab (single file) =====
-TITLE = "科技股周线MACD三形态五结果组特征挖掘实验器 V2.4"
-VERSION = "V2.4-THREE-STATE-FIVE-GROUP-FEATURE-MINING"
+# ===== V2.5 two-feature / leave-one-year-out validation lab (single file) =====
+TITLE = "科技股周线MACD三形态双特征跨年验证器 V2.5"
+VERSION = "V2.5-THREE-STATE-TWO-FEATURE-LOYO"
 
 STATE_ORDER = ("上升趋势", "中性趋势", "下降趋势")
 LOSS_GROUP = "亏损且最高涨幅<30%"
@@ -6914,7 +6914,503 @@ def mining_feature_dictionary() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
+# -----------------------------------------------------------------------------
+# V2.5：双特征组合与整年留出验证
+# -----------------------------------------------------------------------------
+V25_TASKS = (
+    {
+        "任务": "避免亏损",
+        "目标组": (LOW_PROFIT_GROUP,),
+        "对照组": (LOSS_GROUP,),
+        "含义": "在MFE都不足30%的股票中，区分盈利与亏损",
+        "正式验收": True,
+    },
+    {
+        "任务": "达到30%基础",
+        "目标组": (MID_GROUP, HIGH_GROUP, DOUBLE_GROUP),
+        "对照组": (LOW_PROFIT_GROUP,),
+        "含义": "在已经避免亏损后，区分能否进入30%以上行情",
+        "正式验收": True,
+    },
+    {
+        "任务": "进入50%强化",
+        "目标组": (HIGH_GROUP, DOUBLE_GROUP),
+        "对照组": (MID_GROUP,),
+        "含义": "在已经达到30%的股票中，区分能否继续进入50%以上行情",
+        "正式验收": True,
+    },
+    {
+        "任务": "翻倍附加",
+        "目标组": (DOUBLE_GROUP,),
+        "对照组": (HIGH_GROUP,),
+        "含义": "50%～100%与翻倍组的探索性比较；样本不足，不作正式验收",
+        "正式验收": False,
+    },
+)
+
+# 所有规则形状在看留出年以前固定。阈值只能由训练年份的分位数生成。
+V25_RULE_SHAPES = (
+    ("低端40%", None, 0.40),
+    ("低端20%", None, 0.20),
+    ("高端40%", 0.60, None),
+    ("高端20%", 0.80, None),
+    ("中间60%", 0.20, 0.80),
+    ("中间40%", 0.30, 0.70),
+    ("偏弱中段", 0.20, 0.60),
+    ("偏强中段", 0.40, 0.80),
+    ("排除最高20%", None, 0.80),
+    ("排除最低20%", 0.20, None),
+)
+
+V25_MIN_TRAIN_EACH = 15
+V25_MIN_TEST_EACH = 5
+V25_TOP_SINGLE_FEATURES = 10
+V25_TOP_PAIRS_PER_FOLD = 10
+V25_MAX_PAIR_CORRELATION = 0.90
+
+
+def v25_task_definitions() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "分层任务": task["任务"],
+            "目标组": " + ".join(task["目标组"]),
+            "对照组": " + ".join(task["对照组"]),
+            "研究含义": task["含义"],
+            "是否正式验收": "是" if task["正式验收"] else "否，只作探索",
+        }
+        for task in V25_TASKS
+    ])
+
+
+def v25_rule_mask(values: pd.Series, lower: float, upper: float) -> pd.Series:
+    x = pd.to_numeric(values, errors="coerce")
+    selected = pd.Series(True, index=x.index, dtype=bool)
+    if math.isfinite(lower):
+        selected &= x.ge(lower)
+    if math.isfinite(upper):
+        selected &= x.le(upper)
+    return selected & x.notna()
+
+
+def v25_binary_metrics(labels: pd.Series, selected: pd.Series) -> dict[str, Any]:
+    y = labels.astype(bool)
+    picked = selected.reindex(y.index, fill_value=False).astype(bool)
+    target_n = int(y.sum())
+    control_n = int((~y).sum())
+    selected_target = int((picked & y).sum())
+    selected_control = int((picked & ~y).sum())
+    selected_n = selected_target + selected_control
+    baseline = target_n / (target_n + control_n) if target_n + control_n else np.nan
+    precision = selected_target / selected_n if selected_n else np.nan
+    target_coverage = selected_target / target_n if target_n else np.nan
+    control_entry = selected_control / control_n if control_n else np.nan
+    lift = precision / baseline if selected_n and baseline > 0 else np.nan
+    return {
+        "目标样本": target_n,
+        "对照样本": control_n,
+        "入选目标": selected_target,
+        "误入对照": selected_control,
+        "入选总数": selected_n,
+        "基准目标率(%)": baseline * 100.0 if math.isfinite(baseline) else np.nan,
+        "入选目标率(%)": precision * 100.0 if math.isfinite(precision) else np.nan,
+        "目标覆盖率(%)": target_coverage * 100.0 if math.isfinite(target_coverage) else np.nan,
+        "对照误入率(%)": control_entry * 100.0 if math.isfinite(control_entry) else np.nan,
+        "相对基准提升倍数": lift,
+    }
+
+
+def v25_training_year_consistency(frame: pd.DataFrame,
+                                  selected: pd.Series) -> tuple[int, int]:
+    work = frame.copy()
+    work["_Selected"] = selected.reindex(work.index, fill_value=False).astype(bool)
+    improved = comparable = 0
+    for _, year in work.groupby("Selection_Year"):
+        labels = year["_Target"].astype(bool)
+        if int(labels.sum()) < 5 or int((~labels).sum()) < 5:
+            continue
+        metrics = v25_binary_metrics(labels, year["_Selected"])
+        if metrics["入选总数"] < 3 or not math.isfinite(metrics["相对基准提升倍数"]):
+            continue
+        comparable += 1
+        improved += int(metrics["相对基准提升倍数"] > 1.0)
+    return improved, comparable
+
+
+def v25_learn_single_rules(train: pd.DataFrame) -> pd.DataFrame:
+    """只用训练年份选择每个数值特征的最佳预设形状与训练分位阈值。"""
+    rows: list[dict[str, Any]] = []
+    labels = train["_Target"].astype(bool)
+    for feature_label, field in NUMERIC_MINING_FEATURES.items():
+        if field not in train:
+            continue
+        values = pd.to_numeric(train[field], errors="coerce")
+        if values.notna().sum() < 30 or values.nunique(dropna=True) < 8:
+            continue
+        for shape_name, lower_q, upper_q in V25_RULE_SHAPES:
+            lower = float(values.quantile(lower_q)) if lower_q is not None else np.nan
+            upper = float(values.quantile(upper_q)) if upper_q is not None else np.nan
+            selected = v25_rule_mask(values, lower, upper)
+            metrics = v25_binary_metrics(labels, selected)
+            target_coverage = metrics["目标覆盖率(%)"] / 100.0
+            edge = (metrics["目标覆盖率(%)"] - metrics["对照误入率(%)"]) / 100.0
+            lift = metrics["相对基准提升倍数"]
+            if (target_coverage < 0.20 or metrics["入选总数"] < 8
+                    or not math.isfinite(lift) or edge <= 0 or lift <= 1.02):
+                continue
+            improved, comparable = v25_training_year_consistency(train, selected)
+            consistency = improved / comparable if comparable else 0.0
+            score = edge * 100.0 + (lift - 1.0) * 20.0 + consistency * 5.0
+            rows.append({
+                "特征": feature_label, "字段": field, "规则形状": shape_name,
+                "训练下限": lower, "训练上限": upper,
+                **metrics,
+                "训练改善年份": improved, "训练可比较年份": comparable,
+                "训练规则分": score,
+            })
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    # 每个字段只留下一个形状，避免同一指标用十种切法制造虚假候选。
+    result = result.sort_values("训练规则分", ascending=False)
+    result = result.drop_duplicates("字段", keep="first")
+    return result.head(V25_TOP_SINGLE_FEATURES).reset_index(drop=True)
+
+
+def v25_apply_rule(frame: pd.DataFrame, rule: pd.Series | dict[str, Any]) -> pd.Series:
+    field = str(rule["字段"])
+    lower = finite_num(rule.get("训练下限", np.nan))
+    upper = finite_num(rule.get("训练上限", np.nan))
+    return v25_rule_mask(frame.get(field, pd.Series(np.nan, index=frame.index)), lower, upper)
+
+
+def v25_learn_pairs(train: pd.DataFrame,
+                    single_rules: pd.DataFrame) -> pd.DataFrame:
+    """在训练年内组合两个不同字段；相关性过高的重复指标禁止配对。"""
+    if len(single_rules) < 2:
+        return pd.DataFrame()
+    labels = train["_Target"].astype(bool)
+    rows: list[dict[str, Any]] = []
+    for left_i in range(len(single_rules)):
+        for right_i in range(left_i + 1, len(single_rules)):
+            left = single_rules.iloc[left_i]
+            right = single_rules.iloc[right_i]
+            left_values = pd.to_numeric(train[left["字段"]], errors="coerce")
+            right_values = pd.to_numeric(train[right["字段"]], errors="coerce")
+            correlation = left_values.corr(right_values, method="spearman")
+            if math.isfinite(correlation) and abs(correlation) > V25_MAX_PAIR_CORRELATION:
+                continue
+            selected = v25_apply_rule(train, left) & v25_apply_rule(train, right)
+            metrics = v25_binary_metrics(labels, selected)
+            target_coverage = metrics["目标覆盖率(%)"] / 100.0
+            lift = metrics["相对基准提升倍数"]
+            if (target_coverage < 0.10 or metrics["入选总数"] < 6
+                    or not math.isfinite(lift) or lift <= 1.02):
+                continue
+            improved, comparable = v25_training_year_consistency(train, selected)
+            consistency = improved / comparable if comparable else 0.0
+            edge = (metrics["目标覆盖率(%)"] - metrics["对照误入率(%)"]) / 100.0
+            precision_edge = metrics["入选目标率(%)"] - metrics["基准目标率(%)"]
+            score = precision_edge + edge * 50.0 + consistency * 5.0
+            signature_parts = sorted([
+                (str(left["字段"]), str(left["特征"]), str(left["规则形状"])),
+                (str(right["字段"]), str(right["特征"]), str(right["规则形状"])),
+            ])
+            rows.append({
+                "特征1": left["特征"], "字段1": left["字段"],
+                "形状1": left["规则形状"], "下限1": left["训练下限"], "上限1": left["训练上限"],
+                "特征2": right["特征"], "字段2": right["字段"],
+                "形状2": right["规则形状"], "下限2": right["训练下限"], "上限2": right["训练上限"],
+                "组合签名": f"{signature_parts[0][0]}[{signature_parts[0][2]}] + "
+                            f"{signature_parts[1][0]}[{signature_parts[1][2]}]",
+                "字段组合": " + ".join(sorted([str(left["字段"]), str(right["字段"])])),
+                "训练Spearman相关": correlation,
+                **metrics,
+                "训练改善年份": improved, "训练可比较年份": comparable,
+                "训练组合分": score,
+            })
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    result = result.sort_values(
+        ["训练组合分", "相对基准提升倍数", "目标覆盖率(%)"],
+        ascending=False,
+    ).head(V25_TOP_PAIRS_PER_FOLD).reset_index(drop=True)
+    result["训练排名"] = np.arange(1, len(result) + 1)
+    return result
+
+
+def v25_apply_pair(frame: pd.DataFrame, pair: pd.Series | dict[str, Any]) -> pd.Series:
+    left = {
+        "字段": pair["字段1"], "训练下限": pair.get("下限1", np.nan),
+        "训练上限": pair.get("上限1", np.nan),
+    }
+    right = {
+        "字段": pair["字段2"], "训练下限": pair.get("下限2", np.nan),
+        "训练上限": pair.get("上限2", np.nan),
+    }
+    return v25_apply_rule(frame, left) & v25_apply_rule(frame, right)
+
+
+def v25_prepare_candidates(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    if "Selection_Date" not in out:
+        raise ValueError("输入缺少 Selection_Date")
+    out["Selection_Date"] = out["Selection_Date"].map(normalize_date)
+    out["Selection_Date_dt"] = pd.to_datetime(
+        out["Selection_Date"], format="%Y%m%d", errors="coerce"
+    )
+    out["Selection_Year"] = out["Selection_Date"].str[:4]
+    required = {
+        "Weekly_Trend", "CP_W2_Delayed_MFE_8W_pct", "Realised_Utility",
+        *NUMERIC_MINING_FEATURES.values(),
+    }
+    missing = sorted(required - set(out.columns))
+    if missing:
+        raise ValueError("输入缺少V2.5所需字段：" + "、".join(missing))
+    out = assign_five_outcome_groups(out)
+    out = out[
+        out["三形态有效"] & out["结果组"].isin(GROUP_ORDER)
+        & out["Selection_Date_dt"].notna()
+    ].copy()
+    identity = [c for c in ("Cycle_ID", "Selection_Date", "ts_code") if c in out]
+    if identity:
+        out = out.drop_duplicates(identity, keep="first")
+    return out.sort_values(["Selection_Date", "ts_code"]).reset_index(drop=True)
+
+
+def v25_load_v24_upload(uploaded_file: Any) -> tuple[pd.DataFrame, pd.DataFrame]:
+    raw = uploaded_file.getvalue()
+    input_summary = pd.DataFrame()
+    if str(uploaded_file.name).lower().endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
+            names = archive.namelist()
+            candidate_names = [name for name in names if
+                               "15_all_evaluation_candidate_features" in name]
+            if not candidate_names:
+                candidate_names = [name for name in names if
+                                   "all_evaluation_candidate_features" in name]
+            if not candidate_names:
+                raise ValueError("ZIP中没有找到V2.4的15号候选特征文件")
+            with archive.open(candidate_names[0]) as source:
+                candidates = pd.read_csv(source, low_memory=False)
+            summary_names = [name for name in names if "01_run_summary" in name]
+            if summary_names:
+                with archive.open(summary_names[0]) as source:
+                    input_summary = pd.read_csv(source, low_memory=False)
+    else:
+        candidates = pd.read_csv(io.BytesIO(raw), low_memory=False)
+    return v25_prepare_candidates(candidates), input_summary
+
+
+def v25_run_loyo(candidates: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """逐形态、逐层级、逐年留出；留出年的标签不参与规则和阈值选择。"""
+    fold_rows: list[dict[str, Any]] = []
+    single_rows: list[dict[str, Any]] = []
+    pair_rows: list[dict[str, Any]] = []
+    best_rows: list[dict[str, Any]] = []
+    selected_rows: list[dict[str, Any]] = []
+    years = sorted(candidates["Selection_Year"].dropna().astype(str).unique())
+    for state in STATE_ORDER:
+        state_frame = candidates[candidates["Weekly_Trend"].eq(state)].copy()
+        for task in V25_TASKS:
+            target_groups = tuple(task["目标组"])
+            control_groups = tuple(task["对照组"])
+            allowed_groups = target_groups + control_groups
+            task_frame = state_frame[state_frame["结果组"].isin(allowed_groups)].copy()
+            task_frame["_Target"] = task_frame["结果组"].isin(target_groups)
+            for holdout in years:
+                fold_id = f"{state}|{task['任务']}|留出{holdout}"
+                train = task_frame[task_frame["Selection_Year"].ne(holdout)].copy()
+                test = task_frame[task_frame["Selection_Year"].eq(holdout)].copy()
+                train_target = int(train["_Target"].sum())
+                train_control = int((~train["_Target"]).sum())
+                test_target = int(test["_Target"].sum())
+                test_control = int((~test["_Target"]).sum())
+                min_train = 5 if not task["正式验收"] else V25_MIN_TRAIN_EACH
+                min_test = 2 if not task["正式验收"] else V25_MIN_TEST_EACH
+                eligible = (
+                    train_target >= min_train and train_control >= min_train
+                    and test_target >= min_test and test_control >= min_test
+                )
+                fold_row = {
+                    "折叠ID": fold_id, "红柱形态": state, "分层任务": task["任务"],
+                    "留出年份": holdout, "正式验收任务": bool(task["正式验收"]),
+                    "训练目标": train_target, "训练对照": train_control,
+                    "测试目标": test_target, "测试对照": test_control,
+                    "样本门槛通过": eligible,
+                    "处理状态": "样本不足" if not eligible else "待训练",
+                }
+                if not eligible:
+                    fold_rows.append(fold_row)
+                    continue
+                single = v25_learn_single_rules(train)
+                if single.empty:
+                    fold_row["处理状态"] = "训练年没有合格单特征"
+                    fold_rows.append(fold_row)
+                    continue
+                single = single.copy()
+                single.insert(0, "折叠ID", fold_id)
+                single.insert(1, "红柱形态", state)
+                single.insert(2, "分层任务", task["任务"])
+                single.insert(3, "留出年份", holdout)
+                single["训练单特征排名"] = np.arange(1, len(single) + 1)
+                for _, rule in single.iterrows():
+                    test_metrics = v25_binary_metrics(test["_Target"], v25_apply_rule(test, rule))
+                    row = rule.to_dict()
+                    row.update({f"测试_{key}": value for key, value in test_metrics.items()})
+                    single_rows.append(row)
+                pairs = v25_learn_pairs(train, single)
+                if pairs.empty:
+                    fold_row["处理状态"] = "训练年没有合格双特征组合"
+                    fold_rows.append(fold_row)
+                    continue
+                fold_row["处理状态"] = "完成"
+                fold_row["训练单特征数"] = len(single)
+                fold_row["训练组合数"] = len(pairs)
+                fold_rows.append(fold_row)
+                best_single = single.iloc[0]
+                best_single_test = v25_binary_metrics(
+                    test["_Target"], v25_apply_rule(test, best_single)
+                )
+                for _, pair in pairs.iterrows():
+                    test_selected = v25_apply_pair(test, pair)
+                    test_metrics = v25_binary_metrics(test["_Target"], test_selected)
+                    row = pair.to_dict()
+                    row.update({
+                        "折叠ID": fold_id, "红柱形态": state,
+                        "分层任务": task["任务"], "留出年份": holdout,
+                        "正式验收任务": bool(task["正式验收"]),
+                        "测试判卷有效": test_metrics["入选总数"] >= (
+                            5 if task["正式验收"] else 2
+                        ),
+                        **{f"测试_{key}": value for key, value in test_metrics.items()},
+                    })
+                    pair_rows.append(row)
+                    if int(pair["训练排名"]) == 1:
+                        best = row.copy()
+                        best.update({
+                            "最佳单特征": best_single["特征"],
+                            "最佳单特征形状": best_single["规则形状"],
+                            **{f"单特征测试_{key}": value
+                               for key, value in best_single_test.items()},
+                        })
+                        best_rows.append(best)
+                        picked = test[test_selected].copy()
+                        for _, event in picked.iterrows():
+                            selected_rows.append({
+                                "折叠ID": fold_id, "红柱形态": state,
+                                "分层任务": task["任务"], "留出年份": holdout,
+                                "组合签名": pair["组合签名"],
+                                "是否目标组": bool(event["_Target"]),
+                                "结果组": event["结果组"],
+                                "Selection_Date": event.get("Selection_Date", ""),
+                                "ts_code": event.get("ts_code", ""),
+                                "name": event.get("name", ""),
+                                "MFE8周(%)": event.get("CP_W2_Delayed_MFE_8W_pct", np.nan),
+                                "MAE8周(%)": event.get("CP_W2_Delayed_MAE_8W_pct", np.nan),
+                                "8周末收益(%)": event.get("CP_W2_Delayed_Return_8W_pct", np.nan),
+                            })
+    folds = pd.DataFrame(fold_rows)
+    singles = pd.DataFrame(single_rows)
+    pairs = pd.DataFrame(pair_rows)
+    best = pd.DataFrame(best_rows)
+    selected = pd.DataFrame(selected_rows)
+    aggregate = v25_aggregate_acceptance(best)
+    stability = v25_pair_stability(pairs)
+    return {
+        "folds": folds, "singles": singles, "pairs": pairs,
+        "best": best, "aggregate": aggregate,
+        "stability": stability, "selected": selected,
+    }
+
+
+def v25_aggregate_acceptance(best: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if best.empty:
+        return pd.DataFrame()
+    for (state, task_name), group in best.groupby(["红柱形态", "分层任务"]):
+        target_n = int(num(group["测试_目标样本"]).sum())
+        control_n = int(num(group["测试_对照样本"]).sum())
+        selected_target = int(num(group["测试_入选目标"]).sum())
+        selected_control = int(num(group["测试_误入对照"]).sum())
+        selected_n = selected_target + selected_control
+        baseline = target_n / (target_n + control_n) if target_n + control_n else np.nan
+        precision = selected_target / selected_n if selected_n else np.nan
+        coverage = selected_target / target_n if target_n else np.nan
+        lift = precision / baseline if selected_n and baseline > 0 else np.nan
+        adequate_mask = num(group["测试_入选总数"]).ge(5)
+        adequate_folds = int(adequate_mask.sum())
+        improved = int((adequate_mask & num(group["测试_相对基准提升倍数"]).gt(1.0)).sum())
+        folds = len(group)
+        single_target = int(num(group["单特征测试_入选目标"]).sum())
+        single_control = int(num(group["单特征测试_误入对照"]).sum())
+        single_n = single_target + single_control
+        single_precision = single_target / single_n if single_n else np.nan
+        formal = bool(group["正式验收任务"].iloc[0])
+        needed_improved = math.ceil(folds * 2 / 3)
+        if not formal:
+            verdict = "探索层：禁止正式通过"
+        elif folds < 3:
+            verdict = "样本不足：少于3个可判卷年份"
+        elif adequate_folds < 3:
+            verdict = "样本不足：少于3年各自入选至少5只"
+        elif selected_n < 20:
+            verdict = "样本不足：留出年合计入选少于20"
+        elif improved < needed_improved:
+            verdict = "未通过：跨年方向不稳定"
+        elif not math.isfinite(lift) or lift < 1.15:
+            verdict = "未通过：相对基准提升不足15%"
+        elif not math.isfinite(coverage) or coverage < 0.12:
+            verdict = "未通过：目标覆盖率不足12%"
+        elif math.isfinite(single_precision) and precision <= single_precision:
+            verdict = "未通过：双特征未优于最佳单特征"
+        else:
+            verdict = "通过候选验收，可进入下一阶段"
+        rows.append({
+            "红柱形态": state, "分层任务": task_name,
+            "可判卷年份": folds, "入选至少5只年份": adequate_folds, "改善年份": improved,
+            "要求改善年份": needed_improved,
+            "测试目标样本": target_n, "测试对照样本": control_n,
+            "双特征入选数": selected_n,
+            "双特征目标率(%)": precision * 100.0 if math.isfinite(precision) else np.nan,
+            "未筛选基准目标率(%)": baseline * 100.0 if math.isfinite(baseline) else np.nan,
+            "双特征OOS提升倍数": lift,
+            "双特征目标覆盖率(%)": coverage * 100.0 if math.isfinite(coverage) else np.nan,
+            "最佳单特征目标率(%)": single_precision * 100.0
+            if math.isfinite(single_precision) else np.nan,
+            "验收结论": verdict,
+        })
+    return pd.DataFrame(rows).sort_values(["红柱形态", "分层任务"])
+
+
+def v25_pair_stability(pairs: pd.DataFrame) -> pd.DataFrame:
+    if pairs.empty:
+        return pd.DataFrame()
+    top = pairs[num(pairs["训练排名"]).le(5)].copy()
+    top["测试改善"] = (
+        num(top["测试_入选总数"]).ge(5)
+        & num(top["测试_相对基准提升倍数"]).gt(1.0)
+    )
+    rows = []
+    for keys, group in top.groupby(["红柱形态", "分层任务", "组合签名", "字段组合"]):
+        rows.append({
+            "红柱形态": keys[0], "分层任务": keys[1],
+            "组合签名": keys[2], "字段组合": keys[3],
+            "进入训练前5次数": len(group),
+            "涉及留出年份": group["留出年份"].nunique(),
+            "测试改善次数": int(group["测试改善"].sum()),
+            "平均训练提升倍数": num(group["相对基准提升倍数"]).mean(),
+            "平均OOS提升倍数": num(group["测试_相对基准提升倍数"]).mean(),
+            "平均OOS目标覆盖率(%)": num(group["测试_目标覆盖率(%)"]).mean(),
+            "OOS合计入选": int(num(group["测试_入选总数"]).sum()),
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["红柱形态", "分层任务", "涉及留出年份", "测试改善次数", "平均OOS提升倍数"],
+        ascending=[True, True, False, False, False],
+    )
+
+
+def v24_main_legacy() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
@@ -7140,6 +7636,307 @@ def main() -> None:
         mime="application/zip", type="primary", key="v24_download",
     )
     st.warning("本版只发现区别特征。任何特征进入评分前，必须等待跨年稳定性、覆盖率和误选率审查。")
+
+
+def main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption(
+        "每次把一个年份完全留出，只用其他年份学习特征形状、分位阈值和两个特征的组合；"
+        "留出年份只负责判卷。本版不产生最终评分，也不选Top3。"
+    )
+
+    with st.sidebar:
+        st.header("数据来源")
+        source_mode = st.radio(
+            "选择底层样本来源",
+            ("上传V2.4全部结果ZIP（推荐）", "重新下载行情并生成样本"),
+            key="v25_source_mode",
+        )
+        uploaded = None
+        if source_mode.startswith("上传"):
+            uploaded = st.file_uploader(
+                "上传 weekly_macd_three_state_feature_mining_v2_4_all_results.zip",
+                type=["zip", "csv"], key="v25_v24_upload",
+                help="也可以直接上传V2.4的15号候选特征CSV。这样能严格复用2371个样本，且无需重新下载行情。",
+            )
+            st.info("推荐使用本次V2.4结果ZIP：样本完全一致，几分钟内即可完成组合验证。")
+            eval_date = end_date = obs_date = None
+            cache = True
+            pause = 0.12
+        else:
+            st.header("正式评价区间")
+            eval_date = st.date_input("评价开始", value=date(2023, 6, 5), key="v25_eval")
+            end_date = st.date_input("信号截止", value=date(2026, 6, 5), key="v25_end")
+            obs_date = st.date_input(
+                "行情观察截止", value=date.today(), max_value=date.today(), key="v25_obs"
+            )
+            cache = st.checkbox("使用逐股票缓存", value=True, key="v25_cache")
+            pause = st.number_input(
+                "每次API调用后暂停(秒)", 0.0, 3.0, 0.12, 0.05, key="v25_pause"
+            )
+            if st.button("清除本程序缓存", key="v25_clear"):
+                if os.path.isdir(CACHE_DIR):
+                    shutil.rmtree(CACHE_DIR)
+                st.success("缓存已清除")
+
+        st.header("冻结验证规则")
+        st.write("形态：上升、中性、下降分别验证")
+        st.write("层级：避免亏损、达到30%、进入50%、翻倍附加")
+        st.write("每条规则最多两个数值特征")
+        st.write("阈值只来自训练年份分位数")
+        st.write("行业名称不参与组合，避免把历史主线写死")
+        st.write("翻倍层只探索，任何结果都不正式通过")
+
+    token = ""
+    if source_mode.startswith("重新"):
+        token = st.text_input("Tushare Token", type="password", key="v25_token")
+
+    session_key = "two_feature_oos_v25_zip"
+    run_requested = st.button("开始V2.5双特征跨年验证", type="primary", key="v25_run")
+    if not run_requested:
+        if session_key in st.session_state:
+            st.success("上一次V2.5结果仍然保留，可直接下载。")
+            st.download_button(
+                "下载上一次全部结果ZIP", st.session_state[session_key],
+                file_name="weekly_macd_two_feature_oos_v2_5_all_results.zip",
+                mime="application/zip", key="v25_previous_download",
+            )
+        return
+
+    API_ERRORS = []
+    input_summary = pd.DataFrame()
+    universe_audit = pd.DataFrame()
+    population = pd.DataFrame()
+    reject_frame = pd.DataFrame()
+    featured = pd.DataFrame()
+    data_failures = cache_hits = 0
+
+    if source_mode.startswith("上传"):
+        if uploaded is None:
+            st.error("请先上传V2.4全部结果ZIP或15号候选特征CSV。")
+            return
+        try:
+            with st.spinner("读取并核对V2.4三形态五结果组样本..."):
+                candidates, input_summary = v25_load_v24_upload(uploaded)
+        except Exception as exc:
+            st.error(f"V2.4结果读取失败：{exc}")
+            return
+        source_description = f"复用上传文件 {uploaded.name}"
+        research = candidates["Selection_Date"].min()
+        end = candidates["Selection_Date"].max()
+        obs = "沿用V2.4"
+    else:
+        if not token:
+            st.error("请输入Tushare Token。")
+            return
+        if eval_date is None or end_date is None or obs_date is None:
+            st.error("日期配置不完整。")
+            return
+        if eval_date >= end_date or end_date > obs_date:
+            st.error("日期关系不正确。")
+            return
+        ts.set_token(token)
+        pro = ts.pro_api()
+        eval_start = pd.Timestamp(eval_date)
+        research = eval_date.strftime("%Y%m%d")
+        end = end_date.strftime("%Y%m%d")
+        obs = obs_date.strftime("%Y%m%d")
+        preload = (eval_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+        config = {
+            "signal_start": research, "signal_end": end, "market_end": obs,
+            "preload_start": preload, "min_price": 10.0, "min_mv": 100.0,
+            "max_mv": 1_000_000_000.0, "price_tolerance_pct": 3.0,
+            "stop_threshold_pct": 10.0, "buy_slippage_pct": 0.20,
+            "sell_slippage_pct": 0.20, "sample_per_board": 0,
+            "sample_seed": DEFAULT_SAMPLE_SEED,
+            "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+            "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+            "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+        }
+        try:
+            with st.spinner("加载基础数据、完整交易日历和板块指数..."):
+                opens = load_trade_calendar(preload, obs)
+                full = load_trade_calendar(
+                    preload, (obs_date + timedelta(days=7)).strftime("%Y%m%d")
+                )
+                basic = load_stock_basic()
+                memberships = load_sw_tech_memberships(float(pause))
+                week_map = complete_week_last_dates(full)
+                boards: dict[str, pd.DataFrame] = {}
+                for code in sorted(set(BOARD_INDEX.values())):
+                    board_daily = fetch_index_history(
+                        code, preload, obs, bool(cache), float(pause)
+                    )
+                    if not board_daily.empty:
+                        boards[code] = build_weekly(board_daily, week_map)
+        except Exception as exc:
+            st.error(f"基础数据加载失败：{exc}")
+            return
+
+        periods = build_period_index(memberships)
+        codes = sorted(set(periods) & set(basic.ts_code.astype(str)))
+        universe = basic[basic.ts_code.isin(codes)].copy()
+        stocks, universe_audit, population = build_stratified_sample(
+            universe, periods, end, 0, DEFAULT_SAMPLE_SEED
+        )
+        listed = stocks.list_date.apply(lambda x: normalize_date(x, "19000101"))
+        delisted = stocks.delist_date.apply(lambda x: normalize_date(x, "99991231"))
+        stocks = stocks[~listed.gt(end) & ~delisted.lt(preload)].reset_index(drop=True)
+        open_pos = {trade_date: i for i, trade_date in enumerate(opens)}
+        records: list[dict[str, Any]] = []
+        histories: dict[str, pd.DataFrame] = {}
+        rejects: dict[str, int] = {}
+        progress = st.progress(0.0)
+        status = st.empty()
+        for i, stock in stocks.iterrows():
+            code = str(stock.ts_code)
+            progress.progress((i + 1) / len(stocks), text=f"{i + 1}/{len(stocks)} {code}")
+            status.caption(f"事件{len(records)}；缓存{cache_hits}；失败{data_failures}")
+            daily, daily_basic, hit = fetch_stock_history(
+                code, preload, obs, bool(cache), float(pause)
+            )
+            cache_hits += int(hit)
+            if daily.empty:
+                data_failures += 1
+                continue
+            stock_records, stock_rejects, _ = analyze_stock(
+                stock, periods.get(code, []), daily, daily_basic,
+                week_map, opens, open_pos, config,
+            )
+            records.extend(stock_records)
+            if stock_records:
+                histories[code] = daily.copy()
+            for reason, count in stock_rejects.items():
+                rejects[reason] = rejects.get(reason, 0) + count
+        progress.empty()
+        status.empty()
+        if not records:
+            st.error("没有生成事件。")
+            return
+        with st.spinner("生成与V2.4完全相同的严格扩张成熟候选..."):
+            events = pd.DataFrame(records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+            opportunities = build_cycle_opportunities(
+                events, histories, obs, config["sell_slippage_pct"]
+            )
+            featured = prepare_features(opportunities, boards)
+            candidates = featured[
+                featured.Strict_Eligible.map(bool_value)
+                & featured.Outcome_Mature.map(bool_value)
+                & featured.Selection_Date_dt.ge(eval_start)
+            ].copy()
+            candidates = v25_prepare_candidates(candidates)
+        reject_frame = pd.DataFrame(
+            [{"剔除原因": reason, "次数": count} for reason, count in rejects.items()]
+        )
+        source_description = "本次从Tushare重新生成底层样本"
+
+    if candidates.empty:
+        st.error("没有形成可验证的成熟候选。")
+        return
+    if candidates["Selection_Year"].nunique() < 3:
+        st.error("至少需要三个不同年份，才能进行整年留出验证。")
+        return
+
+    with st.spinner("逐形态、逐层级、逐年份学习并验证双特征组合..."):
+        reports = v25_run_loyo(candidates)
+        group_summary = five_group_summary(candidates)
+        yearly = year_group_summary(candidates)
+        paths = path_audit(candidates)
+
+    aggregate = reports["aggregate"]
+    completed_folds = int(reports["folds"]["处理状态"].eq("完成").sum()) \
+        if not reports["folds"].empty else 0
+    passed = int(aggregate["验收结论"].str.startswith("通过候选").sum()) \
+        if not aggregate.empty else 0
+    counts = candidates["结果组"].value_counts().reindex(GROUP_ORDER, fill_value=0)
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "版本": VERSION, "数据来源": source_description,
+        "评价开始": research, "信号截止": end, "观察截止": obs,
+        "成熟候选": len(candidates), "候选周": candidates.Selection_Date.nunique(),
+        "不同股票": candidates.ts_code.nunique(),
+        "上升趋势": int(candidates.Weekly_Trend.eq("上升趋势").sum()),
+        "中性趋势": int(candidates.Weekly_Trend.eq("中性趋势").sum()),
+        "下降趋势": int(candidates.Weekly_Trend.eq("下降趋势").sum()),
+        "亏损且MFE<30": int(counts[LOSS_GROUP]),
+        "盈利且MFE<30": int(counts[LOW_PROFIT_GROUP]),
+        "MFE30至50": int(counts[MID_GROUP]),
+        "MFE50至100": int(counts[HIGH_GROUP]),
+        "MFE翻倍": int(counts[DOUBLE_GROUP]),
+        "完成留出折叠": completed_folds,
+        "通过候选验收任务": passed,
+        "行情失败": data_failures, "缓存命中": cache_hits,
+    }])
+    metadata = pd.DataFrame([
+        ("程序定位", "三形态、四层级、双特征组合的整年留出验证；不生成最终评分"),
+        ("底层口径", "严格沿用V2.4：科技池、价≥10元、流通市值≥100亿元、第二根完整红柱严格扩张"),
+        ("结果标签", "第二根红柱确认后次日开盘买入，未来40个市场交易日五个互斥结果组"),
+        ("验证隔离", "每个留出年份的标签、分布和阈值均不参与该折叠的训练"),
+        ("规则形状", "仅允许预先固定的高端、低端、中间、偏强中段、偏弱中段、排除极端等分位形状"),
+        ("组合限制", "每条组合严格两个不同字段；训练期Spearman绝对相关>0.90禁止配对"),
+        ("特征限制", "只使用第二根完整红柱确认时已知的24个数值特征；行业名称不参与组合"),
+        ("验收对象", "每个折叠仅训练排名第1的组合参与正式汇总；其余组合只作探索审计"),
+        ("正式门槛", "至少3个可判卷年份且每年各入选≥5只、2/3年份改善、OOS提升≥1.15、覆盖≥12%、合计入选≥20、双特征优于单特征"),
+        ("翻倍限制", "翻倍层无论结果如何都禁止正式通过；只输出低置信度探索"),
+        ("禁止事项", "本版不评分、不选Top3、不做模式切换、不用留出年反向修改规则"),
+    ], columns=["项目", "值"])
+
+    files = {
+        "01_run_summary_two_feature_oos_v2_5.csv": run_summary,
+        "02_five_group_summary_two_feature_oos_v2_5.csv": group_summary,
+        "03_layer_task_definitions_two_feature_oos_v2_5.csv": v25_task_definitions(),
+        "04_fold_sample_audit_two_feature_oos_v2_5.csv": reports["folds"],
+        "05_train_only_single_rules_two_feature_oos_v2_5.csv": reports["singles"],
+        "06_all_pair_oos_results_two_feature_oos_v2_5.csv": reports["pairs"],
+        "07_best_pair_each_fold_two_feature_oos_v2_5.csv": reports["best"],
+        "08_oos_acceptance_summary_two_feature_oos_v2_5.csv": aggregate,
+        "09_pair_cross_year_stability_two_feature_oos_v2_5.csv": reports["stability"],
+        "10_best_pair_selected_event_detail_two_feature_oos_v2_5.csv": reports["selected"],
+        "11_year_five_group_summary_two_feature_oos_v2_5.csv": yearly,
+        "12_target_stop_path_audit_two_feature_oos_v2_5.csv": paths,
+        "13_all_evaluation_candidate_features_two_feature_oos_v2_5.csv": candidates,
+        "14_feature_dictionary_two_feature_oos_v2_5.csv": mining_feature_dictionary(),
+        "15_metadata_two_feature_oos_v2_5.csv": metadata,
+    }
+    if not input_summary.empty:
+        files["16_input_v2_4_run_summary_two_feature_oos_v2_5.csv"] = input_summary
+    if not universe_audit.empty:
+        files["17_full_tech_universe_two_feature_oos_v2_5.csv"] = universe_audit
+    if not population.empty:
+        files["18_population_two_feature_oos_v2_5.csv"] = population
+    if not reject_frame.empty:
+        files["19_rejection_audit_two_feature_oos_v2_5.csv"] = reject_frame
+    if not featured.empty:
+        files["20_all_event_features_two_feature_oos_v2_5.csv"] = featured
+
+    result_zip = make_result_zip(files)
+    st.session_state[session_key] = result_zip
+    st.success(
+        f"完成：{len(candidates)}个成熟候选，{completed_folds}个留出折叠完成；"
+        f"{passed}个形态×层级任务通过候选验收。"
+    )
+    st.subheader("正式OOS验收结论")
+    st.dataframe(aggregate, use_container_width=True, hide_index=True)
+    st.subheader("每个留出年份的训练第一名组合")
+    st.dataframe(reports["best"], use_container_width=True, hide_index=True)
+    with st.expander("查看重复出现的组合与全部折叠样本审计"):
+        st.dataframe(reports["stability"], use_container_width=True, hide_index=True)
+        st.dataframe(reports["folds"], use_container_width=True, hide_index=True)
+    st.download_button(
+        "下载全部结果ZIP", result_zip,
+        file_name="weekly_macd_two_feature_oos_v2_5_all_results.zip",
+        mime="application/zip", type="primary", key="v25_download",
+    )
+    st.download_button(
+        "单独下载8号OOS验收总表", csv_bytes(aggregate),
+        file_name="08_oos_acceptance_summary_two_feature_oos_v2_5.csv",
+        mime="text/csv", key="v25_acceptance_download",
+    )
+    st.warning(
+        "如果没有任务通过，这不是程序失败，而是说明现有两个技术特征不足以跨年稳定区分层级。"
+        "禁止为了让结果好看而在本轮查看留出年后修改阈值。"
+    )
 
 
 if __name__ == "__main__":
