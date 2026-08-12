@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD直接目标与亏损否决跨年验证器 V2.6（单文件版）
-========================================================
+科技股周线MACD止损先到特征与误删代价前沿实验器 V2.7（单文件版）
+=========================================================
 
 本程序在第二根完整红柱严格扩张候选中，先按红柱出现时的周线状态互斥分成
 上升趋势、中性趋势、下降趋势，再按未来八周最高涨幅和既有交易效用分成五个
-结果组。程序不再串联“低盈利→30%→50%”条件，而是让30%以上直接对比全部
-30%以下、50%以上直接对比全部50%以下；亏损特征另作反向否决实验。每个留出
-年份只负责判卷，不参与特征、阈值和组合选择。程序不生成最终评分、不选Top3。
+结果组。程序把实盘坏结果重新定义为“-10%止损先于+30%目标”，把好结果定义为
+“+30%目标先于-10%止损”，并在允许误删20%、30%、40%、50%好股票的预算下，
+寻找最多能排除多少止损交易。加入当时已知的科技股、行业和上市板块环境变量，
+严格使用扩展时间窗口训练、未来半年判卷。程序不生成最终评分、不选Top3。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30%/+50%/+100% 的概率。
@@ -32,7 +33,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_direct_target_oos_v2_6_single.py
+    streamlit run weekly_macd_stop_first_veto_frontier_v2_7_single.py
 """
 
 from __future__ import annotations
@@ -8416,7 +8417,7 @@ def v26_selection_concentration(selected: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
+def v26_main_legacy() -> None:
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
     st.caption(
@@ -8555,6 +8556,806 @@ def main() -> None:
         "目标率提高但亏损率没有同步下降，只能称为行情潜力识别，不能进入实盘评分。"
         "禁止为了让某个任务通过而查看留出年后修改分位阈值。"
     )
+
+
+# =============================================================================
+# V2.7：止损先到负向特征、环境变量与误删代价前沿
+# =============================================================================
+TITLE = "科技股周线MACD止损先到特征与误删代价前沿实验器 V2.7"
+VERSION = "V2.7-STOP-FIRST-VETO-COST-FRONTIER"
+V27_BUDGETS = (20, 30, 40, 50)
+V27_MAX_BASE_RULES = 20
+V27_MIN_TRAIN_RESOLVED_EACH = 30
+V27_MIN_TEST_RESOLVED_EACH = 5
+
+V27_ENV_FEATURES = {
+    "科技池样本数": "Env_Tech_N",
+    "科技池站上MA20比例(%)": "Env_Tech_Above_MA20_pct",
+    "科技池站上MA60比例(%)": "Env_Tech_Above_MA60_pct",
+    "科技池红柱比例(%)": "Env_Tech_Red_pct",
+    "科技池红柱扩张比例(%)": "Env_Tech_Red_Expand_pct",
+    "科技池4周收益中位数(%)": "Env_Tech_Return4W_Median_pct",
+    "科技池8周收益中位数(%)": "Env_Tech_Return8W_Median_pct",
+    "科技池13周收益中位数(%)": "Env_Tech_Return13W_Median_pct",
+    "科技池量能扩张中位数": "Env_Tech_Volume_Ratio_Median",
+    "科技池换手扩张中位数": "Env_Tech_Turnover_Ratio_Median",
+    "行业样本数": "Env_Industry_N",
+    "行业站上MA20比例(%)": "Env_Industry_Above_MA20_pct",
+    "行业站上MA60比例(%)": "Env_Industry_Above_MA60_pct",
+    "行业红柱比例(%)": "Env_Industry_Red_pct",
+    "行业红柱扩张比例(%)": "Env_Industry_Red_Expand_pct",
+    "行业4周收益中位数(%)": "Env_Industry_Return4W_Median_pct",
+    "行业8周收益中位数(%)": "Env_Industry_Return8W_Median_pct",
+    "行业13周收益中位数(%)": "Env_Industry_Return13W_Median_pct",
+    "行业量能扩张中位数": "Env_Industry_Volume_Ratio_Median",
+    "行业换手扩张中位数": "Env_Industry_Turnover_Ratio_Median",
+    "个股相对行业4周强度": "Env_Stock_RS_Industry4W",
+    "个股相对行业8周强度": "Env_Stock_RS_Industry8W",
+    "个股相对行业13周强度": "Env_Stock_RS_Industry13W",
+    "板块样本数": "Env_Board_N",
+    "板块站上MA20比例(%)": "Env_Board_Above_MA20_pct",
+    "板块站上MA60比例(%)": "Env_Board_Above_MA60_pct",
+    "板块红柱扩张比例(%)": "Env_Board_Red_Expand_pct",
+    "板块13周收益中位数(%)": "Env_Board_Return13W_Median_pct",
+    "板块整体风险得分": "Env_Board_Risk_Score",
+}
+V27_ALL_FEATURES = {**NUMERIC_MINING_FEATURES, **V27_ENV_FEATURES}
+
+
+def v27_stock_environment_rows(stock: pd.Series,
+                               stock_periods: list[dict[str, str]],
+                               daily: pd.DataFrame,
+                               daily_basic: pd.DataFrame,
+                               week_map: dict[pd.Timestamp, str],
+                               start_date: str,
+                               end_date: str) -> list[dict[str, Any]]:
+    """构造一只股票在每个完整周末的当时环境贡献；不使用未来数据。"""
+    weekly = build_weekly(daily, week_map)
+    if weekly.empty:
+        return []
+    weekly = weekly.copy()
+    weekly["return_4w_pct"] = (weekly["close"] / weekly["close"].shift(4) - 1.0) * 100.0
+    weekly["return_8w_pct"] = (weekly["close"] / weekly["close"].shift(8) - 1.0) * 100.0
+    weekly["ma60"] = weekly["close"].rolling(60).mean()
+    weekly["hist_prev"] = weekly["hist"].shift(1)
+    if daily_basic.empty:
+        weekly["raw_close"] = np.nan
+        weekly["circ_mv"] = np.nan
+        weekly["turnover_rate"] = np.nan
+    else:
+        basic = daily_basic[[c for c in ["trade_date", "close", "circ_mv", "turnover_rate"]
+                             if c in daily_basic]].copy()
+        basic = basic.rename(columns={"close": "raw_close"})
+        weekly = weekly.merge(basic.drop_duplicates("trade_date", keep="last"),
+                              on="trade_date", how="left")
+    turnover = pd.to_numeric(weekly.get("turnover_rate"), errors="coerce")
+    weekly["turnover_median13_prev"] = turnover.shift(1).rolling(13).median()
+    weekly["turnover_ratio13"] = turnover / weekly["turnover_median13_prev"]
+    board = sample_board(stock)
+    rows: list[dict[str, Any]] = []
+    for _, row in weekly.iterrows():
+        trade_date = normalize_date(row.get("trade_date"))
+        if not trade_date or trade_date < start_date or trade_date > end_date:
+            continue
+        membership = membership_on_date(stock_periods, trade_date)
+        if membership is None:
+            continue
+        raw_close = finite_num(row.get("raw_close"))
+        circ_mv = finite_num(row.get("circ_mv"))
+        circ_billion = circ_mv / 10000.0 if math.isfinite(circ_mv) else np.nan
+        # 环境宽度与策略股票池保持同一价格、市值口径。
+        if (not math.isfinite(raw_close) or raw_close < 10.0
+                or not math.isfinite(circ_billion) or circ_billion < 100.0):
+            continue
+        close = finite_num(row.get("close"))
+        ma20 = finite_num(row.get("ma20"))
+        ma60 = finite_num(row.get("ma60"))
+        hist = finite_num(row.get("hist"))
+        hist_prev = finite_num(row.get("hist_prev"))
+        rows.append({
+            "Selection_Date": trade_date, "ts_code": str(stock.get("ts_code", "")),
+            "Sample_Board": board, "SW_L1": membership.get("l1", ""),
+            "SW_L2": membership.get("l2", ""),
+            "EnvStock_Return4W_pct": finite_num(row.get("return_4w_pct")),
+            "EnvStock_Return8W_pct": finite_num(row.get("return_8w_pct")),
+            "EnvStock_Return13W_pct": finite_num(row.get("return_13w_pct")),
+            "EnvStock_Above_MA20": math.isfinite(close) and math.isfinite(ma20) and close > ma20,
+            "EnvStock_Above_MA60": math.isfinite(close) and math.isfinite(ma60) and close > ma60,
+            "EnvStock_Red": math.isfinite(hist) and hist > 0,
+            "EnvStock_Red_Expand": (math.isfinite(hist) and math.isfinite(hist_prev)
+                                    and hist > 0 and hist > hist_prev),
+            "EnvStock_Volume_Ratio": finite_num(row.get("vol_ratio20")),
+            "EnvStock_Turnover_Ratio": finite_num(row.get("turnover_ratio13")),
+        })
+    return rows
+
+
+def v27_environment_aggregate(detail: pd.DataFrame,
+                              group_columns: list[str],
+                              prefix: str) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if detail.empty:
+        return pd.DataFrame()
+    grouped = detail.groupby(group_columns, dropna=False)
+    for keys, group in grouped:
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        row = {column: value for column, value in zip(group_columns, keys)}
+        row.update({
+            f"{prefix}_N": len(group),
+            f"{prefix}_Above_MA20_pct": rate(group["EnvStock_Above_MA20"]),
+            f"{prefix}_Above_MA60_pct": rate(group["EnvStock_Above_MA60"]),
+            f"{prefix}_Red_pct": rate(group["EnvStock_Red"]),
+            f"{prefix}_Red_Expand_pct": rate(group["EnvStock_Red_Expand"]),
+            f"{prefix}_Return4W_Median_pct": num(group["EnvStock_Return4W_pct"]).median(),
+            f"{prefix}_Return8W_Median_pct": num(group["EnvStock_Return8W_pct"]).median(),
+            f"{prefix}_Return13W_Median_pct": num(group["EnvStock_Return13W_pct"]).median(),
+            f"{prefix}_Volume_Ratio_Median": num(group["EnvStock_Volume_Ratio"]).median(),
+            f"{prefix}_Turnover_Ratio_Median": num(group["EnvStock_Turnover_Ratio"]).median(),
+        })
+        row[f"{prefix}_Risk_Score"] = (
+            0.35 * row[f"{prefix}_Above_MA20_pct"]
+            + 0.25 * row[f"{prefix}_Above_MA60_pct"]
+            + 0.25 * row[f"{prefix}_Red_pct"]
+            + 0.15 * row[f"{prefix}_Red_Expand_pct"]
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def v27_enrich_environment(candidates: pd.DataFrame,
+                           detail: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    out = candidates.copy()
+    out["Selection_Date"] = out["Selection_Date"].map(normalize_date)
+    if detail.empty:
+        for field in V27_ENV_FEATURES.values():
+            out[field] = np.nan
+        return out, {"detail": detail, "tech": pd.DataFrame(),
+                     "industry": pd.DataFrame(), "board": pd.DataFrame()}
+    detail = detail.copy()
+    detail["Selection_Date"] = detail["Selection_Date"].map(normalize_date)
+    tech = v27_environment_aggregate(detail, ["Selection_Date"], "Env_Tech")
+    industry = v27_environment_aggregate(
+        detail, ["Selection_Date", "SW_L2"], "Env_Industry"
+    )
+    board = v27_environment_aggregate(
+        detail, ["Selection_Date", "Sample_Board"], "Env_Board"
+    )
+    stock_fields = detail[["Selection_Date", "ts_code", "EnvStock_Return4W_pct",
+                           "EnvStock_Return8W_pct", "EnvStock_Return13W_pct"]].drop_duplicates(
+                               ["Selection_Date", "ts_code"], keep="last")
+    out = out.merge(stock_fields, on=["Selection_Date", "ts_code"], how="left")
+    out = out.merge(tech, on="Selection_Date", how="left")
+    out = out.merge(industry, on=["Selection_Date", "SW_L2"], how="left")
+    out = out.merge(board, on=["Selection_Date", "Sample_Board"], how="left")
+    out["Env_Stock_RS_Industry4W"] = (
+        num(out["EnvStock_Return4W_pct"]) - num(out["Env_Industry_Return4W_Median_pct"])
+    )
+    out["Env_Stock_RS_Industry8W"] = (
+        num(out["EnvStock_Return8W_pct"]) - num(out["Env_Industry_Return8W_Median_pct"])
+    )
+    out["Env_Stock_RS_Industry13W"] = (
+        num(out["EnvStock_Return13W_pct"]) - num(out["Env_Industry_Return13W_Median_pct"])
+    )
+    return out, {"detail": detail, "tech": tech, "industry": industry, "board": board}
+
+
+def v27_path_labels(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    status30 = out["CP_W2_Delayed_First_30_vs_Stop"].fillna("").astype(str)
+    out["V27_Path_Label"] = np.select(
+        [status30.eq("目标先到"), status30.isin(["止损先到", "同日不确定_按止损"])],
+        ["30%目标先到", "-10%止损先到"], default="八周均未触发",
+    )
+    out["V27_Resolved"] = out["V27_Path_Label"].isin(["30%目标先到", "-10%止损先到"])
+    out["V27_Stop_First"] = out["V27_Path_Label"].eq("-10%止损先到")
+    out["V27_Target_First"] = out["V27_Path_Label"].eq("30%目标先到")
+    return out
+
+
+def v27_rule_mask(frame: pd.DataFrame, rule: pd.Series | dict[str, Any]) -> pd.Series:
+    field = str(rule["字段"])
+    return v25_rule_mask(
+        frame.get(field, pd.Series(np.nan, index=frame.index)),
+        finite_num(rule.get("下限", np.nan)), finite_num(rule.get("上限", np.nan)),
+    )
+
+
+def v27_veto_metrics(frame: pd.DataFrame,
+                     veto: pd.Series) -> dict[str, Any]:
+    veto = veto.reindex(frame.index, fill_value=False).astype(bool)
+    resolved = frame["V27_Resolved"].astype(bool)
+    stops = frame["V27_Stop_First"].astype(bool)
+    targets = frame["V27_Target_First"].astype(bool)
+    retained = ~veto
+    stop_total = int(stops.sum())
+    target_total = int(targets.sum())
+    veto_stop = int((veto & stops).sum())
+    veto_target = int((veto & targets).sum())
+    retained_stop = int((retained & stops).sum())
+    retained_target = int((retained & targets).sum())
+    baseline_target_rate = target_total / (stop_total + target_total) if stop_total + target_total else np.nan
+    retained_target_rate = retained_target / (retained_stop + retained_target) \
+        if retained_stop + retained_target else np.nan
+    status50 = frame["CP_W2_Delayed_First_50_vs_Stop"].fillna("").astype(str)
+    status100 = frame["CP_W2_Delayed_First_100_vs_Stop"].fillna("").astype(str)
+    target50 = status50.eq("目标先到")
+    target100 = status100.eq("目标先到")
+    utility = num(frame.get("Realised_Utility"), frame.index)
+    selection_dates = frame.get("Selection_Date", pd.Series("", index=frame.index)).astype(str)
+    all_weeks = selection_dates[selection_dates.ne("")].nunique()
+    retained_weeks = selection_dates[retained & selection_dates.ne("")].nunique()
+    retained_count = int(retained.sum())
+    result = {
+        "全部样本": len(frame), "已决样本": int(resolved.sum()),
+        "止损先到总数": stop_total, "目标先到总数": target_total,
+        "否决总数": int(veto.sum()), "否决止损先到数": veto_stop,
+        "误删目标先到数": veto_target,
+        "止损剔除率(%)": veto_stop / stop_total * 100.0 if stop_total else np.nan,
+        "目标误删率(%)": veto_target / target_total * 100.0 if target_total else np.nan,
+        "否决命中止损精度(%)": veto_stop / int((veto & resolved).sum()) * 100.0
+        if int((veto & resolved).sum()) else np.nan,
+        "保留止损先到数": retained_stop, "保留目标先到数": retained_target,
+        "原始目标先到率(%)": baseline_target_rate * 100.0
+        if math.isfinite(baseline_target_rate) else np.nan,
+        "保留池目标先到率(%)": retained_target_rate * 100.0
+        if math.isfinite(retained_target_rate) else np.nan,
+        "目标先到率提升(百分点)": (retained_target_rate - baseline_target_rate) * 100.0
+        if math.isfinite(baseline_target_rate) and math.isfinite(retained_target_rate) else np.nan,
+        "止损剔除/目标误删倍数": (veto_stop / stop_total) / (veto_target / target_total)
+        if stop_total and target_total and veto_target else np.inf if veto_stop else np.nan,
+        "50%目标误删率(%)": int((veto & target50).sum()) / int(target50.sum()) * 100.0
+        if int(target50.sum()) else np.nan,
+        "100%目标误删率(%)": int((veto & target100).sum()) / int(target100.sum()) * 100.0
+        if int(target100.sum()) else np.nan,
+        "原始效用均值": utility.mean(), "保留池效用均值": utility[retained].mean(),
+        "原始效用中位数": utility.median(), "保留池效用中位数": utility[retained].median(),
+        "保留事件": retained_count, "原始信号周": all_weeks,
+        "保留信号周": retained_weeks, "新增空窗周": all_weeks - retained_weeks,
+        "保留周平均事件": retained_count / retained_weeks if retained_weeks else np.nan,
+    }
+    for group_name in GROUP_ORDER:
+        group_mask = frame["结果组"].eq(group_name)
+        total = int(group_mask.sum())
+        result[f"{group_name}_总数"] = total
+        result[f"{group_name}_误删数"] = int((veto & group_mask).sum())
+        result[f"{group_name}_误删率(%)"] = int((veto & group_mask).sum()) / total * 100.0 \
+            if total else np.nan
+    return result
+
+
+def v27_learn_base_rules(train: pd.DataFrame) -> pd.DataFrame:
+    resolved = train[train["V27_Resolved"]].copy()
+    labels = resolved["V27_Stop_First"].astype(bool)
+    rows: list[dict[str, Any]] = []
+    for feature_label, field in V27_ALL_FEATURES.items():
+        if field not in train:
+            continue
+        values = pd.to_numeric(resolved[field], errors="coerce")
+        if values.notna().sum() < 40 or values.nunique(dropna=True) < 8:
+            continue
+        for shape_name, lower_q, upper_q in V25_RULE_SHAPES:
+            lower = float(values.quantile(lower_q)) if lower_q is not None else np.nan
+            upper = float(values.quantile(upper_q)) if upper_q is not None else np.nan
+            veto_resolved = v25_rule_mask(values, lower, upper)
+            binary = v25_binary_metrics(labels, veto_resolved)
+            if (binary["入选总数"] < 8 or binary["目标覆盖率(%)"] < 5.0
+                    or not math.isfinite(binary["相对基准提升倍数"])
+                    or binary["相对基准提升倍数"] <= 1.02):
+                continue
+            rule = {"字段": field, "下限": lower, "上限": upper}
+            veto_all = v27_rule_mask(train, rule)
+            metrics = v27_veto_metrics(train, veto_all)
+            efficiency = metrics["止损剔除/目标误删倍数"]
+            efficiency_score = min(efficiency, 10.0) if math.isfinite(efficiency) else 10.0
+            score = metrics["止损剔除率(%)"] + efficiency_score * 3.0
+            rows.append({
+                "特征": feature_label, "字段": field, "规则形状": shape_name,
+                "下限": lower, "上限": upper, "规则类型": "单规则",
+                "规则签名": f"{field}[{shape_name}]", "训练风险分": score,
+                **{f"训练_{key}": value for key, value in metrics.items()},
+            })
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    # 分别为20/30/40/50%误删预算保留候选，避免高预算规则把低误删规则挤出组合搜索。
+    result = result.drop_duplicates(["字段", "规则形状"], keep="first")
+    selected: list[pd.DataFrame] = []
+    per_budget = max(4, V27_MAX_BASE_RULES // len(V27_BUDGETS) + 1)
+    for budget in V27_BUDGETS:
+        eligible = result[num(result["训练_目标误删率(%)"]).le(float(budget))].copy()
+        eligible = eligible.sort_values(
+            ["训练_止损剔除率(%)", "训练_止损剔除/目标误删倍数", "训练风险分"],
+            ascending=False,
+        )
+        selected.append(eligible.head(per_budget))
+    result = pd.concat(selected, ignore_index=True) if selected else result.head(0)
+    result = result.drop_duplicates("规则签名", keep="first")
+    result = result.sort_values("训练风险分", ascending=False)
+    return result.head(V27_MAX_BASE_RULES).reset_index(drop=True)
+
+
+def v27_candidate_veto_rules(train: pd.DataFrame,
+                             base_rules: pd.DataFrame) -> pd.DataFrame:
+    if base_rules.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    base_masks: list[pd.Series] = []
+    for _, rule in base_rules.iterrows():
+        mask = v27_rule_mask(train, rule)
+        base_masks.append(mask)
+        rows.append(rule.to_dict())
+    for left_i in range(len(base_rules)):
+        for right_i in range(left_i + 1, len(base_rules)):
+            left = base_rules.iloc[left_i]
+            right = base_rules.iloc[right_i]
+            if left["字段"] == right["字段"]:
+                continue
+            for logic, mask in (
+                ("任一命中OR", base_masks[left_i] | base_masks[right_i]),
+                ("同时命中AND", base_masks[left_i] & base_masks[right_i]),
+            ):
+                metrics = v27_veto_metrics(train, mask)
+                if metrics["否决总数"] < 8 or metrics["否决止损先到数"] < 5:
+                    continue
+                efficiency = metrics["止损剔除/目标误删倍数"]
+                efficiency_score = min(efficiency, 10.0) if math.isfinite(efficiency) else 10.0
+                score = metrics["止损剔除率(%)"] + efficiency_score * 3.0
+                rows.append({
+                    "特征": f"{left['特征']} + {right['特征']}",
+                    "字段": f"{left['字段']}|{right['字段']}",
+                    "规则形状": f"{left['规则形状']}|{right['规则形状']}",
+                    "下限": np.nan, "上限": np.nan, "规则类型": logic,
+                    "字段1": left["字段"], "形状1": left["规则形状"],
+                    "下限1": left["下限"], "上限1": left["上限"],
+                    "字段2": right["字段"], "形状2": right["规则形状"],
+                    "下限2": right["下限"], "上限2": right["上限"],
+                    "规则签名": f"{left['规则签名']} {logic} {right['规则签名']}",
+                    "训练风险分": score,
+                    **{f"训练_{key}": value for key, value in metrics.items()},
+                })
+    return pd.DataFrame(rows)
+
+
+def v27_apply_veto(frame: pd.DataFrame, rule: pd.Series | dict[str, Any]) -> pd.Series:
+    rule_type = str(rule.get("规则类型", "单规则"))
+    if rule_type == "单规则":
+        return v27_rule_mask(frame, rule)
+    left = {"字段": rule["字段1"], "下限": rule.get("下限1", np.nan),
+            "上限": rule.get("上限1", np.nan)}
+    right = {"字段": rule["字段2"], "下限": rule.get("下限2", np.nan),
+             "上限": rule.get("上限2", np.nan)}
+    left_mask = v27_rule_mask(frame, left)
+    right_mask = v27_rule_mask(frame, right)
+    return left_mask | right_mask if rule_type == "任一命中OR" else left_mask & right_mask
+
+
+def v27_frontier_choice(candidates: pd.DataFrame,
+                        budget: int) -> pd.Series | None:
+    if candidates.empty:
+        return None
+    eligible = candidates[
+        num(candidates["训练_目标误删率(%)"]).le(float(budget))
+        & num(candidates["训练_止损剔除率(%)"]).gt(0)
+    ].copy()
+    if eligible.empty:
+        return None
+    eligible = eligible.sort_values(
+        ["训练_止损剔除率(%)", "训练_止损剔除/目标误删倍数", "训练风险分"],
+        ascending=False,
+    )
+    return eligible.iloc[0]
+
+
+def v27_time_folds(candidates: pd.DataFrame) -> list[dict[str, Any]]:
+    dates = pd.to_datetime(candidates["Selection_Date"], format="%Y%m%d", errors="coerce")
+    min_date, max_date = dates.min(), dates.max()
+    proposed = [
+        ("2025上半年", pd.Timestamp("2025-01-01"), pd.Timestamp("2025-06-30")),
+        ("2025下半年", pd.Timestamp("2025-07-01"), pd.Timestamp("2025-12-31")),
+        ("2026上半年", pd.Timestamp("2026-01-01"), pd.Timestamp("2026-06-30")),
+    ]
+    folds = []
+    for name, start, end in proposed:
+        if start > max_date or end < min_date:
+            continue
+        folds.append({"测试期": name, "测试开始": start,
+                      "测试结束": min(end, max_date)})
+    return folds
+
+
+def v27_run_frontier(candidates: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    data = v27_path_labels(candidates)
+    data["Selection_Date_dt"] = pd.to_datetime(
+        data["Selection_Date"], format="%Y%m%d", errors="coerce"
+    )
+    maturity = pd.to_datetime(
+        data.get("Outcome_Maturity_Date_dt"), errors="coerce"
+    )
+    if maturity.isna().all():
+        maturity = data["Selection_Date_dt"] + pd.Timedelta(days=56)
+    data["V27_Maturity_Date"] = maturity
+    folds = v27_time_folds(data)
+    fold_rows: list[dict[str, Any]] = []
+    base_rows: list[dict[str, Any]] = []
+    candidate_rows: list[dict[str, Any]] = []
+    frontier_rows: list[dict[str, Any]] = []
+    selected_rows: list[dict[str, Any]] = []
+    for state in STATE_ORDER:
+        state_data = data[data["Weekly_Trend"].eq(state)].copy()
+        for fold in folds:
+            train = state_data[
+                state_data["Selection_Date_dt"].lt(fold["测试开始"])
+                & state_data["V27_Maturity_Date"].lt(fold["测试开始"])
+            ].copy()
+            test = state_data[
+                state_data["Selection_Date_dt"].ge(fold["测试开始"])
+                & state_data["Selection_Date_dt"].le(fold["测试结束"])
+            ].copy()
+            train_stop = int(train["V27_Stop_First"].sum())
+            train_target = int(train["V27_Target_First"].sum())
+            test_stop = int(test["V27_Stop_First"].sum())
+            test_target = int(test["V27_Target_First"].sum())
+            eligible = (train_stop >= V27_MIN_TRAIN_RESOLVED_EACH
+                        and train_target >= V27_MIN_TRAIN_RESOLVED_EACH
+                        and test_stop >= V27_MIN_TEST_RESOLVED_EACH
+                        and test_target >= V27_MIN_TEST_RESOLVED_EACH)
+            audit = {
+                "红柱形态": state, "测试期": fold["测试期"],
+                "训练截止": (fold["测试开始"] - pd.Timedelta(days=1)).strftime("%Y%m%d"),
+                "测试开始": fold["测试开始"].strftime("%Y%m%d"),
+                "测试结束": fold["测试结束"].strftime("%Y%m%d"),
+                "训练样本": len(train), "训练止损先到": train_stop,
+                "训练目标先到": train_target, "测试样本": len(test),
+                "测试止损先到": test_stop, "测试目标先到": test_target,
+                "样本门槛通过": eligible,
+            }
+            if not eligible:
+                audit["处理状态"] = "样本不足"
+                fold_rows.append(audit)
+                continue
+            base = v27_learn_base_rules(train)
+            if base.empty:
+                audit["处理状态"] = "无有效负向单规则"
+                fold_rows.append(audit)
+                continue
+            all_rules = v27_candidate_veto_rules(train, base)
+            if all_rules.empty:
+                audit["处理状态"] = "无有效候选否决规则"
+                fold_rows.append(audit)
+                continue
+            audit.update({"处理状态": "完成", "基础规则": len(base),
+                          "单项与组合规则": len(all_rules)})
+            fold_rows.append(audit)
+            for _, row in base.iterrows():
+                base_rows.append({"红柱形态": state, "测试期": fold["测试期"], **row.to_dict()})
+            for _, row in all_rules.iterrows():
+                candidate_rows.append({"红柱形态": state, "测试期": fold["测试期"], **row.to_dict()})
+            for budget in V27_BUDGETS:
+                chosen = v27_frontier_choice(all_rules, budget)
+                if chosen is None:
+                    frontier_rows.append({
+                        "红柱形态": state, "测试期": fold["测试期"],
+                        "允许目标误删预算(%)": budget, "处理状态": "训练期无规则满足预算",
+                    })
+                    continue
+                test_veto = v27_apply_veto(test, chosen)
+                test_metrics = v27_veto_metrics(test, test_veto)
+                frontier_rows.append({
+                    "红柱形态": state, "测试期": fold["测试期"],
+                    "允许目标误删预算(%)": budget, "处理状态": "完成",
+                    "规则签名": chosen["规则签名"], "规则类型": chosen["规则类型"],
+                    **{key: chosen.get(key, np.nan) for key in
+                       ["字段", "规则形状", "下限", "上限", "字段1", "形状1", "下限1", "上限1",
+                        "字段2", "形状2", "下限2", "上限2"]},
+                    **{key: value for key, value in chosen.items() if str(key).startswith("训练_")},
+                    **{f"测试_{key}": value for key, value in test_metrics.items()},
+                })
+                retained = test[~test_veto]
+                for _, event in retained.iterrows():
+                    selected_rows.append({
+                        "红柱形态": state, "测试期": fold["测试期"],
+                        "允许目标误删预算(%)": budget, "规则签名": chosen["规则签名"],
+                        "Selection_Date": event.get("Selection_Date", ""),
+                        "ts_code": event.get("ts_code", ""), "name": event.get("name", ""),
+                        "结果组": event.get("结果组", ""), "路径标签": event.get("V27_Path_Label", ""),
+                        "Realised_Utility": event.get("Realised_Utility", np.nan),
+                        "MFE8周(%)": event.get("CP_W2_Delayed_MFE_8W_pct", np.nan),
+                        "MAE8周(%)": event.get("CP_W2_Delayed_MAE_8W_pct", np.nan),
+                    })
+    return {
+        "labeled": data, "folds": pd.DataFrame(fold_rows),
+        "base_rules": pd.DataFrame(base_rows), "candidate_rules": pd.DataFrame(candidate_rows),
+        "frontier": pd.DataFrame(frontier_rows), "retained": pd.DataFrame(selected_rows),
+    }
+
+
+def v27_frontier_summary(frontier: pd.DataFrame) -> pd.DataFrame:
+    if frontier.empty:
+        return pd.DataFrame()
+    complete = frontier[frontier["处理状态"].eq("完成")].copy()
+    rows: list[dict[str, Any]] = []
+    for (state, budget), group in complete.groupby(["红柱形态", "允许目标误删预算(%)"]):
+        stop_total = num(group["测试_止损先到总数"]).sum()
+        target_total = num(group["测试_目标先到总数"]).sum()
+        veto_stop = num(group["测试_否决止损先到数"]).sum()
+        veto_target = num(group["测试_误删目标先到数"]).sum()
+        retained_stop = stop_total - veto_stop
+        retained_target = target_total - veto_target
+        stop_rate = veto_stop / stop_total * 100.0 if stop_total else np.nan
+        target_error = veto_target / target_total * 100.0 if target_total else np.nan
+        base_rate = target_total / (target_total + stop_total) * 100.0 \
+            if target_total + stop_total else np.nan
+        kept_rate = retained_target / (retained_target + retained_stop) * 100.0 \
+            if retained_target + retained_stop else np.nan
+        improved_folds = int((num(group["测试_目标先到率提升(百分点)"]) > 0).sum())
+        efficiency = stop_rate / target_error if math.isfinite(target_error) and target_error > 0 \
+            else np.inf if math.isfinite(stop_rate) and stop_rate > 0 else np.nan
+        if (len(group) >= 2 and math.isfinite(stop_rate) and math.isfinite(target_error)
+                and stop_rate >= target_error * 1.25 and improved_folds >= 2
+                and math.isfinite(kept_rate) and kept_rate >= base_rate + 3.0):
+            verdict = "OOS有效前沿候选"
+        elif math.isfinite(stop_rate) and math.isfinite(target_error) and stop_rate > target_error:
+            verdict = "有一定净剔除，但证据不足"
+        else:
+            verdict = "误删代价不划算"
+        rows.append({
+            "红柱形态": state, "允许目标误删预算(%)": budget,
+            "完成测试期": len(group), "改善测试期": improved_folds,
+            "OOS止损先到总数": int(stop_total), "OOS目标先到总数": int(target_total),
+            "OOS剔除止损数": int(veto_stop), "OOS误删目标数": int(veto_target),
+            "OOS止损剔除率(%)": stop_rate, "OOS目标误删率(%)": target_error,
+            "OOS净剔除优势(百分点)": stop_rate - target_error,
+            "OOS止损剔除/目标误删倍数": efficiency,
+            "OOS原始目标先到率(%)": base_rate, "OOS保留池目标先到率(%)": kept_rate,
+            "OOS目标先到率提升(百分点)": kept_rate - base_rate,
+            "30至50组OOS误删数": int(num(group.get("测试_30%～50%_误删数", 0)).sum()),
+            "50至100组OOS误删数": int(num(group.get("测试_50%～100%_误删数", 0)).sum()),
+            "翻倍组OOS误删数": int(num(group.get("测试_翻倍以上_误删数", 0)).sum()),
+            "前沿判断": verdict,
+        })
+    return pd.DataFrame(rows).sort_values(["红柱形态", "允许目标误删预算(%)"])
+
+
+def v27_path_summary(candidates: pd.DataFrame) -> pd.DataFrame:
+    labeled = v27_path_labels(candidates)
+    rows = []
+    for state in STATE_ORDER:
+        group = labeled[labeled["Weekly_Trend"].eq(state)]
+        for label in ("30%目标先到", "-10%止损先到", "八周均未触发"):
+            count = int(group["V27_Path_Label"].eq(label).sum())
+            rows.append({"红柱形态": state, "路径": label, "数量": count,
+                         "形态内占比(%)": count / len(group) * 100.0 if len(group) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def v27_retained_concentration(retained: pd.DataFrame) -> pd.DataFrame:
+    if retained.empty:
+        return pd.DataFrame()
+    rows = []
+    keys = ["红柱形态", "测试期", "允许目标误删预算(%)"]
+    for values, group in retained.groupby(keys):
+        counts = group["ts_code"].astype(str).value_counts()
+        rows.append({
+            "红柱形态": values[0], "测试期": values[1],
+            "允许目标误删预算(%)": values[2], "保留事件": len(group),
+            "不同股票": group["ts_code"].nunique(),
+            "单股最大占比(%)": counts.iloc[0] / len(group) * 100.0 if len(group) else np.nan,
+            "前5股占比(%)": counts.head(5).sum() / len(group) * 100.0 if len(group) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def v27_feature_dictionary() -> pd.DataFrame:
+    rows = []
+    for label, field in V27_ALL_FEATURES.items():
+        source = "当周全科技股/行业/板块截面" if field.startswith("Env_") else "个股第二根完整红柱"
+        rows.append({"特征": label, "字段": field, "使用时点": "选股当时已知",
+                     "来源": source, "用途": "仅训练负向否决规则，不评分"})
+    return pd.DataFrame(rows)
+
+
+def main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption(
+        "分别在上升、中性、下降形态内，学习“-10%止损先到”特征；"
+        "用20%/30%/40%/50%的目标误删预算检查代价前沿。本版不评分、不排名。"
+    )
+    with st.sidebar:
+        st.header("正式评价区间")
+        eval_date = st.date_input("评价开始", value=date(2023, 6, 5), key="v27_eval")
+        end_date = st.date_input("信号截止", value=date(2026, 6, 5), key="v27_end")
+        obs_date = st.date_input("行情观察截止", value=date.today(), max_value=date.today(), key="v27_obs")
+        st.header("冻结实验口径")
+        st.write("坏样本：-10%止损早于+30%目标")
+        st.write("好样本：+30%目标早于-10%止损")
+        st.write("八周均未触发单独审计，不参与学习标签")
+        st.write("训练误删预算：20% / 30% / 40% / 50%")
+        st.write("时间折：2025上半年、2025下半年、2026上半年")
+        st.write("每个测试期只用当时已成熟的历史样本")
+        st.write("加入科技宽度、行业强度、红柱扩散、量价和板块风险")
+        cache = st.checkbox("使用逐股票缓存", value=True, key="v27_cache")
+        pause = st.number_input("每次API调用后暂停(秒)", 0.0, 3.0, 0.12, 0.05, key="v27_pause")
+        if st.button("清除本程序缓存", key="v27_clear"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("缓存已清除")
+    token = st.text_input("Tushare Token", type="password", key="v27_token")
+    if not token:
+        st.info("请输入Tushare Token。本版要重建每周全科技股环境，不能只上传V2.6结果。")
+        return
+    session_key = "stop_first_veto_frontier_v27_zip"
+    if not st.button("开始V2.7止损先到特征与代价前沿实验", type="primary", key="v27_run"):
+        if session_key in st.session_state:
+            st.download_button("下载上一次全部结果ZIP", st.session_state[session_key],
+                               file_name="weekly_macd_stop_first_veto_frontier_v2_7_all_results.zip",
+                               mime="application/zip", key="v27_previous_download")
+        return
+    if eval_date >= end_date or end_date > obs_date:
+        st.error("日期关系不正确。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    eval_start = pd.Timestamp(eval_date)
+    research, end, obs = (eval_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"),
+                          obs_date.strftime("%Y%m%d"))
+    preload = (eval_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    config = {
+        "signal_start": research, "signal_end": end, "market_end": obs,
+        "preload_start": preload, "min_price": 10.0, "min_mv": 100.0,
+        "max_mv": 1_000_000_000.0, "price_tolerance_pct": 3.0,
+        "stop_threshold_pct": 10.0, "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "sample_per_board": 0, "sample_seed": DEFAULT_SAMPLE_SEED,
+        "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+    }
+    try:
+        with st.spinner("加载交易日历、历史科技股池和板块指数..."):
+            opens = load_trade_calendar(preload, obs)
+            full = load_trade_calendar(preload, (obs_date + timedelta(days=7)).strftime("%Y%m%d"))
+            basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(pause))
+            week_map = complete_week_last_dates(full)
+            boards: dict[str, pd.DataFrame] = {}
+            for code in sorted(set(BOARD_INDEX.values())):
+                board_daily = fetch_index_history(code, preload, obs, bool(cache), float(pause))
+                if not board_daily.empty:
+                    boards[code] = build_weekly(board_daily, week_map)
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+
+    periods = build_period_index(memberships)
+    codes = sorted(set(periods) & set(basic.ts_code.astype(str)))
+    universe = basic[basic.ts_code.isin(codes)].copy()
+    stocks, universe_audit, population = build_stratified_sample(
+        universe, periods, end, 0, DEFAULT_SAMPLE_SEED
+    )
+    listed = stocks.list_date.apply(lambda x: normalize_date(x, "19000101"))
+    delisted = stocks.delist_date.apply(lambda x: normalize_date(x, "99991231"))
+    stocks = stocks[~listed.gt(end) & ~delisted.lt(preload)].reset_index(drop=True)
+    open_pos = {trade_date: i for i, trade_date in enumerate(opens)}
+    records: list[dict[str, Any]] = []
+    environment_rows: list[dict[str, Any]] = []
+    histories: dict[str, pd.DataFrame] = {}
+    rejects: dict[str, int] = {}
+    cache_hits = data_failures = 0
+    progress = st.progress(0.0)
+    status = st.empty()
+    for i, stock in stocks.iterrows():
+        code = str(stock.ts_code)
+        progress.progress((i + 1) / len(stocks), text=f"{i + 1}/{len(stocks)} {code}")
+        status.caption(f"事件{len(records)}；环境截面{len(environment_rows)}；缓存{cache_hits}；失败{data_failures}")
+        daily, daily_basic, hit = fetch_stock_history(code, preload, obs, bool(cache), float(pause))
+        cache_hits += int(hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        environment_rows.extend(v27_stock_environment_rows(
+            stock, periods.get(code, []), daily, daily_basic, week_map, research, end
+        ))
+        stock_records, stock_rejects, _ = analyze_stock(
+            stock, periods.get(code, []), daily, daily_basic, week_map, opens, open_pos, config
+        )
+        records.extend(stock_records)
+        if stock_records:
+            histories[code] = daily.copy()
+        for reason, count in stock_rejects.items():
+            rejects[reason] = rejects.get(reason, 0) + count
+    progress.empty()
+    status.empty()
+    if not records:
+        st.error("没有生成事件。")
+        return
+
+    try:
+        with st.spinner("重建当时环境、生成三形态路径标签并运行三段按时间OOS验证..."):
+            events = pd.DataFrame(records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+            opportunities = build_cycle_opportunities(events, histories, obs, config["sell_slippage_pct"])
+            featured = prepare_features(opportunities, boards)
+            candidates = featured[
+                featured.Strict_Eligible.map(bool_value)
+                & featured.Outcome_Mature.map(bool_value)
+                & featured.Selection_Date_dt.ge(eval_start)
+            ].copy()
+            candidates = v25_prepare_candidates(candidates)
+            environment_detail = pd.DataFrame(environment_rows)
+            enriched, panels = v27_enrich_environment(candidates, environment_detail)
+            results = v27_run_frontier(enriched)
+            frontier_summary = v27_frontier_summary(results["frontier"])
+            path_summary = v27_path_summary(enriched)
+            concentration = v27_retained_concentration(results["retained"])
+    except Exception as exc:
+        st.error(f"V2.7实验失败：{exc}")
+        return
+
+    env_coverage = pd.DataFrame([
+        {"特征": label, "字段": field, "候选非空数": int(enriched[field].notna().sum()) if field in enriched else 0,
+         "候选覆盖率(%)": enriched[field].notna().mean() * 100.0 if field in enriched and len(enriched) else 0.0}
+        for label, field in V27_ENV_FEATURES.items()
+    ])
+    group_counts = enriched["结果组"].value_counts().reindex(GROUP_ORDER, fill_value=0)
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "版本": VERSION, "评价开始": research, "信号截止": end,
+        "观察截止": obs, "成熟候选": len(enriched), "候选周": enriched.Selection_Date.nunique(),
+        "不同股票": enriched.ts_code.nunique(), "上升趋势": int(enriched.Weekly_Trend.eq("上升趋势").sum()),
+        "中性趋势": int(enriched.Weekly_Trend.eq("中性趋势").sum()),
+        "下降趋势": int(enriched.Weekly_Trend.eq("下降趋势").sum()),
+        "亏损且MFE<30": int(group_counts[LOSS_GROUP]), "盈利且MFE<30": int(group_counts[LOW_PROFIT_GROUP]),
+        "MFE30至50": int(group_counts[MID_GROUP]), "MFE50至100": int(group_counts[HIGH_GROUP]),
+        "MFE翻倍": int(group_counts[DOUBLE_GROUP]), "环境股周截面": len(environment_detail),
+        "行情失败": data_failures, "缓存命中": cache_hits,
+    }])
+    reject_frame = pd.DataFrame([{"剔除原因": key, "次数": value} for key, value in rejects.items()])
+    metadata = pd.DataFrame([
+        ("研究问题", "能否用当时已知特征剔除-10%止损先到样本，并明示为此误删多少+30%目标先到样本"),
+        ("三形态", "上升、中性、下降完全分开训练与验证"),
+        ("正标签", "+30%目标早于-10%止损"),
+        ("负标签", "-10%止损早于+30%目标；即使后来大涨也仍属于当前买点的负样本"),
+        ("未决样本", "八周内均未触发，不进入标签学习，但进入保留池和空窗审计"),
+        ("环境特征", "科技宽度；行业4/8/13周强度、MA20/60覆盖、红柱扩散、量价扩张；个股相对行业；板块风险"),
+        ("误删代价前沿", "训练期允许误删+30%目标先到样本20%/30%/40%/50%；测试期如实报告实际代价"),
+        ("未来隔离", "测试前只能使用测试开始日之前已走完8周观察窗的样本"),
+        ("本版禁止", "不生成评分、不选Top3、不把OOS结果反向写入当期规则"),
+    ], columns=["项目", "值"])
+    files = {
+        "01_run_summary_stop_first_veto_frontier_v2_7.csv": run_summary,
+        "02_path_label_summary_stop_first_veto_frontier_v2_7.csv": path_summary,
+        "03_chronological_fold_audit_stop_first_veto_frontier_v2_7.csv": results["folds"],
+        "04_oos_cost_frontier_stop_first_veto_frontier_v2_7.csv": results["frontier"],
+        "05_oos_frontier_aggregate_stop_first_veto_frontier_v2_7.csv": frontier_summary,
+        "06_training_base_veto_rules_stop_first_veto_frontier_v2_7.csv": results["base_rules"],
+        "07_training_all_candidate_rules_stop_first_veto_frontier_v2_7.csv": results["candidate_rules"],
+        "08_oos_retained_event_detail_stop_first_veto_frontier_v2_7.csv": results["retained"],
+        "09_oos_retained_concentration_stop_first_veto_frontier_v2_7.csv": concentration,
+        "10_environment_feature_coverage_stop_first_veto_frontier_v2_7.csv": env_coverage,
+        "11_feature_dictionary_stop_first_veto_frontier_v2_7.csv": v27_feature_dictionary(),
+        "12_all_enriched_candidate_features_stop_first_veto_frontier_v2_7.csv": results["labeled"],
+        "13_tech_weekly_environment_stop_first_veto_frontier_v2_7.csv": panels["tech"],
+        "14_industry_weekly_environment_stop_first_veto_frontier_v2_7.csv": panels["industry"],
+        "15_board_weekly_environment_stop_first_veto_frontier_v2_7.csv": panels["board"],
+        "16_stock_weekly_environment_detail_stop_first_veto_frontier_v2_7.csv": panels["detail"],
+        "17_full_tech_universe_stop_first_veto_frontier_v2_7.csv": universe_audit,
+        "18_population_stop_first_veto_frontier_v2_7.csv": population,
+        "19_rejection_audit_stop_first_veto_frontier_v2_7.csv": reject_frame,
+        "20_metadata_stop_first_veto_frontier_v2_7.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state[session_key] = result_zip
+    st.success(f"完成：{len(enriched)}个成熟候选；三形态×三个时间折×四档误删预算已输出。")
+    st.subheader("路径底数")
+    st.dataframe(path_summary, use_container_width=True, hide_index=True)
+    st.subheader("跨时间OOS误删代价前沿")
+    st.dataframe(frontier_summary, use_container_width=True, hide_index=True)
+    st.download_button("下载全部结果ZIP", result_zip,
+                       file_name="weekly_macd_stop_first_veto_frontier_v2_7_all_results.zip",
+                       mime="application/zip", type="primary", key="v27_download")
+    st.warning("即使某档前沿有效，也只证明负向否决有研究价值；还不是可直接实盘使用的最终评分。")
 
 
 if __name__ == "__main__":
