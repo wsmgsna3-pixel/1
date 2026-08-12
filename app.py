@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 """
-独立选股研究系统 v1.1
-构建编号：SELECTOR-V1.1-20260812-FINAL
+独立选股研究系统 v1.2
+构建编号：SELECTOR-V1.2-20260812-FINAL
 
 本文件不是“ｖ1.0日线版.py”。
-v1.1固定同时运行相对强度单因子与原综合模型，并包含独立趋势事件、
-排名区间、合格池超额收益、因子IC、牛股依赖检验和ZIP打包下载。
+v1.2保持A/B模型与v1.1完全一致，只新增入场位置诊断、
+B模型第一名与前三名等权对照，以及ZIP打包下载。
+所有新增指标只用于事后研究，不参与选股和排名。
 """
 
 import io
@@ -26,9 +27,9 @@ import streamlit as st
 import tushare as ts
 
 
-APP_NAME = "独立选股研究系统 v1.1"
-APP_VERSION = "1.1.0"
-BUILD_ID = "SELECTOR-V1.1-20260812-FINAL"
+APP_NAME = "独立选股研究系统 v1.2"
+APP_VERSION = "1.2.0"
+BUILD_ID = "SELECTOR-V1.2-20260812-FINAL"
 CACHE_DIR = Path(__file__).resolve().parent / ".selector_research_cache_v1"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -341,7 +342,22 @@ def prepare_price_panels(history: pd.DataFrame, trade_dates: list[str]) -> dict[
         adjusted_close = aligned["adj_close"].ffill()
         aligned["feature_close"] = adjusted_close
         aligned["ret1"] = adjusted_close.pct_change(fill_method=None).fillna(0.0)
+        aligned["ret5"] = adjusted_close / adjusted_close.shift(5) - 1.0
+        aligned["ret20"] = adjusted_close / adjusted_close.shift(20) - 1.0
+        aligned["ret60"] = adjusted_close / adjusted_close.shift(60) - 1.0
         aligned["ret120_ex5"] = adjusted_close.shift(5) / adjusted_close.shift(125) - 1.0
+        prior15_return = adjusted_close.shift(5) / adjusted_close.shift(20) - 1.0
+        prior15_equivalent_5 = (1.0 + prior15_return).pow(1.0 / 3.0) - 1.0
+        aligned["acceleration5"] = aligned["ret5"] - prior15_equivalent_5
+        aligned["distance_high20"] = (
+            adjusted_close / adjusted_close.rolling(20, min_periods=18).max() - 1.0
+        )
+        aligned["distance_high60"] = (
+            adjusted_close / adjusted_close.rolling(60, min_periods=55).max() - 1.0
+        )
+        aligned["distance_ma20"] = (
+            adjusted_close / adjusted_close.rolling(20, min_periods=18).mean() - 1.0
+        )
         aligned["vol60"] = aligned["ret1"].rolling(60, min_periods=55).std(ddof=0) * math.sqrt(252)
         aligned["mdd60"] = adjusted_close.rolling(60, min_periods=55).apply(max_drawdown, raw=True)
         aligned["amount20"] = aligned["amount"].rolling(20, min_periods=18).mean()
@@ -404,6 +420,13 @@ def score_one_week(
                 "三级行业": row.l3_name,
                 "上市日期": row.list_date,
                 "退市日期": row.delist_date,
+                "信号前5日涨幅": safe_number(point.get("ret5")),
+                "信号前20日涨幅": safe_number(point.get("ret20")),
+                "信号前60日涨幅": safe_number(point.get("ret60")),
+                "近5日加速度": safe_number(point.get("acceleration5")),
+                "距20日最高价": safe_number(point.get("distance_high20")),
+                "距60日最高价": safe_number(point.get("distance_high60")),
+                "距20日均线": safe_number(point.get("distance_ma20")),
                 "ret120_ex5": safe_number(point.get("ret120_ex5")),
                 "vol60": safe_number(point.get("vol60")),
                 "mdd60": safe_number(point.get("mdd60")),
@@ -819,6 +842,121 @@ def build_rank_summary(candidates: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def rank_band(values: pd.Series) -> pd.Series:
+    return pd.cut(
+        values,
+        bins=[0, 1, 3, 10, 50, np.inf],
+        labels=["第1名", "第2-3名", "第4-10名", "第11-50名", "第51名以后"],
+    ).astype(str)
+
+
+def build_entry_diagnostics(candidates: pd.DataFrame) -> pd.DataFrame:
+    """比较各排名区间的买入前位置；这些字段不参与评分。"""
+    if candidates.empty:
+        return pd.DataFrame()
+    work = candidates.copy()
+    work["排名区间"] = rank_band(work["周排名"])
+    diagnostic_columns = [
+        "信号前5日涨幅",
+        "信号前20日涨幅",
+        "信号前60日涨幅",
+        "近5日加速度",
+        "距20日最高价",
+        "距60日最高价",
+        "距20日均线",
+    ]
+    rows: list[dict] = []
+    for (model, band), group in work.groupby(["模型", "排名区间"], dropna=False):
+        for horizon in (20, 60, 120):
+            sample = group.loc[
+                (group["能否按次日开盘买入"] == True)  # noqa: E712
+                & (group[f"{horizon}日完整"] == True)  # noqa: E712
+            ].copy()
+            if sample.empty:
+                continue
+            row: dict[str, object] = {
+                "模型": model,
+                "排名区间": band,
+                "观察窗口": horizon,
+                "样本数": len(sample),
+                "不同股票数": sample["ts_code"].nunique(),
+            }
+            for column in diagnostic_columns:
+                row[f"{column}中位数"] = sample[column].median()
+            row.update(
+                {
+                    "未来MFE中位数": sample[f"{horizon}日MFE"].median(),
+                    "未来MAE中位数": sample[f"{horizon}日MAE"].median(),
+                    "期末收益中位数": sample[f"{horizon}日末收益"].median(),
+                    "超额收益中位数": sample[f"{horizon}日超额收益"].median(),
+                }
+            )
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_b_top3_comparison(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """在完全相同的成熟周中，比较B模型第一名与前三名等权期末收益。"""
+    if candidates.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    model_b = candidates.loc[candidates["模型"] == "B_原综合模型"].copy()
+    rows: list[dict] = []
+    for horizon in (20, 60, 120):
+        for signal_date, week in model_b.groupby("信号日", sort=True):
+            top3 = week.loc[week["周排名"] <= 3].sort_values("周排名").copy()
+            paired = top3.loc[
+                (top3["能否按次日开盘买入"] == True)  # noqa: E712
+                & (top3[f"{horizon}日完整"] == True)  # noqa: E712
+            ]
+            if len(top3) != 3 or len(paired) != 3 or not (paired["周排名"] == 1).any():
+                continue
+            top1 = paired.loc[paired["周排名"] == 1].iloc[0]
+            benchmark = safe_number(top1.get(f"{horizon}日合格池基准收益"))
+            top1_return = safe_number(top1.get(f"{horizon}日末收益"))
+            top3_return = safe_number(paired[f"{horizon}日末收益"].mean())
+            difference = top3_return - top1_return
+            definitions = [
+                ("B_第一名", paired.loc[paired["周排名"] == 1], top1_return),
+                ("B_前三名等权", paired, top3_return),
+            ]
+            for method, constituents, end_return in definitions:
+                rows.append(
+                    {
+                        "信号日": signal_date,
+                        "观察窗口": horizon,
+                        "组合口径": method,
+                        "成分数量": len(constituents),
+                        "成分股票": "、".join(constituents["股票名称"].astype(str).tolist()),
+                        "期末收益": end_return,
+                        "合格池基准收益": benchmark,
+                        "超额收益": end_return - benchmark,
+                        "是否盈利": end_return > 0,
+                        "是否跑赢合格池": end_return > benchmark,
+                        "前三名减第一名": difference,
+                    }
+                )
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return detail, pd.DataFrame()
+    summary_rows: list[dict] = []
+    for (horizon, method), group in detail.groupby(["观察窗口", "组合口径"], sort=True):
+        summary_rows.append(
+            {
+                "观察窗口": horizon,
+                "组合口径": method,
+                "配对成熟周数": len(group),
+                "期末收益均值": group["期末收益"].mean(),
+                "期末收益中位数": group["期末收益"].median(),
+                "超额收益均值": group["超额收益"].mean(),
+                "超额收益中位数": group["超额收益"].median(),
+                "盈利周比例": group["是否盈利"].mean(),
+                "跑赢合格池比例": group["是否跑赢合格池"].mean(),
+                "前三名减第一名中位数": group["前三名减第一名"].median(),
+            }
+        )
+    return detail, pd.DataFrame(summary_rows)
+
+
 def build_factor_ic(candidates: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
     factor_columns = ["相对强度分", "低波动分", "低回撤分", "综合分"]
@@ -892,9 +1030,11 @@ def build_robustness(events: pd.DataFrame) -> pd.DataFrame:
 
 def format_percent_columns(frame: pd.DataFrame) -> pd.DataFrame:
     display = frame.copy()
-    keywords = ("收益", "MFE", "MAE", "回撤", "比例", "ret120", "分")
+    keywords = ("收益", "MFE", "MAE", "回撤", "比例", "ret120", "涨幅", "加速度", "距")
+    score_columns = {"综合分", "相对强度分", "低波动分", "低回撤分", "价格模型分", "排名百分位"}
     for col in display.columns:
-        if any(key in str(col) for key in keywords) and pd.api.types.is_numeric_dtype(display[col]):
+        is_percent = any(key in str(col) for key in keywords) or str(col) in score_columns
+        if is_percent and pd.api.types.is_numeric_dtype(display[col]):
             display[col] = display[col].map(lambda x: "" if pd.isna(x) else f"{x:.2%}")
     return display
 
@@ -903,18 +1043,21 @@ def result_files(result: dict) -> list[tuple[str, pd.DataFrame | bytes]]:
     run_id = str(result["run_id"])
     config_bytes = json.dumps(result["config"], ensure_ascii=False, indent=2).encode("utf-8")
     return [
-        (f"weekly_signals_selector_v1_1_{run_id}.csv", result["signals"]),
-        (f"independent_events_selector_v1_1_{run_id}.csv", result["events"]),
-        (f"weekly_top10_selector_v1_1_{run_id}.csv", result["top10"]),
-        (f"all_candidates_paths_selector_v1_1_{run_id}.csv", result["candidates"]),
-        (f"model_comparison_selector_v1_1_{run_id}.csv", result["model_summary"]),
-        (f"rank_bands_selector_v1_1_{run_id}.csv", result["rank_summary"]),
-        (f"factor_ic_selector_v1_1_{run_id}.csv", result["factor_ic"]),
-        (f"robustness_selector_v1_1_{run_id}.csv", result["robustness"]),
-        (f"bucket_summary_selector_v1_1_{run_id}.csv", result["bucket"]),
-        (f"funnel_selector_v1_1_{run_id}.csv", result["funnel"]),
-        (f"data_gaps_selector_v1_1_{run_id}.csv", result["gaps"]),
-        (f"research_config_selector_v1_1_{run_id}.json", config_bytes),
+        (f"weekly_signals_selector_v1_2_{run_id}.csv", result["signals"]),
+        (f"independent_events_selector_v1_2_{run_id}.csv", result["events"]),
+        (f"weekly_top10_selector_v1_2_{run_id}.csv", result["top10"]),
+        (f"all_candidates_paths_selector_v1_2_{run_id}.csv", result["candidates"]),
+        (f"model_comparison_selector_v1_2_{run_id}.csv", result["model_summary"]),
+        (f"rank_bands_selector_v1_2_{run_id}.csv", result["rank_summary"]),
+        (f"entry_diagnostics_selector_v1_2_{run_id}.csv", result["entry_diagnostics"]),
+        (f"b_top3_comparison_selector_v1_2_{run_id}.csv", result["b_top3_summary"]),
+        (f"b_top3_weekly_selector_v1_2_{run_id}.csv", result["b_top3_detail"]),
+        (f"factor_ic_selector_v1_2_{run_id}.csv", result["factor_ic"]),
+        (f"robustness_selector_v1_2_{run_id}.csv", result["robustness"]),
+        (f"bucket_summary_selector_v1_2_{run_id}.csv", result["bucket"]),
+        (f"funnel_selector_v1_2_{run_id}.csv", result["funnel"]),
+        (f"data_gaps_selector_v1_2_{run_id}.csv", result["gaps"]),
+        (f"research_config_selector_v1_2_{run_id}.json", config_bytes),
     ]
 
 
@@ -1022,6 +1165,8 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
         ignore_index=True,
     )
     rank_summary = build_rank_summary(candidates)
+    entry_diagnostics = build_entry_diagnostics(candidates)
+    b_top3_detail, b_top3_summary = build_b_top3_comparison(candidates)
     factor_ic = build_factor_ic(candidates)
     robustness = build_robustness(independent_events)
     funnel = pd.DataFrame(funnel_rows)
@@ -1029,7 +1174,12 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
 
     status.update(label="研究完成", state="complete", expanded=False)
     return {
-        "config": asdict(config),
+        "config": {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "build_id": BUILD_ID,
+            **asdict(config),
+        },
         "run_id": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "candidates": candidates,
         "top10": weekly_top10,
@@ -1037,6 +1187,9 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
         "events": independent_events,
         "model_summary": model_summary,
         "rank_summary": rank_summary,
+        "entry_diagnostics": entry_diagnostics,
+        "b_top3_detail": b_top3_detail,
+        "b_top3_summary": b_top3_summary,
         "factor_ic": factor_ic,
         "robustness": robustness,
         "bucket": bucket_summary,
@@ -1052,6 +1205,9 @@ def render_results(result: dict) -> None:
     events: pd.DataFrame = result["events"]
     model_summary: pd.DataFrame = result["model_summary"]
     rank_summary: pd.DataFrame = result["rank_summary"]
+    entry_diagnostics: pd.DataFrame = result["entry_diagnostics"]
+    b_top3_detail: pd.DataFrame = result["b_top3_detail"]
+    b_top3_summary: pd.DataFrame = result["b_top3_summary"]
     factor_ic: pd.DataFrame = result["factor_ic"]
     robustness: pd.DataFrame = result["robustness"]
     bucket: pd.DataFrame = result["bucket"]
@@ -1076,13 +1232,15 @@ def render_results(result: dict) -> None:
     st.caption("A为行业相对强度单因子；B为原50%相对强度+25%低波动+25%低回撤。两者固定同时运行，不搜索权重。")
     st.dataframe(format_percent_columns(model_summary), use_container_width=True, hide_index=True)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-        ["每周第一名", "独立趋势事件", "排名区间", "因子诊断", "牛股依赖", "每周Top10", "分组单调性", "数据审计"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+        ["每周第一名", "独立趋势事件", "排名区间", "入场位置", "因子诊断", "牛股依赖", "每周Top10", "分组单调性", "数据审计"]
     )
     with tab1:
         preferred = [
             "信号日", "买入日", "模型", "周排名", "ts_code", "股票名称", "二级行业",
             "综合分", "未复权收盘", "流通市值万元", "能否按次日开盘买入", "无法买入原因",
+            "信号前5日涨幅", "信号前20日涨幅", "信号前60日涨幅", "近5日加速度",
+            "距20日最高价", "距60日最高价", "距20日均线",
             "20日MFE", "20日MAE", "20日路径分类", "60日MFE", "60日MAE", "60日路径分类",
             "120日MFE", "120日MAE", "120日末收益", "120日峰值天数", "120日峰值前MAE",
             "120日峰后至期末回撤", "120日超额收益", "120日路径分类",
@@ -1096,17 +1254,24 @@ def render_results(result: dict) -> None:
         st.caption("直接比较第1名、第2-3名、第4-10名；第一名应稳定优于后续排名才有实盘意义。")
         st.dataframe(format_percent_columns(rank_summary), use_container_width=True, hide_index=True)
     with tab4:
+        st.caption("只诊断追高与入场位置，不改变A/B排名。近5日加速度=最近5日涨幅减去此前15日折算的5日涨幅。")
+        st.dataframe(format_percent_columns(entry_diagnostics), use_container_width=True, hide_index=True)
+        st.markdown("**B模型：第一名与前三名等权（相同成熟周配对比较）**")
+        st.dataframe(format_percent_columns(b_top3_summary), use_container_width=True, hide_index=True)
+        with st.expander("查看逐周配对明细"):
+            st.dataframe(format_percent_columns(b_top3_detail), use_container_width=True, hide_index=True)
+    with tab5:
         st.caption("逐周Spearman相关。MFE、期末收益希望为正；MAE希望为正，代表评分越高、亏损越小。")
         st.dataframe(format_percent_columns(factor_ic), use_container_width=True, hide_index=True)
-    with tab5:
+    with tab6:
         st.caption("基于独立趋势事件，依次删除期末表现最好的1、3、5只股票，检查结果是否坍塌。")
         st.dataframe(format_percent_columns(robustness), use_container_width=True, hide_index=True)
-    with tab6:
-        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
     with tab7:
+        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
+    with tab8:
         st.caption("只有从Q1到Q5总体改善，才说明排名具有可信的横截面区分能力。")
         st.dataframe(format_percent_columns(bucket), use_container_width=True, hide_index=True)
-    with tab8:
+    with tab9:
         st.markdown("**筛选漏斗**")
         st.dataframe(funnel, use_container_width=True, hide_index=True)
         st.markdown("**数据缺口**")
@@ -1120,7 +1285,7 @@ def render_results(result: dict) -> None:
     st.download_button(
         "一键下载全部研究结果（ZIP）",
         data=build_zip(result),
-        file_name=f"selector_research_v1_1_{result['run_id']}.zip",
+        file_name=f"selector_research_v1_2_{result['run_id']}.zip",
         mime="application/zip",
         type="primary",
         key=f"download_all_{result['run_id']}",
@@ -1172,7 +1337,7 @@ def main() -> None:
         min_amount = st.number_input("20日平均成交额下限（亿元）", min_value=0.0, value=1.0, step=0.1)
 
         st.header("研究模型")
-        st.caption("固定同时运行A：相对强度单因子；B：原综合模型。暂不加入财务因子，不进行权重搜索。")
+        st.caption("固定同时运行A：相对强度单因子；B：原综合模型。v1.2不改模型，只增加入场诊断。")
         use_st = st.checkbox(
             "尝试调用历史ST列表",
             value=True,
@@ -1188,7 +1353,7 @@ def main() -> None:
 
     st.info(
         "A模型只按行业相对强度排名；B模型固定为相对强度50% + 低波动25% + 低回撤25%。"
-        "重点比较第一名是否稳定优于第2-10名，以及+20%能否先于-10%。"
+        "重点比较第一名是否稳定优于第2-10名，并诊断短期涨幅、加速度和距离近期高点。"
     )
 
     if run_button:
@@ -1222,12 +1387,12 @@ def main() -> None:
             severe_mae=-float(severe_mae_pct) / 100.0,
         )
         try:
-            st.session_state["selector_v1_1_result"] = run_research(pro, config)
+            st.session_state["selector_v1_2_result"] = run_research(pro, config)
         except Exception as exc:
             st.exception(exc)
 
-    if "selector_v1_1_result" in st.session_state:
-        render_results(st.session_state["selector_v1_1_result"])
+    if "selector_v1_2_result" in st.session_state:
+        render_results(st.session_state["selector_v1_2_result"])
 
 
 if __name__ == "__main__":
