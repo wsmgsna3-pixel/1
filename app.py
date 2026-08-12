@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 """
-独立选股研究系统 v1.3
-构建编号：SELECTOR-V1.3-20260812-FINAL
+独立选股研究系统 v1.4
+构建编号：SELECTOR-V1.4-20260812-FINAL
 
 本文件不是“ｖ1.0日线版.py”。
-v1.3保持v1.2的A/B模型、权重和研究诊断完全一致，
-新增B模型周度前三名的30万元三仓组合回测，并列比较四种固定退出方案。
-退出信号在收盘确认、下一交易日开盘执行，避免未来数据参与成交。
+v1.4保持A/B模型和权重不变，只保留跨年度为正的固定60日三仓方案。
+本版并列比较“每周可买”与“科技池120日上涨家数不足一半时空仓”，
+并用12个起始周偏移检查建仓相位；同时分开报告信号期末与最终清仓结果。
 """
 
 import io
@@ -27,9 +27,9 @@ import streamlit as st
 import tushare as ts
 
 
-APP_NAME = "独立选股研究系统 v1.3"
-APP_VERSION = "1.3.0"
-BUILD_ID = "SELECTOR-V1.3-20260812-FINAL"
+APP_NAME = "独立选股研究系统 v1.4"
+APP_VERSION = "1.4.0"
+BUILD_ID = "SELECTOR-V1.4-20260812-FINAL"
 CACHE_DIR = Path(__file__).resolve().parent / ".selector_research_cache_v1"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -80,17 +80,14 @@ class PortfolioPolicy:
 
 
 PORTFOLIO_POLICIES = (
-    PortfolioPolicy("P1_固定60日", 60),
-    PortfolioPolicy("P2_固定120日", 120),
-    PortfolioPolicy("P3_120日_收盘亏损10%", 120, close_stop_loss=-0.10),
-    PortfolioPolicy(
-        "P4_120日_亏损10%_盈利20%后回撤10%",
-        120,
-        close_stop_loss=-0.10,
-        trailing_activation=0.20,
-        trailing_drawdown=-0.10,
-    ),
+    PortfolioPolicy("固定60日", 60),
 )
+
+MARKET_GATES = (
+    ("G0_不设空仓门槛", False),
+    ("G1_上涨家数不足一半空仓", True),
+)
+PHASE_OFFSETS = tuple(range(12))
 
 
 def ymd(value: date | datetime | str | pd.Timestamp) -> str:
@@ -481,6 +478,10 @@ def score_one_week(
         "有足够行情": int(len(features)),
         "价格市值合格": 0,
         "上市与流动性合格": 0,
+        "具备120日趋势数据": 0,
+        "科技池120日上涨比例": np.nan,
+        "科技池120日收益中位数": np.nan,
+        "多数股票上涨": False,
         "绝对趋势为正": 0,
         "排除ST后合格": 0,
     }
@@ -515,16 +516,28 @@ def score_one_week(
     features = features.loc[liquidity].copy()
     funnel["上市与流动性合格"] = int(len(features))
 
-    features = features.loc[
-        features[["ret120_ex5", "vol60", "mdd60"]].notna().all(axis=1)
-        & (features["ret120_ex5"] > 0)
-    ].copy()
-    funnel["绝对趋势为正"] = int(len(features))
+    ready = features[["ret120_ex5", "vol60", "mdd60"]].notna().all(axis=1)
+    breadth_pool = features.loc[ready & ~features["ts_code"].isin(st_codes)].copy()
+    funnel["具备120日趋势数据"] = int(len(breadth_pool))
+    if not breadth_pool.empty:
+        breadth = float((breadth_pool["ret120_ex5"] > 0).mean())
+        median_return = float(breadth_pool["ret120_ex5"].median())
+        funnel["科技池120日上涨比例"] = breadth
+        funnel["科技池120日收益中位数"] = median_return
+        funnel["多数股票上涨"] = bool(breadth >= 0.50)
+    else:
+        breadth = np.nan
+        median_return = np.nan
 
-    features = features.loc[~features["ts_code"].isin(st_codes)].copy()
+    funnel["绝对趋势为正"] = int((features.loc[ready, "ret120_ex5"] > 0).sum())
+    features = breadth_pool.loc[breadth_pool["ret120_ex5"] > 0].copy()
     funnel["排除ST后合格"] = int(len(features))
     if features.empty:
         return features, funnel
+
+    features["科技池120日上涨比例"] = breadth
+    features["科技池120日收益中位数"] = median_return
+    features["多数股票上涨"] = bool(breadth >= 0.50)
 
     industry_median = features.groupby("二级行业")["ret120_ex5"].transform("median")
     features["行业超额强度"] = features["ret120_ex5"] - industry_median
@@ -1039,16 +1052,32 @@ def simulate_portfolio_policy(
     trade_dates: list[str],
     config: Config,
     policy: PortfolioPolicy,
+    gate_name: str = "G0_不设空仓门槛",
+    require_majority_trend: bool = False,
+    phase_offset_weeks: int = 0,
 ) -> dict[str, pd.DataFrame | dict]:
     """B模型前三名、最多三仓；卖出信号收盘确认，下一交易日开盘执行。"""
+    run_label = f"{policy.name}|{gate_name}|偏移{phase_offset_weeks:02d}周"
     top3 = candidates.loc[
         (candidates["模型"] == "B_原综合模型") & (candidates["周排名"] <= 3)
     ].copy()
     top3 = top3.sort_values(["信号日", "周排名", "ts_code"])
+    signal_weeks = sorted(top3["信号日"].astype(str).unique().tolist())
+    skipped_start_weeks = set(signal_weeks[: max(0, int(phase_offset_weeks))])
     simulation_dates = [d for d in trade_dates if config.start_date <= d]
     schedules: dict[str, list[dict]] = {}
     unscheduled: list[dict] = []
+    rejected: list[tuple[dict, str]] = []
     for record in top3.to_dict("records"):
+        signal_date = str(record.get("信号日", ""))
+        if signal_date in skipped_start_weeks:
+            rejected.append((record, "起始周偏移跳过"))
+            continue
+        majority = record.get("多数股票上涨", False)
+        majority_ok = bool(majority) if pd.notna(majority) else False
+        if require_majority_trend and not majority_ok:
+            rejected.append((record, "科技池120日上涨家数不足一半"))
+            continue
         entry_date = str(record.get("买入日", "") or "")
         if not entry_date or entry_date not in trade_dates:
             unscheduled.append(record)
@@ -1063,10 +1092,24 @@ def simulate_portfolio_policy(
     audit: list[dict] = []
     curve: list[dict] = []
 
+    for record, reason in rejected:
+        audit.append(
+            {
+                "退出方案": run_label,
+                "信号日": record.get("信号日", ""),
+                "计划买入日": record.get("买入日", ""),
+                "周排名": record.get("周排名", np.nan),
+                "ts_code": record.get("ts_code", ""),
+                "股票名称": record.get("股票名称", ""),
+                "处理结果": "规则跳过",
+                "原因": reason,
+            }
+        )
+
     for record in unscheduled:
         audit.append(
             {
-                "退出方案": policy.name,
+                "退出方案": run_label,
                 "信号日": record.get("信号日", ""),
                 "计划买入日": "",
                 "周排名": record.get("周排名", np.nan),
@@ -1100,7 +1143,7 @@ def simulate_portfolio_policy(
             net_return = net_proceeds / position["entry_total_cost"] - 1.0
             orders.append(
                 {
-                    "退出方案": policy.name,
+                    "退出方案": run_label,
                     "交易日": trade_date,
                     "方向": "卖出",
                     "ts_code": code,
@@ -1118,7 +1161,7 @@ def simulate_portfolio_policy(
             )
             ledger.append(
                 {
-                    "退出方案": policy.name,
+                    "退出方案": run_label,
                     "ts_code": code,
                     "股票名称": position["股票名称"],
                     "信号日": position["信号日"],
@@ -1145,7 +1188,7 @@ def simulate_portfolio_policy(
         for signal in schedules.get(trade_date, []):
             code = str(signal["ts_code"])
             audit_row = {
-                "退出方案": policy.name,
+                "退出方案": run_label,
                 "信号日": signal["信号日"],
                 "计划买入日": trade_date,
                 "周排名": signal["周排名"],
@@ -1214,7 +1257,7 @@ def simulate_portfolio_policy(
             }
             orders.append(
                 {
-                    "退出方案": policy.name,
+                    "退出方案": run_label,
                     "交易日": trade_date,
                     "方向": "买入",
                     "ts_code": code,
@@ -1264,7 +1307,7 @@ def simulate_portfolio_policy(
         equity_peak = max(previous_peak, equity)
         curve.append(
             {
-                "退出方案": policy.name,
+                "退出方案": run_label,
                 "交易日": trade_date,
                 "现金": cash,
                 "持仓市值": market_value,
@@ -1283,14 +1326,14 @@ def simulate_portfolio_policy(
     orders_frame = pd.DataFrame(orders)
     audit_frame = pd.DataFrame(audit)
     open_rows: list[dict] = []
-    final_date = simulation_dates[-1] if simulation_dates else ""
+    actual_end_date = str(curve_frame["交易日"].iloc[-1]) if not curve_frame.empty else ""
     for position in positions.values():
         mark = position["last_close"]
         market_value = position["shares"] * mark
         open_rows.append(
             {
-                "退出方案": policy.name,
-                "截至日期": final_date,
+                "退出方案": run_label,
+                "截至日期": actual_end_date,
                 "ts_code": position["ts_code"],
                 "股票名称": position["股票名称"],
                 "信号日": position["信号日"],
@@ -1308,9 +1351,24 @@ def simulate_portfolio_policy(
     open_frame = pd.DataFrame(open_rows)
 
     final_equity = float(curve_frame["总权益"].iloc[-1]) if not curve_frame.empty else INITIAL_CAPITAL
+    signal_curve = curve_frame.loc[curve_frame["交易日"].astype(str) <= config.end_date].copy()
+    signal_end_date = str(signal_curve["交易日"].iloc[-1]) if not signal_curve.empty else ""
+    signal_end_equity = (
+        float(signal_curve["总权益"].iloc[-1]) if not signal_curve.empty else INITIAL_CAPITAL
+    )
+    signal_elapsed_days = (
+        (pd.Timestamp(signal_end_date) - pd.Timestamp(simulation_dates[0])).days
+        if signal_end_date and simulation_dates
+        else 0
+    )
+    signal_annualized = (
+        (signal_end_equity / INITIAL_CAPITAL) ** (365.25 / signal_elapsed_days) - 1.0
+        if signal_elapsed_days > 0 and signal_end_equity > 0
+        else np.nan
+    )
     elapsed_days = (
-        (pd.Timestamp(final_date) - pd.Timestamp(simulation_dates[0])).days
-        if len(simulation_dates) >= 2
+        (pd.Timestamp(actual_end_date) - pd.Timestamp(simulation_dates[0])).days
+        if actual_end_date and simulation_dates
         else 0
     )
     annualized = (
@@ -1321,19 +1379,36 @@ def simulate_portfolio_policy(
     closed_returns = ledger_frame.get("净收益率", pd.Series(dtype=float))
     reason_counts = ledger_frame.get("卖出原因", pd.Series(dtype=str)).value_counts()
     audit_reasons = audit_frame.get("原因", pd.Series(dtype=str)).value_counts()
+    breadth_skipped_weeks = (
+        audit_frame.loc[
+            audit_frame.get("原因", pd.Series(dtype=str)) == "科技池120日上涨家数不足一半",
+            "信号日",
+        ].nunique()
+        if not audit_frame.empty
+        else 0
+    )
     summary = {
-        "退出方案": policy.name,
+        "退出方案": run_label,
+        "持有规则": policy.name,
+        "空仓规则": gate_name,
+        "起始周偏移": int(phase_offset_weeks),
         "最大持有交易日": policy.max_holding_days,
         "收盘止损": policy.close_stop_loss,
         "移动保护启动收益": policy.trailing_activation,
         "峰值回撤退出": policy.trailing_drawdown,
         "组合起始日": simulation_dates[0] if simulation_dates else "",
-        "组合截至日": final_date,
+        "信号期结束日": signal_end_date,
+        "信号期结束权益": signal_end_equity,
+        "信号期收益率": signal_end_equity / INITIAL_CAPITAL - 1.0,
+        "信号期年化收益率": signal_annualized,
+        "信号期内最大回撤": signal_curve["回撤"].min() if not signal_curve.empty else np.nan,
+        "实际回测结束日": actual_end_date,
+        "是否全部平仓": len(open_frame) == 0,
         "初始资金": INITIAL_CAPITAL,
-        "期末权益": final_equity,
-        "总收益率": final_equity / INITIAL_CAPITAL - 1.0,
-        "年化收益率": annualized,
-        "最大回撤": curve_frame["回撤"].min() if not curve_frame.empty else np.nan,
+        "最终权益": final_equity,
+        "最终收益率": final_equity / INITIAL_CAPITAL - 1.0,
+        "最终年化收益率": annualized,
+        "全程最大回撤": curve_frame["回撤"].min() if not curve_frame.empty else np.nan,
         "买入次数": int((orders_frame.get("方向", pd.Series(dtype=str)) == "买入").sum()),
         "已完成交易": len(ledger_frame),
         "期末持仓": len(open_frame),
@@ -1348,6 +1423,8 @@ def simulate_portfolio_policy(
         "到期退出数": int(sum(count for reason, count in reason_counts.items() if str(reason).startswith("持有达到"))),
         "三仓已满未买": int(audit_reasons.get("三仓已满", 0)),
         "重复持仓未买": int(audit_reasons.get("已有持仓", 0)),
+        "宽度不足跳过周数": int(breadth_skipped_weeks),
+        "起始偏移跳过周数": len(skipped_start_weeks),
         "无法成交未买": int(
             sum(
                 count
@@ -1372,22 +1449,92 @@ def run_portfolio_comparison(
     trade_dates: list[str],
     config: Config,
 ) -> dict[str, pd.DataFrame]:
-    outputs = [
-        simulate_portfolio_policy(candidates, panels, trade_dates, config, policy)
-        for policy in PORTFOLIO_POLICIES
-    ]
+    outputs: list[dict[str, object]] = []
+    policy = PORTFOLIO_POLICIES[0]
+    for gate_name, require_majority in MARKET_GATES:
+        for phase_offset in PHASE_OFFSETS:
+            result = simulate_portfolio_policy(
+                candidates,
+                panels,
+                trade_dates,
+                config,
+                policy,
+                gate_name=gate_name,
+                require_majority_trend=require_majority,
+                phase_offset_weeks=phase_offset,
+            )
+            result["_gate_name"] = gate_name
+            result["_phase_offset"] = phase_offset
+            outputs.append(result)
 
-    def combine(key: str) -> pd.DataFrame:
-        frames = [item[key] for item in outputs if not item[key].empty]
+    def combine(items: list[dict[str, object]], key: str) -> pd.DataFrame:
+        frames = [item[key] for item in items if isinstance(item[key], pd.DataFrame) and not item[key].empty]
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
+    phase_summary = combine(outputs, "summary")
+    gate_rows: list[dict] = []
+    if not phase_summary.empty:
+        for gate_name, group in phase_summary.groupby("空仓规则", sort=False):
+            gate_rows.append(
+                {
+                    "空仓规则": gate_name,
+                    "相位数量": len(group),
+                    "信号期收益均值": group["信号期收益率"].mean(),
+                    "信号期收益中位数": group["信号期收益率"].median(),
+                    "信号期盈利相位比例": (group["信号期收益率"] > 0).mean(),
+                    "信号期最差收益": group["信号期收益率"].min(),
+                    "信号期最好收益": group["信号期收益率"].max(),
+                    "信号期最大回撤中位数": group["信号期内最大回撤"].median(),
+                    "信号期最差最大回撤": group["信号期内最大回撤"].min(),
+                    "最终收益中位数": group["最终收益率"].median(),
+                    "全程最大回撤中位数": group["全程最大回撤"].median(),
+                    "平均买入次数": group["买入次数"].mean(),
+                    "平均宽度不足跳过周数": group["宽度不足跳过周数"].mean(),
+                }
+            )
+
+    cohort_rows: list[dict] = []
+    for output in outputs:
+        summary = output["summary"].iloc[0]
+        ledger = output["ledger"]
+        open_positions = output["open_positions"]
+        pieces: list[pd.DataFrame] = []
+        if isinstance(ledger, pd.DataFrame) and not ledger.empty:
+            pieces.append(
+                ledger[["信号日", "净收益"]].rename(columns={"净收益": "批次盈亏"})
+            )
+        if isinstance(open_positions, pd.DataFrame) and not open_positions.empty:
+            pieces.append(
+                open_positions[["信号日", "未实现净收益"]].rename(
+                    columns={"未实现净收益": "批次盈亏"}
+                )
+            )
+        if not pieces:
+            continue
+        pnl = pd.concat(pieces, ignore_index=True)
+        for signal_date, group in pnl.groupby("信号日", sort=True):
+            cohort_rows.append(
+                {
+                    "退出方案": summary["退出方案"],
+                    "空仓规则": summary["空仓规则"],
+                    "起始周偏移": summary["起始周偏移"],
+                    "信号日": signal_date,
+                    "该批股票数": len(group),
+                    "该批合计盈亏": group["批次盈亏"].sum(),
+                }
+            )
+
+    standard_outputs = [item for item in outputs if int(item["_phase_offset"]) == 0]
     return {
-        "portfolio_summary": combine("summary"),
-        "portfolio_curve": combine("curve"),
-        "portfolio_orders": combine("orders"),
-        "portfolio_ledger": combine("ledger"),
-        "portfolio_signal_audit": combine("audit"),
-        "portfolio_open_positions": combine("open_positions"),
+        "portfolio_summary": combine(standard_outputs, "summary"),
+        "portfolio_curve": combine(standard_outputs, "curve"),
+        "portfolio_orders": combine(standard_outputs, "orders"),
+        "portfolio_ledger": combine(standard_outputs, "ledger"),
+        "portfolio_signal_audit": combine(standard_outputs, "audit"),
+        "portfolio_open_positions": combine(standard_outputs, "open_positions"),
+        "phase_audit_summary": phase_summary,
+        "phase_gate_summary": pd.DataFrame(gate_rows),
+        "phase_cohorts": pd.DataFrame(cohort_rows),
     }
 
 
@@ -1479,27 +1626,30 @@ def result_files(result: dict) -> list[tuple[str, pd.DataFrame | bytes]]:
     run_id = str(result["run_id"])
     config_bytes = json.dumps(result["config"], ensure_ascii=False, indent=2).encode("utf-8")
     return [
-        (f"weekly_signals_selector_v1_3_{run_id}.csv", result["signals"]),
-        (f"independent_events_selector_v1_3_{run_id}.csv", result["events"]),
-        (f"weekly_top10_selector_v1_3_{run_id}.csv", result["top10"]),
-        (f"all_candidates_paths_selector_v1_3_{run_id}.csv", result["candidates"]),
-        (f"model_comparison_selector_v1_3_{run_id}.csv", result["model_summary"]),
-        (f"rank_bands_selector_v1_3_{run_id}.csv", result["rank_summary"]),
-        (f"entry_diagnostics_selector_v1_3_{run_id}.csv", result["entry_diagnostics"]),
-        (f"b_top3_comparison_selector_v1_3_{run_id}.csv", result["b_top3_summary"]),
-        (f"b_top3_weekly_selector_v1_3_{run_id}.csv", result["b_top3_detail"]),
-        (f"portfolio_summary_selector_v1_3_{run_id}.csv", result["portfolio_summary"]),
-        (f"portfolio_curve_selector_v1_3_{run_id}.csv", result["portfolio_curve"]),
-        (f"portfolio_orders_selector_v1_3_{run_id}.csv", result["portfolio_orders"]),
-        (f"portfolio_ledger_selector_v1_3_{run_id}.csv", result["portfolio_ledger"]),
-        (f"portfolio_signal_audit_selector_v1_3_{run_id}.csv", result["portfolio_signal_audit"]),
-        (f"portfolio_open_positions_selector_v1_3_{run_id}.csv", result["portfolio_open_positions"]),
-        (f"factor_ic_selector_v1_3_{run_id}.csv", result["factor_ic"]),
-        (f"robustness_selector_v1_3_{run_id}.csv", result["robustness"]),
-        (f"bucket_summary_selector_v1_3_{run_id}.csv", result["bucket"]),
-        (f"funnel_selector_v1_3_{run_id}.csv", result["funnel"]),
-        (f"data_gaps_selector_v1_3_{run_id}.csv", result["gaps"]),
-        (f"research_config_selector_v1_3_{run_id}.json", config_bytes),
+        (f"weekly_signals_selector_v1_4_{run_id}.csv", result["signals"]),
+        (f"independent_events_selector_v1_4_{run_id}.csv", result["events"]),
+        (f"weekly_top10_selector_v1_4_{run_id}.csv", result["top10"]),
+        (f"all_candidates_paths_selector_v1_4_{run_id}.csv", result["candidates"]),
+        (f"model_comparison_selector_v1_4_{run_id}.csv", result["model_summary"]),
+        (f"rank_bands_selector_v1_4_{run_id}.csv", result["rank_summary"]),
+        (f"entry_diagnostics_selector_v1_4_{run_id}.csv", result["entry_diagnostics"]),
+        (f"b_top3_comparison_selector_v1_4_{run_id}.csv", result["b_top3_summary"]),
+        (f"b_top3_weekly_selector_v1_4_{run_id}.csv", result["b_top3_detail"]),
+        (f"portfolio_summary_selector_v1_4_{run_id}.csv", result["portfolio_summary"]),
+        (f"portfolio_curve_selector_v1_4_{run_id}.csv", result["portfolio_curve"]),
+        (f"portfolio_orders_selector_v1_4_{run_id}.csv", result["portfolio_orders"]),
+        (f"portfolio_ledger_selector_v1_4_{run_id}.csv", result["portfolio_ledger"]),
+        (f"portfolio_signal_audit_selector_v1_4_{run_id}.csv", result["portfolio_signal_audit"]),
+        (f"portfolio_open_positions_selector_v1_4_{run_id}.csv", result["portfolio_open_positions"]),
+        (f"phase_audit_summary_selector_v1_4_{run_id}.csv", result["phase_audit_summary"]),
+        (f"phase_gate_summary_selector_v1_4_{run_id}.csv", result["phase_gate_summary"]),
+        (f"phase_cohorts_selector_v1_4_{run_id}.csv", result["phase_cohorts"]),
+        (f"factor_ic_selector_v1_4_{run_id}.csv", result["factor_ic"]),
+        (f"robustness_selector_v1_4_{run_id}.csv", result["robustness"]),
+        (f"bucket_summary_selector_v1_4_{run_id}.csv", result["bucket"]),
+        (f"funnel_selector_v1_4_{run_id}.csv", result["funnel"]),
+        (f"data_gaps_selector_v1_4_{run_id}.csv", result["gaps"]),
+        (f"research_config_selector_v1_4_{run_id}.json", config_bytes),
     ]
 
 
@@ -1609,7 +1759,7 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
     rank_summary = build_rank_summary(candidates)
     entry_diagnostics = build_entry_diagnostics(candidates)
     b_top3_detail, b_top3_summary = build_b_top3_comparison(candidates)
-    status.write("运行B模型前三名的30万元三仓组合对照")
+    status.write("运行固定60日、两种空仓规则和12个起始周相位")
     portfolio = run_portfolio_comparison(candidates, panels, trade_dates, config)
     factor_ic = build_factor_ic(candidates)
     robustness = build_robustness(independent_events)
@@ -1630,8 +1780,17 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
                 "minimum_commission": MIN_COMMISSION,
                 "sell_stamp_duty": SELL_STAMP_DUTY,
                 "one_way_slippage": SLIPPAGE_RATE,
-                "execution_rule": "收盘确认退出，下一交易日开盘执行",
+                "execution_rule": "固定持有60个交易日，下一交易日开盘卖出",
                 "policies": [asdict(policy) for policy in PORTFOLIO_POLICIES],
+                "market_gates": [
+                    {
+                        "name": name,
+                        "require_majority_120d_uptrend": require_majority,
+                        "threshold": 0.50 if require_majority else None,
+                    }
+                    for name, require_majority in MARKET_GATES
+                ],
+                "phase_offsets_weeks": list(PHASE_OFFSETS),
             },
             **asdict(config),
         },
@@ -1670,6 +1829,9 @@ def render_results(result: dict) -> None:
     portfolio_ledger: pd.DataFrame = result["portfolio_ledger"]
     portfolio_signal_audit: pd.DataFrame = result["portfolio_signal_audit"]
     portfolio_open_positions: pd.DataFrame = result["portfolio_open_positions"]
+    phase_audit_summary: pd.DataFrame = result["phase_audit_summary"]
+    phase_gate_summary: pd.DataFrame = result["phase_gate_summary"]
+    phase_cohorts: pd.DataFrame = result["phase_cohorts"]
     factor_ic: pd.DataFrame = result["factor_ic"]
     robustness: pd.DataFrame = result["robustness"]
     bucket: pd.DataFrame = result["bucket"]
@@ -1696,14 +1858,16 @@ def render_results(result: dict) -> None:
 
     st.subheader("30万元三仓组合对照")
     st.caption(
-        "只使用B模型每周前三名；最多3仓，空仓时按排名补入。"
+        "只使用B模型每周前三名和固定60日；最多3仓，空仓时按排名补入。"
         "买卖均按下一交易日开盘并计入固定佣金、卖出印花税和单边0.05%滑点。"
-        "四种退出方案同时运行，不根据本次结果自动选择。"
+        "G1仅在科技池中过去120日上涨股票达到一半时允许建仓。"
     )
     st.dataframe(format_percent_columns(portfolio_summary), use_container_width=True, hide_index=True)
+    st.markdown("**12个不同起始周的总体稳健性**")
+    st.dataframe(format_percent_columns(phase_gate_summary), use_container_width=True, hide_index=True)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
-        ["每周第一名", "独立趋势事件", "排名区间", "入场位置", "三仓明细", "因子诊断", "牛股依赖", "每周Top10", "分组单调性", "数据审计"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
+        ["每周第一名", "独立趋势事件", "排名区间", "入场位置", "三仓明细", "相位审计", "因子诊断", "牛股依赖", "每周Top10", "分组单调性", "数据审计"]
     )
     with tab1:
         preferred = [
@@ -1751,17 +1915,24 @@ def render_results(result: dict) -> None:
         with st.expander("查看每日组合权益"):
             st.dataframe(format_percent_columns(portfolio_curve), use_container_width=True, hide_index=True)
     with tab6:
+        st.caption(
+            "偏移0～11周分别启动同一固定60日策略。大多数相位都盈利，才说明结果不是首次建仓日期碰巧选得好。"
+        )
+        st.dataframe(format_percent_columns(phase_audit_summary), use_container_width=True, hide_index=True)
+        with st.expander("查看各相位实际买入批次及盈亏"):
+            st.dataframe(phase_cohorts, use_container_width=True, hide_index=True)
+    with tab7:
         st.caption("逐周Spearman相关。MFE、期末收益希望为正；MAE希望为正，代表评分越高、亏损越小。")
         st.dataframe(format_percent_columns(factor_ic), use_container_width=True, hide_index=True)
-    with tab7:
+    with tab8:
         st.caption("基于独立趋势事件，依次删除期末表现最好的1、3、5只股票，检查结果是否坍塌。")
         st.dataframe(format_percent_columns(robustness), use_container_width=True, hide_index=True)
-    with tab8:
-        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
     with tab9:
+        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
+    with tab10:
         st.caption("只有从Q1到Q5总体改善，才说明排名具有可信的横截面区分能力。")
         st.dataframe(format_percent_columns(bucket), use_container_width=True, hide_index=True)
-    with tab10:
+    with tab11:
         st.markdown("**筛选漏斗**")
         st.dataframe(funnel, use_container_width=True, hide_index=True)
         st.markdown("**数据缺口**")
@@ -1775,7 +1946,7 @@ def render_results(result: dict) -> None:
     st.download_button(
         "一键下载全部研究结果（ZIP）",
         data=build_zip(result),
-        file_name=f"selector_research_v1_3_{result['run_id']}.zip",
+        file_name=f"selector_research_v1_4_{result['run_id']}.zip",
         mime="application/zip",
         type="primary",
         key=f"download_all_{result['run_id']}",
@@ -1797,7 +1968,7 @@ def main() -> None:
     st.set_page_config(page_title=APP_NAME, layout="wide")
     st.title(APP_NAME)
     st.code(f"版本：{APP_VERSION}｜构建编号：{BUILD_ID}", language=None)
-    st.caption("从零设计；不使用MACD、红绿柱、旧评分阈值或旧版本交易规则。v1.3新增B模型前三名的正式三仓组合验证。")
+    st.caption("从零设计；不使用MACD或红绿柱。v1.4只研究固定60日、允许空仓和建仓相位稳健性。")
 
     with st.sidebar:
         st.header("数据与股票池")
@@ -1827,7 +1998,7 @@ def main() -> None:
         min_amount = st.number_input("20日平均成交额下限（亿元）", min_value=0.0, value=1.0, step=0.1)
 
         st.header("研究模型")
-        st.caption("固定同时运行A：相对强度单因子；B：原综合模型。v1.3不改评分，只让B模型进入三仓组合。")
+        st.caption("A/B评分保持不变；三仓组合只使用B模型前三名和固定60日。")
         use_st = st.checkbox(
             "尝试调用历史ST列表",
             value=True,
@@ -1842,14 +2013,14 @@ def main() -> None:
         st.header("三仓组合（固定口径）")
         st.caption(
             "初始资金30万元、最多3仓。佣金0.03%且最低5元；卖出印花税0.05%；"
-            "买卖各计0.05%滑点。参数固定，不在侧边栏优化。"
+            "买卖各计0.05%滑点。并列运行两种空仓规则和12个起始周，不提供参数优化。"
         )
 
         run_button = st.button("开始研究", type="primary", use_container_width=True)
 
     st.info(
         "A模型只按行业相对强度排名；B模型固定为相对强度50% + 低波动25% + 低回撤25%。"
-        "组合只采用B模型每周前三名，比较60日、120日、收盘止损和盈利回撤保护四种固定退出方案。"
+        "G1规则在科技池过去120日上涨股票不足50%时不建新仓；该门槛只代表多数趋势，不由收益倒推。"
     )
 
     if run_button:
@@ -1883,12 +2054,12 @@ def main() -> None:
             severe_mae=-float(severe_mae_pct) / 100.0,
         )
         try:
-            st.session_state["selector_v1_3_result"] = run_research(pro, config)
+            st.session_state["selector_v1_4_result"] = run_research(pro, config)
         except Exception as exc:
             st.exception(exc)
 
-    if "selector_v1_3_result" in st.session_state:
-        render_results(st.session_state["selector_v1_3_result"])
+    if "selector_v1_4_result" in st.session_state:
+        render_results(st.session_state["selector_v1_4_result"])
 
 
 if __name__ == "__main__":
