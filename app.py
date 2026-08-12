@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+"""
+独立选股研究系统 v1.1
+构建编号：SELECTOR-V1.1-20260812-FINAL
+
+本文件不是“ｖ1.0日线版.py”。
+v1.1固定同时运行相对强度单因子与原综合模型，并包含独立趋势事件、
+排名区间、合格池超额收益、因子IC、牛股依赖检验和ZIP打包下载。
+"""
+
 import io
 import json
 import math
 import os
 import time
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,8 +26,9 @@ import streamlit as st
 import tushare as ts
 
 
-APP_NAME = "独立选股研究系统 v1.0"
-APP_VERSION = "1.0.0"
+APP_NAME = "独立选股研究系统 v1.1"
+APP_VERSION = "1.1.0"
+BUILD_ID = "SELECTOR-V1.1-20260812-FINAL"
 CACHE_DIR = Path(__file__).resolve().parent / ".selector_research_cache_v1"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -30,18 +41,22 @@ TECH_INDUSTRIES = {
     "国防军工": "801740.SI",
 }
 
+TECH_SUBINDUSTRIES = {
+    "自动化设备（机器人/工控/激光）": "801078.SI",
+}
+
 
 @dataclass(frozen=True)
 class Config:
     start_date: str
     end_date: str
     l1_codes: tuple[str, ...]
+    l2_codes: tuple[str, ...]
     min_price: float
     min_circ_mv_yi: float
     max_circ_mv_yi: float
     min_listing_days: int
     min_amount_yi: float
-    mode: str
     use_historical_st: bool
     success_mfe: float
     severe_mae: float
@@ -166,7 +181,12 @@ def get_stock_basic(pro, gaps: list[dict]) -> pd.DataFrame:
     return stocks.loc[board_ok & exchange_ok].copy()
 
 
-def get_industry_members(pro, l1_codes: Iterable[str], gaps: list[dict]) -> pd.DataFrame:
+def get_industry_members(
+    pro,
+    l1_codes: Iterable[str],
+    l2_codes: Iterable[str],
+    gaps: list[dict],
+) -> pd.DataFrame:
     pieces: list[pd.DataFrame] = []
     fields = "l1_code,l1_name,l2_code,l2_name,l3_code,l3_name,ts_code,name,in_date,out_date,is_new"
     for code in l1_codes:
@@ -178,6 +198,23 @@ def get_industry_members(pro, l1_codes: Iterable[str], gaps: list[dict]) -> pd.D
                 lambda code=code, is_new=is_new: api_call(
                     pro.index_member_all,
                     l1_code=code,
+                    is_new=is_new,
+                    fields=fields,
+                ),
+                gaps,
+                required=is_new == "Y",
+            )
+            if not frame.empty:
+                pieces.append(frame)
+    for code in l2_codes:
+        for is_new in ("Y", "N"):
+            key = f"L2_{code}_{is_new}"
+            frame = load_or_fetch(
+                "index_member_all",
+                key,
+                lambda code=code, is_new=is_new: api_call(
+                    pro.index_member_all,
+                    l2_code=code,
                     is_new=is_new,
                     fields=fields,
                 ),
@@ -318,82 +355,6 @@ def prepare_price_panels(history: pd.DataFrame, trade_dates: list[str]) -> dict[
     return panels
 
 
-def latest_financial_asof(financial: pd.DataFrame, signal_date: str) -> dict[str, float]:
-    if financial.empty:
-        return {"roe_dt": np.nan, "ocf_to_or": np.nan, "debt_to_assets": np.nan, "财报公告日": ""}
-    available = financial.loc[financial["ann_date"].astype(str) <= signal_date].copy()
-    if available.empty:
-        return {"roe_dt": np.nan, "ocf_to_or": np.nan, "debt_to_assets": np.nan, "财报公告日": ""}
-    available = available.sort_values(["ann_date", "end_date", "update_flag"])
-    row = available.iloc[-1]
-    return {
-        "roe_dt": safe_number(row.get("roe_dt")),
-        "ocf_to_or": safe_number(row.get("ocf_to_or")),
-        "debt_to_assets": safe_number(row.get("debt_to_assets")),
-        "财报公告日": str(row.get("ann_date", "")),
-    }
-
-
-def fetch_financials(
-    pro,
-    codes: list[str],
-    start_date: str,
-    end_date: str,
-    gaps: list[dict],
-    progress,
-) -> dict[str, pd.DataFrame]:
-    output: dict[str, pd.DataFrame] = {}
-    fields = "ts_code,ann_date,end_date,update_flag,roe_dt,ocf_to_or,debt_to_assets"
-    report_start = ymd(pd.Timestamp(start_date) - pd.Timedelta(days=900))
-    for index, code in enumerate(codes):
-        cache_key = f"{code.replace('.', '_')}_{report_start}_{end_date}"
-        frame = load_or_fetch(
-            "fina_indicator",
-            cache_key,
-            lambda code=code: api_call(
-                pro.fina_indicator,
-                ts_code=code,
-                start_date=report_start,
-                end_date=end_date,
-                fields=fields,
-            ),
-            gaps,
-            required=False,
-        )
-        if not frame.empty:
-            for col in ("roe_dt", "ocf_to_or", "debt_to_assets"):
-                frame[col] = pd.to_numeric(frame[col], errors="coerce")
-            output[code] = frame
-        if index % 5 == 0 or index + 1 == len(codes):
-            progress.progress((index + 1) / max(1, len(codes)), text=f"财务风险数据 {index + 1}/{len(codes)}")
-    return output
-
-
-def financial_permission_available(pro, sample_code: str, end_date: str, gaps: list[dict]) -> bool:
-    """只探测一次，避免权限不足时对数百只股票重复等待重试。"""
-    try:
-        api_call(
-            pro.fina_indicator,
-            retries=1,
-            pause=0.0,
-            ts_code=sample_code,
-            start_date=ymd(pd.Timestamp(end_date) - pd.Timedelta(days=900)),
-            end_date=end_date,
-            fields="ts_code,ann_date,end_date,update_flag,roe_dt,ocf_to_or,debt_to_assets",
-        )
-        return True
-    except Exception as exc:
-        gaps.append(
-            {
-                "数据类型": "fina_indicator",
-                "日期或代码": "权限探测",
-                "错误": str(exc),
-                "是否关键": False,
-            }
-        )
-        return False
-
-
 def percentile(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
     if series.notna().sum() <= 1:
         return pd.Series(0.5, index=series.index, dtype=float)
@@ -420,7 +381,6 @@ def score_one_week(
     panels: dict[str, pd.DataFrame],
     daily_basic: pd.DataFrame,
     st_codes: set[str],
-    financials: dict[str, pd.DataFrame],
 ) -> tuple[pd.DataFrame, dict]:
     active = active_members_on(members, signal_date)
     meta = stocks[["ts_code", "symbol", "name", "market", "list_date", "delist_date"]].copy()
@@ -515,24 +475,6 @@ def score_one_week(
         + 0.25 * features["低波动分"]
         + 0.25 * features["低回撤分"]
     )
-
-    if financials:
-        fin_rows = []
-        for code in features["ts_code"]:
-            values = latest_financial_asof(financials.get(code, pd.DataFrame()), signal_date)
-            values["ts_code"] = code
-            fin_rows.append(values)
-        fin = pd.DataFrame(fin_rows)
-        features = features.merge(fin, on="ts_code", how="left")
-        features["ROE风险分"] = percentile(features["roe_dt"], True)
-        features["现金流风险分"] = percentile(features["ocf_to_or"], True)
-        features["负债风险分"] = percentile(features["debt_to_assets"], False)
-        features["财务覆盖项"] = features[["roe_dt", "ocf_to_or", "debt_to_assets"]].notna().sum(axis=1)
-        components = features[["ROE风险分", "现金流风险分", "负债风险分"]].copy()
-        raw_available = features[["roe_dt", "ocf_to_or", "debt_to_assets"]].notna()
-        components = components.where(raw_available, 0.5)
-        features["财务风险分"] = components.mean(axis=1)
-        features["含财务模型分"] = 0.80 * features["价格模型分"] + 0.20 * features["财务风险分"]
 
     return features, funnel
 
@@ -661,54 +603,60 @@ def attach_forward_paths(
     date_to_pos = {value: index for index, value in enumerate(trade_dates)}
     rows: list[dict] = []
     records = candidates.to_dict("records")
+    path_cache: dict[tuple[str, str], dict[str, object]] = {}
     for number, row in enumerate(records):
         signal_date = str(row["信号日"])
-        signal_pos = date_to_pos.get(signal_date, -1)
-        entry_pos = signal_pos + 1
         code = str(row["ts_code"])
-        panel = panels.get(code)
-        row["买入日"] = trade_dates[entry_pos] if 0 <= entry_pos < len(trade_dates) else ""
-        row["研究买入价"] = np.nan
-        row["能否按次日开盘买入"] = False
-        row["无法买入原因"] = ""
-
-        if panel is None or not (0 <= entry_pos < len(panel)):
-            row["无法买入原因"] = "没有下一交易日数据"
-        else:
-            entry = panel.iloc[entry_pos]
-            entry_price = safe_number(entry.get("adj_open"))
-            raw_open = safe_number(entry.get("open"))
-            raw_high = safe_number(entry.get("high"))
-            raw_low = safe_number(entry.get("low"))
-            pct_chg = safe_number(entry.get("pct_chg"))
-            traded = bool(entry.get("traded", False))
-            one_price_limit_up = (
-                traded
-                and np.isfinite(raw_open)
-                and np.isfinite(raw_high)
-                and np.isfinite(raw_low)
-                and abs(raw_high - raw_low) < 1e-8
-                and np.isfinite(pct_chg)
-                and pct_chg >= 9.5
-            )
-            if not traded or not np.isfinite(entry_price):
-                row["无法买入原因"] = "次日停牌或缺少开盘价"
-            elif one_price_limit_up:
-                row["无法买入原因"] = "次日一字涨停"
+        cache_key = (signal_date, code)
+        if cache_key not in path_cache:
+            signal_pos = date_to_pos.get(signal_date, -1)
+            entry_pos = signal_pos + 1
+            panel = panels.get(code)
+            path_row: dict[str, object] = {
+                "买入日": trade_dates[entry_pos] if 0 <= entry_pos < len(trade_dates) else "",
+                "研究买入价": np.nan,
+                "能否按次日开盘买入": False,
+                "无法买入原因": "",
+            }
+            if panel is None or not (0 <= entry_pos < len(panel)):
+                path_row["无法买入原因"] = "没有下一交易日数据"
             else:
-                row["能否按次日开盘买入"] = True
-                row["研究买入价"] = entry_price
-                for horizon in (20, 60, 120):
-                    row.update(
-                        path_metrics(
-                            panel,
-                            entry_pos,
-                            entry_price,
-                            horizon,
-                            success_mfe,
-                            severe_mae,
+                entry = panel.iloc[entry_pos]
+                entry_price = safe_number(entry.get("adj_open"))
+                raw_open = safe_number(entry.get("open"))
+                raw_high = safe_number(entry.get("high"))
+                raw_low = safe_number(entry.get("low"))
+                pct_chg = safe_number(entry.get("pct_chg"))
+                traded = bool(entry.get("traded", False))
+                one_price_limit_up = (
+                    traded
+                    and np.isfinite(raw_open)
+                    and np.isfinite(raw_high)
+                    and np.isfinite(raw_low)
+                    and abs(raw_high - raw_low) < 1e-8
+                    and np.isfinite(pct_chg)
+                    and pct_chg >= 9.5
+                )
+                if not traded or not np.isfinite(entry_price):
+                    path_row["无法买入原因"] = "次日停牌或缺少开盘价"
+                elif one_price_limit_up:
+                    path_row["无法买入原因"] = "次日一字涨停"
+                else:
+                    path_row["能否按次日开盘买入"] = True
+                    path_row["研究买入价"] = entry_price
+                    for horizon in (20, 60, 120):
+                        path_row.update(
+                            path_metrics(
+                                panel,
+                                entry_pos,
+                                entry_price,
+                                horizon,
+                                success_mfe,
+                                severe_mae,
+                            )
                         )
-                    )
+            path_cache[cache_key] = path_row
+        row.update(path_cache[cache_key])
         rows.append(row)
         if number % 250 == 0 or number + 1 == len(records):
             progress.progress((number + 1) / len(records), text=f"完整价格路径 {number + 1}/{len(records)}")
@@ -750,6 +698,198 @@ def build_bucket_summary(candidates: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def add_weekly_benchmark(candidates: pd.DataFrame) -> pd.DataFrame:
+    """以同一信号日的全部合格股票为等权基准，不使用未来数据参与选股。"""
+    output = candidates.copy()
+    for horizon in (20, 60, 120):
+        complete = output[f"{horizon}日完整"] == True  # noqa: E712
+        tradable = output["能否按次日开盘买入"] == True  # noqa: E712
+        sample = output.loc[complete & tradable]
+        benchmark = sample.groupby(["信号日", "模型"])[f"{horizon}日末收益"].mean()
+        key = pd.MultiIndex.from_frame(output[["信号日", "模型"]])
+        output[f"{horizon}日合格池基准收益"] = benchmark.reindex(key).to_numpy()
+        output[f"{horizon}日超额收益"] = (
+            output[f"{horizon}日末收益"] - output[f"{horizon}日合格池基准收益"]
+        )
+    return output
+
+
+def build_model_summary(signals: pd.DataFrame, sample_type: str) -> pd.DataFrame:
+    rows: list[dict] = []
+    for model, model_frame in signals.groupby("模型"):
+        for horizon in (20, 60, 120):
+            sample = model_frame.loc[
+                (model_frame["能否按次日开盘买入"] == True)  # noqa: E712
+                & (model_frame[f"{horizon}日完整"] == True)  # noqa: E712
+            ].copy()
+            if sample.empty:
+                continue
+            rows.append(
+                {
+                    "样本口径": sample_type,
+                    "模型": model,
+                    "观察窗口": horizon,
+                    "样本数": len(sample),
+                    "不同股票数": sample["ts_code"].nunique(),
+                    "MFE均值": sample[f"{horizon}日MFE"].mean(),
+                    "MFE中位数": sample[f"{horizon}日MFE"].median(),
+                    "MAE中位数": sample[f"{horizon}日MAE"].median(),
+                    "期末收益均值": sample[f"{horizon}日末收益"].mean(),
+                    "期末收益中位数": sample[f"{horizon}日末收益"].median(),
+                    "超额收益均值": sample[f"{horizon}日超额收益"].mean(),
+                    "超额收益中位数": sample[f"{horizon}日超额收益"].median(),
+                    "达到20%比例": (sample[f"{horizon}日MFE"] >= 0.20).mean(),
+                    "先+20%比例": (sample[f"{horizon}日先+20还是-10"] == "先+20%").mean(),
+                    "先-10%比例": (sample[f"{horizon}日先+20还是-10"] == "先-10%").mean(),
+                    "真正失败比例": (sample[f"{horizon}日路径分类"] == "真正失败").mean(),
+                    "利润回吐比例": (sample[f"{horizon}日路径分类"] == "选股成功_利润回吐").mean(),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def mark_independent_events(signals: pd.DataFrame, max_gap_days: int = 14) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """同一模型、同一股票、间隔不超过14天的第一名信号合并为一次趋势事件。"""
+    if signals.empty:
+        return signals.copy(), signals.copy()
+    marked_parts: list[pd.DataFrame] = []
+    event_number = 0
+    for model, model_frame in signals.groupby("模型", sort=False):
+        frame = model_frame.copy()
+        frame["_date"] = pd.to_datetime(frame["信号日"].astype(str), format="%Y%m%d")
+        frame = frame.sort_values("_date")
+        last_seen: dict[str, pd.Timestamp] = {}
+        active_event: dict[str, str] = {}
+        event_ids: list[str] = []
+        first_flags: list[bool] = []
+        for _, row in frame.iterrows():
+            code = str(row["ts_code"])
+            current = row["_date"]
+            is_new = code not in last_seen or (current - last_seen[code]).days > max_gap_days
+            if is_new:
+                event_number += 1
+                active_event[code] = f"E{event_number:04d}"
+            event_ids.append(active_event[code])
+            first_flags.append(is_new)
+            last_seen[code] = current
+        frame["事件编号"] = event_ids
+        frame["是否事件首信号"] = first_flags
+        frame["事件连续信号数"] = frame.groupby("事件编号")["事件编号"].transform("size")
+        frame["事件最后信号日"] = frame.groupby("事件编号")["信号日"].transform("max")
+        marked_parts.append(frame.drop(columns="_date"))
+    marked = pd.concat(marked_parts, ignore_index=True).sort_values(["信号日", "模型"])
+    events = marked.loc[marked["是否事件首信号"] == True].copy()  # noqa: E712
+    return marked.reset_index(drop=True), events.reset_index(drop=True)
+
+
+def build_rank_summary(candidates: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict] = []
+    bands = pd.cut(
+        candidates["周排名"],
+        bins=[0, 1, 3, 10, 50, np.inf],
+        labels=["第1名", "第2-3名", "第4-10名", "第11-50名", "第51名以后"],
+    )
+    work = candidates.copy()
+    work["排名区间"] = bands.astype(str)
+    for (model, band), group in work.groupby(["模型", "排名区间"], dropna=False):
+        for horizon in (20, 60, 120):
+            sample = group.loc[
+                (group["能否按次日开盘买入"] == True)  # noqa: E712
+                & (group[f"{horizon}日完整"] == True)  # noqa: E712
+            ]
+            if sample.empty:
+                continue
+            rows.append(
+                {
+                    "模型": model,
+                    "排名区间": band,
+                    "观察窗口": horizon,
+                    "样本数": len(sample),
+                    "不同股票数": sample["ts_code"].nunique(),
+                    "MFE中位数": sample[f"{horizon}日MFE"].median(),
+                    "MAE中位数": sample[f"{horizon}日MAE"].median(),
+                    "期末收益中位数": sample[f"{horizon}日末收益"].median(),
+                    "超额收益中位数": sample[f"{horizon}日超额收益"].median(),
+                    "达到20%比例": (sample[f"{horizon}日MFE"] >= 0.20).mean(),
+                    "先+20%比例": (sample[f"{horizon}日先+20还是-10"] == "先+20%").mean(),
+                    "先-10%比例": (sample[f"{horizon}日先+20还是-10"] == "先-10%").mean(),
+                    "真正失败比例": (sample[f"{horizon}日路径分类"] == "真正失败").mean(),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def build_factor_ic(candidates: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict] = []
+    factor_columns = ["相对强度分", "低波动分", "低回撤分", "综合分"]
+    for model, model_frame in candidates.groupby("模型"):
+        for horizon in (20, 60, 120):
+            sample = model_frame.loc[
+                (model_frame["能否按次日开盘买入"] == True)  # noqa: E712
+                & (model_frame[f"{horizon}日完整"] == True)  # noqa: E712
+            ]
+            for factor in factor_columns:
+                for target in (f"{horizon}日MFE", f"{horizon}日末收益", f"{horizon}日MAE"):
+                    weekly_values: list[float] = []
+                    for _, week in sample.groupby("信号日"):
+                        if len(week) >= 20 and week[factor].nunique() > 1 and week[target].nunique() > 1:
+                            value = week[factor].corr(week[target], method="spearman")
+                            if pd.notna(value):
+                                weekly_values.append(float(value))
+                    if weekly_values:
+                        values = pd.Series(weekly_values)
+                        rows.append(
+                            {
+                                "模型": model,
+                                "观察窗口": horizon,
+                                "因子": factor,
+                                "目标": target,
+                                "成熟周数": len(values),
+                                "逐周IC均值": values.mean(),
+                                "逐周IC中位数": values.median(),
+                                "IC为正周比例": (values > 0).mean(),
+                            }
+                        )
+    return pd.DataFrame(rows)
+
+
+def build_robustness(events: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict] = []
+    for model, model_frame in events.groupby("模型"):
+        for horizon in (20, 60, 120):
+            sample = model_frame.loc[
+                (model_frame["能否按次日开盘买入"] == True)  # noqa: E712
+                & (model_frame[f"{horizon}日完整"] == True)  # noqa: E712
+            ].copy()
+            if sample.empty:
+                continue
+            stock_performance = sample.groupby("ts_code")[f"{horizon}日末收益"].mean().sort_values(ascending=False)
+            for remove_count in (0, 1, 3, 5):
+                removed = set(stock_performance.head(remove_count).index) if remove_count else set()
+                remaining = sample.loc[~sample["ts_code"].isin(removed)]
+                if remaining.empty:
+                    continue
+                rows.append(
+                    {
+                        "模型": model,
+                        "观察窗口": horizon,
+                        "剔除最好股票数": remove_count,
+                        "被剔除股票": "、".join(
+                            sample.loc[sample["ts_code"].isin(removed), "股票名称"].drop_duplicates().tolist()
+                        ),
+                        "剩余事件数": len(remaining),
+                        "剩余股票数": remaining["ts_code"].nunique(),
+                        "MFE均值": remaining[f"{horizon}日MFE"].mean(),
+                        "MFE中位数": remaining[f"{horizon}日MFE"].median(),
+                        "期末收益均值": remaining[f"{horizon}日末收益"].mean(),
+                        "期末收益中位数": remaining[f"{horizon}日末收益"].median(),
+                        "达到20%比例": (remaining[f"{horizon}日MFE"] >= 0.20).mean(),
+                        "先+20%比例": (remaining[f"{horizon}日先+20还是-10"] == "先+20%").mean(),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
 def format_percent_columns(frame: pd.DataFrame) -> pd.DataFrame:
     display = frame.copy()
     keywords = ("收益", "MFE", "MAE", "回撤", "比例", "ret120", "分")
@@ -757,6 +897,34 @@ def format_percent_columns(frame: pd.DataFrame) -> pd.DataFrame:
         if any(key in str(col) for key in keywords) and pd.api.types.is_numeric_dtype(display[col]):
             display[col] = display[col].map(lambda x: "" if pd.isna(x) else f"{x:.2%}")
     return display
+
+
+def result_files(result: dict) -> list[tuple[str, pd.DataFrame | bytes]]:
+    run_id = str(result["run_id"])
+    config_bytes = json.dumps(result["config"], ensure_ascii=False, indent=2).encode("utf-8")
+    return [
+        (f"weekly_signals_selector_v1_1_{run_id}.csv", result["signals"]),
+        (f"independent_events_selector_v1_1_{run_id}.csv", result["events"]),
+        (f"weekly_top10_selector_v1_1_{run_id}.csv", result["top10"]),
+        (f"all_candidates_paths_selector_v1_1_{run_id}.csv", result["candidates"]),
+        (f"model_comparison_selector_v1_1_{run_id}.csv", result["model_summary"]),
+        (f"rank_bands_selector_v1_1_{run_id}.csv", result["rank_summary"]),
+        (f"factor_ic_selector_v1_1_{run_id}.csv", result["factor_ic"]),
+        (f"robustness_selector_v1_1_{run_id}.csv", result["robustness"]),
+        (f"bucket_summary_selector_v1_1_{run_id}.csv", result["bucket"]),
+        (f"funnel_selector_v1_1_{run_id}.csv", result["funnel"]),
+        (f"data_gaps_selector_v1_1_{run_id}.csv", result["gaps"]),
+        (f"research_config_selector_v1_1_{run_id}.json", config_bytes),
+    ]
+
+
+def build_zip(result: dict) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for filename, content in result_files(result):
+            data = to_csv_bytes(content) if isinstance(content, pd.DataFrame) else content
+            archive.writestr(filename, data)
+    return buffer.getvalue()
 
 
 def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
@@ -771,7 +939,7 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
         raise RuntimeError("无法取得交易日历，不能继续。")
 
     stocks = get_stock_basic(pro, gaps)
-    members = get_industry_members(pro, config.l1_codes, gaps)
+    members = get_industry_members(pro, config.l1_codes, config.l2_codes, gaps)
     if stocks.empty or members.empty:
         raise RuntimeError("无法建立股票池，请检查TuShare积分和接口权限。")
     members = members.loc[members["ts_code"].isin(set(stocks["ts_code"]))].copy()
@@ -797,22 +965,6 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
     if not signals:
         raise RuntimeError("所选期间内没有可用周末信号日。")
 
-    financials: dict[str, pd.DataFrame] = {}
-    if config.mode in ("价格+财务风险（B组）", "同时运行A/B"):
-        fin_progress = st.progress(0.0, text="检查财务风险接口")
-        sample_code = sorted(universe)[0]
-        if financial_permission_available(pro, sample_code, config.end_date, gaps):
-            financials = fetch_financials(
-                pro,
-                sorted(universe),
-                config.start_date,
-                config.end_date,
-                gaps,
-                fin_progress,
-            )
-        if not financials:
-            status.write("财务数据不可用：B组将不生成，A组仍可正常完成。")
-
     scoring_progress = st.progress(0.0, text="逐周排名")
     ranked_weeks: list[pd.DataFrame] = []
     funnel_rows: list[dict] = []
@@ -836,14 +988,11 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
             panels,
             basic,
             st_codes,
-            financials,
         )
         funnel_rows.append(funnel)
         if not base.empty:
-            if config.mode in ("纯价格（A组）", "同时运行A/B") or not financials:
-                ranked_weeks.append(assign_model_ranks(base, "A_纯价格", "价格模型分"))
-            if config.mode in ("价格+财务风险（B组）", "同时运行A/B") and financials and "含财务模型分" in base:
-                ranked_weeks.append(assign_model_ranks(base, "B_价格+财务风险", "含财务模型分"))
+            ranked_weeks.append(assign_model_ranks(base, "A_相对强度单因子", "相对强度分"))
+            ranked_weeks.append(assign_model_ranks(base, "B_原综合模型", "价格模型分"))
         scoring_progress.progress((index + 1) / len(signals), text=f"逐周排名 {index + 1}/{len(signals)}")
 
     if not ranked_weeks:
@@ -859,19 +1008,37 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
         config.severe_mae,
         path_progress,
     )
+    candidates = add_weekly_benchmark(candidates)
     candidates = candidates.sort_values(["信号日", "模型", "周排名"]).reset_index(drop=True)
     weekly_top10 = candidates.loc[candidates["周排名"] <= 10].copy()
     weekly_signals = candidates.loc[candidates["周排名"] == 1].copy()
+    weekly_signals, independent_events = mark_independent_events(weekly_signals)
     bucket_summary = build_bucket_summary(candidates)
+    model_summary = pd.concat(
+        [
+            build_model_summary(weekly_signals, "全部周第一名"),
+            build_model_summary(independent_events, "独立趋势事件"),
+        ],
+        ignore_index=True,
+    )
+    rank_summary = build_rank_summary(candidates)
+    factor_ic = build_factor_ic(candidates)
+    robustness = build_robustness(independent_events)
     funnel = pd.DataFrame(funnel_rows)
     gap_frame = pd.DataFrame(gaps)
 
     status.update(label="研究完成", state="complete", expanded=False)
     return {
         "config": asdict(config),
+        "run_id": datetime.now().strftime("%Y%m%d_%H%M%S"),
         "candidates": candidates,
         "top10": weekly_top10,
         "signals": weekly_signals,
+        "events": independent_events,
+        "model_summary": model_summary,
+        "rank_summary": rank_summary,
+        "factor_ic": factor_ic,
+        "robustness": robustness,
         "bucket": bucket_summary,
         "funnel": funnel,
         "gaps": gap_frame,
@@ -882,6 +1049,11 @@ def render_results(result: dict) -> None:
     candidates: pd.DataFrame = result["candidates"]
     signals: pd.DataFrame = result["signals"]
     top10: pd.DataFrame = result["top10"]
+    events: pd.DataFrame = result["events"]
+    model_summary: pd.DataFrame = result["model_summary"]
+    rank_summary: pd.DataFrame = result["rank_summary"]
+    factor_ic: pd.DataFrame = result["factor_ic"]
+    robustness: pd.DataFrame = result["robustness"]
     bucket: pd.DataFrame = result["bucket"]
     funnel: pd.DataFrame = result["funnel"]
     gaps: pd.DataFrame = result["gaps"]
@@ -893,21 +1065,19 @@ def render_results(result: dict) -> None:
     else:
         complete120 = tradable_signals.iloc[0:0].copy()
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("周信号数", len(signals))
-    c2.metric("次日可买", len(tradable_signals))
-    c3.metric("完整120日样本", len(complete120))
+    c1.metric("研究周数", signals["信号日"].nunique())
+    c2.metric("双模型周信号", len(signals))
+    c3.metric("独立趋势事件", len(events))
     if not complete120.empty:
         c4.metric("120日MFE中位数", f"{complete120['120日MFE'].median():.2%}")
     else:
         c4.metric("120日MFE中位数", "样本不足")
 
-    if not complete120.empty:
-        label_counts = complete120["120日路径分类"].value_counts().rename_axis("路径分类").reset_index(name="数量")
-        st.caption("这里按完整路径分类。‘选股成功_利润回吐’不会被算成真正失败。")
-        st.dataframe(label_counts, use_container_width=True, hide_index=True)
+    st.caption("A为行业相对强度单因子；B为原50%相对强度+25%低波动+25%低回撤。两者固定同时运行，不搜索权重。")
+    st.dataframe(format_percent_columns(model_summary), use_container_width=True, hide_index=True)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["每周第一名", "每周Top10", "分组单调性", "筛选漏斗", "数据缺口"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+        ["每周第一名", "独立趋势事件", "排名区间", "因子诊断", "牛股依赖", "每周Top10", "分组单调性", "数据审计"]
     )
     with tab1:
         preferred = [
@@ -915,17 +1085,31 @@ def render_results(result: dict) -> None:
             "综合分", "未复权收盘", "流通市值万元", "能否按次日开盘买入", "无法买入原因",
             "20日MFE", "20日MAE", "20日路径分类", "60日MFE", "60日MAE", "60日路径分类",
             "120日MFE", "120日MAE", "120日末收益", "120日峰值天数", "120日峰值前MAE",
-            "120日峰后至期末回撤", "120日路径分类",
+            "120日峰后至期末回撤", "120日超额收益", "120日路径分类",
+            "事件编号", "是否事件首信号", "事件连续信号数",
         ]
         st.dataframe(format_percent_columns(signals[[c for c in preferred if c in signals.columns]]), use_container_width=True, hide_index=True)
     with tab2:
-        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
+        st.caption("同一模型、同一股票、相邻信号间隔不超过14天，只保留第一次作为独立事件。")
+        st.dataframe(format_percent_columns(events), use_container_width=True, hide_index=True)
     with tab3:
+        st.caption("直接比较第1名、第2-3名、第4-10名；第一名应稳定优于后续排名才有实盘意义。")
+        st.dataframe(format_percent_columns(rank_summary), use_container_width=True, hide_index=True)
+    with tab4:
+        st.caption("逐周Spearman相关。MFE、期末收益希望为正；MAE希望为正，代表评分越高、亏损越小。")
+        st.dataframe(format_percent_columns(factor_ic), use_container_width=True, hide_index=True)
+    with tab5:
+        st.caption("基于独立趋势事件，依次删除期末表现最好的1、3、5只股票，检查结果是否坍塌。")
+        st.dataframe(format_percent_columns(robustness), use_container_width=True, hide_index=True)
+    with tab6:
+        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
+    with tab7:
         st.caption("只有从Q1到Q5总体改善，才说明排名具有可信的横截面区分能力。")
         st.dataframe(format_percent_columns(bucket), use_container_width=True, hide_index=True)
-    with tab4:
+    with tab8:
+        st.markdown("**筛选漏斗**")
         st.dataframe(funnel, use_container_width=True, hide_index=True)
-    with tab5:
+        st.markdown("**数据缺口**")
         if gaps.empty:
             st.success("没有记录到数据缺口。")
         else:
@@ -933,37 +1117,31 @@ def render_results(result: dict) -> None:
             st.dataframe(gaps, use_container_width=True, hide_index=True)
 
     st.subheader("下载结果")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    files = [
-        ("每周第一名", signals, f"weekly_signals_selector_v1_{stamp}.csv"),
-        ("每周Top10", top10, f"weekly_top10_selector_v1_{stamp}.csv"),
-        ("全部候选与路径", candidates, f"all_candidates_paths_selector_v1_{stamp}.csv"),
-        ("分组单调性", bucket, f"bucket_summary_selector_v1_{stamp}.csv"),
-        ("筛选漏斗", funnel, f"funnel_selector_v1_{stamp}.csv"),
-        ("数据缺口", gaps, f"data_gaps_selector_v1_{stamp}.csv"),
-    ]
-    columns = st.columns(3)
-    for index, (label, frame, filename) in enumerate(files):
-        columns[index % 3].download_button(
-            label=f"下载{label}",
-            data=to_csv_bytes(frame),
-            file_name=filename,
-            mime="text/csv",
-            key=f"download_{label}_{stamp}",
-        )
-    config_bytes = json.dumps(result["config"], ensure_ascii=False, indent=2).encode("utf-8")
     st.download_button(
-        "下载本次参数",
-        data=config_bytes,
-        file_name=f"research_config_selector_v1_{stamp}.json",
-        mime="application/json",
-        key=f"download_config_{stamp}",
+        "一键下载全部研究结果（ZIP）",
+        data=build_zip(result),
+        file_name=f"selector_research_v1_1_{result['run_id']}.zip",
+        mime="application/zip",
+        type="primary",
+        key=f"download_all_{result['run_id']}",
     )
+    with st.expander("单独下载文件（备用）"):
+        columns = st.columns(3)
+        for index, (filename, content) in enumerate(result_files(result)):
+            data = to_csv_bytes(content) if isinstance(content, pd.DataFrame) else content
+            columns[index % 3].download_button(
+                label=filename.rsplit("_selector", 1)[0],
+                data=data,
+                file_name=filename,
+                mime="application/json" if filename.endswith(".json") else "text/csv",
+                key=f"download_single_{index}_{result['run_id']}",
+            )
 
 
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, layout="wide")
     st.title(APP_NAME)
+    st.code(f"版本：{APP_VERSION}｜构建编号：{BUILD_ID}", language=None)
     st.caption("从零设计；不使用MACD、红绿柱、旧评分阈值或旧版本交易规则。当前版本只验证选股能力，不模拟组合卖出。")
 
     with st.sidebar:
@@ -971,13 +1149,20 @@ def main() -> None:
         token_default = os.environ.get("TUSHARE_TOKEN", "")
         token = st.text_input("TuShare Token", value=token_default, type="password")
         default_end = date.today()
-        default_start = default_end - timedelta(days=730)
+        # 开发阶段默认只研究最近一年；需要最终验证时再由用户手动扩大区间。
+        default_start = default_end - timedelta(days=365)
         start_value = st.date_input("信号开始日期", value=default_start)
         end_value = st.date_input("信号结束日期", value=default_end)
         industry_names = st.multiselect(
             "申万一级行业",
             options=list(TECH_INDUSTRIES.keys()),
-            default=["电子", "计算机", "通信"],
+            default=["电子", "计算机", "通信", "电力设备", "国防军工"],
+        )
+        subindustry_names = st.multiselect(
+            "补充申万二级行业",
+            options=list(TECH_SUBINDUSTRIES.keys()),
+            default=list(TECH_SUBINDUSTRIES.keys()),
+            help="只补入机械设备中的自动化设备，不把整个机械设备行业纳入。",
         )
         min_price = st.number_input("最低股价（元）", min_value=1.0, value=20.0, step=1.0)
         c1, c2 = st.columns(2)
@@ -987,12 +1172,7 @@ def main() -> None:
         min_amount = st.number_input("20日平均成交额下限（亿元）", min_value=0.0, value=1.0, step=0.1)
 
         st.header("研究模型")
-        mode = st.radio(
-            "运行方式",
-            ["纯价格（A组）", "价格+财务风险（B组）", "同时运行A/B"],
-            index=0,
-            help="建议先运行A组。B组需要fina_indicator权限，会逐只股票下载并缓存。",
-        )
+        st.caption("固定同时运行A：相对强度单因子；B：原综合模型。暂不加入财务因子，不进行权重搜索。")
         use_st = st.checkbox(
             "尝试调用历史ST列表",
             value=True,
@@ -1007,8 +1187,8 @@ def main() -> None:
         run_button = st.button("开始研究", type="primary", use_container_width=True)
 
     st.info(
-        "价格模型固定为：行业超额强度50% + 低波动25% + 低回撤25%。"
-        "B组在此基础上加入20%财务风险分；亏损公司不会被直接删除。"
+        "A模型只按行业相对强度排名；B模型固定为相对强度50% + 低波动25% + 低回撤25%。"
+        "重点比较第一名是否稳定优于第2-10名，以及+20%能否先于-10%。"
     )
 
     if run_button:
@@ -1018,7 +1198,7 @@ def main() -> None:
         if start_value >= end_value:
             st.error("结束日期必须晚于开始日期。")
             return
-        if not industry_names:
+        if not industry_names and not subindustry_names:
             st.error("至少选择一个申万行业。")
             return
         if max_mv <= min_mv:
@@ -1031,23 +1211,23 @@ def main() -> None:
             start_date=ymd(start_value),
             end_date=ymd(end_value),
             l1_codes=tuple(TECH_INDUSTRIES[name] for name in industry_names),
+            l2_codes=tuple(TECH_SUBINDUSTRIES[name] for name in subindustry_names),
             min_price=float(min_price),
             min_circ_mv_yi=float(min_mv),
             max_circ_mv_yi=float(max_mv),
             min_listing_days=int(min_listing),
             min_amount_yi=float(min_amount),
-            mode=mode,
             use_historical_st=bool(use_st),
             success_mfe=float(success_mfe_pct) / 100.0,
             severe_mae=-float(severe_mae_pct) / 100.0,
         )
         try:
-            st.session_state["selector_v1_result"] = run_research(pro, config)
+            st.session_state["selector_v1_1_result"] = run_research(pro, config)
         except Exception as exc:
             st.exception(exc)
 
-    if "selector_v1_result" in st.session_state:
-        render_results(st.session_state["selector_v1_result"])
+    if "selector_v1_1_result" in st.session_state:
+        render_results(st.session_state["selector_v1_1_result"])
 
 
 if __name__ == "__main__":
