@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 """
-独立选股研究系统 v1.2
-构建编号：SELECTOR-V1.2-20260812-FINAL
+独立选股研究系统 v1.3
+构建编号：SELECTOR-V1.3-20260812-FINAL
 
 本文件不是“ｖ1.0日线版.py”。
-v1.2保持A/B模型与v1.1完全一致，只新增入场位置诊断、
-B模型第一名与前三名等权对照，以及ZIP打包下载。
-所有新增指标只用于事后研究，不参与选股和排名。
+v1.3保持v1.2的A/B模型、权重和研究诊断完全一致，
+新增B模型周度前三名的30万元三仓组合回测，并列比较四种固定退出方案。
+退出信号在收盘确认、下一交易日开盘执行，避免未来数据参与成交。
 """
 
 import io
@@ -27,11 +27,18 @@ import streamlit as st
 import tushare as ts
 
 
-APP_NAME = "独立选股研究系统 v1.2"
-APP_VERSION = "1.2.0"
-BUILD_ID = "SELECTOR-V1.2-20260812-FINAL"
+APP_NAME = "独立选股研究系统 v1.3"
+APP_VERSION = "1.3.0"
+BUILD_ID = "SELECTOR-V1.3-20260812-FINAL"
 CACHE_DIR = Path(__file__).resolve().parent / ".selector_research_cache_v1"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+INITIAL_CAPITAL = 300_000.0
+MAX_POSITIONS = 3
+COMMISSION_RATE = 0.0003
+MIN_COMMISSION = 5.0
+SELL_STAMP_DUTY = 0.0005
+SLIPPAGE_RATE = 0.0005
 
 TECH_INDUSTRIES = {
     "电子": "801080.SI",
@@ -61,6 +68,29 @@ class Config:
     use_historical_st: bool
     success_mfe: float
     severe_mae: float
+
+
+@dataclass(frozen=True)
+class PortfolioPolicy:
+    name: str
+    max_holding_days: int
+    close_stop_loss: float | None = None
+    trailing_activation: float | None = None
+    trailing_drawdown: float | None = None
+
+
+PORTFOLIO_POLICIES = (
+    PortfolioPolicy("P1_固定60日", 60),
+    PortfolioPolicy("P2_固定120日", 120),
+    PortfolioPolicy("P3_120日_收盘亏损10%", 120, close_stop_loss=-0.10),
+    PortfolioPolicy(
+        "P4_120日_亏损10%_盈利20%后回撤10%",
+        120,
+        close_stop_loss=-0.10,
+        trailing_activation=0.20,
+        trailing_drawdown=-0.10,
+    ),
+)
 
 
 def ymd(value: date | datetime | str | pd.Timestamp) -> str:
@@ -340,6 +370,14 @@ def prepare_price_panels(history: pd.DataFrame, trade_dates: list[str]) -> dict[
             aligned[f"adj_{col}"] = aligned[col] * aligned["adj_factor"]
 
         adjusted_close = aligned["adj_close"].ffill()
+        # 用样本最早日已经可知的复权因子做固定缩放，只改变价格单位，不使用未来因子决定仓位。
+        valid_factors = aligned["adj_factor"].dropna()
+        scale_factor = float(valid_factors.iloc[0]) if not valid_factors.empty else 1.0
+        if not np.isfinite(scale_factor) or scale_factor <= 0:
+            scale_factor = 1.0
+        for col in ("open", "high", "low", "close"):
+            aligned[f"portfolio_{col}"] = aligned[f"adj_{col}"] / scale_factor
+        aligned["portfolio_close"] = aligned["portfolio_close"].ffill()
         aligned["feature_close"] = adjusted_close
         aligned["ret1"] = adjusted_close.pct_change(fill_method=None).fillna(0.0)
         aligned["ret5"] = adjusted_close / adjusted_close.shift(5) - 1.0
@@ -957,6 +995,402 @@ def build_b_top3_comparison(candidates: pd.DataFrame) -> tuple[pd.DataFrame, pd.
     return detail, pd.DataFrame(summary_rows)
 
 
+def execution_open(
+    panel: pd.DataFrame | None,
+    trade_date: str,
+    side: str,
+) -> tuple[float, str]:
+    if panel is None or trade_date not in panel.index:
+        return np.nan, "缺少行情"
+    row = panel.loc[trade_date]
+    if not bool(row.get("traded", False)):
+        return np.nan, "停牌或无成交"
+    price = safe_number(row.get("portfolio_open"))
+    raw_high = safe_number(row.get("high"))
+    raw_low = safe_number(row.get("low"))
+    pct_chg = safe_number(row.get("pct_chg"))
+    if not np.isfinite(price) or price <= 0:
+        return np.nan, "缺少开盘价"
+    one_price = (
+        np.isfinite(raw_high)
+        and np.isfinite(raw_low)
+        and abs(raw_high - raw_low) < 1e-8
+        and np.isfinite(pct_chg)
+    )
+    if side == "buy" and one_price and pct_chg >= 9.5:
+        return np.nan, "一字涨停无法买入"
+    if side == "sell" and one_price and pct_chg <= -9.5:
+        return np.nan, "一字跌停无法卖出"
+    return price, ""
+
+
+def position_mark_price(position: dict, panels: dict[str, pd.DataFrame], trade_date: str, field: str) -> float:
+    panel = panels.get(str(position["ts_code"]))
+    if panel is not None and trade_date in panel.index:
+        value = safe_number(panel.loc[trade_date].get(field))
+        if np.isfinite(value) and value > 0:
+            return value
+    return float(position["last_close"])
+
+
+def simulate_portfolio_policy(
+    candidates: pd.DataFrame,
+    panels: dict[str, pd.DataFrame],
+    trade_dates: list[str],
+    config: Config,
+    policy: PortfolioPolicy,
+) -> dict[str, pd.DataFrame | dict]:
+    """B模型前三名、最多三仓；卖出信号收盘确认，下一交易日开盘执行。"""
+    top3 = candidates.loc[
+        (candidates["模型"] == "B_原综合模型") & (candidates["周排名"] <= 3)
+    ].copy()
+    top3 = top3.sort_values(["信号日", "周排名", "ts_code"])
+    simulation_dates = [d for d in trade_dates if config.start_date <= d]
+    schedules: dict[str, list[dict]] = {}
+    unscheduled: list[dict] = []
+    for record in top3.to_dict("records"):
+        entry_date = str(record.get("买入日", "") or "")
+        if not entry_date or entry_date not in trade_dates:
+            unscheduled.append(record)
+        else:
+            schedules.setdefault(entry_date, []).append(record)
+    last_required_date = max([config.end_date, *schedules.keys()])
+
+    cash = INITIAL_CAPITAL
+    positions: dict[str, dict] = {}
+    orders: list[dict] = []
+    ledger: list[dict] = []
+    audit: list[dict] = []
+    curve: list[dict] = []
+
+    for record in unscheduled:
+        audit.append(
+            {
+                "退出方案": policy.name,
+                "信号日": record.get("信号日", ""),
+                "计划买入日": "",
+                "周排名": record.get("周排名", np.nan),
+                "ts_code": record.get("ts_code", ""),
+                "股票名称": record.get("股票名称", ""),
+                "处理结果": "未买入",
+                "原因": "没有下一交易日数据",
+            }
+        )
+
+    for trade_date in simulation_dates:
+        sold_today: set[str] = set()
+
+        # 前一交易日收盘确认的卖出条件，只能在今天开盘执行。
+        for code in list(positions):
+            position = positions[code]
+            reason = str(position.get("pending_exit_reason", "") or "")
+            if not reason:
+                continue
+            panel = panels.get(code)
+            open_price, block_reason = execution_open(panel, trade_date, "sell")
+            if not np.isfinite(open_price):
+                position["exit_delay_days"] += 1
+                continue
+            execution_price = open_price * (1.0 - SLIPPAGE_RATE)
+            gross_amount = position["shares"] * execution_price
+            commission = max(MIN_COMMISSION, gross_amount * COMMISSION_RATE)
+            stamp_duty = gross_amount * SELL_STAMP_DUTY
+            net_proceeds = gross_amount - commission - stamp_duty
+            cash += net_proceeds
+            net_return = net_proceeds / position["entry_total_cost"] - 1.0
+            orders.append(
+                {
+                    "退出方案": policy.name,
+                    "交易日": trade_date,
+                    "方向": "卖出",
+                    "ts_code": code,
+                    "股票名称": position["股票名称"],
+                    "对应信号日": position["信号日"],
+                    "对应周排名": position["周排名"],
+                    "成交价": execution_price,
+                    "股数": position["shares"],
+                    "成交金额": gross_amount,
+                    "佣金": commission,
+                    "印花税": stamp_duty,
+                    "总交易成本": commission + stamp_duty + position["shares"] * open_price * SLIPPAGE_RATE,
+                    "卖出原因": reason,
+                }
+            )
+            ledger.append(
+                {
+                    "退出方案": policy.name,
+                    "ts_code": code,
+                    "股票名称": position["股票名称"],
+                    "信号日": position["信号日"],
+                    "买入日": position["entry_date"],
+                    "卖出日": trade_date,
+                    "买入排名": position["周排名"],
+                    "买入成交价": position["entry_price"],
+                    "卖出成交价": execution_price,
+                    "股数": position["shares"],
+                    "买入总成本": position["entry_total_cost"],
+                    "卖出净收入": net_proceeds,
+                    "净收益": net_proceeds - position["entry_total_cost"],
+                    "净收益率": net_return,
+                    "持有交易日": position["holding_days"],
+                    "持有期最高收盘收益": position["peak_close"] / position["entry_price"] - 1.0,
+                    "退出触发后延迟天数": position["exit_delay_days"],
+                    "卖出原因": reason,
+                }
+            )
+            sold_today.add(code)
+            del positions[code]
+
+        # 当天开盘先处理卖出，再用释放出的仓位按B模型周排名依次补入。
+        for signal in schedules.get(trade_date, []):
+            code = str(signal["ts_code"])
+            audit_row = {
+                "退出方案": policy.name,
+                "信号日": signal["信号日"],
+                "计划买入日": trade_date,
+                "周排名": signal["周排名"],
+                "ts_code": code,
+                "股票名称": signal["股票名称"],
+                "处理结果": "未买入",
+                "原因": "",
+            }
+            if code in sold_today:
+                audit_row["原因"] = "当日刚卖出，不立即回补"
+                audit.append(audit_row)
+                continue
+            if code in positions:
+                audit_row["原因"] = "已有持仓"
+                audit.append(audit_row)
+                continue
+            if len(positions) >= MAX_POSITIONS:
+                audit_row["原因"] = "三仓已满"
+                audit.append(audit_row)
+                continue
+            open_price, block_reason = execution_open(panels.get(code), trade_date, "buy")
+            if not np.isfinite(open_price):
+                audit_row["原因"] = block_reason
+                audit.append(audit_row)
+                continue
+
+            open_market_value = sum(
+                pos["shares"] * position_mark_price(pos, panels, trade_date, "portfolio_open")
+                for pos in positions.values()
+            )
+            current_equity = cash + open_market_value
+            budget = min(cash, current_equity / MAX_POSITIONS)
+            execution_price = open_price * (1.0 + SLIPPAGE_RATE)
+            shares = math.floor(budget / (execution_price * (1.0 + COMMISSION_RATE)) / 100.0) * 100
+            while shares > 0:
+                gross_amount = shares * execution_price
+                commission = max(MIN_COMMISSION, gross_amount * COMMISSION_RATE)
+                total_cost = gross_amount + commission
+                if total_cost <= budget + 1e-8 and total_cost <= cash + 1e-8:
+                    break
+                shares -= 100
+            if shares <= 0:
+                audit_row["原因"] = "可用资金不足100股"
+                audit.append(audit_row)
+                continue
+
+            panel = panels[code]
+            close_price = safe_number(panel.loc[trade_date].get("portfolio_close"))
+            if not np.isfinite(close_price) or close_price <= 0:
+                close_price = execution_price
+            cash -= total_cost
+            positions[code] = {
+                "ts_code": code,
+                "股票名称": signal["股票名称"],
+                "信号日": signal["信号日"],
+                "周排名": int(signal["周排名"]),
+                "entry_date": trade_date,
+                "entry_price": execution_price,
+                "entry_total_cost": total_cost,
+                "shares": int(shares),
+                "holding_days": 0,
+                "last_close": close_price,
+                "peak_close": close_price,
+                "pending_exit_reason": "",
+                "exit_delay_days": 0,
+            }
+            orders.append(
+                {
+                    "退出方案": policy.name,
+                    "交易日": trade_date,
+                    "方向": "买入",
+                    "ts_code": code,
+                    "股票名称": signal["股票名称"],
+                    "对应信号日": signal["信号日"],
+                    "对应周排名": signal["周排名"],
+                    "成交价": execution_price,
+                    "股数": shares,
+                    "成交金额": gross_amount,
+                    "佣金": commission,
+                    "印花税": 0.0,
+                    "总交易成本": commission + shares * open_price * SLIPPAGE_RATE,
+                    "卖出原因": "",
+                }
+            )
+            audit_row["处理结果"] = "已买入"
+            audit_row["原因"] = ""
+            audit.append(audit_row)
+
+        market_value = 0.0
+        for position in positions.values():
+            close_price = position_mark_price(position, panels, trade_date, "portfolio_close")
+            position["last_close"] = close_price
+            position["peak_close"] = max(position["peak_close"], close_price)
+            position["holding_days"] += 1
+            market_value += position["shares"] * close_price
+
+            if position["pending_exit_reason"]:
+                continue
+            close_return = close_price / position["entry_price"] - 1.0
+            peak_return = position["peak_close"] / position["entry_price"] - 1.0
+            peak_drawdown = close_price / position["peak_close"] - 1.0
+            if policy.close_stop_loss is not None and close_return <= policy.close_stop_loss:
+                position["pending_exit_reason"] = "收盘亏损达到10%"
+            elif (
+                policy.trailing_activation is not None
+                and policy.trailing_drawdown is not None
+                and peak_return >= policy.trailing_activation
+                and peak_drawdown <= policy.trailing_drawdown
+            ):
+                position["pending_exit_reason"] = "盈利达到20%后从收盘峰值回撤10%"
+            elif position["holding_days"] >= policy.max_holding_days:
+                position["pending_exit_reason"] = f"持有达到{policy.max_holding_days}个交易日"
+
+        equity = cash + market_value
+        previous_peak = max((row["权益峰值"] for row in curve), default=INITIAL_CAPITAL)
+        equity_peak = max(previous_peak, equity)
+        curve.append(
+            {
+                "退出方案": policy.name,
+                "交易日": trade_date,
+                "现金": cash,
+                "持仓市值": market_value,
+                "总权益": equity,
+                "权益峰值": equity_peak,
+                "回撤": equity / equity_peak - 1.0 if equity_peak > 0 else np.nan,
+                "持仓数量": len(positions),
+                "资金暴露": market_value / equity if equity > 0 else np.nan,
+            }
+        )
+        if trade_date >= last_required_date and not positions:
+            break
+
+    curve_frame = pd.DataFrame(curve)
+    ledger_frame = pd.DataFrame(ledger)
+    orders_frame = pd.DataFrame(orders)
+    audit_frame = pd.DataFrame(audit)
+    open_rows: list[dict] = []
+    final_date = simulation_dates[-1] if simulation_dates else ""
+    for position in positions.values():
+        mark = position["last_close"]
+        market_value = position["shares"] * mark
+        open_rows.append(
+            {
+                "退出方案": policy.name,
+                "截至日期": final_date,
+                "ts_code": position["ts_code"],
+                "股票名称": position["股票名称"],
+                "信号日": position["信号日"],
+                "买入日": position["entry_date"],
+                "买入排名": position["周排名"],
+                "股数": position["shares"],
+                "买入总成本": position["entry_total_cost"],
+                "期末市值": market_value,
+                "未实现净收益": market_value - position["entry_total_cost"],
+                "未实现收益率": market_value / position["entry_total_cost"] - 1.0,
+                "已持有交易日": position["holding_days"],
+                "待执行卖出原因": position["pending_exit_reason"],
+            }
+        )
+    open_frame = pd.DataFrame(open_rows)
+
+    final_equity = float(curve_frame["总权益"].iloc[-1]) if not curve_frame.empty else INITIAL_CAPITAL
+    elapsed_days = (
+        (pd.Timestamp(final_date) - pd.Timestamp(simulation_dates[0])).days
+        if len(simulation_dates) >= 2
+        else 0
+    )
+    annualized = (
+        (final_equity / INITIAL_CAPITAL) ** (365.25 / elapsed_days) - 1.0
+        if elapsed_days > 0 and final_equity > 0
+        else np.nan
+    )
+    closed_returns = ledger_frame.get("净收益率", pd.Series(dtype=float))
+    reason_counts = ledger_frame.get("卖出原因", pd.Series(dtype=str)).value_counts()
+    audit_reasons = audit_frame.get("原因", pd.Series(dtype=str)).value_counts()
+    summary = {
+        "退出方案": policy.name,
+        "最大持有交易日": policy.max_holding_days,
+        "收盘止损": policy.close_stop_loss,
+        "移动保护启动收益": policy.trailing_activation,
+        "峰值回撤退出": policy.trailing_drawdown,
+        "组合起始日": simulation_dates[0] if simulation_dates else "",
+        "组合截至日": final_date,
+        "初始资金": INITIAL_CAPITAL,
+        "期末权益": final_equity,
+        "总收益率": final_equity / INITIAL_CAPITAL - 1.0,
+        "年化收益率": annualized,
+        "最大回撤": curve_frame["回撤"].min() if not curve_frame.empty else np.nan,
+        "买入次数": int((orders_frame.get("方向", pd.Series(dtype=str)) == "买入").sum()),
+        "已完成交易": len(ledger_frame),
+        "期末持仓": len(open_frame),
+        "已完成交易胜率": (closed_returns > 0).mean() if len(closed_returns) else np.nan,
+        "单笔净收益率均值": closed_returns.mean() if len(closed_returns) else np.nan,
+        "单笔净收益率中位数": closed_returns.median() if len(closed_returns) else np.nan,
+        "平均持有交易日": ledger_frame["持有交易日"].mean() if not ledger_frame.empty else np.nan,
+        "平均持仓数": curve_frame["持仓数量"].mean() if not curve_frame.empty else np.nan,
+        "平均资金暴露": curve_frame["资金暴露"].mean() if not curve_frame.empty else np.nan,
+        "收盘亏损退出数": int(reason_counts.get("收盘亏损达到10%", 0)),
+        "盈利回撤退出数": int(reason_counts.get("盈利达到20%后从收盘峰值回撤10%", 0)),
+        "到期退出数": int(sum(count for reason, count in reason_counts.items() if str(reason).startswith("持有达到"))),
+        "三仓已满未买": int(audit_reasons.get("三仓已满", 0)),
+        "重复持仓未买": int(audit_reasons.get("已有持仓", 0)),
+        "无法成交未买": int(
+            sum(
+                count
+                for reason, count in audit_reasons.items()
+                if reason in {"缺少行情", "停牌或无成交", "缺少开盘价", "一字涨停无法买入", "没有下一交易日数据"}
+            )
+        ),
+    }
+    return {
+        "summary": pd.DataFrame([summary]),
+        "curve": curve_frame,
+        "orders": orders_frame,
+        "ledger": ledger_frame,
+        "audit": audit_frame,
+        "open_positions": open_frame,
+    }
+
+
+def run_portfolio_comparison(
+    candidates: pd.DataFrame,
+    panels: dict[str, pd.DataFrame],
+    trade_dates: list[str],
+    config: Config,
+) -> dict[str, pd.DataFrame]:
+    outputs = [
+        simulate_portfolio_policy(candidates, panels, trade_dates, config, policy)
+        for policy in PORTFOLIO_POLICIES
+    ]
+
+    def combine(key: str) -> pd.DataFrame:
+        frames = [item[key] for item in outputs if not item[key].empty]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    return {
+        "portfolio_summary": combine("summary"),
+        "portfolio_curve": combine("curve"),
+        "portfolio_orders": combine("orders"),
+        "portfolio_ledger": combine("ledger"),
+        "portfolio_signal_audit": combine("audit"),
+        "portfolio_open_positions": combine("open_positions"),
+    }
+
+
 def build_factor_ic(candidates: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
     factor_columns = ["相对强度分", "低波动分", "低回撤分", "综合分"]
@@ -1031,7 +1465,9 @@ def build_robustness(events: pd.DataFrame) -> pd.DataFrame:
 def format_percent_columns(frame: pd.DataFrame) -> pd.DataFrame:
     display = frame.copy()
     keywords = ("收益", "MFE", "MAE", "回撤", "比例", "ret120", "涨幅", "加速度", "距")
-    score_columns = {"综合分", "相对强度分", "低波动分", "低回撤分", "价格模型分", "排名百分位"}
+    score_columns = {
+        "综合分", "相对强度分", "低波动分", "低回撤分", "价格模型分", "排名百分位", "收盘止损"
+    }
     for col in display.columns:
         is_percent = any(key in str(col) for key in keywords) or str(col) in score_columns
         if is_percent and pd.api.types.is_numeric_dtype(display[col]):
@@ -1043,21 +1479,27 @@ def result_files(result: dict) -> list[tuple[str, pd.DataFrame | bytes]]:
     run_id = str(result["run_id"])
     config_bytes = json.dumps(result["config"], ensure_ascii=False, indent=2).encode("utf-8")
     return [
-        (f"weekly_signals_selector_v1_2_{run_id}.csv", result["signals"]),
-        (f"independent_events_selector_v1_2_{run_id}.csv", result["events"]),
-        (f"weekly_top10_selector_v1_2_{run_id}.csv", result["top10"]),
-        (f"all_candidates_paths_selector_v1_2_{run_id}.csv", result["candidates"]),
-        (f"model_comparison_selector_v1_2_{run_id}.csv", result["model_summary"]),
-        (f"rank_bands_selector_v1_2_{run_id}.csv", result["rank_summary"]),
-        (f"entry_diagnostics_selector_v1_2_{run_id}.csv", result["entry_diagnostics"]),
-        (f"b_top3_comparison_selector_v1_2_{run_id}.csv", result["b_top3_summary"]),
-        (f"b_top3_weekly_selector_v1_2_{run_id}.csv", result["b_top3_detail"]),
-        (f"factor_ic_selector_v1_2_{run_id}.csv", result["factor_ic"]),
-        (f"robustness_selector_v1_2_{run_id}.csv", result["robustness"]),
-        (f"bucket_summary_selector_v1_2_{run_id}.csv", result["bucket"]),
-        (f"funnel_selector_v1_2_{run_id}.csv", result["funnel"]),
-        (f"data_gaps_selector_v1_2_{run_id}.csv", result["gaps"]),
-        (f"research_config_selector_v1_2_{run_id}.json", config_bytes),
+        (f"weekly_signals_selector_v1_3_{run_id}.csv", result["signals"]),
+        (f"independent_events_selector_v1_3_{run_id}.csv", result["events"]),
+        (f"weekly_top10_selector_v1_3_{run_id}.csv", result["top10"]),
+        (f"all_candidates_paths_selector_v1_3_{run_id}.csv", result["candidates"]),
+        (f"model_comparison_selector_v1_3_{run_id}.csv", result["model_summary"]),
+        (f"rank_bands_selector_v1_3_{run_id}.csv", result["rank_summary"]),
+        (f"entry_diagnostics_selector_v1_3_{run_id}.csv", result["entry_diagnostics"]),
+        (f"b_top3_comparison_selector_v1_3_{run_id}.csv", result["b_top3_summary"]),
+        (f"b_top3_weekly_selector_v1_3_{run_id}.csv", result["b_top3_detail"]),
+        (f"portfolio_summary_selector_v1_3_{run_id}.csv", result["portfolio_summary"]),
+        (f"portfolio_curve_selector_v1_3_{run_id}.csv", result["portfolio_curve"]),
+        (f"portfolio_orders_selector_v1_3_{run_id}.csv", result["portfolio_orders"]),
+        (f"portfolio_ledger_selector_v1_3_{run_id}.csv", result["portfolio_ledger"]),
+        (f"portfolio_signal_audit_selector_v1_3_{run_id}.csv", result["portfolio_signal_audit"]),
+        (f"portfolio_open_positions_selector_v1_3_{run_id}.csv", result["portfolio_open_positions"]),
+        (f"factor_ic_selector_v1_3_{run_id}.csv", result["factor_ic"]),
+        (f"robustness_selector_v1_3_{run_id}.csv", result["robustness"]),
+        (f"bucket_summary_selector_v1_3_{run_id}.csv", result["bucket"]),
+        (f"funnel_selector_v1_3_{run_id}.csv", result["funnel"]),
+        (f"data_gaps_selector_v1_3_{run_id}.csv", result["gaps"]),
+        (f"research_config_selector_v1_3_{run_id}.json", config_bytes),
     ]
 
 
@@ -1167,6 +1609,8 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
     rank_summary = build_rank_summary(candidates)
     entry_diagnostics = build_entry_diagnostics(candidates)
     b_top3_detail, b_top3_summary = build_b_top3_comparison(candidates)
+    status.write("运行B模型前三名的30万元三仓组合对照")
+    portfolio = run_portfolio_comparison(candidates, panels, trade_dates, config)
     factor_ic = build_factor_ic(candidates)
     robustness = build_robustness(independent_events)
     funnel = pd.DataFrame(funnel_rows)
@@ -1178,6 +1622,17 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
             "app_name": APP_NAME,
             "app_version": APP_VERSION,
             "build_id": BUILD_ID,
+            "portfolio_assumptions": {
+                "initial_capital": INITIAL_CAPITAL,
+                "max_positions": MAX_POSITIONS,
+                "entry_candidates": "B模型每周前三名，空仓时按排名补入",
+                "commission_rate": COMMISSION_RATE,
+                "minimum_commission": MIN_COMMISSION,
+                "sell_stamp_duty": SELL_STAMP_DUTY,
+                "one_way_slippage": SLIPPAGE_RATE,
+                "execution_rule": "收盘确认退出，下一交易日开盘执行",
+                "policies": [asdict(policy) for policy in PORTFOLIO_POLICIES],
+            },
             **asdict(config),
         },
         "run_id": datetime.now().strftime("%Y%m%d_%H%M%S"),
@@ -1190,6 +1645,7 @@ def run_research(pro, config: Config) -> dict[str, pd.DataFrame | dict]:
         "entry_diagnostics": entry_diagnostics,
         "b_top3_detail": b_top3_detail,
         "b_top3_summary": b_top3_summary,
+        **portfolio,
         "factor_ic": factor_ic,
         "robustness": robustness,
         "bucket": bucket_summary,
@@ -1208,6 +1664,12 @@ def render_results(result: dict) -> None:
     entry_diagnostics: pd.DataFrame = result["entry_diagnostics"]
     b_top3_detail: pd.DataFrame = result["b_top3_detail"]
     b_top3_summary: pd.DataFrame = result["b_top3_summary"]
+    portfolio_summary: pd.DataFrame = result["portfolio_summary"]
+    portfolio_curve: pd.DataFrame = result["portfolio_curve"]
+    portfolio_orders: pd.DataFrame = result["portfolio_orders"]
+    portfolio_ledger: pd.DataFrame = result["portfolio_ledger"]
+    portfolio_signal_audit: pd.DataFrame = result["portfolio_signal_audit"]
+    portfolio_open_positions: pd.DataFrame = result["portfolio_open_positions"]
     factor_ic: pd.DataFrame = result["factor_ic"]
     robustness: pd.DataFrame = result["robustness"]
     bucket: pd.DataFrame = result["bucket"]
@@ -1232,8 +1694,16 @@ def render_results(result: dict) -> None:
     st.caption("A为行业相对强度单因子；B为原50%相对强度+25%低波动+25%低回撤。两者固定同时运行，不搜索权重。")
     st.dataframe(format_percent_columns(model_summary), use_container_width=True, hide_index=True)
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
-        ["每周第一名", "独立趋势事件", "排名区间", "入场位置", "因子诊断", "牛股依赖", "每周Top10", "分组单调性", "数据审计"]
+    st.subheader("30万元三仓组合对照")
+    st.caption(
+        "只使用B模型每周前三名；最多3仓，空仓时按排名补入。"
+        "买卖均按下一交易日开盘并计入固定佣金、卖出印花税和单边0.05%滑点。"
+        "四种退出方案同时运行，不根据本次结果自动选择。"
+    )
+    st.dataframe(format_percent_columns(portfolio_summary), use_container_width=True, hide_index=True)
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+        ["每周第一名", "独立趋势事件", "排名区间", "入场位置", "三仓明细", "因子诊断", "牛股依赖", "每周Top10", "分组单调性", "数据审计"]
     )
     with tab1:
         preferred = [
@@ -1261,17 +1731,37 @@ def render_results(result: dict) -> None:
         with st.expander("查看逐周配对明细"):
             st.dataframe(format_percent_columns(b_top3_detail), use_container_width=True, hide_index=True)
     with tab5:
+        if portfolio_curve.empty:
+            st.warning("没有可显示的组合曲线。")
+        else:
+            chart = portfolio_curve.pivot(index="交易日", columns="退出方案", values="总权益")
+            chart.index = pd.to_datetime(chart.index.astype(str), format="%Y%m%d")
+            st.line_chart(chart)
+        st.markdown("**已完成交易**")
+        st.dataframe(format_percent_columns(portfolio_ledger), use_container_width=True, hide_index=True)
+        st.markdown("**期末未平仓持仓**")
+        if portfolio_open_positions.empty:
+            st.success("所有方案在可用行情结束前均无未平仓持仓。")
+        else:
+            st.dataframe(format_percent_columns(portfolio_open_positions), use_container_width=True, hide_index=True)
+        with st.expander("查看全部买卖订单"):
+            st.dataframe(portfolio_orders, use_container_width=True, hide_index=True)
+        with st.expander("查看每周前三名为何买入或未买入"):
+            st.dataframe(portfolio_signal_audit, use_container_width=True, hide_index=True)
+        with st.expander("查看每日组合权益"):
+            st.dataframe(format_percent_columns(portfolio_curve), use_container_width=True, hide_index=True)
+    with tab6:
         st.caption("逐周Spearman相关。MFE、期末收益希望为正；MAE希望为正，代表评分越高、亏损越小。")
         st.dataframe(format_percent_columns(factor_ic), use_container_width=True, hide_index=True)
-    with tab6:
+    with tab7:
         st.caption("基于独立趋势事件，依次删除期末表现最好的1、3、5只股票，检查结果是否坍塌。")
         st.dataframe(format_percent_columns(robustness), use_container_width=True, hide_index=True)
-    with tab7:
-        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
     with tab8:
+        st.dataframe(format_percent_columns(top10), use_container_width=True, hide_index=True)
+    with tab9:
         st.caption("只有从Q1到Q5总体改善，才说明排名具有可信的横截面区分能力。")
         st.dataframe(format_percent_columns(bucket), use_container_width=True, hide_index=True)
-    with tab9:
+    with tab10:
         st.markdown("**筛选漏斗**")
         st.dataframe(funnel, use_container_width=True, hide_index=True)
         st.markdown("**数据缺口**")
@@ -1285,7 +1775,7 @@ def render_results(result: dict) -> None:
     st.download_button(
         "一键下载全部研究结果（ZIP）",
         data=build_zip(result),
-        file_name=f"selector_research_v1_2_{result['run_id']}.zip",
+        file_name=f"selector_research_v1_3_{result['run_id']}.zip",
         mime="application/zip",
         type="primary",
         key=f"download_all_{result['run_id']}",
@@ -1307,7 +1797,7 @@ def main() -> None:
     st.set_page_config(page_title=APP_NAME, layout="wide")
     st.title(APP_NAME)
     st.code(f"版本：{APP_VERSION}｜构建编号：{BUILD_ID}", language=None)
-    st.caption("从零设计；不使用MACD、红绿柱、旧评分阈值或旧版本交易规则。当前版本只验证选股能力，不模拟组合卖出。")
+    st.caption("从零设计；不使用MACD、红绿柱、旧评分阈值或旧版本交易规则。v1.3新增B模型前三名的正式三仓组合验证。")
 
     with st.sidebar:
         st.header("数据与股票池")
@@ -1337,7 +1827,7 @@ def main() -> None:
         min_amount = st.number_input("20日平均成交额下限（亿元）", min_value=0.0, value=1.0, step=0.1)
 
         st.header("研究模型")
-        st.caption("固定同时运行A：相对强度单因子；B：原综合模型。v1.2不改模型，只增加入场诊断。")
+        st.caption("固定同时运行A：相对强度单因子；B：原综合模型。v1.3不改评分，只让B模型进入三仓组合。")
         use_st = st.checkbox(
             "尝试调用历史ST列表",
             value=True,
@@ -1349,11 +1839,17 @@ def main() -> None:
         severe_mae_pct = st.number_input("严重前置回撤（%）", min_value=3.0, value=10.0, step=1.0)
         st.caption("这两个数只用于事后分类，不参与选股评分，也不是止盈止损。")
 
+        st.header("三仓组合（固定口径）")
+        st.caption(
+            "初始资金30万元、最多3仓。佣金0.03%且最低5元；卖出印花税0.05%；"
+            "买卖各计0.05%滑点。参数固定，不在侧边栏优化。"
+        )
+
         run_button = st.button("开始研究", type="primary", use_container_width=True)
 
     st.info(
         "A模型只按行业相对强度排名；B模型固定为相对强度50% + 低波动25% + 低回撤25%。"
-        "重点比较第一名是否稳定优于第2-10名，并诊断短期涨幅、加速度和距离近期高点。"
+        "组合只采用B模型每周前三名，比较60日、120日、收盘止损和盈利回撤保护四种固定退出方案。"
     )
 
     if run_button:
@@ -1387,12 +1883,12 @@ def main() -> None:
             severe_mae=-float(severe_mae_pct) / 100.0,
         )
         try:
-            st.session_state["selector_v1_2_result"] = run_research(pro, config)
+            st.session_state["selector_v1_3_result"] = run_research(pro, config)
         except Exception as exc:
             st.exception(exc)
 
-    if "selector_v1_2_result" in st.session_state:
-        render_results(st.session_state["selector_v1_2_result"])
+    if "selector_v1_3_result" in st.session_state:
+        render_results(st.session_state["selector_v1_3_result"])
 
 
 if __name__ == "__main__":
