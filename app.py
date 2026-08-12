@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD止损先到特征与误删代价前沿实验器 V2.7（单文件版）
-=========================================================
+科技股周线MACD月线状态冻结审计器 V2.8（单文件版）
+===============================================
 
-本程序在第二根完整红柱严格扩张候选中，先按红柱出现时的周线状态互斥分成
-上升趋势、中性趋势、下降趋势，再按未来八周最高涨幅和既有交易效用分成五个
-结果组。程序把实盘坏结果重新定义为“-10%止损先于+30%目标”，把好结果定义为
-“+30%目标先于-10%止损”，并在允许误删20%、30%、40%、50%好股票的预算下，
-寻找最多能排除多少止损交易。加入当时已知的科技股、行业和上市板块环境变量，
-严格使用扩展时间窗口训练、未来半年判卷。程序不生成最终评分、不选Top3。
+本程序在第二根完整周线红柱严格扩张候选中，用信号日当时已经存在的日线价格
+实时合成未完成月K，计算当时可见的月线MACD，并按预先冻结的八个月线状态直接
+判卷。程序不训练状态、不搜索阈值、不生成最终评分、不选Top3。
 以下底层统计仍保留在程序中，用于生成事件和未来路径：
 1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
 2. 两类趋势中，未来八周触及 +10%/+20%/+30%/+50%/+100% 的概率。
@@ -33,7 +30,7 @@
 - “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
 
 运行：
-    streamlit run weekly_macd_stop_first_veto_frontier_v2_7_single.py
+    streamlit run weekly_macd_monthly_state_audit_v2_8_single.py
 """
 
 from __future__ import annotations
@@ -9155,7 +9152,7 @@ def v27_feature_dictionary() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
+def v27_main_legacy() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
@@ -9356,6 +9353,512 @@ def main() -> None:
                        file_name="weekly_macd_stop_first_veto_frontier_v2_7_all_results.zip",
                        mime="application/zip", type="primary", key="v27_download")
     st.warning("即使某档前沿有效，也只证明负向否决有研究价值；还不是可直接实盘使用的最终评分。")
+
+
+# ===== V2.8 frozen monthly-MACD state audit (single file) =====
+TITLE = "科技股周线MACD月线状态冻结审计器 V2.8"
+VERSION = "V2.8-FROZEN-ASOF-MONTHLY-MACD-STATE-AUDIT"
+V28_NEAR_ZERO_RATIO = 0.20
+V28_STABLE_RATIO = 0.90
+V28_MIN_MONTHS = 30
+
+M_GREEN_NEW = "M1_刚由红转绿"
+M_GREEN_EXPAND = "M2_绿柱扩大或稳定"
+M_GREEN_SHRINK_FAR = "M3_绿柱缩短_远离零轴"
+M_GREEN_SHRINK_NEAR = "M4_绿柱缩短_接近零轴"
+M_RED_NEW = "M5_刚由绿转红"
+M_RED_EXPAND_NEAR = "M6_红柱扩大或稳定_接近零轴"
+M_RED_EXPAND_FAR = "M7_红柱扩大或稳定_远离零轴"
+M_RED_SHRINK_NEAR = "M8_红柱缩短_接近零轴"
+M_RED_SHRINK_FAR = "M9_红柱缩短_远离零轴"
+V28_MONTHLY_STATES = (
+    M_GREEN_NEW, M_GREEN_EXPAND, M_GREEN_SHRINK_FAR, M_GREEN_SHRINK_NEAR,
+    M_RED_NEW, M_RED_EXPAND_NEAR, M_RED_EXPAND_FAR,
+    M_RED_SHRINK_NEAR, M_RED_SHRINK_FAR,
+)
+
+V28_SCHEMES = {
+    "S1_用户原始假设": {
+        "states": {M_GREEN_SHRINK_NEAR, M_RED_EXPAND_FAR, M_RED_SHRINK_FAR},
+        "meaning": "绿柱缩短且接近零轴，或红柱仍远离零轴（不限扩大/缩短）",
+    },
+    "S2_结构修正假设": {
+        "states": {M_GREEN_SHRINK_NEAR, M_RED_NEW, M_RED_EXPAND_NEAR, M_RED_EXPAND_FAR},
+        "meaning": "绿柱缩短接近零轴，刚由绿转红，或红柱仍在扩大/稳定",
+    },
+    "S3_保守趋势假设": {
+        "states": {M_RED_EXPAND_FAR},
+        "meaning": "只保留红柱远离零轴且扩大/稳定",
+    },
+}
+
+
+def v28_monthly_snapshot(daily: pd.DataFrame, signal_date: str) -> dict[str, Any]:
+    """用截至信号日的日线实时合成当月未完成月K；不读取信号日后价格。"""
+    empty = {"Monthly_State": "无法计算", "Monthly_Audit_Reason": "无日线"}
+    if daily.empty or "trade_date" not in daily or "close" not in daily:
+        return empty
+    cutoff = normalize_date(signal_date)
+    work = daily.copy()
+    work["trade_date"] = work["trade_date"].astype(str).map(normalize_date)
+    work = work[work["trade_date"].le(cutoff)].copy()
+    if work.empty:
+        return empty
+    work["dt"] = pd.to_datetime(work["trade_date"], format="%Y%m%d", errors="coerce")
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    work = work.dropna(subset=["dt", "close"]).sort_values("dt")
+    work["month"] = work["dt"].dt.to_period("M")
+    monthly = work.groupby("month", as_index=False).agg(
+        trade_date=("trade_date", "last"), close=("close", "last"),
+        month_trading_days_seen=("trade_date", "size"),
+    )
+    if len(monthly) < V28_MIN_MONTHS:
+        return {"Monthly_State": "无法计算", "Monthly_Audit_Reason": f"月线预热不足<{V28_MIN_MONTHS}月",
+                "Monthly_Months_Seen": len(monthly)}
+    monthly["ema12"] = monthly["close"].ewm(span=12, adjust=False).mean()
+    monthly["ema26"] = monthly["close"].ewm(span=26, adjust=False).mean()
+    monthly["dif"] = monthly["ema12"] - monthly["ema26"]
+    monthly["dea"] = monthly["dif"].ewm(span=9, adjust=False).mean()
+    monthly["hist"] = (monthly["dif"] - monthly["dea"]) * 2.0
+    current = monthly.iloc[-1]
+    previous = monthly.iloc[-2]
+    previous2 = monthly.iloc[-3]
+    hist = finite_num(current["hist"])
+    prev_hist = finite_num(previous["hist"])
+    prev2_hist = finite_num(previous2["hist"])
+    reference = pd.to_numeric(monthly["hist"].iloc[max(0, len(monthly) - 13):-1], errors="coerce").abs().max()
+    near_ratio = abs(hist) / reference if math.isfinite(hist) and math.isfinite(reference) and reference > 1e-12 else np.nan
+    near_zero = math.isfinite(near_ratio) and near_ratio <= V28_NEAR_ZERO_RATIO
+    abs_ratio_prev = abs(hist) / abs(prev_hist) if math.isfinite(prev_hist) and abs(prev_hist) > 1e-12 else np.nan
+    if hist < 0 and prev_hist >= 0:
+        state = M_GREEN_NEW
+    elif hist < 0:
+        shrinking = math.isfinite(abs_ratio_prev) and abs_ratio_prev < V28_STABLE_RATIO
+        state = (M_GREEN_SHRINK_NEAR if near_zero else M_GREEN_SHRINK_FAR) if shrinking else M_GREEN_EXPAND
+    elif hist > 0 and prev_hist <= 0:
+        state = M_RED_NEW
+    elif hist > 0:
+        expanding_or_stable = math.isfinite(abs_ratio_prev) and abs_ratio_prev >= V28_STABLE_RATIO
+        if expanding_or_stable:
+            state = M_RED_EXPAND_NEAR if near_zero else M_RED_EXPAND_FAR
+        else:
+            state = M_RED_SHRINK_NEAR if near_zero else M_RED_SHRINK_FAR
+    else:
+        state = "无法计算"
+    dif = finite_num(current["dif"])
+    dea = finite_num(current["dea"])
+    if dif > 0 and dea > 0:
+        line_zone = "DIF_DEA均在零轴上"
+    elif dif < 0 and dea < 0:
+        line_zone = "DIF_DEA均在零轴下"
+    else:
+        line_zone = "DIF_DEA分居零轴两侧"
+    if hist > 0 and prev_hist > 0 and prev2_hist > 0:
+        persistent = (abs(hist) < abs(prev_hist) * V28_STABLE_RATIO
+                      and abs(prev_hist) < abs(prev2_hist) * V28_STABLE_RATIO)
+    elif hist < 0 and prev_hist < 0 and prev2_hist < 0:
+        persistent = (abs(hist) < abs(prev_hist) * V28_STABLE_RATIO
+                      and abs(prev_hist) < abs(prev2_hist) * V28_STABLE_RATIO)
+    else:
+        persistent = False
+    signal_dt = pd.to_datetime(cutoff, format="%Y%m%d")
+    return {
+        "Monthly_State": state, "Monthly_Audit_Reason": "完成",
+        "Monthly_AsOf_Date": cutoff, "Monthly_Month": str(current["month"]),
+        "Monthly_Months_Seen": len(monthly), "Monthly_Current_Close": finite_num(current["close"]),
+        "Monthly_DIF": dif, "Monthly_DEA": dea, "Monthly_Hist": hist,
+        "Monthly_Prev_Hist": prev_hist, "Monthly_Prev2_Hist": prev2_hist,
+        "Monthly_Hist_Abs_vs_Prev": abs_ratio_prev,
+        "Monthly_Zero_Distance_Ratio12": near_ratio,
+        "Monthly_Near_Zero_Frozen20": near_zero,
+        "Monthly_Line_Zone": line_zone, "Monthly_Two_Step_Shrink": persistent,
+        "Monthly_Calendar_Progress_pct": signal_dt.day / signal_dt.days_in_month * 100.0,
+        "Monthly_Trading_Days_Seen": int(current["month_trading_days_seen"]),
+    }
+
+
+def v28_add_monthly_states(candidates: pd.DataFrame,
+                           histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for _, event in candidates.iterrows():
+        code = str(event.get("ts_code", ""))
+        snapshot = v28_monthly_snapshot(histories.get(code, pd.DataFrame()),
+                                        normalize_date(event.get("Selection_Date")))
+        rows.append(snapshot)
+    monthly = pd.DataFrame(rows, index=candidates.index)
+    out = candidates.copy()
+    for column in monthly.columns:
+        out[column] = monthly[column]
+    return v27_path_labels(out)
+
+
+def v28_period_masks(frame: pd.DataFrame) -> list[tuple[str, pd.Series]]:
+    dates = pd.to_datetime(frame["Selection_Date"], format="%Y%m%d", errors="coerce")
+    return [
+        ("全部", pd.Series(True, index=frame.index)),
+        ("2023下半年", dates.between("2023-06-05", "2023-12-31")),
+        ("2024", dates.between("2024-01-01", "2024-12-31")),
+        ("2025", dates.between("2025-01-01", "2025-12-31")),
+        ("2026上半年", dates.between("2026-01-01", "2026-06-30")),
+    ]
+
+
+def v28_metrics(frame: pd.DataFrame) -> dict[str, Any]:
+    n = len(frame)
+    targets = frame["V27_Target_First"].astype(bool)
+    stops = frame["V27_Stop_First"].astype(bool)
+    resolved = targets | stops
+    status50 = frame["CP_W2_Delayed_First_50_vs_Stop"].fillna("").astype(str).eq("目标先到")
+    status100 = frame["CP_W2_Delayed_First_100_vs_Stop"].fillna("").astype(str).eq("目标先到")
+    return {
+        "候选数": n, "不同股票": frame["ts_code"].nunique() if n else 0,
+        "候选周": frame["Selection_Date"].nunique() if n else 0,
+        "30%目标先到数": int(targets.sum()), "-10%止损先到数": int(stops.sum()),
+        "八周均未触发数": int((~resolved).sum()),
+        "30%目标先到率_全部(%)": targets.mean() * 100.0 if n else np.nan,
+        "-10%止损先到率_全部(%)": stops.mean() * 100.0 if n else np.nan,
+        "30%目标先到率_已决(%)": targets.sum() / resolved.sum() * 100.0 if resolved.sum() else np.nan,
+        "50%目标先到数": int(status50.sum()), "100%目标先到数": int(status100.sum()),
+        "MFE30至50数": int(frame["结果组"].eq(MID_GROUP).sum()),
+        "MFE50至100数": int(frame["结果组"].eq(HIGH_GROUP).sum()),
+        "MFE翻倍数": int(frame["结果组"].eq(DOUBLE_GROUP).sum()),
+        "8周MFE均值(%)": num(frame.get("CP_W2_Delayed_MFE_8W_pct"), frame.index).mean(),
+        "8周MFE中位数(%)": num(frame.get("CP_W2_Delayed_MFE_8W_pct"), frame.index).median(),
+        "交易效用均值": num(frame.get("Realised_Utility"), frame.index).mean(),
+        "交易效用中位数": num(frame.get("Realised_Utility"), frame.index).median(),
+    }
+
+
+def v28_state_summary(frame: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for period, period_mask in v28_period_masks(frame):
+        period_data = frame[period_mask]
+        for state in STATE_ORDER:
+            state_data = period_data[period_data["Weekly_Trend"].eq(state)]
+            baseline = v28_metrics(state_data)
+            rows.append({"统计期": period, "周线形态": state,
+                         "月线状态": "BASE_形态全部候选", "形态内占比(%)": 100.0,
+                         **baseline})
+            for monthly_state in V28_MONTHLY_STATES:
+                selected = state_data[state_data["Monthly_State"].eq(monthly_state)]
+                metrics = v28_metrics(selected)
+                rows.append({"统计期": period, "周线形态": state,
+                             "月线状态": monthly_state,
+                             "形态内占比(%)": len(selected) / len(state_data) * 100.0 if len(state_data) else np.nan,
+                             **metrics})
+    return pd.DataFrame(rows)
+
+
+def v28_scheme_audit(frame: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for period, period_mask in v28_period_masks(frame):
+        period_data = frame[period_mask]
+        for state in STATE_ORDER:
+            baseline = period_data[period_data["Weekly_Trend"].eq(state)]
+            base = v28_metrics(baseline)
+            base_weeks = set(baseline["Selection_Date"].astype(str))
+            for scheme_name, spec in V28_SCHEMES.items():
+                selected = baseline[baseline["Monthly_State"].isin(spec["states"])]
+                metrics = v28_metrics(selected)
+                selected_weeks = set(selected["Selection_Date"].astype(str))
+                row = {
+                    "统计期": period, "周线形态": state, "冻结方案": scheme_name,
+                    "方案含义": spec["meaning"],
+                    "原始候选数": len(baseline), "保留比例(%)": len(selected) / len(baseline) * 100.0 if len(baseline) else np.nan,
+                    "原始候选周": len(base_weeks), "保留候选周": len(selected_weeks),
+                    "新增空窗周": len(base_weeks - selected_weeks),
+                    "原始30%目标先到率_已决(%)": base["30%目标先到率_已决(%)"],
+                    "原始止损先到率_全部(%)": base["-10%止损先到率_全部(%)"],
+                    **{f"保留_{key}": value for key, value in metrics.items()},
+                }
+                row["30%目标先到率提升(百分点)"] = (
+                    row["保留_30%目标先到率_已决(%)"]
+                    - row["原始30%目标先到率_已决(%)"]
+                )
+                row["止损先到率下降(百分点)"] = (
+                    row["原始止损先到率_全部(%)"]
+                    - row["保留_-10%止损先到率_全部(%)"]
+                )
+                for outcome, short in ((MID_GROUP, "30至50"), (HIGH_GROUP, "50至100"), (DOUBLE_GROUP, "翻倍")):
+                    total = int(baseline["结果组"].eq(outcome).sum())
+                    kept = int(selected["结果组"].eq(outcome).sum())
+                    row[f"{short}组保留数"] = kept
+                    row[f"{short}组保留率(%)"] = kept / total * 100.0 if total else np.nan
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def v28_acceptance(audit: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    period_order = ["2024", "2025", "2026上半年"]
+    for state in STATE_ORDER:
+        for scheme in V28_SCHEMES:
+            group = audit[(audit["周线形态"].eq(state)) & (audit["冻结方案"].eq(scheme))]
+            overall = group[group["统计期"].eq("全部")]
+            if overall.empty:
+                continue
+            overall = overall.iloc[0]
+            period_group = group[group["统计期"].isin(period_order)].copy()
+            period_group["改善"] = (
+                num(period_group["30%目标先到率提升(百分点)"]).gt(0)
+                & num(period_group["止损先到率下降(百分点)"]).gt(0)
+                & num(period_group["保留_候选数"]).ge(5)
+            )
+            flags = []
+            for period in period_order:
+                item = period_group[period_group["统计期"].eq(period)]
+                flags.append(bool(item.iloc[0]["改善"]) if not item.empty else False)
+            max_streak = streak = 0
+            for flag in flags:
+                streak = streak + 1 if flag else 0
+                max_streak = max(max_streak, streak)
+            retain = finite_num(overall["保留比例(%)"])
+            target_lift = finite_num(overall["30%目标先到率提升(百分点)"])
+            stop_drop = finite_num(overall["止损先到率下降(百分点)"])
+            pass_all = (retain >= 30.0 and target_lift >= 5.0 and stop_drop >= 10.0
+                        and max_streak >= 2)
+            if pass_all:
+                verdict = "通过月线状态候选验收"
+            elif retain < 30.0:
+                verdict = "未通过：保留候选不足30%"
+            elif target_lift < 5.0:
+                verdict = "未通过：目标先到率提升不足5个百分点"
+            elif stop_drop < 10.0:
+                verdict = "未通过：止损率下降不足10个百分点"
+            else:
+                verdict = "未通过：没有连续两期同向改善"
+            rows.append({
+                "周线形态": state, "冻结方案": scheme,
+                "全部保留比例(%)": retain, "全部目标先到率提升(百分点)": target_lift,
+                "全部止损率下降(百分点)": stop_drop,
+                "2024改善": flags[0], "2025改善": flags[1], "2026上半年改善": flags[2],
+                "最长连续改善期": max_streak,
+                "30至50组保留率(%)": overall["30至50组保留率(%)"],
+                "50至100组保留率(%)": overall["50至100组保留率(%)"],
+                "翻倍组保留率(%)": overall["翻倍组保留率(%)"],
+                "新增空窗周": overall["新增空窗周"], "验收结论": verdict,
+            })
+    return pd.DataFrame(rows)
+
+
+def v28_month_progress_audit(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    progress = num(out.get("Monthly_Calendar_Progress_pct"), out.index)
+    out["月内信号阶段"] = pd.cut(progress, bins=[-np.inf, 33.333, 66.667, np.inf],
+                                  labels=["月初三分之一", "月中三分之一", "月末三分之一"])
+    rows = []
+    for (weekly, monthly, progress_label), group in out.groupby(
+            ["Weekly_Trend", "Monthly_State", "月内信号阶段"], observed=True):
+        rows.append({"周线形态": weekly, "月线状态": monthly,
+                     "月内信号阶段": progress_label, **v28_metrics(group)})
+    return pd.DataFrame(rows)
+
+
+def v28_state_dictionary() -> pd.DataFrame:
+    descriptions = {
+        M_GREEN_NEW: "当月柱为绿，上月为红；刚转弱",
+        M_GREEN_EXPAND: "绿柱未缩短至上月的90%以下；下跌动能未明显收缩",
+        M_GREEN_SHRINK_FAR: "绿柱绝对值<上月90%，但仍>12月参考峰值20%",
+        M_GREEN_SHRINK_NEAR: "绿柱绝对值<上月90%，且≤12月参考峰值20%",
+        M_RED_NEW: "当月柱为红，上月为绿；刚转强",
+        M_RED_EXPAND_NEAR: "红柱≥上月90%，且≤12月参考峰值20%",
+        M_RED_EXPAND_FAR: "红柱≥上月90%，且>12月参考峰值20%",
+        M_RED_SHRINK_NEAR: "红柱<上月90%，且≤12月参考峰值20%",
+        M_RED_SHRINK_FAR: "红柱<上月90%，但仍>12月参考峰值20%",
+    }
+    rows = [{"类型": "月线状态", "名称": state, "冻结定义": descriptions[state]} for state in V28_MONTHLY_STATES]
+    rows.extend({"类型": "固定方案", "名称": name, "冻结定义": spec["meaning"]}
+                for name, spec in V28_SCHEMES.items())
+    rows.extend([
+        {"类型": "固定阈值", "名称": "接近零轴", "冻结定义": "|当月MACD柱| ≤ 过去12个已知月最大|柱|的20%"},
+        {"类型": "固定阈值", "名称": "扩大或稳定", "冻结定义": "|当月MACD柱| ≥ |上月柱|的90%"},
+        {"类型": "信息时点", "名称": "实时月K", "冻结定义": "仅用第二根完整周红柱确认日及之前日线合成当月未完成月K"},
+    ])
+    return pd.DataFrame(rows)
+
+
+def main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    st.caption("月线状态和阈值事先冻结；只审计、不训练、不搜索最优切分点、不生成评分。")
+    with st.sidebar:
+        st.header("正式评价区间")
+        eval_date = st.date_input("评价开始", value=date(2023, 6, 5), key="v28_eval")
+        end_date = st.date_input("信号截止", value=date(2026, 6, 5), key="v28_end")
+        obs_date = st.date_input("行情观察截止", value=date.today(), max_value=date.today(), key="v28_obs")
+        st.header("冻结月线定义")
+        st.write("接近零轴：柱长≤过去12月峰值20%")
+        st.write("扩大/稳定：当月柱长≥上月90%")
+        st.write("当月使用信号日实时未完成月K")
+        st.write("月线MACD至少预热30个月")
+        st.write("三个固定方案同时判卷")
+        st.write("不使用V2.7的负向否决规则")
+        cache = st.checkbox("使用逐股票缓存", value=True, key="v28_cache")
+        pause = st.number_input("每次API调用后暂停(秒)", 0.0, 3.0, 0.12, 0.05, key="v28_pause")
+        if st.button("清除本程序缓存", key="v28_clear"):
+            if os.path.isdir(CACHE_DIR):
+                shutil.rmtree(CACHE_DIR)
+            st.success("缓存已清除")
+    token = st.text_input("Tushare Token", type="password", key="v28_token")
+    if not token:
+        st.info("请输入Tushare Token。V2.7逐股票缓存可直接复用，不要清除缓存。")
+        return
+    session_key = "monthly_state_audit_v28_zip"
+    if not st.button("开始V2.8月线状态冻结审计", type="primary", key="v28_run"):
+        if session_key in st.session_state:
+            st.download_button("下载上一次全部结果ZIP", st.session_state[session_key],
+                               file_name="weekly_macd_monthly_state_audit_v2_8_all_results.zip",
+                               mime="application/zip", key="v28_previous_download")
+        return
+    if eval_date >= end_date or end_date > obs_date:
+        st.error("日期关系不正确。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    eval_start = pd.Timestamp(eval_date)
+    research, end, obs = eval_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), obs_date.strftime("%Y%m%d")
+    # 与V2.7保持相同下载起点，可复用已有缓存；最早候选仍有约36个月MACD预热。
+    preload = (eval_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    config = {
+        "signal_start": research, "signal_end": end, "market_end": obs, "preload_start": preload,
+        "min_price": 10.0, "min_mv": 100.0, "max_mv": 1_000_000_000.0,
+        "price_tolerance_pct": 3.0, "stop_threshold_pct": 10.0,
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20, "sample_per_board": 0,
+        "sample_seed": DEFAULT_SAMPLE_SEED, "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+        "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT,
+        "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+    }
+    try:
+        with st.spinner("加载交易日历、历史科技股池和板块指数..."):
+            opens = load_trade_calendar(preload, obs)
+            full = load_trade_calendar(preload, (obs_date + timedelta(days=7)).strftime("%Y%m%d"))
+            basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(pause))
+            week_map = complete_week_last_dates(full)
+            boards: dict[str, pd.DataFrame] = {}
+            for code in sorted(set(BOARD_INDEX.values())):
+                board_daily = fetch_index_history(code, preload, obs, bool(cache), float(pause))
+                if not board_daily.empty:
+                    boards[code] = build_weekly(board_daily, week_map)
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+    periods = build_period_index(memberships)
+    codes = sorted(set(periods) & set(basic.ts_code.astype(str)))
+    universe = basic[basic.ts_code.isin(codes)].copy()
+    stocks, universe_audit, population = build_stratified_sample(universe, periods, end, 0, DEFAULT_SAMPLE_SEED)
+    listed = stocks.list_date.apply(lambda x: normalize_date(x, "19000101"))
+    delisted = stocks.delist_date.apply(lambda x: normalize_date(x, "99991231"))
+    stocks = stocks[~listed.gt(end) & ~delisted.lt(preload)].reset_index(drop=True)
+    open_pos = {trade_date: i for i, trade_date in enumerate(opens)}
+    records: list[dict[str, Any]] = []
+    histories: dict[str, pd.DataFrame] = {}
+    rejects: dict[str, int] = {}
+    cache_hits = data_failures = 0
+    progress = st.progress(0.0)
+    status = st.empty()
+    for i, stock in stocks.iterrows():
+        code = str(stock.ts_code)
+        progress.progress((i + 1) / len(stocks), text=f"{i + 1}/{len(stocks)} {code}")
+        status.caption(f"事件{len(records)}；缓存{cache_hits}；失败{data_failures}")
+        daily, daily_basic, hit = fetch_stock_history(code, preload, obs, bool(cache), float(pause))
+        cache_hits += int(hit)
+        if daily.empty:
+            data_failures += 1
+            continue
+        stock_records, stock_rejects, _ = analyze_stock(
+            stock, periods.get(code, []), daily, daily_basic, week_map, opens, open_pos, config
+        )
+        records.extend(stock_records)
+        if stock_records:
+            histories[code] = daily.copy()
+        for reason, count in stock_rejects.items():
+            rejects[reason] = rejects.get(reason, 0) + count
+    progress.empty(); status.empty()
+    if not records:
+        st.error("没有生成事件。")
+        return
+    try:
+        with st.spinner("按信号日实时合成月K，计算冻结月线状态并判卷..."):
+            events = pd.DataFrame(records).sort_values(["Signal_Date", "ts_code", "Event_Type"])
+            opportunities = build_cycle_opportunities(events, histories, obs, config["sell_slippage_pct"])
+            featured = prepare_features(opportunities, boards)
+            candidates = featured[
+                featured.Strict_Eligible.map(bool_value) & featured.Outcome_Mature.map(bool_value)
+                & featured.Selection_Date_dt.ge(eval_start)
+                & featured.Selection_Date_dt.le(pd.Timestamp(end_date))
+            ].copy()
+            candidates = v25_prepare_candidates(candidates)
+            audited = v28_add_monthly_states(candidates, histories)
+            valid = audited[audited["Monthly_State"].isin(V28_MONTHLY_STATES)].copy()
+            state_summary = v28_state_summary(valid)
+            scheme_audit = v28_scheme_audit(valid)
+            acceptance = v28_acceptance(scheme_audit)
+            progress_audit = v28_month_progress_audit(valid)
+    except Exception as exc:
+        st.error(f"V2.8月线审计失败：{exc}")
+        return
+
+    monthly_counts = audited["Monthly_State"].value_counts()
+    group_counts = valid["结果组"].value_counts().reindex(GROUP_ORDER, fill_value=0)
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "版本": VERSION, "评价开始": research, "信号截止": end,
+        "观察截止": obs, "严格成熟候选": len(candidates), "月线状态有效候选": len(valid),
+        "月线无法计算": int(len(audited) - len(valid)), "候选周": valid.Selection_Date.nunique(),
+        "不同股票": valid.ts_code.nunique(), "上升趋势": int(valid.Weekly_Trend.eq("上升趋势").sum()),
+        "中性趋势": int(valid.Weekly_Trend.eq("中性趋势").sum()),
+        "下降趋势": int(valid.Weekly_Trend.eq("下降趋势").sum()),
+        "亏损且MFE<30": int(group_counts[LOSS_GROUP]), "盈利且MFE<30": int(group_counts[LOW_PROFIT_GROUP]),
+        "MFE30至50": int(group_counts[MID_GROUP]), "MFE50至100": int(group_counts[HIGH_GROUP]),
+        "MFE翻倍": int(group_counts[DOUBLE_GROUP]), "缓存命中": cache_hits, "行情失败": data_failures,
+    }])
+    monthly_count_table = pd.DataFrame([
+        {"月线状态": state, "数量": int(monthly_counts.get(state, 0)),
+         "占有效候选(%)": monthly_counts.get(state, 0) / len(valid) * 100.0 if len(valid) else np.nan}
+        for state in V28_MONTHLY_STATES
+    ])
+    line_zone_summary = valid.groupby(["Weekly_Trend", "Monthly_State", "Monthly_Line_Zone"], dropna=False).size().reset_index(name="数量")
+    reject_frame = pd.DataFrame([{"剔除原因": key, "次数": value} for key, value in rejects.items()])
+    metadata = pd.DataFrame([
+        ("研究定位", "月线状态最后假设的一次冻结审计；不搜索最优阈值"),
+        ("买点", "第二根完整周线红柱严格扩张确认后，次日开盘"),
+        ("月线时点", "仅用信号日及之前日线，实时合成未完成月K；不使用月底后来数据"),
+        ("接近零轴", "|当月柱|≤过去12个当时已知月份最大|柱|的20%"),
+        ("扩大或稳定", "|当月柱|≥|上月柱|的90%"),
+        ("验收门槛", "保留≥30%；整体目标先到率+5个百分点；整体止损率-10个百分点；2024/2025/2026上半年至少连续两期同向改善"),
+        ("信号截止", "Selection_Date严格不晚于用户设定信号截止日，已修正V2.7多纳6个次周候选的边界问题"),
+        ("本版禁止", "不训练、不评分、不选Top3、不根据结果改动20%/90%阈值"),
+    ], columns=["项目", "值"])
+    files = {
+        "01_run_summary_monthly_state_audit_v2_8.csv": run_summary,
+        "02_monthly_state_count_monthly_state_audit_v2_8.csv": monthly_count_table,
+        "03_state_period_quality_monthly_state_audit_v2_8.csv": state_summary,
+        "04_frozen_scheme_period_audit_monthly_state_audit_v2_8.csv": scheme_audit,
+        "05_frozen_scheme_acceptance_monthly_state_audit_v2_8.csv": acceptance,
+        "06_month_progress_stability_monthly_state_audit_v2_8.csv": progress_audit,
+        "07_monthly_dif_dea_zone_monthly_state_audit_v2_8.csv": line_zone_summary,
+        "08_monthly_state_dictionary_monthly_state_audit_v2_8.csv": v28_state_dictionary(),
+        "09_all_valid_candidate_monthly_detail_monthly_state_audit_v2_8.csv": valid,
+        "10_all_candidate_including_monthly_failures_monthly_state_audit_v2_8.csv": audited,
+        "11_full_tech_universe_monthly_state_audit_v2_8.csv": universe_audit,
+        "12_population_monthly_state_audit_v2_8.csv": population,
+        "13_rejection_audit_monthly_state_audit_v2_8.csv": reject_frame,
+        "14_metadata_monthly_state_audit_v2_8.csv": metadata,
+    }
+    result_zip = make_result_zip(files)
+    st.session_state[session_key] = result_zip
+    st.success(f"完成：{len(valid)}个月线状态有效候选；9个冻结状态和3个固定方案已判卷。")
+    st.subheader("三个固定方案验收")
+    st.dataframe(acceptance, use_container_width=True, hide_index=True)
+    st.subheader("月线状态数量")
+    st.dataframe(monthly_count_table, use_container_width=True, hide_index=True)
+    st.download_button("下载全部结果ZIP", result_zip,
+                       file_name="weekly_macd_monthly_state_audit_v2_8_all_results.zip",
+                       mime="application/zip", type="primary", key="v28_download")
+    st.warning("如果三个事先冻结方案均未通过，应停止继续挖掘技术评分，不再事后改月线阈值。")
 
 
 if __name__ == "__main__":
