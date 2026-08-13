@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-科技股完整周线SKDJ金叉股票池＋日线MACD进场审计器 V3.1
+科技股周线SKDJ底部重置金叉＋日线MACD对照审计器 V3.2
 
 研究问题：
-1. 完整周线SKDJ金叉能否比完整周线MACD首红更早识别上涨启动？
-2. 金叉位置≤25与>25，哪一组的数量、收益、回撤和稳定性更好？
-3. 周线SKDJ建池后，由日线MACD第一根红柱确认进场，信号是否仍然拥挤？
+1. 完整周线SKDJ金叉前3周内曾触及25，能否过滤中高位缠绕产生的伪金叉？
+2. “最近3周触及25”与“金叉位置20-35”分别贡献了什么，两者组合是否稳定？
+3. 金叉次日直接买与等待日线MACD首红，哪种进场方式更适合底部重置组？
+4. 三仓条件下，同日随机顺序是否仍会导致结果大幅波动？
 
 本文件是独立精简版，只保留本次研究必需的行情、事件、成交和审计代码。
 周线MACD仅作为“迟到程度”的研究基准，不参与候选生成。
 
-运行：streamlit run weekly_skdj_pool_daily_macd_audit_v3_1_single.py
+运行：streamlit run app.py
 """
 from __future__ import annotations
 
@@ -30,8 +31,8 @@ import streamlit as st
 import tushare as ts
 
 
-TITLE = "科技股完整周线SKDJ金叉池＋日线MACD进场审计器 V3.1"
-VERSION = "V3.1-WEEKLY-SKDJ-POOL-DAILY-MACD-AUDIT"
+TITLE = "科技股周线SKDJ底部重置金叉审计器 V3.2"
+VERSION = "V3.2-WEEKLY-SKDJ-BOTTOM-RESET-AUDIT"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # 复用同目录逐股票行情缓存，日期相同时无需重新下载。
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
@@ -39,6 +40,9 @@ CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 SKDJ_N = 9
 SKDJ_M = 3
 SKDJ_BOTTOM = 25.0
+RESET_LOOKBACK_WEEKS = 3
+CROSS_ZONE_LOW = 20.0
+CROSS_ZONE_HIGH = 35.0
 DAILY_CONFIRM_MAX_WAIT = 20
 HOLD_TRADING_DAYS = 40
 MACD_WARMUP_WEEKS = 40
@@ -360,12 +364,6 @@ def build_complete_weekly(daily: pd.DataFrame, week_last_map: dict[pd.Timestamp,
     return add_skdj(add_weekly_macd(weekly)) if not weekly.empty else weekly
 
 
-def build_provisional_weekly(daily: pd.DataFrame, n: int, m: int) -> pd.DataFrame:
-    if daily.empty:
-        return pd.DataFrame()
-    return add_skdj(aggregate_weekly(daily), n, m)
-
-
 def add_daily_macd(daily: pd.DataFrame) -> pd.DataFrame:
     work = daily.copy().sort_values("trade_date").reset_index(drop=True)
     ema12 = work["close"].ewm(span=12, adjust=False).mean()
@@ -429,6 +427,33 @@ def lag_bin(value: Any) -> str:
     if lag <= 8:
         return "5-8周"
     return ">8周"
+
+
+def daily_macd_state(trigger: dict[str, Any]) -> str:
+    hist = finite_num(trigger.get("Daily_MACD_Hist_At_Cross"))
+    age = finite_num(trigger.get("Daily_Red_Age_At_Weekly_Cross"))
+    if not math.isfinite(hist):
+        return "缺少信号日行情"
+    if hist <= 0:
+        return "绿柱或零轴"
+    if not math.isfinite(age):
+        return "红柱_柱龄未知"
+    # age以0为首日，因此0-4对应红柱第1-5日。
+    if age <= 4:
+        return "红柱第1-5日"
+    if age <= 9:
+        return "红柱第6-10日"
+    return "红柱超过10日"
+
+
+def reset_quadrant(touched_bottom: bool, in_cross_zone: bool) -> str:
+    if touched_bottom and in_cross_zone:
+        return "触及25_金叉20-35"
+    if touched_bottom:
+        return "触及25_金叉区间外"
+    if in_cross_zone:
+        return "未触及25_金叉20-35"
+    return "未触及25_金叉区间外"
 
 
 def weekly_macd_lag(weekly: pd.DataFrame, position: int) -> dict[str, Any]:
@@ -630,8 +655,10 @@ def build_event(stock: pd.Series, membership: dict[str, str], weekly: pd.DataFra
         config["rejects"][reason] = config["rejects"].get(reason, 0) + 1
         return None
     level = (float(row["SKDJ_K"]) + float(row["SKDJ_D"])) / 2.0
-    recent = weekly.iloc[max(0, position - 2):position + 1]
+    recent = weekly.iloc[max(0, position - RESET_LOOKBACK_WEEKS + 1):position + 1]
     recent_min = float(pd.concat([recent["SKDJ_K"], recent["SKDJ_D"]]).min())
+    touched_bottom = recent_min <= SKDJ_BOTTOM
+    in_cross_zone = CROSS_ZONE_LOW < level <= CROSS_ZONE_HIGH
     death_date = next_death_cross_date(weekly, position)
     trigger = find_daily_trigger(daily_ind, signal_date, death_date, config["market_end"], open_dates, open_pos)
     base_path = evaluate_entry(daily, signal_date, str(stock["ts_code"]), open_dates, open_pos, config)
@@ -643,9 +670,13 @@ def build_event(stock: pd.Series, membership: dict[str, str], weekly: pd.DataFra
         "SW_L2": membership["l2"], "SW_L3": membership["l3"],
         "Signal_Date": signal_date, "Weekly_Close": float(row["close"]),
         "Weekly_SKDJ_K": float(row["SKDJ_K"]), "Weekly_SKDJ_D": float(row["SKDJ_D"]),
-        "Cross_Level": level, "Cross_25_Group": "≤25" if level <= SKDJ_BOTTOM else ">25",
-        "Cross_Level_Bin": cross_level_bin(level), "Recent_3W_Min_SKDJ": recent_min,
-        "Recent_3W_Touched_25": recent_min <= SKDJ_BOTTOM,
+        "Cross_Level": level, "Cross_Level_Bin": cross_level_bin(level),
+        "Recent_3W_Min_SKDJ": recent_min,
+        "Recent_3W_Touched_25": touched_bottom,
+        "Cross_In_20_35": in_cross_zone,
+        "Bottom_Reset_Core": touched_bottom and in_cross_zone,
+        "Bottom_Reset_Quadrant": reset_quadrant(touched_bottom, in_cross_zone),
+        "Daily_MACD_State_At_Cross": daily_macd_state(trigger),
         "Weekly_SKDJ_Death_Cross_Date": death_date,
         **snapshot, **lag, **trigger,
     }
@@ -700,10 +731,16 @@ def natural_week_calendar(open_dates: list[str], start: str, end: str, events: p
     weeks = days.groupby("week")["trade_date"].max().rename("Week_Last_Trade_Date").reset_index(drop=True).to_frame()
     counts = events.groupby("Signal_Date").size()
     weeks["All_Cross_Count"] = weeks["Week_Last_Trade_Date"].map(counts).fillna(0).astype(int)
-    for group in ("≤25", ">25"):
-        grouped = events[events["Cross_25_Group"].eq(group)].groupby("Signal_Date").size()
-        weeks[f"Cross_{group}_Count"] = weeks["Week_Last_Trade_Date"].map(grouped).fillna(0).astype(int)
+    variants = {
+        "Touched_25_Count": events[events["Recent_3W_Touched_25"].map(to_bool)],
+        "Cross_20_35_Count": events[events["Cross_In_20_35"].map(to_bool)],
+        "Bottom_Reset_Core_Count": events[events["Bottom_Reset_Core"].map(to_bool)],
+    }
+    for column, frame in variants.items():
+        grouped = frame.groupby("Signal_Date").size()
+        weeks[column] = weeks["Week_Last_Trade_Date"].map(grouped).fillna(0).astype(int)
     weeks["Is_Empty_Week"] = weeks["All_Cross_Count"].eq(0)
+    weeks["Core_Is_Empty_Week"] = weeks["Bottom_Reset_Core_Count"].eq(0)
     return weeks
 
 
@@ -726,37 +763,67 @@ def stat_row(frame: pd.DataFrame, label: str, natural_weeks: int) -> dict[str, A
         "MACD首红前平均涨幅(%)": pd.to_numeric(early.get("Price_Gain_To_Weekly_MACD_pct"), errors="coerce").mean() if len(early) else np.nan,
         "MACD首红前涨幅中位数(%)": pd.to_numeric(early.get("Price_Gain_To_Weekly_MACD_pct"), errors="coerce").median() if len(early) else np.nan,
         "金叉次日买20%先到率(%)": float(direct["Cross_NextOpen_First_20_vs_Stop"].astype(str).str.contains("止盈").mean() * 100) if len(direct) else np.nan,
+        "金叉次日买10%止损率(%)": float(direct["Cross_NextOpen_First_20_vs_Stop"].astype(str).str.contains("止损").mean() * 100) if len(direct) else np.nan,
         "金叉次日买平均T20收益(%)": pd.to_numeric(direct.get("Cross_NextOpen_Exit_T20_Return_pct"), errors="coerce").mean() if len(direct) else np.nan,
+        "金叉次日买T20中位数(%)": pd.to_numeric(direct.get("Cross_NextOpen_Exit_T20_Return_pct"), errors="coerce").median() if len(direct) else np.nan,
+        "金叉次日买正收益比例(%)": pd.to_numeric(direct.get("Cross_NextOpen_Exit_T20_Return_pct"), errors="coerce").gt(0).mean() * 100 if len(direct) else np.nan,
         "金叉次日买平均MFE(%)": pd.to_numeric(direct.get("Cross_NextOpen_MFE_8W_pct"), errors="coerce").mean() if len(direct) else np.nan,
         "日线确认买成熟数": len(confirmed),
         "日线确认买20%先到率(%)": float(confirmed["Daily_Confirm_First_20_vs_Stop"].astype(str).str.contains("止盈").mean() * 100) if len(confirmed) else np.nan,
+        "日线确认买10%止损率(%)": float(confirmed["Daily_Confirm_First_20_vs_Stop"].astype(str).str.contains("止损").mean() * 100) if len(confirmed) else np.nan,
         "日线确认买平均T20收益(%)": pd.to_numeric(confirmed.get("Daily_Confirm_Exit_T20_Return_pct"), errors="coerce").mean() if len(confirmed) else np.nan,
+        "日线确认买T20中位数(%)": pd.to_numeric(confirmed.get("Daily_Confirm_Exit_T20_Return_pct"), errors="coerce").median() if len(confirmed) else np.nan,
+        "日线确认买正收益比例(%)": pd.to_numeric(confirmed.get("Daily_Confirm_Exit_T20_Return_pct"), errors="coerce").gt(0).mean() * 100 if len(confirmed) else np.nan,
         "日线确认买平均MFE(%)": pd.to_numeric(confirmed.get("Daily_Confirm_MFE_8W_pct"), errors="coerce").mean() if len(confirmed) else np.nan,
     }
 
 
-def summaries(events: pd.DataFrame, pool_calendar: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def research_variants(events: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    touched = events["Recent_3W_Touched_25"].map(to_bool)
+    in_zone = events["Cross_In_20_35"].map(to_bool)
+    return {
+        "全部金叉": events,
+        "最近3周触及25": events[touched],
+        "最近3周未触及25": events[~touched],
+        "金叉位置20-35": events[in_zone],
+        "底部重置核心_触及25且金叉20-35": events[touched & in_zone],
+        "触及25但金叉不在20-35": events[touched & ~in_zone],
+        "未触及25但金叉20-35": events[~touched & in_zone],
+    }
+
+
+def summaries(events: pd.DataFrame, pool_calendar: pd.DataFrame) -> tuple[pd.DataFrame, ...]:
     natural_weeks = len(pool_calendar)
-    rows = [stat_row(events, "全部金叉", natural_weeks)]
-    for group, frame in events.groupby("Cross_25_Group", sort=False):
-        rows.append(stat_row(frame, f"金叉位置{group}", natural_weeks))
-    for group, frame in events.groupby("Cross_Level_Bin", sort=False):
-        rows.append(stat_row(frame, f"细分_{group}", natural_weeks))
-    overall = pd.DataFrame(rows)
+    variants = research_variants(events)
+    overall = pd.DataFrame([stat_row(frame, label, natural_weeks) for label, frame in variants.items()])
     yearly_rows = []
-    years = events["Signal_Date"].astype(str).str[:4]
-    for (year, group), frame in events.groupby([years, "Cross_25_Group"]):
-        year_weeks = int(pool_calendar["Week_Last_Trade_Date"].astype(str).str[:4].eq(str(year)).sum())
-        row = stat_row(frame, f"{year}_{group}", natural_weeks=max(1, year_weeks))
-        row["年份"] = year; row["25分组"] = group
-        yearly_rows.append(row)
+    all_years = sorted(events["Signal_Date"].astype(str).str[:4].unique())
+    for label, variant in variants.items():
+        years = variant["Signal_Date"].astype(str).str[:4]
+        for year in all_years:
+            frame = variant[years.eq(year)]
+            year_weeks = int(pool_calendar["Week_Last_Trade_Date"].astype(str).str[:4].eq(str(year)).sum())
+            row = stat_row(frame, f"{year}_{label}", natural_weeks=max(1, year_weeks))
+            row["年份"] = year; row["研究分组"] = label
+            yearly_rows.append(row)
     yearly = pd.DataFrame(yearly_rows)
+    quadrant_rows = []
+    for group, frame in events.groupby("Bottom_Reset_Quadrant", sort=False):
+        row = stat_row(frame, str(group), natural_weeks)
+        row["底部重置四象限"] = group
+        quadrant_rows.append(row)
     lag_rows = []
-    for (cross_group, lag_group), frame in events.groupby(["Cross_25_Group", "Weekly_MACD_Lag_Group"]):
-        row = stat_row(frame, f"{cross_group}_{lag_group}", natural_weeks)
-        row["25分组"] = cross_group; row["MACD迟到分组"] = lag_group
+    core = events[events["Bottom_Reset_Core"].map(to_bool)]
+    for lag_group, frame in core.groupby("Weekly_MACD_Lag_Group", sort=False):
+        row = stat_row(frame, f"核心组_{lag_group}", natural_weeks)
+        row["MACD迟到分组"] = lag_group
         lag_rows.append(row)
-    return overall, yearly, pd.DataFrame(lag_rows)
+    daily_state_rows = []
+    for state, frame in core.groupby("Daily_MACD_State_At_Cross", sort=False):
+        row = stat_row(frame, f"核心组_{state}", natural_weeks)
+        row["金叉当周日线MACD状态"] = state
+        daily_state_rows.append(row)
+    return overall, yearly, pd.DataFrame(quadrant_rows), pd.DataFrame(lag_rows), pd.DataFrame(daily_state_rows)
 
 
 def fee(amount: float, rate_pct: float, minimum: float = 0.0) -> float:
@@ -769,20 +836,29 @@ def close_on_or_before(history: pd.DataFrame, trade_date: str) -> float:
 
 
 def simulate_portfolio(events: pd.DataFrame, histories: dict[str, pd.DataFrame], open_dates: list[str],
-                       config: dict[str, Any], seed: int, build_detail: bool = False):
+                       config: dict[str, Any], seed: int, build_detail: bool = False,
+                       entry_prefix: str = "Daily_Confirm"):
+    if entry_prefix not in {"Daily_Confirm", "Cross_NextOpen"}:
+        raise ValueError(f"不支持的进场前缀: {entry_prefix}")
     work = events[
-        events["Daily_Confirm_Tradable"].map(to_bool)
-        & events["Daily_Confirm_Has_8W_Future"].map(to_bool)
-        & events["Daily_Confirm_Entry_Date"].astype(str).ne("")
-        & events["Daily_Confirm_Exit_T20_Date"].astype(str).ne("")
+        events[f"{entry_prefix}_Tradable"].map(to_bool)
+        & events[f"{entry_prefix}_Has_8W_Future"].map(to_bool)
+        & events[f"{entry_prefix}_Entry_Date"].astype(str).ne("")
+        & events[f"{entry_prefix}_Exit_T20_Date"].astype(str).ne("")
     ].copy()
     if work.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {"实际买入": 0, "仓位满错过": 0, "总收益率(%)": np.nan}
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {
+            "同日随机种子": seed, "初始资金": INITIAL_CAPITAL, "实际买入": 0,
+            "仓位满错过": 0, "期末权益": INITIAL_CAPITAL, "总收益率(%)": 0.0,
+            "最大回撤(%)": 0.0, "交易胜率(%)": np.nan,
+        }
     rng = np.random.default_rng(seed)
     work["_tie"] = rng.random(len(work))
-    work = work.sort_values(["Daily_Confirm_Entry_Date", "_tie", "ts_code"], kind="mergesort")
-    entry_groups = {day: frame for day, frame in work.groupby("Daily_Confirm_Entry_Date", sort=True)}
-    first_day, last_day = str(work["Daily_Confirm_Entry_Date"].min()), str(work["Daily_Confirm_Exit_T20_Date"].max())
+    entry_date_col = f"{entry_prefix}_Entry_Date"
+    exit_date_col = f"{entry_prefix}_Exit_T20_Date"
+    work = work.sort_values([entry_date_col, "_tie", "ts_code"], kind="mergesort")
+    entry_groups = {day: frame for day, frame in work.groupby(entry_date_col, sort=True)}
+    first_day, last_day = str(work[entry_date_col].min()), str(work[exit_date_col].max())
     days = [day for day in open_dates if first_day <= day <= last_day]
     cash = INITIAL_CAPITAL
     active: dict[str, dict[str, Any]] = {}
@@ -793,7 +869,7 @@ def simulate_portfolio(events: pd.DataFrame, histories: dict[str, pd.DataFrame],
         for _, row in entry_groups.get(trade_date, pd.DataFrame()).iterrows():
             code = str(row["ts_code"])
             reason = "同一股票已持仓" if code in active else "3个仓位已满" if len(active) >= MAX_POSITIONS else ""
-            price = finite_num(row["Daily_Confirm_Entry_Price"])
+            price = finite_num(row[f"{entry_prefix}_Entry_Price"])
             budget = min(POSITION_BUDGET, cash)
             shares = int(math.floor(budget / price / LOT_SIZE) * LOT_SIZE) if price > 0 else 0
             while shares >= LOT_SIZE:
@@ -807,9 +883,10 @@ def simulate_portfolio(events: pd.DataFrame, histories: dict[str, pd.DataFrame],
             if build_detail:
                 orders.append({
                     "Entry_Date": trade_date, "Signal_Date": row["Signal_Date"], "ts_code": code,
-                    "name": row.get("name", ""), "Cross_25_Group": row["Cross_25_Group"],
+                    "name": row.get("name", ""), "Bottom_Reset_Quadrant": row["Bottom_Reset_Quadrant"],
+                    "进场方式": "日线MACD确认" if entry_prefix == "Daily_Confirm" else "周线金叉次日",
                     "Action": "未买入" if reason else "已买入", "Reason": reason or f"随机同日顺序买入{shares}股",
-                    "Prospective_Exit_Date": row["Daily_Confirm_Exit_T20_Date"], "Tie_Seed": seed,
+                    "Prospective_Exit_Date": row[exit_date_col], "Tie_Seed": seed,
                 })
             if reason:
                 continue
@@ -818,11 +895,12 @@ def simulate_portfolio(events: pd.DataFrame, histories: dict[str, pd.DataFrame],
             cash -= amount + buy_fee
             trade = {
                 "Signal_Date": row["Signal_Date"], "Entry_Date": trade_date, "ts_code": code,
-                "name": row.get("name", ""), "Cross_25_Group": row["Cross_25_Group"],
+                "name": row.get("name", ""), "Bottom_Reset_Quadrant": row["Bottom_Reset_Quadrant"],
+                "进场方式": "日线MACD确认" if entry_prefix == "Daily_Confirm" else "周线金叉次日",
                 "Shares": shares, "Entry_Price": price, "Entry_Amount": amount, "Buy_Fees": buy_fee,
-                "Planned_Exit_Date": str(row["Daily_Confirm_Exit_T20_Date"]),
-                "Exit_Price": finite_num(row["Daily_Confirm_Exit_T20_Price"]),
-                "Exit_Reason": row["Daily_Confirm_Exit_T20_Reason"], "PnL": np.nan, "Net_Return_pct": np.nan,
+                "Planned_Exit_Date": str(row[exit_date_col]),
+                "Exit_Price": finite_num(row[f"{entry_prefix}_Exit_T20_Price"]),
+                "Exit_Reason": row[f"{entry_prefix}_Exit_T20_Reason"], "PnL": np.nan, "Net_Return_pct": np.nan,
             }
             active[code] = trade; ledger.append(trade)
         exiting = []
@@ -866,24 +944,26 @@ def simulate_portfolio(events: pd.DataFrame, histories: dict[str, pd.DataFrame],
 
 def run_monte_carlo(events: pd.DataFrame, histories: dict[str, pd.DataFrame], open_dates: list[str],
                     config: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    all_variants = research_variants(events)
     variants = {
-        "全部金叉": events,
-        "金叉≤25": events[events["Cross_25_Group"].eq("≤25")],
-        "金叉>25": events[events["Cross_25_Group"].eq(">25")],
-        "金叉25-35": events[events["Cross_Level_Bin"].eq("25-35")],
+        "全部金叉": all_variants["全部金叉"],
+        "底部重置核心_触及25且金叉20-35": all_variants["底部重置核心_触及25且金叉20-35"],
     }
     rows = []
-    for name, frame in variants.items():
-        for seed in range(MC_RUNS):
-            _, ledger, _, summary = simulate_portfolio(frame, histories, open_dates, config, seed, False)
-            rows.append({"策略组": name, "随机种子": seed, "总收益率(%)": summary["总收益率(%)"],
-                         "实际买入": summary["实际买入"], "交易胜率(%)": summary["交易胜率(%)"]})
+    for entry_name, prefix in (("金叉次日直接买", "Cross_NextOpen"), ("日线MACD确认买", "Daily_Confirm")):
+        for name, frame in variants.items():
+            for seed in range(MC_RUNS):
+                _, ledger, _, summary = simulate_portfolio(
+                    frame, histories, open_dates, config, seed, False, entry_prefix=prefix)
+                rows.append({"策略组": name, "进场方式": entry_name, "随机种子": seed,
+                             "总收益率(%)": summary["总收益率(%)"],
+                             "实际买入": summary["实际买入"], "交易胜率(%)": summary["交易胜率(%)"]})
     distribution = pd.DataFrame(rows)
     summary_rows = []
-    for name, frame in distribution.groupby("策略组"):
+    for (name, entry_name), frame in distribution.groupby(["策略组", "进场方式"]):
         returns = pd.to_numeric(frame["总收益率(%)"], errors="coerce")
         summary_rows.append({
-            "策略组": name, "随机次数": len(frame), "平均总收益率(%)": returns.mean(),
+            "策略组": name, "进场方式": entry_name, "随机次数": len(frame), "平均总收益率(%)": returns.mean(),
             "中位总收益率(%)": returns.median(), "标准差(百分点)": returns.std(),
             "最差总收益率(%)": returns.min(), "最好总收益率(%)": returns.max(),
             "盈利模拟比例(%)": returns.gt(0).mean() * 100,
@@ -892,43 +972,32 @@ def run_monte_carlo(events: pd.DataFrame, histories: dict[str, pd.DataFrame], op
     return pd.DataFrame(summary_rows), distribution
 
 
-# -----------------------------------------------------------------------------
-# SKDJ参数锚点审计
-# -----------------------------------------------------------------------------
-def anchor_values(daily_300458: pd.DataFrame, daily_688017: pd.DataFrame, n: int, m: int) -> dict[str, float]:
-    out = {"Daily_K": np.nan, "Daily_D": np.nan, "Weekly_K": np.nan, "Weekly_D": np.nan}
-    if not daily_300458.empty:
-        daily_skdj = add_skdj(daily_300458, n, m)
-        hit = daily_skdj[daily_skdj["trade_date"].astype(str).eq("20260813")]
-        if not hit.empty:
-            out["Daily_K"], out["Daily_D"] = finite_num(hit.iloc[-1]["SKDJ_K"]), finite_num(hit.iloc[-1]["SKDJ_D"])
-    if not daily_688017.empty:
-        weekly_skdj = build_provisional_weekly(daily_688017, n, m)
-        hit = weekly_skdj[weekly_skdj["trade_date"].astype(str).eq("20260813")]
-        if not hit.empty:
-            out["Weekly_K"], out["Weekly_D"] = finite_num(hit.iloc[-1]["SKDJ_K"]), finite_num(hit.iloc[-1]["SKDJ_D"])
-    return out
-
-
-def parameter_anchor_audit(daily_300458: pd.DataFrame, daily_688017: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for n in range(2, 61):
-        for m in range(2, 21):
-            values = anchor_values(daily_300458, daily_688017, n, m)
-            errors = []
-            for key, target in (("Daily_K", 53.11), ("Daily_D", 42.92), ("Weekly_K", 33.22), ("Weekly_D", 33.07)):
-                value = values[key]
-                if math.isfinite(value):
-                    errors.append(abs(value - target))
-            rows.append({
-                "N": n, "M": m, "全志日K": values["Daily_K"], "全志日D": values["Daily_D"],
-                "绿谐周K": values["Weekly_K"], "绿谐周D": values["Weekly_D"],
-                "可用锚点数": len(errors), "平均绝对误差": float(np.mean(errors)) if errors else np.nan,
-                "冻结参数N9M3": n == SKDJ_N and m == SKDJ_M,
-            })
-    result = pd.DataFrame(rows).sort_values(["可用锚点数", "平均绝对误差", "N", "M"], ascending=[False, True, True, True])
-    frozen = result[result["冻结参数N9M3"]]
-    return pd.concat([result.head(30), frozen]).drop_duplicates(["N", "M"]).reset_index(drop=True)
+def build_entry_competition(events: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    variants = research_variants(events)
+    selected = {
+        "全部金叉": variants["全部金叉"],
+        "最近3周触及25": variants["最近3周触及25"],
+        "金叉位置20-35": variants["金叉位置20-35"],
+        "底部重置核心_触及25且金叉20-35": variants["底部重置核心_触及25且金叉20-35"],
+    }
+    for group_name, frame in selected.items():
+        for entry_name, prefix in (("金叉次日直接买", "Cross_NextOpen"), ("日线MACD确认买", "Daily_Confirm")):
+            executable = frame[
+                frame[f"{prefix}_Tradable"].map(to_bool)
+                & frame[f"{prefix}_Entry_Date"].astype(str).ne("")
+            ]
+            counts = executable.groupby(f"{prefix}_Entry_Date").agg(
+                Signal_Count=("ts_code", "size"), Unique_Stocks=("ts_code", "nunique"),
+                Cross_Weeks=("Signal_Date", "nunique")
+            ).reset_index().rename(columns={f"{prefix}_Entry_Date": "Entry_Date"})
+            for row in counts.itertuples(index=False):
+                rows.append({
+                    "研究分组": group_name, "进场方式": entry_name, "Entry_Date": row.Entry_Date,
+                    "Signal_Count": int(row.Signal_Count), "Unique_Stocks": int(row.Unique_Stocks),
+                    "Cross_Weeks": int(row.Cross_Weeks), "More_Than_3": int(row.Signal_Count) > 3,
+                })
+    return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
@@ -936,40 +1005,44 @@ def parameter_anchor_audit(daily_300458: pd.DataFrame, daily_688017: pd.DataFram
 # -----------------------------------------------------------------------------
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线SKDJ池 V3.1", layout="wide")
+    st.set_page_config(page_title="周线SKDJ底部重置 V3.2", layout="wide")
     st.title(TITLE)
-    st.caption("完整周线SKDJ金叉建池；比较金叉≤25与>25；日线MACD首红确认进场。周线MACD只测迟到，不参与选股。")
+    st.caption("验证底部重置能否排除中高位缠绕金叉；同时保留全部对照事件，不评分、不按收益选前三名。")
     with st.expander("冻结规则", expanded=True):
         st.markdown(f"""
-- **股票池事件**：完整周线 `K>D 且上周K≤D`；SKDJ暂冻结 `N={SKDJ_N}, M={SKDJ_M}`。
-- **位置比较**：主比较以金叉当周 `(K+D)/2` 是否≤25分组；同时报告≤20、20-25、25-35、35-50、>50。
+- **基础事件**：所有完整周线 `K>D 且上周K≤D`；SKDJ冻结 `N={SKDJ_N}, M={SKDJ_M}`。
+- **底部重置**：含金叉当周在内，最近{RESET_LOOKBACK_WEEKS}个完整周内，K或D最低值曾≤{SKDJ_BOTTOM:.0f}。
+- **金叉区域**：金叉当周 `(K+D)/2` 严格>{CROSS_ZONE_LOW:.0f}且≤{CROSS_ZONE_HIGH:.0f}。
+- **核心研究组**：同时满足“最近3周触及25”和“金叉位置20-35”；它不是预先宣布的实盘规则。
 - **日线确认**：若周线金叉当周日线MACD已经首红，周五确认；否则最多等待{DAILY_CONFIRM_MAX_WAIT}个市场交易日。
 - **失效**：等待期间先出现完整周线SKDJ死叉，则不再买入；日线红柱若早于金叉当周，不视为新鲜确认。
 - **成交与判卷**：触发后下一市场交易日开盘；-10%止损、+20%止盈、最长40个市场交易日；严格T+1。
-- **禁止事项**：不评分、不按收益调参数、不把周线MACD首红作为候选条件。
+- **双进场对照**：逐笔和三仓蒙特卡洛都比较“金叉次日直接买”与“日线MACD确认买”。
+- **禁止事项**：不评分、不按本次收益调参数、不把周线MACD首红作为候选条件。
 """)
     with st.sidebar:
         st.header("运行参数")
-        signal_start_date = st.date_input("信号开始", date(2023, 6, 5), key="v31_start")
-        signal_end_date = st.date_input("信号截止", date(2026, 6, 5), key="v31_end")
-        market_end_date = st.date_input("行情观察截止", date.today(), key="v31_market_end")
-        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v31_pause")
-        use_cache = st.checkbox("复用逐股票缓存", True, key="v31_cache")
+        signal_start_date = st.date_input("信号开始", date(2023, 6, 5), key="v32_start")
+        signal_end_date = st.date_input("信号截止", date(2026, 6, 5), key="v32_end")
+        market_end_date = st.date_input("行情观察截止", date.today(), key="v32_market_end")
+        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v32_pause")
+        use_cache = st.checkbox("复用逐股票缓存", True, key="v32_cache")
         st.divider()
         commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f")
         stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f")
         transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f")
-        if st.button("清除本程序行情缓存", key="v31_clear"):
+        if st.button("清除本程序行情缓存", key="v32_clear"):
             shutil.rmtree(CACHE_DIR, ignore_errors=True); st.success("缓存已清除")
-    token = st.text_input("Tushare Token", type="password", key="v31_token")
-    session_key = "weekly_skdj_pool_v31_zip"
+    token = st.text_input("Tushare Token", type="password", key="v32_token")
+    session_key = "weekly_skdj_bottom_reset_v32_zip"
     if not token:
         st.info("请输入Tushare Token；同日期逐股票行情缓存可以直接复用。")
         return
-    if not st.button("开始V3.1验证", type="primary", key="v31_run"):
+    if not st.button("开始V3.2验证", type="primary", key="v32_run"):
         if session_key in st.session_state:
             st.download_button("下载上一次结果ZIP", st.session_state[session_key],
-                               file_name="weekly_skdj_pool_daily_macd_audit_v3_1_all_results.zip", mime="application/zip")
+                               file_name="weekly_skdj_bottom_reset_audit_v3_2_all_results.zip",
+                               mime="application/zip", on_click="ignore")
         return
     error = validate_dates(signal_start_date, signal_end_date, market_end_date)
     if error:
@@ -1007,7 +1080,6 @@ def main() -> None:
     open_pos = {day: position for position, day in enumerate(open_dates)}
     events: list[dict[str, Any]] = []
     histories: dict[str, pd.DataFrame] = {}
-    anchor_histories: dict[str, pd.DataFrame] = {}
     cache_hits = data_failures = 0
     progress, status = st.progress(0.0), st.empty()
     for number, stock in stocks.iterrows():
@@ -1018,104 +1090,106 @@ def main() -> None:
         cache_hits += int(cache_hit)
         if daily.empty:
             data_failures += 1; continue
-        if code in {"300458.SZ", "688017.SH"}:
-            anchor_histories[code] = daily.copy()
         records = analyze_stock(stock, period_index.get(code, []), daily, daily_basic,
                                 week_last_map, open_dates, open_pos, config)
         if records:
             events.extend(records); histories[code] = daily.copy()
     progress.empty(); status.empty()
-    # 锚点股票即使不在事件样本中也强制取数，避免参数审计再次出现空表。
-    for code in ("300458.SZ", "688017.SH"):
-        if code not in anchor_histories:
-            daily, _, hit = fetch_stock_history(code, preload, market_end, bool(use_cache), float(pause))
-            cache_hits += int(hit)
-            if not daily.empty:
-                anchor_histories[code] = daily
     if not events:
         st.error("研究区间没有生成符合价格、市值和历史科技池条件的周线SKDJ金叉事件。"); return
     try:
-        with st.spinner("生成位置比较、MACD迟到审计、三仓随机顺序敏感性..."):
+        with st.spinner("生成底部重置对照、双进场审计和三仓随机顺序敏感性..."):
             event_frame = pd.DataFrame(events).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
             pool_calendar = natural_week_calendar(open_dates, signal_start, signal_end, event_frame)
-            overall, yearly, lag_summary = summaries(event_frame, pool_calendar)
-            executable = event_frame[
-                event_frame["Daily_Confirm_Tradable"].map(to_bool)
-                & event_frame["Daily_Confirm_Entry_Date"].astype(str).ne("")
-            ]
-            competition = executable.groupby("Daily_Confirm_Entry_Date").agg(
-                Signal_Count=("ts_code", "size"), Unique_Stocks=("ts_code", "nunique"),
-                Cross_Weeks=("Signal_Date", "nunique")
-            ).reset_index().rename(columns={"Daily_Confirm_Entry_Date": "Entry_Date"})
-            competition["More_Than_3"] = competition["Signal_Count"].gt(3)
-            no_confirm = event_frame[~event_frame["Daily_MACD_Confirmed"].map(to_bool)].copy()
-            curve, ledger, orders, primary_summary = simulate_portfolio(
-                event_frame, histories, open_dates, config, PRIMARY_SEED, True)
+            overall, yearly, quadrants, lag_summary, daily_state_summary = summaries(event_frame, pool_calendar)
+            competition = build_entry_competition(event_frame)
+            core = event_frame[event_frame["Bottom_Reset_Core"].map(to_bool)].copy()
+            no_confirm = core[~core["Daily_MACD_Confirmed"].map(to_bool)].copy()
+            confirm_curve, confirm_ledger, confirm_orders, confirm_summary = simulate_portfolio(
+                core, histories, open_dates, config, PRIMARY_SEED, True, entry_prefix="Daily_Confirm")
+            direct_curve, direct_ledger, direct_orders, direct_summary = simulate_portfolio(
+                core, histories, open_dates, config, PRIMARY_SEED, True, entry_prefix="Cross_NextOpen")
+            for summary, entry_name in ((direct_summary, "金叉次日直接买"), (confirm_summary, "日线MACD确认买")):
+                summary["策略组"] = "底部重置核心_触及25且金叉20-35"
+                summary["进场方式"] = entry_name
+            primary_comparison = pd.DataFrame([direct_summary, confirm_summary])
             mc_summary, mc_distribution = run_monte_carlo(event_frame, histories, open_dates, config)
-            anchor_audit = parameter_anchor_audit(
-                anchor_histories.get("300458.SZ", pd.DataFrame()),
-                anchor_histories.get("688017.SH", pd.DataFrame()))
     except Exception as exc:
         st.exception(exc); return
+    core_competition = competition[
+        competition["研究分组"].eq("底部重置核心_触及25且金叉20-35")
+        & competition["进场方式"].eq("日线MACD确认买")
+    ]
     run_summary = pd.DataFrame([{
         "程序": TITLE, "版本": VERSION, "信号开始": signal_start, "信号截止": signal_end,
         "观察截止": market_end, "周线SKDJ金叉": len(event_frame), "不同股票": event_frame["ts_code"].nunique(),
         "自然周": len(pool_calendar), "平均每周金叉": len(event_frame) / len(pool_calendar),
-        "空窗周": int(pool_calendar["Is_Empty_Week"].sum()), "金叉≤25": int(event_frame["Cross_25_Group"].eq("≤25").sum()),
-        "金叉>25": int(event_frame["Cross_25_Group"].eq(">25").sum()),
-        "日线MACD确认": int(event_frame["Daily_MACD_Confirmed"].map(to_bool).sum()),
-        "超过3只的买入日": int(competition["More_Than_3"].sum()),
-        "单日最多": int(competition["Signal_Count"].max()) if len(competition) else 0,
-        "主三仓总收益率(%)": primary_summary.get("总收益率(%)", np.nan),
+        "全部金叉空窗周": int(pool_calendar["Is_Empty_Week"].sum()),
+        "底部重置核心信号": len(core), "核心平均每周": len(core) / len(pool_calendar),
+        "核心空窗周": int(pool_calendar["Core_Is_Empty_Week"].sum()),
+        "核心日线MACD确认": int(core["Daily_MACD_Confirmed"].map(to_bool).sum()),
+        "核心确认买入日超过3只": int(core_competition["More_Than_3"].sum()),
+        "核心确认单日最多": int(core_competition["Signal_Count"].max()) if len(core_competition) else 0,
+        "核心直接买主三仓收益率(%)": direct_summary.get("总收益率(%)", np.nan),
+        "核心确认买主三仓收益率(%)": confirm_summary.get("总收益率(%)", np.nan),
         "行情失败": data_failures, "缓存命中": cache_hits,
     }])
     metadata = pd.DataFrame([
         ("候选池", "完整周线SKDJ金叉；周线MACD不参与候选生成"),
         ("SKDJ公式", "LOWV=LLV(LOW,N); HIGHV=HHV(HIGH,N); RSV=EMA((C-LOWV)/(HIGHV-LOWV)*100,M); K=EMA(RSV,M); D=MA(K,M)"),
-        ("冻结参数", f"N={SKDJ_N},M={SKDJ_M}；不根据收益寻优"),
-        ("25分组", "以金叉当周(K+D)/2≤25或>25分组；另报五档位置"),
+        ("冻结参数", f"N={SKDJ_N},M={SKDJ_M}；最低股价10元、最低流通市值100亿元"),
+        ("底部重置", f"含金叉当周在内，最近{RESET_LOOKBACK_WEEKS}个完整周K或D最低值≤{SKDJ_BOTTOM:.0f}"),
+        ("金叉区域", f"金叉当周(K+D)/2>{CROSS_ZONE_LOW:.0f}且≤{CROSS_ZONE_HIGH:.0f}"),
+        ("核心研究组", "同时满足底部重置和金叉20-35；全部对照事件仍完整保留"),
         ("日线确认", f"金叉当周日线MACD已首红，或金叉后{DAILY_CONFIRM_MAX_WAIT}个市场交易日内出现首红"),
         ("候选失效", "等待期间先确认完整周线SKDJ死叉，则取消候选"),
         ("周线MACD", "只记录从SKDJ金叉到周线MACD首红的周数和期间涨幅，不参与交易"),
         ("判卷", "触发后下一市场交易日开盘；-10%止损、+20%止盈、40市场交易日；T+1"),
-        ("参数锚点", "全志科技300458日线20260813 K53.11/D42.92；绿的谐波688017周线当周K33.22/D33.07"),
+        ("三仓主审计", "核心研究组＋日线MACD确认买；30万元、3个等额仓位、同日随机顺序"),
+        ("参数原则", "本版冻结N=9,M=3，不按本次收益寻优"),
     ], columns=["项目", "值"])
     files = {
-        "01_run_summary_v3_1.csv": run_summary,
-        "02_cross_level_comparison_v3_1.csv": overall,
-        "03_yearly_cross_level_stability_v3_1.csv": yearly,
-        "04_weekly_macd_lag_audit_v3_1.csv": lag_summary,
-        "05_weekly_pool_calendar_v3_1.csv": pool_calendar,
-        "06_daily_entry_competition_v3_1.csv": competition,
-        "07_all_weekly_skdj_events_v3_1.csv": event_frame,
-        "08_no_daily_macd_confirmation_v3_1.csv": no_confirm,
-        "09_primary_3slot_summary_v3_1.csv": pd.DataFrame([primary_summary]),
-        "10_primary_3slot_ledger_v3_1.csv": ledger,
-        "11_primary_3slot_orders_v3_1.csv": orders,
-        "12_primary_3slot_equity_curve_v3_1.csv": curve,
-        "13_random_tie_mc_summary_v3_1.csv": mc_summary,
-        "14_random_tie_mc_distribution_v3_1.csv": mc_distribution,
-        "15_skdj_two_anchor_parameter_audit_v3_1.csv": anchor_audit,
-        "16_full_tech_universe_v3_1.csv": stocks,
-        "17_board_population_v3_1.csv": population,
-        "18_rejection_audit_v3_1.csv": pd.DataFrame([{"剔除原因": k, "次数": v} for k, v in sorted(rejects.items())]),
-        "19_api_errors_v3_1.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "20_metadata_v3_1.csv": metadata,
+        "01_run_summary_v3_2.csv": run_summary,
+        "02_bottom_reset_hypothesis_comparison_v3_2.csv": overall,
+        "03_yearly_bottom_reset_stability_v3_2.csv": yearly,
+        "04_bottom_reset_four_quadrants_v3_2.csv": quadrants,
+        "05_core_weekly_macd_lag_audit_v3_2.csv": lag_summary,
+        "06_core_daily_macd_state_audit_v3_2.csv": daily_state_summary,
+        "07_weekly_pool_calendar_v3_2.csv": pool_calendar,
+        "08_entry_competition_by_group_v3_2.csv": competition,
+        "09_all_weekly_skdj_events_v3_2.csv": event_frame,
+        "10_bottom_reset_core_events_v3_2.csv": core,
+        "11_core_no_daily_macd_confirmation_v3_2.csv": no_confirm,
+        "12_primary_3slot_entry_comparison_v3_2.csv": primary_comparison,
+        "13_direct_primary_ledger_v3_2.csv": direct_ledger,
+        "14_direct_primary_orders_v3_2.csv": direct_orders,
+        "15_direct_primary_equity_curve_v3_2.csv": direct_curve,
+        "16_confirm_primary_ledger_v3_2.csv": confirm_ledger,
+        "17_confirm_primary_orders_v3_2.csv": confirm_orders,
+        "18_confirm_primary_equity_curve_v3_2.csv": confirm_curve,
+        "19_random_tie_mc_summary_v3_2.csv": mc_summary,
+        "20_random_tie_mc_distribution_v3_2.csv": mc_distribution,
+        "21_full_tech_universe_v3_2.csv": stocks,
+        "22_board_population_v3_2.csv": population,
+        "23_rejection_audit_v3_2.csv": pd.DataFrame([{"剔除原因": k, "次数": v} for k, v in sorted(rejects.items())]),
+        "24_api_errors_v3_2.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "25_metadata_v3_2.csv": metadata,
     }
     result_zip = make_zip(files); st.session_state[session_key] = result_zip
-    st.success(f"完成：{len(event_frame)}个完整周线SKDJ金叉；≤25有{event_frame['Cross_25_Group'].eq('≤25').sum()}个，>25有{event_frame['Cross_25_Group'].eq('>25').sum()}个。")
+    st.success(f"完成：全部金叉{len(event_frame)}个；底部重置核心组{len(core)}个。")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("周线金叉", len(event_frame)); c2.metric("平均每周", f"{len(event_frame)/len(pool_calendar):.2f}")
-    c3.metric("超过3只买入日", int(competition["More_Than_3"].sum()))
-    c4.metric("单日最多", int(competition["Signal_Count"].max()) if len(competition) else 0)
-    st.subheader("金叉位置比较")
+    c1.metric("全部周线金叉", len(event_frame)); c2.metric("核心组信号", len(core))
+    c3.metric("核心平均每周", f"{len(core)/len(pool_calendar):.2f}")
+    c4.metric("核心空窗周", int(pool_calendar["Core_Is_Empty_Week"].sum()))
+    st.subheader("底部重置假设对照")
     st.dataframe(overall, use_container_width=True, hide_index=True)
-    st.subheader("随机同日顺序三仓敏感性")
+    st.subheader("双进场方式＋随机同日顺序三仓敏感性")
+    st.dataframe(primary_comparison, use_container_width=True, hide_index=True)
     st.dataframe(mc_summary, use_container_width=True, hide_index=True)
-    st.download_button("下载V3.1全部结果ZIP", result_zip,
-                       file_name="weekly_skdj_pool_daily_macd_audit_v3_1_all_results.zip",
-                       mime="application/zip", type="primary", key="v31_download")
-    st.info("先看≤25与>25的逐年稳定性、MACD迟到期间涨幅、日线确认后的信号拥挤度；不要只看一次三仓总收益。")
+    st.download_button("下载V3.2全部结果ZIP", result_zip,
+                       file_name="weekly_skdj_bottom_reset_audit_v3_2_all_results.zip",
+                       mime="application/zip", type="primary", key="v32_download", on_click="ignore")
+    st.info("先看02、03、04确认底部重置是否跨年稳定，再看19的双进场三仓随机分布；不要只看主随机种子的一次总收益。")
 
 
 if __name__ == "__main__":
