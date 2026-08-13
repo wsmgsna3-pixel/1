@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线SKDJ核心池：日线SKDJ Top2/Top3真实组合回测 V3.6
+科技股周线SKDJ核心池：Top2固定止损与退出审计 V3.7
 
 目的：
 1. 唯一候选池为“近3个完整周触及25且金叉位置20~35”的周线SKDJ核心池。
-2. 同一信号周按日线SKDJ位置从高到低，分别选择Top2和Top3。
-3. 资金30万元、最多3仓、单仓预算10万元；已有持仓和仓位占用按交易日真实推进。
-4. 主退出为日线SKDJ在75以上形成死叉后下一可交易日开盘卖出。
-5. 固定持有40个市场交易日、到期收盘卖出作为对照。
+2. 冻结同一信号周按日线SKDJ位置从高到低选择Top2，不再比较Top3。
+3. 资金30万元、最多3仓；每次按当日开盘权益的1/3确定目标仓位，现金不足80%目标仓位时放弃零碎买入。
+4. 主退出为日线SKDJ在75以上形成死叉；新增相对买入价-8%/-10%/-12%三档收盘止损审计。
+5. 所有退出信号均在下一市场交易日开盘执行并遵守T+1；固定40日作为对照。
 
-注意：Top2/Top3规则来自V3.5同一段历史，V3.6验证的是组合可执行性，不是新的独立样本外证明。
+注意：Top2规则来自同一段历史，本版只做退出参数审计，不是新的独立样本外证明。
 
 运行：streamlit run app.py
 """
@@ -29,8 +29,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tushare as ts
-TITLE = "科技股周线SKDJ核心池：日线SKDJ Top2/Top3真实组合回测 V3.6"
-VERSION = "V3.6-WEEKLY-SKDJ-DAILY-SKDJ-TOPK-PORTFOLIO"
+TITLE = "科技股周线SKDJ核心池：Top2固定止损与退出审计 V3.7"
+VERSION = "V3.7-WEEKLY-SKDJ-TOP2-RISK-EXIT-AUDIT"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 
@@ -47,7 +47,9 @@ HIGH_DEATH_ZONE = 75.0
 
 INITIAL_CAPITAL = 300_000.0
 MAX_POSITIONS = 3
-POSITION_BUDGET = 100_000.0
+TARGET_POSITION_FRACTION = 1.0 / 3.0
+MIN_CASH_TO_TARGET_RATIO = 0.80
+STOP_LEVELS = (8, 10, 12)
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -62,9 +64,10 @@ BOARDS = ("主板", "创业板", "科创板")
 
 STRATEGIES = {
     "Top2_HighDeath": (2, "HighDeath", "日线SKDJ Top2＋高位死叉"),
-    "Top3_HighDeath": (3, "HighDeath", "日线SKDJ Top3＋高位死叉"),
+    "Top2_HighDeath_Stop8": (2, "HighDeathStop8", "日线SKDJ Top2＋高位死叉或收盘止损8%"),
+    "Top2_HighDeath_Stop10": (2, "HighDeathStop10", "日线SKDJ Top2＋高位死叉或收盘止损10%"),
+    "Top2_HighDeath_Stop12": (2, "HighDeathStop12", "日线SKDJ Top2＋高位死叉或收盘止损12%"),
     "Top2_Fixed40": (2, "Fixed40", "日线SKDJ Top2＋固定40日"),
-    "Top3_Fixed40": (3, "Fixed40", "日线SKDJ Top3＋固定40日"),
 }
 
 pro = None
@@ -502,7 +505,9 @@ def build_portfolio_exit_plans(path: pd.DataFrame, entry_date: str,
                                config: dict[str, Any]) -> dict[str, Any]:
     ordered = path.sort_values("trade_date").reset_index(drop=True)
     defaults: dict[str, Any] = {}
-    for method in ("HighDeath", "Fixed40"):
+    methods = ("HighDeath", "HighDeathStop8", "HighDeathStop10",
+               "HighDeathStop12", "Fixed40")
+    for method in methods:
         defaults.update({
             f"{method}_Exit_Signal_Date": "", f"{method}_Exit_Date": "",
             f"{method}_Exit_Price": np.nan, f"{method}_Exit_Session": "",
@@ -520,29 +525,47 @@ def build_portfolio_exit_plans(path: pd.DataFrame, entry_date: str,
         "Fixed40_Exit_Price": fixed_price, "Fixed40_Exit_Session": "CLOSE",
         "Fixed40_Exit_Reason": "固定40个市场交易日到期",
         "Fixed40_Hold_Market_Days": fixed_hold,
-        "HighDeath_Exit_Signal_Date": last_date, "HighDeath_Exit_Date": last_date,
-        "HighDeath_Exit_Price": fixed_price, "HighDeath_Exit_Session": "CLOSE",
-        "HighDeath_Exit_Reason": "40日内未出现高位死叉_到期退出",
-        "HighDeath_Hold_Market_Days": fixed_hold,
     })
-    for position, row in ordered.iterrows():
-        if not to_bool(row.get("D_SKDJ_Death_Cross")) or position + 1 >= len(ordered):
-            continue
-        levels = [finite_num(row.get("D_SKDJ_Level")), finite_num(row.get("D_SKDJ_Prev_Level"))]
-        if not any(math.isfinite(value) and value >= HIGH_DEATH_ZONE for value in levels):
-            continue
-        exit_row = ordered.iloc[position + 1]
-        exit_date = str(exit_row["trade_date"])
-        exit_price = float(exit_row["open"]) * (1 - config["sell_slippage_pct"] / 100.0)
-        hold = float(open_pos[exit_date] - open_pos[entry_date] + 1) \
-            if exit_date in open_pos and entry_date in open_pos else np.nan
+    stop_map = {"HighDeath": None, "HighDeathStop8": 8.0,
+                "HighDeathStop10": 10.0, "HighDeathStop12": 12.0}
+    for method, stop_pct in stop_map.items():
         defaults.update({
-            "HighDeath_Exit_Signal_Date": str(row["trade_date"]),
-            "HighDeath_Exit_Date": exit_date, "HighDeath_Exit_Price": exit_price,
-            "HighDeath_Exit_Session": "OPEN", "HighDeath_Exit_Reason": "日线SKDJ高位死叉",
-            "HighDeath_Hold_Market_Days": hold,
+            f"{method}_Exit_Signal_Date": last_date, f"{method}_Exit_Date": last_date,
+            f"{method}_Exit_Price": fixed_price, f"{method}_Exit_Session": "CLOSE",
+            f"{method}_Exit_Reason": "40日内未触发退出_到期退出",
+            f"{method}_Hold_Market_Days": fixed_hold,
         })
-        break
+        for position, row in ordered.iterrows():
+            if position + 1 >= len(ordered):
+                continue
+            levels = [finite_num(row.get("D_SKDJ_Level")),
+                      finite_num(row.get("D_SKDJ_Prev_Level"))]
+            high_death = (to_bool(row.get("D_SKDJ_Death_Cross"))
+                          and any(math.isfinite(value) and value >= HIGH_DEATH_ZONE
+                                  for value in levels))
+            close = finite_num(row.get("close"))
+            stop_hit = (stop_pct is not None and math.isfinite(close)
+                        and close <= entry_price * (1.0 - stop_pct / 100.0))
+            if not high_death and not stop_hit:
+                continue
+            exit_row = ordered.iloc[position + 1]
+            exit_date = str(exit_row["trade_date"])
+            exit_price = float(exit_row["open"]) * (1 - config["sell_slippage_pct"] / 100.0)
+            hold = float(open_pos[exit_date] - open_pos[entry_date] + 1) \
+                if exit_date in open_pos and entry_date in open_pos else np.nan
+            if high_death and stop_hit:
+                reason = f"日线SKDJ高位死叉且收盘止损{stop_pct:.0f}%"
+            elif high_death:
+                reason = "日线SKDJ高位死叉"
+            else:
+                reason = f"相对买入价收盘止损{stop_pct:.0f}%"
+            defaults.update({
+                f"{method}_Exit_Signal_Date": str(row["trade_date"]),
+                f"{method}_Exit_Date": exit_date, f"{method}_Exit_Price": exit_price,
+                f"{method}_Exit_Session": "OPEN", f"{method}_Exit_Reason": reason,
+                f"{method}_Hold_Market_Days": hold,
+            })
+            break
     return defaults
 
 
@@ -555,7 +578,8 @@ def direct_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
         "MFE_20D_pct": np.nan, "MAE_20D_pct": np.nan, "MFE_40D_pct": np.nan, "MAE_40D_pct": np.nan,
         "Portfolio_Entry_Price": np.nan,
     }
-    for method in ("HighDeath", "Fixed40"):
+    for method in ("HighDeath", "HighDeathStop8", "HighDeathStop10",
+                   "HighDeathStop12", "Fixed40"):
         out.update({
             f"{method}_Exit_Signal_Date": "", f"{method}_Exit_Date": "",
             f"{method}_Exit_Price": np.nan, f"{method}_Exit_Session": "",
@@ -692,17 +716,21 @@ def rank_core_candidates(events: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_mark_prices(histories: dict[str, pd.DataFrame],
-                      open_dates: list[str]) -> dict[str, dict[str, float]]:
+                      open_dates: list[str]) -> dict[str, dict[str, dict[str, float]]]:
     calendar = pd.Index(open_dates, dtype=str)
-    result: dict[str, dict[str, float]] = {}
+    result: dict[str, dict[str, dict[str, float]]] = {}
     for code, history in histories.items():
         if history.empty:
-            result[code] = {}
+            result[code] = {"open": {}, "close": {}}
             continue
         clean = history.drop_duplicates("trade_date", keep="last").copy()
         clean["trade_date"] = clean["trade_date"].astype(str)
-        series = pd.to_numeric(clean.set_index("trade_date")["close"], errors="coerce").sort_index()
-        result[code] = series.reindex(calendar).ffill().to_dict()
+        indexed = clean.set_index("trade_date").sort_index()
+        closes = pd.to_numeric(indexed["close"], errors="coerce").reindex(calendar)
+        opens = pd.to_numeric(indexed["open"], errors="coerce").reindex(calendar)
+        close_marks = closes.ffill()
+        open_marks = opens.combine_first(close_marks.shift(1))
+        result[code] = {"open": open_marks.to_dict(), "close": close_marks.to_dict()}
     return result
 
 
@@ -736,8 +764,9 @@ def affordable_units(budget: float, price: float, config: dict[str, Any]) -> flo
     return low
 
 
-def mark_price(mark_prices: dict[str, dict[str, float]], code: str, trade_date: str) -> float:
-    return finite_num(mark_prices.get(code, {}).get(trade_date))
+def mark_price(mark_prices: dict[str, dict[str, dict[str, float]]], code: str,
+               trade_date: str, session: str = "close") -> float:
+    return finite_num(mark_prices.get(code, {}).get(session, {}).get(trade_date))
 
 
 def empty_portfolio_summary(strategy_code: str) -> dict[str, Any]:
@@ -749,7 +778,7 @@ def empty_portfolio_summary(strategy_code: str) -> dict[str, Any]:
     }
 
 
-def simulate_portfolio(core: pd.DataFrame, mark_prices: dict[str, dict[str, float]],
+def simulate_portfolio(core: pd.DataFrame, mark_prices: dict[str, dict[str, dict[str, float]]],
                        open_dates: list[str], config: dict[str, Any],
                        strategy_code: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     topk, exit_method, label = STRATEGIES[strategy_code]
@@ -804,7 +833,16 @@ def simulate_portfolio(core: pd.DataFrame, mark_prices: dict[str, dict[str, floa
             elif len(active) >= MAX_POSITIONS:
                 reason = "3个仓位已满"
             price = finite_num(row["Portfolio_Entry_Price"])
-            budget = min(POSITION_BUDGET, cash)
+            opening_market_value = 0.0
+            for active_code, active_trade in active.items():
+                opening_mark = mark_price(mark_prices, active_code, trade_date, "open")
+                opening_market_value += active_trade["Units"] * (
+                    opening_mark if math.isfinite(opening_mark) else active_trade["Entry_Price"])
+            opening_equity = cash + opening_market_value
+            target_budget = opening_equity * TARGET_POSITION_FRACTION
+            if not reason and cash < target_budget * MIN_CASH_TO_TARGET_RATIO:
+                reason = "现金不足目标仓位80%"
+            budget = min(target_budget, cash) if not reason else 0.0
             units = affordable_units(budget, price, config)
             amount = units * price
             fees = buy_fee(amount, config) if units > 0 else 0.0
@@ -816,6 +854,8 @@ def simulate_portfolio(core: pd.DataFrame, mark_prices: dict[str, dict[str, floa
                 "日线SKDJ位置": row["Daily_SKDJ_Level_At_Cross"],
                 "同周排名": row["Daily_SKDJ_Weekly_Rank"], "Action": "未买入" if reason else "已买入",
                 "Reason": reason or "按日线SKDJ同周排名买入",
+                "买入前开盘权益": opening_equity, "目标仓位金额": target_budget,
+                "计划买入预算": budget,
             })
             if reason:
                 continue
@@ -828,6 +868,8 @@ def simulate_portfolio(core: pd.DataFrame, mark_prices: dict[str, dict[str, floa
                 "Daily_SKDJ_Weekly_Rank": finite_num(row["Daily_SKDJ_Weekly_Rank"]),
                 "Units": units, "Entry_Price": price, "Entry_Amount": amount,
                 "Buy_Fees": fees, "Entry_Total": total,
+                "Opening_Equity_Before_Buy": opening_equity,
+                "Target_Position_Value": target_budget,
                 "Planned_Exit_Date": str(row[exit_date_col]),
                 "Planned_Exit_Price": finite_num(row[exit_price_col]),
                 "Planned_Exit_Session": str(row[exit_session_col]),
@@ -846,7 +888,7 @@ def simulate_portfolio(core: pd.DataFrame, mark_prices: dict[str, dict[str, floa
 
         market_value = 0.0
         for code, trade in active.items():
-            mark = mark_price(mark_prices, code, trade_date)
+            mark = mark_price(mark_prices, code, trade_date, "close")
             market_value += trade["Units"] * (mark if math.isfinite(mark) else trade["Entry_Price"])
         equity = cash + market_value
         curves.append({
@@ -885,6 +927,7 @@ def simulate_portfolio(core: pd.DataFrame, mark_prices: dict[str, dict[str, floa
         "平均资金暴露(%)": curve["Capital_Exposure_pct"].mean(),
         "仓位满错过": int(reason_counts.get("3个仓位已满", 0)),
         "重复持仓错过": int(reason_counts.get("同一股票已持仓", 0)),
+        "现金不足80%目标仓位错过": int(reason_counts.get("现金不足目标仓位80%", 0)),
     }
     return curve, ledger_frame, orders_frame, summary
 
@@ -914,7 +957,33 @@ def annual_portfolio_summary(curves: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def run_portfolios(core: pd.DataFrame, mark_prices: dict[str, dict[str, float]],
+def contribution_robustness(ledger: pd.DataFrame) -> pd.DataFrame:
+    """排除最赚钱的1/3/5笔后重算已实现净利润，识别少数牛股支撑。"""
+    rows: list[dict[str, Any]] = []
+    if ledger.empty:
+        return pd.DataFrame()
+    completed = ledger[pd.to_numeric(ledger.get("PnL"), errors="coerce").notna()].copy()
+    for strategy_code, frame in completed.groupby("策略代码", sort=False):
+        pnl = pd.to_numeric(frame["PnL"], errors="coerce").dropna().sort_values(ascending=False)
+        original = float(pnl.sum())
+        for remove_n in (0, 1, 3, 5):
+            removed = pnl.head(remove_n)
+            remaining = original - float(removed.sum())
+            removed_labels = "；".join(
+                f"{row.get('name', '')}({row.get('ts_code', '')},{float(row['PnL']):.0f}元)"
+                for _, row in frame.nlargest(remove_n, "PnL").iterrows()
+            ) if remove_n else "未排除"
+            rows.append({
+                "策略代码": strategy_code, "策略": frame.iloc[0]["策略"],
+                "排除最赚钱交易数": remove_n, "原始已实现净利润": original,
+                "排除交易净利润": float(removed.sum()), "剩余已实现净利润": remaining,
+                "剩余净利润占初始资金(%)": remaining / INITIAL_CAPITAL * 100.0,
+                "剩余交易数": max(len(pnl) - remove_n, 0), "被排除交易": removed_labels,
+            })
+    return pd.DataFrame(rows)
+
+
+def run_portfolios(core: pd.DataFrame, mark_prices: dict[str, dict[str, dict[str, float]]],
                    open_dates: list[str], config: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     summaries, curves, ledgers, orders = [], [], [], []
     for strategy_code in STRATEGIES:
@@ -951,45 +1020,46 @@ def pool_calendar(open_dates: list[str], start: str, end: str, events: pd.DataFr
 
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线SKDJ TopK组合回测 V3.6", layout="wide")
+    st.set_page_config(page_title="周线SKDJ Top2风险退出审计 V3.7", layout="wide")
     st.title(TITLE)
-    st.caption("本版不再研究市场过滤和复杂评分，直接检验V3.5发现能否转化为30万元、最多3仓的真实资金曲线。")
+    st.caption("本版冻结候选池、Top2排序与买入点，只检验固定止损能否压低组合回撤，并审计收益是否依赖少数牛股。")
     with st.expander("冻结规则与执行顺序", expanded=True):
         st.markdown(f"""
 - **核心池硬条件**：完整周线SKDJ金叉；最近{RESET_LOOKBACK_WEEKS}个完整周K或D曾≤{SKDJ_BOTTOM:.0f}；金叉位置>{CROSS_ZONE_LOW:.0f}且≤{CROSS_ZONE_HIGH:.0f}。
-- **排序**：仅按信号日的日线SKDJ `(K+D)/2` 从高到低，分别验证Top2和Top3；不拼接其他评分。
+- **排序**：仅按信号日的日线SKDJ `(K+D)/2` 从高到低选择Top2；不再比较Top3，也不拼接其他评分。
 - **买入**：周线收盘确认后下一市场交易日开盘，买入滑点后成交；主板一字板不买。
-- **组合**：初始资金{INITIAL_CAPITAL:,.0f}元，最多{MAX_POSITIONS}仓，每次预算不超过{POSITION_BUDGET:,.0f}元；同股已持仓不重复买。
+- **组合**：初始资金{INITIAL_CAPITAL:,.0f}元，最多{MAX_POSITIONS}仓；每笔目标金额为买入前开盘权益的1/3，现金不足目标金额{MIN_CASH_TO_TARGET_RATIO:.0%}时跳过，避免零碎仓位。
 - **当日顺序**：开盘先卖出到期仓位，再按排名买入；固定40日退出在到期日收盘执行。
 - **高位死叉**：当日日线SKDJ死叉，并且当日或前一日SKDJ位置≥{HIGH_DEATH_ZONE:.0f}，下一只可交易日开盘卖出；40日内没有触发则到期退出。
+- **固定止损审计**：分别测试相对实际买入价收盘跌幅达到8%、10%、12%；信号日不成交，严格T+1在下一市场交易日开盘卖出。止损价格不是预设价，跳空损失会保留。
 - **对照组**：固定持有40个市场交易日，到期收盘卖出。
 - **不使用**：市场强弱门槛、机器学习、线性综合评分、任意位置日线SKDJ死叉。
-- **限制**：Top2/Top3来自V3.5同一历史段，本版验证组合可执行性，不能当作新的独立样本外证明。
+- **限制**：8%/10%/12%是参数敏感性审计，不能只挑历史最好的一档；Top2来自同一历史段，仍不是独立样本外证明。
 """)
     with st.sidebar:
         st.header("运行参数")
-        signal_start_date = st.date_input("信号开始", date(2023, 6, 5), key="v36_start")
-        signal_end_date = st.date_input("信号截止", date(2026, 6, 5), key="v36_end")
-        market_end_date = st.date_input("行情观察截止", date.today(), key="v36_market_end")
-        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v36_pause")
-        use_cache = st.checkbox("复用逐股票缓存", True, key="v36_cache")
+        signal_start_date = st.date_input("信号开始", date(2023, 6, 5), key="v37_start")
+        signal_end_date = st.date_input("信号截止", date(2026, 6, 5), key="v37_end")
+        market_end_date = st.date_input("行情观察截止", date.today(), key="v37_market_end")
+        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v37_pause")
+        use_cache = st.checkbox("复用逐股票缓存", True, key="v37_cache")
         st.divider()
         commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f")
         stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f")
         transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f")
-        if st.button("清除本程序行情缓存", key="v36_clear"):
+        if st.button("清除本程序行情缓存", key="v37_clear"):
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
             st.success("缓存已清除")
-    token = st.text_input("Tushare Token", type="password", key="v36_token")
-    session_key = "weekly_skdj_portfolio_v36_zip"
+    token = st.text_input("Tushare Token", type="password", key="v37_token")
+    session_key = "weekly_skdj_risk_exit_v37_zip"
     if not token:
         st.info("请输入Tushare Token；V3.5相同日期范围的逐股票缓存可以直接复用。")
         return
-    if not st.button("开始V3.6真实组合回测", type="primary", key="v36_run"):
+    if not st.button("开始V3.7风险退出审计", type="primary", key="v37_run"):
         if session_key in st.session_state:
             st.download_button(
                 "下载上一次结果ZIP", st.session_state[session_key],
-                file_name="weekly_skdj_topk_portfolio_v3_6_all_results.zip",
+                file_name="weekly_skdj_risk_exit_v3_7_all_results.zip",
                 mime="application/zip", on_click="ignore",
             )
         return
@@ -1052,20 +1122,21 @@ def main() -> None:
         events.extend(stock_events)
         if any(to_bool(item.get("Bottom_Reset_Core")) and to_bool(item.get("Tradable"))
                for item in stock_events):
-            mark_histories[code] = daily[["trade_date", "close"]].copy()
+            mark_histories[code] = daily[["trade_date", "open", "close"]].copy()
     progress.empty()
     status.empty()
     if not events:
         st.error("研究区间没有生成符合历史科技池、价格和市值条件的完整周线SKDJ金叉。")
         return
     try:
-        with st.spinner("计算Top2/Top3排名、退出计划与四条真实资金曲线..."):
+        with st.spinner("计算Top2排名、三档固定止损与五条真实资金曲线..."):
             event_frame = add_cross_section_features(
                 pd.DataFrame(events).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True))
             core = rank_core_candidates(event_frame)
             mark_prices = build_mark_prices(mark_histories, open_dates)
             portfolio_summary, annual_summary, curves, ledger, orders = run_portfolios(
                 core, mark_prices, open_dates, config)
+            robustness = contribution_robustness(ledger)
             calendar = pool_calendar(open_dates, signal_start, signal_end, event_frame)
     except Exception as exc:
         st.exception(exc)
@@ -1089,50 +1160,54 @@ def main() -> None:
         ("SKDJ参数", f"N={SKDJ_N},M={SKDJ_M}，冻结不寻优"),
         ("股票池", "申万2021历史科技池；主板/创业板/科创板；排除北交所"),
         ("价格市值", "信号日原始收盘价≥10元；历史流通市值≥100亿元"),
-        ("排序", "同周核心可交易候选按信号日日线SKDJ位置从高到低；分别验证Top2与Top3"),
-        ("组合", f"初始{INITIAL_CAPITAL:.0f}元；最多{MAX_POSITIONS}仓；单次预算不超过{POSITION_BUDGET:.0f}元"),
+        ("排序", "同周核心可交易候选按信号日日线SKDJ位置从高到低；冻结Top2"),
+        ("组合", f"初始{INITIAL_CAPITAL:.0f}元；最多{MAX_POSITIONS}仓；每笔目标为买入前开盘权益1/3；现金不足目标{MIN_CASH_TO_TARGET_RATIO:.0%}则跳过"),
         ("买入", "完整周线收盘确认，下一市场交易日开盘；主板一字板不买"),
         ("高位死叉", f"日线死叉且当日或前一日(K+D)/2≥{HIGH_DEATH_ZONE:.0f}；下一可交易日开盘卖出"),
+        ("固定止损", "相对实际买入价按收盘确认-8%/-10%/-12%；严格T+1，下一市场交易日开盘卖出，保留跳空风险"),
         ("固定40日", "买入日计第1个市场交易日；第40个市场交易日收盘卖出"),
-        ("同日顺序", "开盘卖出→按排名买入→收盘到期卖出→收盘价估值"),
+        ("同日顺序", "开盘先执行上一交易日确认的退出→按排名买入→40日到期者收盘卖出→收盘价估值"),
         ("成本", "买卖滑点、佣金最低5元、双边佣金与过户费、卖出印花税全部计入"),
         ("份额口径", "使用前复权价格的连续资金份额，不做100股整手取整；用于保证跨除权期收益连续"),
         ("市场门槛", "V3.5未验证通过，本版完全不使用"),
-        ("独立性限制", "Top2/Top3来自V3.5同一历史段；本版验证组合可执行性，不是独立样本外证明"),
+        ("独立性限制", "Top2与止损档位仍来自同一历史段；本版是参数敏感性和风险诊断，不是独立样本外证明"),
     ], columns=["项目", "值"])
     files = {
-        "01_run_summary_v3_6.csv": run_summary,
-        "02_portfolio_comparison_v3_6.csv": portfolio_summary,
-        "03_portfolio_yearly_v3_6.csv": annual_summary,
-        "04_daily_equity_curve_v3_6.csv": curves,
-        "05_trade_ledger_v3_6.csv": ledger,
-        "06_order_and_skip_audit_v3_6.csv": orders,
-        "07_exit_reason_summary_v3_6.csv": exit_reasons,
-        "08_core_candidate_rank_and_exit_plan_v3_6.csv": core,
-        "09_weekly_pool_calendar_v3_6.csv": calendar,
-        "10_all_weekly_skdj_events_v3_6.csv": event_frame,
-        "11_full_tech_universe_v3_6.csv": stocks,
-        "12_board_population_v3_6.csv": population,
-        "13_rejection_audit_v3_6.csv": pd.DataFrame(
+        "01_run_summary_v3_7.csv": run_summary,
+        "02_portfolio_comparison_v3_7.csv": portfolio_summary,
+        "03_portfolio_yearly_v3_7.csv": annual_summary,
+        "04_profit_contribution_robustness_v3_7.csv": robustness,
+        "05_daily_equity_curve_v3_7.csv": curves,
+        "06_trade_ledger_v3_7.csv": ledger,
+        "07_order_and_skip_audit_v3_7.csv": orders,
+        "08_exit_reason_summary_v3_7.csv": exit_reasons,
+        "09_core_candidate_rank_and_exit_plan_v3_7.csv": core,
+        "10_weekly_pool_calendar_v3_7.csv": calendar,
+        "11_all_weekly_skdj_events_v3_7.csv": event_frame,
+        "12_full_tech_universe_v3_7.csv": stocks,
+        "13_board_population_v3_7.csv": population,
+        "14_rejection_audit_v3_7.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "14_api_errors_v3_6.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "15_metadata_v3_6.csv": metadata,
+        "15_api_errors_v3_7.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "16_metadata_v3_7.csv": metadata,
     }
     result_zip = make_zip(files)
     st.session_state[session_key] = result_zip
-    st.success(f"完成：核心可交易成熟事件{len(core)}个，已生成4条真实组合资金曲线。")
-    st.subheader("四种组合结果")
+    st.success(f"完成：核心可交易成熟事件{len(core)}个，已生成5条Top2风险退出资金曲线。")
+    st.subheader("五种Top2退出结果")
     st.dataframe(portfolio_summary, use_container_width=True, hide_index=True)
     st.subheader("年度稳定性")
     st.dataframe(annual_summary, use_container_width=True, hide_index=True)
     st.subheader("退出原因")
     st.dataframe(exit_reasons, use_container_width=True, hide_index=True)
+    st.subheader("收益贡献稳健性：排除最赚钱1/3/5笔")
+    st.dataframe(robustness, use_container_width=True, hide_index=True)
     st.download_button(
-        "下载V3.6全部结果ZIP", result_zip,
-        file_name="weekly_skdj_topk_portfolio_v3_6_all_results.zip",
-        mime="application/zip", type="primary", key="v36_download", on_click="ignore",
+        "下载V3.7全部结果ZIP", result_zip,
+        file_name="weekly_skdj_risk_exit_v3_7_all_results.zip",
+        mime="application/zip", type="primary", key="v37_download", on_click="ignore",
     )
-    st.info("先看02比较Top2/Top3的总收益与最大回撤，再看03是否跨年稳定；若高位死叉不能显著改善回撤，就不能因为平均收益较高而进入实盘。")
+    st.info("先看02的最大回撤是否显著下降，再看03跨年稳定性与04排除最赚钱1/3/5笔后的剩余净利润。不要只挑历史收益最高的止损档。")
 
 
 if __name__ == "__main__":
