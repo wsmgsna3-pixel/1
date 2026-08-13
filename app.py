@@ -10615,7 +10615,8 @@ def v30_find_daily_trigger(event: pd.Series, indicators: pd.DataFrame, market_en
             & work["SKDJ_Both_Above25"].map(bool_value)
         ]
         if math.isfinite(hist) and hist > 0:
-            search = search[search.index.gt(pos)]
+            # pandas.Index 没有 Series 风格的 .gt()；直接做向量比较。
+            search = search[search.index > pos]
         if not search.empty:
             candidate_pos = int(search.index[0])
             original_flip_pos = candidate_pos
