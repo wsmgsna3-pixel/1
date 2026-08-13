@@ -1,36 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线MACD同周RPS/VCP/LTR排序审计器 V2.9（单文件版）
+科技股周线MACD候选池＋日线SKDJ/MACD进场审计器 V3.0（单文件版）
 =====================================================
 
-本程序保持第二根完整周线红柱严格扩张候选池不变，只研究同一信号周内的排序：
-RPS、VCP、RPS+VCP，以及按周分组的XGBoost LambdaMART。所有排序特征只使用
-信号日及以前的数据；未来八周路径只用于结果标签和样本外判卷。
-以下底层统计仍保留在程序中，用于生成事件和未来路径：
-1. 上升/下降趋势中，第一根周线红柱后，下一周继续红柱的概率。
-2. 两类趋势中，未来八周触及 +10%/+20%/+30%/+50%/+100% 的概率。
-3. 第一根红柱买入 vs 同一红柱周期第一次红柱缩短买入。
-4. 第一根红柱后一周立即翻绿的比例。
-5. DIF、DEA 位于零轴上方/下方的差异。
-6. 第一根红柱前回调深度对未来八周表现的影响。
-7. 不随机抽样，研究期历史科技股票池中符合价格、市值条件的事件全部纳入。
-8. 对基准组、上升趋势组、回调<30%组及红柱缩短组做稳健性比较。
-9. 区分评分验证与实际退出；达到20%后仍继续记录完整40交易日影子路径。
-10. 将第一根红柱后的完整周期事后划分为 A/B/C1/C2，验证哪类利润最大。
-11. 只用当时已知数据记录第2—5周状态，检验能否提前识别弱反弹。
-12. 信号截止日与行情截止日分离：股票池和信号严格停在前者，后者仅用于观察未来结果。
+本程序不再训练或使用评分排名。第一根完整周线MACD红柱建立候选池；
+SKDJ的K、D均站上25后，日线MACD第一根红柱负责触发，按触发到达顺序
+分配三个仓位。若周线确认时日线红柱已经开始，则保留原始日线首红日期并
+在周线确认日触发，同时按红柱年龄分桶审计。未来八周路径只用于结果判卷。
 
 严格口径：
 - 周线信号只使用已经结束的完整周，绝不使用周一至周四的临时周K。
-- 信号周最后一个交易日为 D0，下一市场交易日开盘为买入价。
+- 信号周最后一个交易日为 D0；日线触发日的下一市场交易日开盘为买入价。
 - 未来八周按 40 个市场交易日计算，而不是按个股实际成交天数计算。
 - 主板 D1 一字板视为无法成交；双创板沿用既有口径，不做该项剔除。
 - 同一天同时触及止损和目标价时，日线无法判断先后，屏障统计按止损先到处理，
-  避免乐观偏差；单纯“八周内曾达到目标”的统计仍如实记录。
-- “红柱缩短”默认只记录同一轮红柱中的第一次缩短，避免重复样本。
+  且买入当日不允许卖出，严格执行T+1。
+- 同日候选超过剩余仓位时不评分，使用固定随机顺序并做200次随机种子敏感性检验。
 
 运行：
-    streamlit run weekly_macd_same_week_rank_audit_v2_9_single.py
+    streamlit run weekly_macd_skdj_daily_entry_audit_v3_0_single.py
 """
 
 from __future__ import annotations
@@ -10489,6 +10477,584 @@ def main() -> None:
                        file_name="weekly_macd_same_week_rank_audit_v2_9_all_results.zip",
                        mime="application/zip", type="primary", key="v29_download")
     st.warning("只有LTR在连续未来阶段稳定优于RPS、VCP和随机三只，才说明评分排序取得突破。")
+
+
+# =============================================================================
+# V3.0：不用评分排序，改用日线事件到达顺序分配三仓
+# =============================================================================
+TITLE = "科技股周线MACD候选池＋日线SKDJ/MACD进场审计器 V3.0"
+VERSION = "V3.0-WEEKLY-POOL-DAILY-SKDJ-MACD-EVENT-QUEUE"
+V30_SKDJ_N = 9
+V30_SKDJ_M = 3
+V30_SKDJ_BOTTOM = 25.0
+V30_RECENT_BOTTOM_WINDOW = 20
+V30_PRIMARY_TIE_SEED = 20260813
+V30_MONTE_CARLO_RUNS = 200
+
+
+def v30_daily_indicators(daily: pd.DataFrame, n: int = V30_SKDJ_N, m: int = V30_SKDJ_M) -> pd.DataFrame:
+    """复现同花顺公式，并计算标准日线 MACD(12,26,9)。"""
+    work = daily.copy().sort_values("trade_date").reset_index(drop=True)
+    lowv = work["low"].rolling(int(n), min_periods=int(n)).min()
+    highv = work["high"].rolling(int(n), min_periods=int(n)).max()
+    width = (highv - lowv).replace(0, np.nan)
+    raw = (work["close"] - lowv) / width * 100.0
+    rsv = raw.ewm(span=int(m), adjust=False, min_periods=1).mean()
+    work["SKDJ_K"] = rsv.ewm(span=int(m), adjust=False, min_periods=1).mean()
+    work["SKDJ_D"] = work["SKDJ_K"].rolling(int(m), min_periods=int(m)).mean()
+    work["SKDJ_Both_Above25"] = work["SKDJ_K"].gt(V30_SKDJ_BOTTOM) & work["SKDJ_D"].gt(V30_SKDJ_BOTTOM)
+    previous_above = work["SKDJ_Both_Above25"].shift(1).eq(True)
+    work["SKDJ_Bottom_Exit"] = work["SKDJ_Both_Above25"] & ~previous_above
+
+    work["D_EMA12"] = work["close"].ewm(span=12, adjust=False).mean()
+    work["D_EMA26"] = work["close"].ewm(span=26, adjust=False).mean()
+    work["D_DIFF"] = work["D_EMA12"] - work["D_EMA26"]
+    work["D_DEA"] = work["D_DIFF"].ewm(span=9, adjust=False).mean()
+    work["D_MACD_Hist"] = (work["D_DIFF"] - work["D_DEA"]) * 2.0
+    work["D_MACD_First_Red"] = work["D_MACD_Hist"].gt(0) & work["D_MACD_Hist"].shift(1).le(0)
+
+    exit_positions = np.where(work["SKDJ_Bottom_Exit"].to_numpy(), np.arange(len(work)), -1)
+    last_exit = pd.Series(exit_positions).cummax().to_numpy()
+    work["Days_Since_SKDJ_Bottom_Exit"] = np.where(last_exit >= 0, np.arange(len(work)) - last_exit, np.nan)
+    return work
+
+
+def v30_anchor_audit(history: pd.DataFrame) -> pd.DataFrame:
+    """用用户截图作参数识别审计；不按回测收益寻优，也不自动改主口径。"""
+    columns = ["N", "M", "K_20260813", "D_20260813", "K_Abs_Error", "D_Abs_Error", "Total_Abs_Error", "Is_Frozen_9_3"]
+    if history.empty or "20260813" not in set(history["trade_date"].astype(str)):
+        return pd.DataFrame(columns=columns)
+    rows: list[dict[str, Any]] = []
+    for n in range(2, 61):
+        for m in range(2, 21):
+            ind = v30_daily_indicators(history, n, m)
+            hit = ind[ind["trade_date"].astype(str).eq("20260813")]
+            if hit.empty:
+                continue
+            k = finite_num(hit.iloc[-1]["SKDJ_K"])
+            d = finite_num(hit.iloc[-1]["SKDJ_D"])
+            if not (math.isfinite(k) and math.isfinite(d)):
+                continue
+            rows.append({
+                "N": n, "M": m, "K_20260813": k, "D_20260813": d,
+                "K_Abs_Error": abs(k - 53.11), "D_Abs_Error": abs(d - 42.92),
+                "Total_Abs_Error": abs(k - 53.11) + abs(d - 42.92),
+                "Is_Frozen_9_3": n == V30_SKDJ_N and m == V30_SKDJ_M,
+            })
+    return pd.DataFrame(rows).sort_values(["Total_Abs_Error", "N", "M"]).reset_index(drop=True)
+
+
+def v30_red_age_bucket(value: Any) -> str:
+    age = finite_num(value)
+    if not math.isfinite(age):
+        return "无红柱"
+    if age <= 2:
+        return "0-2日"
+    if age <= 4:
+        return "3-4日"
+    if age <= 10:
+        return "5-10日"
+    return ">10日"
+
+
+def v30_find_daily_trigger(event: pd.Series, indicators: pd.DataFrame, market_end: str) -> dict[str, Any]:
+    """找到候选入池后第一个合规触发；若日线已红，则在周线确认日接力。"""
+    signal_date = normalize_date(event.get("Signal_Date"))
+    first_green = normalize_date(event.get("First_Green_Date"))
+    expiry_exclusive = first_green if first_green else "99999999"
+    result: dict[str, Any] = {
+        "Daily_Trigger": False, "Daily_Trigger_Date": "", "Daily_Trigger_Mode": "未触发",
+        "Original_Daily_First_Red_Date": "", "Daily_Red_Age_At_Weekly": np.nan,
+        "Daily_Red_Age_Bucket": "无红柱", "Daily_MACD_State_At_Weekly": "无日线",
+        "D_MACD_Hist_At_Weekly": np.nan, "D_MACD_Hist_Prev_At_Weekly": np.nan,
+        "D_MACD_Expanding_At_Weekly": np.nan, "SKDJ_K_At_MACD_Flip": np.nan,
+        "SKDJ_D_At_MACD_Flip": np.nan, "SKDJ_Days_Since_Bottom_Exit": np.nan,
+        "SKDJ_Recent_Bottom_Exit_20D": False, "Wait_Stock_Trading_Days": np.nan,
+        "Observation_Expiry_Date": first_green or market_end,
+        "No_Trigger_Reason": "红柱周期结束前没有出现合规日线第一根红柱",
+    }
+    if indicators.empty:
+        result["No_Trigger_Reason"] = "无日线行情"
+        return result
+    work = indicators[indicators["trade_date"].astype(str).le(market_end)].copy().reset_index(drop=True)
+    signal_hits = work.index[work["trade_date"].astype(str).eq(signal_date)].tolist()
+    if not signal_hits:
+        result["No_Trigger_Reason"] = "周线确认日个股无交易"
+        return result
+    pos = int(signal_hits[-1])
+    signal_row = work.iloc[pos]
+    hist = finite_num(signal_row.get("D_MACD_Hist"))
+    prev_hist = finite_num(work.iloc[pos - 1].get("D_MACD_Hist")) if pos > 0 else np.nan
+    result["D_MACD_Hist_At_Weekly"] = hist
+    result["D_MACD_Hist_Prev_At_Weekly"] = prev_hist
+    result["D_MACD_Expanding_At_Weekly"] = bool(hist > prev_hist) if math.isfinite(hist) and math.isfinite(prev_hist) else np.nan
+
+    candidate_pos: int | None = None
+    original_flip_pos: int | None = None
+    if math.isfinite(hist) and hist > 0:
+        run_start = pos
+        while run_start > 0 and finite_num(work.iloc[run_start - 1]["D_MACD_Hist"]) > 0:
+            run_start -= 1
+        original_flip_pos = run_start
+        age = pos - run_start
+        result["Daily_Red_Age_At_Weekly"] = float(age)
+        result["Daily_Red_Age_Bucket"] = v30_red_age_bucket(age)
+        result["Daily_MACD_State_At_Weekly"] = "红柱扩张" if result["D_MACD_Expanding_At_Weekly"] else "红柱缩短"
+        flip = work.iloc[run_start]
+        if bool(flip["SKDJ_Both_Above25"]):
+            candidate_pos = pos
+            result["Daily_Trigger_Mode"] = "周线确认时日线已红" if age > 0 else "周线与日线同日首红"
+    else:
+        result["Daily_MACD_State_At_Weekly"] = "绿柱或零轴"
+
+    if candidate_pos is None:
+        search = work[
+            work["trade_date"].astype(str).ge(signal_date)
+            & work["trade_date"].astype(str).lt(expiry_exclusive)
+            & work["D_MACD_First_Red"].map(bool_value)
+            & work["SKDJ_Both_Above25"].map(bool_value)
+        ]
+        if math.isfinite(hist) and hist > 0:
+            search = search[search.index.gt(pos)]
+        if not search.empty:
+            candidate_pos = int(search.index[0])
+            original_flip_pos = candidate_pos
+            result["Daily_Trigger_Mode"] = "入池后等待日线首红"
+
+    if candidate_pos is None or original_flip_pos is None:
+        if math.isfinite(hist) and hist > 0:
+            result["No_Trigger_Reason"] = "当前红柱首日SKDJ未双双站上25，且周期内未再合规首红"
+        return result
+
+    trigger = work.iloc[candidate_pos]
+    flip = work.iloc[original_flip_pos]
+    trigger_date = str(trigger["trade_date"])
+    if trigger_date >= expiry_exclusive:
+        return result
+    days_since = finite_num(flip.get("Days_Since_SKDJ_Bottom_Exit"))
+    result.update({
+        "Daily_Trigger": True, "Daily_Trigger_Date": trigger_date,
+        "Original_Daily_First_Red_Date": str(flip["trade_date"]),
+        "SKDJ_K_At_MACD_Flip": finite_num(flip.get("SKDJ_K")),
+        "SKDJ_D_At_MACD_Flip": finite_num(flip.get("SKDJ_D")),
+        "SKDJ_Days_Since_Bottom_Exit": days_since,
+        "SKDJ_Recent_Bottom_Exit_20D": bool(math.isfinite(days_since) and days_since <= V30_RECENT_BOTTOM_WINDOW),
+        "Wait_Stock_Trading_Days": float(max(candidate_pos - pos, 0)),
+        "No_Trigger_Reason": "",
+    })
+    return result
+
+
+def v30_evaluate_entry(
+    daily: pd.DataFrame, trigger_date: str, open_dates: list[str], open_pos: dict[str, int],
+    buy_slippage_pct: float, sell_slippage_pct: float, stop_pct: float, ts_code: str,
+) -> dict[str, Any]:
+    """触发日收盘确认、次日开盘买入；卖出最早从下一交易日开始，满足 T+1。"""
+    out: dict[str, Any] = {
+        "Tradable": False, "Untradable_Reason": "未来交易日不足", "Entry_Date": "",
+        "Entry_Price": np.nan, "Has_8W_Future": False, "MFE_8W_pct": np.nan,
+        "MAE_8W_pct": np.nan, "Return_8W_pct": np.nan, "Hit_Stop_8W": np.nan,
+    }
+    for target in (10, 20, 30, 50, 100):
+        out.update({f"Hit_{target}_8W": np.nan, f"First_{target}_vs_Stop": "",
+                    f"Exit_T{target}_Date": "", f"Exit_T{target}_Price": np.nan,
+                    f"Exit_T{target}_Return_pct": np.nan, f"Exit_T{target}_Holding_Days": np.nan,
+                    f"Exit_T{target}_Reason": ""})
+    if trigger_date not in open_pos:
+        out["Untradable_Reason"] = "触发日不在市场交易日历"
+        return out
+    entry_market_pos = open_pos[trigger_date] + 1
+    if entry_market_pos >= len(open_dates):
+        return out
+    entry_date = open_dates[entry_market_pos]
+    out["Entry_Date"] = entry_date
+    entry_rows = daily[daily["trade_date"].astype(str).eq(entry_date)]
+    if entry_rows.empty:
+        out["Untradable_Reason"] = "D1停牌或无行情"
+        return out
+    erow = entry_rows.iloc[-1]
+    if is_main_board(ts_code) and float(erow["open"]) == float(erow["high"]) == float(erow["low"]):
+        out["Untradable_Reason"] = "主板D1一字板"
+        return out
+    entry_price = float(erow["open"]) * (1.0 + buy_slippage_pct / 100.0)
+    out.update({"Tradable": True, "Untradable_Reason": "", "Entry_Price": entry_price})
+    horizon_pos = entry_market_pos + HOLD_TRADING_DAYS - 1
+    if horizon_pos >= len(open_dates):
+        out["Untradable_Reason"] = "可买但未来不足40个市场交易日"
+        return out
+    horizon_date = open_dates[horizon_pos]
+    path = daily[(daily["trade_date"].astype(str).ge(entry_date)) & (daily["trade_date"].astype(str).le(horizon_date))].copy().sort_values("trade_date")
+    if path.empty:
+        out["Untradable_Reason"] = "八周窗口无行情"
+        return out
+    exit_path = path[path["trade_date"].astype(str).gt(entry_date)].copy()
+    out["Has_8W_Future"] = True
+    out["MFE_8W_pct"] = (float(path["high"].max()) / entry_price - 1.0) * 100.0
+    out["MAE_8W_pct"] = (float(path["low"].min()) / entry_price - 1.0) * 100.0
+    out["Return_8W_pct"] = (float(path.iloc[-1]["close"]) / entry_price - 1.0) * 100.0
+    out["Hit_Stop_8W"] = bool(float(path["low"].min()) <= entry_price * (1.0 - stop_pct / 100.0))
+    for target in (10, 20, 30, 50, 100):
+        out[f"Hit_{target}_8W"] = bool(float(path["high"].max()) >= entry_price * (1.0 + target / 100.0))
+        barrier = simulate_fixed_exit(exit_path, entry_price, float(target), stop_pct, sell_slippage_pct)
+        out[f"First_{target}_vs_Stop"] = barrier["reason"]
+        out[f"Exit_T{target}_Date"] = barrier["date"]
+        out[f"Exit_T{target}_Price"] = barrier["price"]
+        out[f"Exit_T{target}_Return_pct"] = barrier["return_pct"]
+        out[f"Exit_T{target}_Holding_Days"] = barrier["holding_days"]
+        out[f"Exit_T{target}_Reason"] = barrier["reason"]
+    return out
+
+
+def v30_build_candidate(event: pd.Series, history: pd.DataFrame, indicators: pd.DataFrame,
+                        open_dates: list[str], open_pos: dict[str, int], config: dict[str, Any]) -> dict[str, Any]:
+    row = event.to_dict()
+    trigger = v30_find_daily_trigger(event, indicators, config["market_end"])
+    row.update(trigger)
+    baseline = v30_evaluate_entry(history, normalize_date(event["Signal_Date"]), open_dates, open_pos,
+                                  config["buy_slippage_pct"], config["sell_slippage_pct"],
+                                  config["stop_threshold_pct"], str(event["ts_code"]))
+    row.update({f"Weekly_Baseline_{key}": value for key, value in baseline.items()})
+    if trigger["Daily_Trigger"]:
+        daily_path = v30_evaluate_entry(history, trigger["Daily_Trigger_Date"], open_dates, open_pos,
+                                        config["buy_slippage_pct"], config["sell_slippage_pct"],
+                                        config["stop_threshold_pct"], str(event["ts_code"]))
+    else:
+        daily_path = v30_evaluate_entry(pd.DataFrame(), "", open_dates, open_pos,
+                                        config["buy_slippage_pct"], config["sell_slippage_pct"],
+                                        config["stop_threshold_pct"], str(event["ts_code"]))
+        daily_path["Untradable_Reason"] = trigger["No_Trigger_Reason"]
+    row.update({f"Daily_{key}": value for key, value in daily_path.items()})
+    row["Entry_Delay_Market_Days"] = (
+        open_pos.get(str(daily_path.get("Entry_Date")), np.nan) - open_pos.get(str(baseline.get("Entry_Date")), np.nan)
+        if daily_path.get("Entry_Date") in open_pos and baseline.get("Entry_Date") in open_pos else np.nan
+    )
+    row["Delta_MFE_vs_Weekly_pct"] = finite_num(daily_path.get("MFE_8W_pct")) - finite_num(baseline.get("MFE_8W_pct"))
+    row["Delta_T20_Return_vs_Weekly_pct"] = finite_num(daily_path.get("Exit_T20_Return_pct")) - finite_num(baseline.get("Exit_T20_Return_pct"))
+    return row
+
+
+def v30_stat_row(frame: pd.DataFrame, label: str) -> dict[str, Any]:
+    mature = frame[frame["Daily_Has_8W_Future"].map(bool_value)] if len(frame) else frame
+    return {
+        "分组": label, "周线候选数": len(frame), "日线触发数": int(frame["Daily_Trigger"].map(bool_value).sum()) if len(frame) else 0,
+        "成熟可比数": len(mature), "触发率(%)": float(frame["Daily_Trigger"].map(bool_value).mean() * 100) if len(frame) else np.nan,
+        "平均等待交易日": finite_num(pd.to_numeric(frame.get("Wait_Stock_Trading_Days"), errors="coerce").mean()) if len(frame) else np.nan,
+        "日线入场20%先到率(%)": float(mature["Daily_First_20_vs_Stop"].astype(str).str.contains("止盈").mean() * 100) if len(mature) else np.nan,
+        "周线即买20%先到率(%)": float(mature["Weekly_Baseline_First_20_vs_Stop"].astype(str).str.contains("止盈").mean() * 100) if len(mature) else np.nan,
+        "日线入场平均MFE(%)": finite_num(pd.to_numeric(mature.get("Daily_MFE_8W_pct"), errors="coerce").mean()) if len(mature) else np.nan,
+        "周线即买平均MFE(%)": finite_num(pd.to_numeric(mature.get("Weekly_Baseline_MFE_8W_pct"), errors="coerce").mean()) if len(mature) else np.nan,
+        "日线入场平均T20收益(%)": finite_num(pd.to_numeric(mature.get("Daily_Exit_T20_Return_pct"), errors="coerce").mean()) if len(mature) else np.nan,
+        "周线即买平均T20收益(%)": finite_num(pd.to_numeric(mature.get("Weekly_Baseline_Exit_T20_Return_pct"), errors="coerce").mean()) if len(mature) else np.nan,
+    }
+
+
+def v30_fee(amount: float, rate_pct: float, minimum: float = 0.0) -> float:
+    return max(minimum, amount * rate_pct / 100.0) if amount > 0 else 0.0
+
+
+def v30_simulate_portfolio(candidates: pd.DataFrame, histories: dict[str, pd.DataFrame], open_dates: list[str],
+                           config: dict[str, Any], seed: int, build_curve: bool = True):
+    work = candidates[
+        candidates["Daily_Tradable"].map(bool_value)
+        & candidates["Daily_Has_8W_Future"].map(bool_value)
+        & candidates["Daily_Entry_Date"].astype(str).ne("")
+        & candidates["Daily_Exit_T20_Date"].astype(str).ne("")
+    ].copy()
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {"总收益率(%)": np.nan, "实际买入": 0, "仓位满错过": 0}
+    rng = np.random.default_rng(seed)
+    work["_tie"] = rng.random(len(work))
+    work = work.sort_values(["Daily_Entry_Date", "_tie", "ts_code"], kind="mergesort")
+    entry_groups = {d: g.sort_values(["_tie", "ts_code"]) for d, g in work.groupby("Daily_Entry_Date", sort=True)}
+    last_exit = str(work["Daily_Exit_T20_Date"].max())
+    first_entry = str(work["Daily_Entry_Date"].min())
+    days = [d for d in open_dates if first_entry <= d <= last_exit]
+    cash = INITIAL_CAPITAL
+    active: dict[str, dict[str, Any]] = {}
+    ledger: list[dict[str, Any]] = []
+    orders: list[dict[str, Any]] = []
+    curve: list[dict[str, Any]] = []
+    for trade_date in days:
+        for _, row in entry_groups.get(trade_date, pd.DataFrame()).iterrows():
+            code = str(row["ts_code"])
+            reason = ""
+            if code in active:
+                reason = "同一股票已持仓"
+            elif len(active) >= MAX_POSITIONS:
+                reason = "3个仓位已满"
+            price = finite_num(row.get("Daily_Entry_Price"))
+            shares = int(math.floor(min(POSITION_BUDGET, cash) / price / LOT_SIZE) * LOT_SIZE) if price > 0 else 0
+            while shares >= LOT_SIZE:
+                amount = shares * price
+                fees = v30_fee(amount, config["commission_pct"], 5.0) + v30_fee(amount, config["transfer_fee_pct"])
+                if amount + fees <= min(POSITION_BUDGET, cash) + 1e-8:
+                    break
+                shares -= LOT_SIZE
+            if not reason and shares < LOT_SIZE:
+                reason = "现金不足一手"
+            order = {"Entry_Date": trade_date, "Signal_Date": row["Signal_Date"], "Daily_Trigger_Date": row["Daily_Trigger_Date"],
+                     "ts_code": code, "name": row.get("name", ""), "Tie_Seed": seed,
+                     "Action": "未买入" if reason else "已买入", "Reason": reason or f"随机同日顺序买入{shares}股",
+                     "Prospective_Exit_Date": row["Daily_Exit_T20_Date"],
+                     "Prospective_T20_Return_pct": row["Daily_Exit_T20_Return_pct"]}
+            orders.append(order)
+            if reason:
+                continue
+            amount = shares * price
+            buy_fees = v30_fee(amount, config["commission_pct"], 5.0) + v30_fee(amount, config["transfer_fee_pct"])
+            cash -= amount + buy_fees
+            trade = {"Signal_Date": row["Signal_Date"], "Daily_Trigger_Date": row["Daily_Trigger_Date"],
+                     "Entry_Date": trade_date, "ts_code": code, "name": row.get("name", ""),
+                     "Shares": shares, "Entry_Price": price, "Entry_Amount": amount, "Buy_Fees": buy_fees,
+                     "Planned_Exit_Date": str(row["Daily_Exit_T20_Date"]), "Exit_Price": finite_num(row["Daily_Exit_T20_Price"]),
+                     "Exit_Reason": row["Daily_Exit_T20_Reason"], "Sell_Fees": np.nan, "PnL": np.nan, "Net_Return_pct": np.nan}
+            ledger.append(trade); active[code] = trade
+        exiting = []
+        for code, trade in active.items():
+            if trade["Planned_Exit_Date"] != trade_date:
+                continue
+            gross = trade["Shares"] * trade["Exit_Price"]
+            sell_fees = (v30_fee(gross, config["commission_pct"], 5.0)
+                         + v30_fee(gross, config["transfer_fee_pct"])
+                         + v30_fee(gross, config["stamp_duty_pct"]))
+            proceeds = gross - sell_fees
+            cash += proceeds
+            pnl = proceeds - trade["Entry_Amount"] - trade["Buy_Fees"]
+            trade.update({"Sell_Fees": sell_fees, "Exit_Proceeds": proceeds, "PnL": pnl,
+                          "Net_Return_pct": pnl / (trade["Entry_Amount"] + trade["Buy_Fees"]) * 100.0})
+            exiting.append(code)
+        for code in exiting:
+            active.pop(code, None)
+        if build_curve:
+            mv = 0.0
+            for code, trade in active.items():
+                px = close_on_or_before(histories.get(code, pd.DataFrame()), trade_date)
+                mv += trade["Shares"] * px if math.isfinite(px) else trade["Entry_Amount"]
+            curve.append({"Trade_Date": trade_date, "Cash": cash, "Market_Value": mv,
+                          "Equity": cash + mv, "Positions": len(active),
+                          "Exposure_pct": mv / (cash + mv) * 100.0 if cash + mv > 0 else np.nan})
+    ledger_frame = pd.DataFrame(ledger)
+    order_frame = pd.DataFrame(orders)
+    curve_frame = pd.DataFrame(curve)
+    if len(curve_frame):
+        curve_frame["Drawdown_pct"] = (curve_frame["Equity"] / curve_frame["Equity"].cummax().clip(lower=INITIAL_CAPITAL) - 1.0) * 100.0
+        final_equity = finite_num(curve_frame.iloc[-1]["Equity"])
+        max_dd = finite_num(curve_frame["Drawdown_pct"].min())
+    else:
+        final_equity = cash
+        max_dd = np.nan
+    summary = {"同日随机种子": seed, "初始资金": INITIAL_CAPITAL, "最多持仓": MAX_POSITIONS,
+               "实际买入": len(ledger_frame), "仓位满错过": int(order_frame.get("Reason", pd.Series(dtype=str)).eq("3个仓位已满").sum()),
+               "期末权益": final_equity, "总收益率(%)": (final_equity / INITIAL_CAPITAL - 1.0) * 100.0,
+               "最大回撤(%)": max_dd, "交易胜率(%)": float(ledger_frame["PnL"].gt(0).mean() * 100.0) if len(ledger_frame) else np.nan,
+               "平均每笔净收益(%)": finite_num(ledger_frame.get("Net_Return_pct", pd.Series(dtype=float)).mean()) if len(ledger_frame) else np.nan}
+    return curve_frame, ledger_frame, order_frame, summary
+
+
+def v30_pool_calendar(open_dates: list[str], signal_start: str, signal_end: str, candidates: pd.DataFrame) -> pd.DataFrame:
+    days = pd.DataFrame({"trade_date": [d for d in open_dates if signal_start <= d <= signal_end]})
+    if days.empty:
+        return pd.DataFrame()
+    days["dt"] = pd.to_datetime(days["trade_date"])
+    days["week"] = days["dt"].dt.to_period("W-FRI")
+    weeks = days.groupby("week")["trade_date"].max().rename("Week_Last_Trade_Date").reset_index(drop=True)
+    counts = candidates.groupby("Signal_Date").size()
+    out = weeks.to_frame()
+    out["Candidate_Count"] = out["Week_Last_Trade_Date"].map(counts).fillna(0).astype(int)
+    out["Is_Empty_Week"] = out["Candidate_Count"].eq(0)
+    return out
+
+
+def main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title="周线池＋日线进场 V3.0", layout="wide")
+    st.title(TITLE)
+    st.caption("第一根完整周线红柱只负责入池；SKDJ 已站上25后，日线 MACD 第一根红柱负责触发。三仓按事件到达顺序，不使用评分。")
+    with st.expander("本版冻结规则（先看再跑）", expanded=True):
+        st.markdown("""
+- 周线只使用已结束的完整周；第一根红柱为候选入池日 D0。
+- SKDJ 暂按公式常用固定参数 N=9、M=3 复现；截图锚点只做误差审计，不根据收益调参。
+- 若 D0 日线已在红柱段，且该段第一根红柱当日 K、D 都大于25，则 D0 触发、下一交易日开盘买入。
+- 若 D0 日线仍为绿柱，则观察到本轮周线红柱结束，等待第一根满足 K、D>25 的日线红柱。
+- 日线已红5天以上不先删除，按红柱年龄分桶判卷；“20日内曾从25下方出来”只做严格子组审计。
+- 同日超过剩余仓位时不评分：主结果用固定随机种子，另做200次随机同日顺序敏感性检验。
+- 退出只是统一判卷尺：-10%止损、+20%止盈、最长40个市场交易日；卖出严格 T+1。
+""")
+    with st.sidebar:
+        st.header("运行参数")
+        eval_date = st.date_input("信号开始", date(2023, 6, 5), key="v30_start")
+        end_date = st.date_input("信号截止", date(2026, 6, 5), key="v30_end")
+        obs_date = st.date_input("行情观察截止", date.today(), key="v30_obs")
+        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v30_pause")
+        cache = st.checkbox("复用逐股票缓存", True, key="v30_cache")
+        st.divider()
+        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f")
+        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f")
+        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f")
+        if st.button("清除本程序行情缓存", key="v30_clear"):
+            shutil.rmtree(CACHE_DIR, ignore_errors=True); st.success("缓存已清除")
+    token = st.text_input("Tushare Token", type="password", key="v30_token")
+    session_key = "weekly_skdj_daily_v30_zip"
+    if not token:
+        st.info("请输入 Tushare Token。若曾运行 V2.8/V2.9，逐股票行情缓存可直接复用。")
+        return
+    if not st.button("开始V3.0事件队列验证", type="primary", key="v30_run"):
+        if session_key in st.session_state:
+            st.download_button("下载上一次全部结果ZIP", st.session_state[session_key],
+                               file_name="weekly_macd_skdj_daily_entry_audit_v3_0_all_results.zip", mime="application/zip")
+        return
+    date_error = validate_research_dates(eval_date, end_date, obs_date)
+    if date_error:
+        st.error(date_error); return
+    API_ERRORS = []
+    ts.set_token(token); pro = ts.pro_api()
+    signal_start, signal_end, market_end = (eval_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), obs_date.strftime("%Y%m%d"))
+    preload = (eval_date - timedelta(days=3 * 365)).strftime("%Y%m%d")
+    config = {"signal_start": signal_start, "signal_end": signal_end, "market_end": market_end,
+              "preload_start": preload, "min_price": 10.0, "min_mv": 100.0, "max_mv": 1_000_000_000.0,
+              "price_tolerance_pct": 3.0, "stop_threshold_pct": 10.0,
+              "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20, "sample_per_board": 0,
+              "sample_seed": DEFAULT_SAMPLE_SEED, "long_cycle_min_weeks": DEFAULT_LONG_CYCLE_MIN_WEEKS,
+              "material_hist_change_pct": DEFAULT_MATERIAL_HIST_CHANGE_PCT, "short_strength_ratio": DEFAULT_SHORT_STRENGTH_RATIO,
+              "commission_pct": float(commission_pct), "stamp_duty_pct": float(stamp_duty_pct),
+              "transfer_fee_pct": float(transfer_fee_pct)}
+    try:
+        with st.spinner("加载交易日历和历史科技股池..."):
+            opens = load_trade_calendar(preload, market_end)
+            full_opens = load_trade_calendar(preload, (obs_date + timedelta(days=7)).strftime("%Y%m%d"))
+            stock_basic = load_stock_basic()
+            memberships = load_sw_tech_memberships(float(pause))
+            week_map = complete_week_last_dates(full_opens)
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}"); return
+    periods = build_period_index(memberships)
+    codes = sorted(set(periods) & set(stock_basic.ts_code.astype(str)))
+    universe = stock_basic[stock_basic.ts_code.isin(codes)].copy()
+    stocks, universe_audit, population = build_stratified_sample(universe, periods, signal_end, 0, DEFAULT_SAMPLE_SEED)
+    listed = stocks.list_date.apply(lambda x: normalize_date(x, "19000101"))
+    delisted = stocks.delist_date.apply(lambda x: normalize_date(x, "99991231"))
+    stocks = stocks[~listed.gt(signal_end) & ~delisted.lt(preload)].reset_index(drop=True)
+    open_pos = {d: i for i, d in enumerate(opens)}
+    raw_events: list[dict[str, Any]] = []; histories: dict[str, pd.DataFrame] = {}; indicators: dict[str, pd.DataFrame] = {}
+    rejects: dict[str, int] = {}; cache_hits = data_failures = 0
+    progress = st.progress(0.0); status = st.empty()
+    for i, stock in stocks.iterrows():
+        code = str(stock.ts_code)
+        progress.progress((i + 1) / max(len(stocks), 1), text=f"{i + 1}/{len(stocks)} {code}")
+        status.caption(f"第一根周线红柱事件 {sum(x.get('Event_Type') == '第一根红柱' for x in raw_events)}；缓存 {cache_hits}；失败 {data_failures}")
+        daily, daily_basic, hit = fetch_stock_history(code, preload, market_end, bool(cache), float(pause))
+        cache_hits += int(hit)
+        if daily.empty:
+            data_failures += 1; continue
+        stock_events, stock_rejects, _ = analyze_stock(stock, periods.get(code, []), daily, daily_basic, week_map, opens, open_pos, config)
+        first_red = [x for x in stock_events if x.get("Event_Type") == "第一根红柱"]
+        raw_events.extend(first_red)
+        if first_red:
+            histories[code] = daily.copy(); indicators[code] = v30_daily_indicators(daily)
+        for reason, count in stock_rejects.items():
+            rejects[reason] = rejects.get(reason, 0) + count
+    progress.empty(); status.empty()
+    if not raw_events:
+        st.error("研究区间没有生成第一根完整周线红柱候选。"); return
+    try:
+        with st.spinner("复现SKDJ、定位日线首红、模拟三仓事件队列..."):
+            first_red_events = pd.DataFrame(raw_events).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
+            rows = [v30_build_candidate(row, histories[str(row["ts_code"])], indicators[str(row["ts_code"])], opens, open_pos, config)
+                    for _, row in first_red_events.iterrows()]
+            candidates = pd.DataFrame(rows).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
+            pool_calendar = v30_pool_calendar(opens, signal_start, signal_end, candidates)
+            trigger_detail = candidates[
+                candidates["Daily_Trigger"].map(bool_value)
+                & candidates["Daily_Tradable"].map(bool_value)
+                & candidates["Daily_Entry_Date"].astype(str).ne("")
+            ].copy()
+            competition = trigger_detail.groupby("Daily_Entry_Date").agg(
+                Trigger_Count=("ts_code", "size"), Unique_Stocks=("ts_code", "nunique"),
+                Weekly_Cohorts=("Signal_Date", "nunique")
+            ).reset_index().sort_values("Daily_Entry_Date")
+            competition["More_Than_3"] = competition["Trigger_Count"].gt(3)
+            curve, ledger, orders, portfolio_summary = v30_simulate_portfolio(candidates, histories, opens, config, V30_PRIMARY_TIE_SEED, True)
+            mc_rows = []
+            for seed in range(V30_MONTE_CARLO_RUNS):
+                _, _, _, sm = v30_simulate_portfolio(candidates, histories, opens, config, seed, False)
+                mc_rows.append(sm)
+            monte_carlo = pd.DataFrame(mc_rows)
+    except Exception as exc:
+        st.exception(exc); return
+
+    comparison_rows = [v30_stat_row(candidates, "全部候选")]
+    for label, group in candidates.groupby("Daily_Red_Age_Bucket", dropna=False):
+        comparison_rows.append(v30_stat_row(group, f"周线确认时红柱年龄={label}"))
+    comparison_rows.append(v30_stat_row(candidates[candidates["SKDJ_Recent_Bottom_Exit_20D"].map(bool_value)], "严格子组_20日内SKDJ离开底部"))
+    comparison = pd.DataFrame(comparison_rows)
+    no_trigger = candidates[~candidates["Daily_Trigger"].map(bool_value)].copy()
+    no_trigger["Weekly_Baseline_Big_Opportunity"] = pd.to_numeric(no_trigger["Weekly_Baseline_MFE_8W_pct"], errors="coerce").ge(20)
+    yearly = pd.DataFrame([v30_stat_row(group, str(year)) for year, group in candidates.groupby(candidates["Signal_Date"].astype(str).str[:4])])
+    anchor = v30_anchor_audit(histories.get("300458.SZ", pd.DataFrame()))
+    anchor_top = pd.concat([anchor.head(20), anchor[anchor["Is_Frozen_9_3"]]]).drop_duplicates(["N", "M"]) if len(anchor) else anchor
+    empty_weeks = int(pool_calendar["Is_Empty_Week"].sum()) if len(pool_calendar) else 0
+    pool_mean = float(pool_calendar["Candidate_Count"].mean()) if len(pool_calendar) else np.nan
+    mc_summary = pd.DataFrame([{
+        "随机同日顺序次数": len(monte_carlo), "平均总收益率(%)": finite_num(monte_carlo["总收益率(%)"].mean()) if len(monte_carlo) else np.nan,
+        "总收益率标准差(百分点)": finite_num(monte_carlo["总收益率(%)"].std()) if len(monte_carlo) else np.nan,
+        "最差总收益率(%)": finite_num(monte_carlo["总收益率(%)"].min()) if len(monte_carlo) else np.nan,
+        "最好总收益率(%)": finite_num(monte_carlo["总收益率(%)"].max()) if len(monte_carlo) else np.nan,
+        "平均买入笔数": finite_num(monte_carlo["实际买入"].mean()) if len(monte_carlo) else np.nan,
+        "平均仓满错过": finite_num(monte_carlo["仓位满错过"].mean()) if len(monte_carlo) else np.nan,
+    }])
+    run_summary = pd.DataFrame([{
+        "程序": TITLE, "版本": VERSION, "信号开始": signal_start, "信号截止": signal_end, "观察截止": market_end,
+        "第一根周线红柱候选": len(candidates), "候选股票数": candidates["ts_code"].nunique(), "自然周数": len(pool_calendar),
+        "平均每周候选": pool_mean, "空窗周": empty_weeks, "日线触发": int(candidates["Daily_Trigger"].map(bool_value).sum()),
+        "日线触发率(%)": float(candidates["Daily_Trigger"].map(bool_value).mean() * 100),
+        "同一买入日超过3只的天数": int(competition["More_Than_3"].sum()) if len(competition) else 0,
+        "主三仓实际买入": portfolio_summary.get("实际买入", 0), "主三仓仓满错过": portfolio_summary.get("仓位满错过", 0),
+        "主三仓总收益率(%)": portfolio_summary.get("总收益率(%)", np.nan), "行情失败": data_failures, "缓存命中": cache_hits,
+    }])
+    rejection = pd.DataFrame([{"剔除原因": k, "次数": v} for k, v in sorted(rejects.items())])
+    metadata = pd.DataFrame([
+        ("研究问题", "周线第一根完整红柱提供候选池后，SKDJ+日线MACD是否能用触发先后绕过评分排序"),
+        ("SKDJ公式", "LOWV=LLV(LOW,N); HIGHV=HHV(HIGH,N); RSV=EMA((C-LOWV)/(HIGHV-LOWV)*100,M); K=EMA(RSV,M); D=MA(K,M)"),
+        ("SKDJ冻结参数", "N=9,M=3；截图全志科技20260813 K=53.11,D=42.92只做参数误差审计"),
+        ("主触发", "日线MACD第一根红柱当日K>25且D>25；若周线D0时该日线红柱段已开始，则D0接力触发"),
+        ("候选失效", "第一根完整周线绿柱确认日之前；绿柱确认日不再允许新触发"),
+        ("严格子组", "日线MACD首红前20个个股交易日内，K与D曾共同从25下方状态转为双双大于25"),
+        ("成交", "触发后下一市场交易日开盘；主板D1一字板不可买；买卖各0.20%滑点"),
+        ("退出判卷尺", "-10%止损、+20%止盈、最长40个市场交易日；买入当日不可卖，严格T+1"),
+        ("三仓冲突", "不用评分；同日触发按固定随机种子排序，并用200个随机种子检验结论敏感性"),
+        ("未来隔离", "周线与日线触发只用当日及以前数据；未来路径只用于判卷。First_Green_Date仅作为该日收盘后已确认的池失效边界"),
+    ], columns=["项目", "值"])
+    files = {
+        "01_run_summary_v3_0.csv": run_summary, "02_weekly_pool_calendar_v3_0.csv": pool_calendar,
+        "03_entry_method_comparison_v3_0.csv": comparison, "04_yearly_stability_v3_0.csv": yearly,
+        "05_all_candidate_trigger_detail_v3_0.csv": candidates, "06_daily_entry_competition_v3_0.csv": competition,
+        "07_no_trigger_missed_opportunity_v3_0.csv": no_trigger, "08_primary_3slot_portfolio_summary_v3_0.csv": pd.DataFrame([portfolio_summary]),
+        "09_primary_3slot_ledger_v3_0.csv": ledger, "10_primary_3slot_orders_v3_0.csv": orders,
+        "11_primary_3slot_equity_curve_v3_0.csv": curve, "12_random_tie_mc_summary_v3_0.csv": mc_summary,
+        "13_random_tie_mc_distribution_v3_0.csv": monte_carlo, "14_skdj_screenshot_anchor_audit_v3_0.csv": anchor_top,
+        "15_full_tech_universe_v3_0.csv": universe_audit, "16_population_v3_0.csv": population,
+        "17_rejection_audit_v3_0.csv": rejection, "18_api_errors_v3_0.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "19_metadata_v3_0.csv": metadata,
+    }
+    result_zip = make_result_zip(files); st.session_state[session_key] = result_zip
+    st.success(f"完成：{len(candidates)}个周线候选，{int(candidates['Daily_Trigger'].map(bool_value).sum())}个日线触发；平均每周{pool_mean:.2f}只，空窗{empty_weeks}周。")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("周线候选", len(candidates)); c2.metric("日线触发率", f"{candidates['Daily_Trigger'].map(bool_value).mean()*100:.1f}%")
+    c3.metric(">3只同日竞争", int(competition["More_Than_3"].sum()) if len(competition) else 0)
+    c4.metric("三仓总收益", f"{portfolio_summary.get('总收益率(%)', np.nan):.1f}%")
+    st.subheader("周线即买 vs 日线择时")
+    st.dataframe(comparison, use_container_width=True, hide_index=True)
+    st.subheader("随机同日顺序敏感性")
+    st.dataframe(mc_summary, use_container_width=True, hide_index=True)
+    if len(anchor_top):
+        fixed = anchor_top[anchor_top["Is_Frozen_9_3"]]
+        if len(fixed):
+            err = float(fixed.iloc[0]["Total_Abs_Error"])
+            (st.success if err <= 1.0 else st.warning)(f"SKDJ N=9,M=3 对截图锚点的 K+D 绝对误差合计：{err:.3f}。详情已写入结果。")
+    st.download_button("下载V3.0全部验证结果ZIP", result_zip,
+                       file_name="weekly_macd_skdj_daily_entry_audit_v3_0_all_results.zip",
+                       mime="application/zip", type="primary", key="v30_download")
+    st.info("判断是否真的绕过排序，重点看：同日>3只的天数、仓满错过数量、200次随机顺序收益离散度，以及未触发却出现大行情的比例。")
 
 
 if __name__ == "__main__":
