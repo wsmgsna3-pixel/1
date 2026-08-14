@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-"""科技股周线SKDJ底部结构、上穿25确认与历史股性审计 V4.3。
+"""科技股周线SKDJ持续分离买点、退出与Top3审计 V4.4。
 
 本版只验证一条可执行买入规则：
 1. 周线SKDJ在25以下首次形成独立底部金叉，进入观察状态；
-2. 不设置6周失效期，等待K首次从25下方上穿25，且K>D、K继续上升；
-3. 完整确认周结束后的下一市场交易日开盘买入。
+2. 不设等待上限，K首次从25下方上穿25仅为预确认；
+3. 再观察一个完整周：K、D同时上升、K>D、K保持在25上方且K-D差值扩大；
+4. 持续分离周结束后的下一市场交易日开盘买入。
 
-买入时已知特征与买入后的持仓确认严格分开。底部深度、等待时间、
-确认周K/D分离度、此前1~3次已完成金叉波段的最高K值均只使用信号当时
-已经发生的数据；确认后第1~2周K/D是否继续分离只作为事后持仓诊断。
+历史前三个已完成金叉波段冲击65/70/75的次数只用于透明排序，不作为
+硬条件。所有退出策略从持续分离后的真实次周开盘价重新计算。
 """
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tushare as ts
-TITLE = "科技股周线SKDJ确认结构与历史股性审计 V4.3"
-VERSION = "V4.3-WEEKLY-SKDJ-CONFIRMATION-STRUCTURE-AUDIT"
+TITLE = "科技股周线SKDJ持续分离买点与Top3审计 V4.4"
+VERSION = "V4.4-WEEKLY-SKDJ-PERSISTENT-SEPARATION-ENTRY"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 
@@ -37,9 +37,13 @@ SKDJ_BOTTOM = 25.0
 INDICATOR_WARMUP_WEEKS = 40
 HOLD_20D = 20
 HOLD_40D = 40
-AUDIT_WEEKS = 12
+AUDIT_WEEKS = 8
 HISTORY_PEAK_LEVELS = (65.0, 70.0, 75.0)
 FIRST_HIT_PROFIT_LEVELS = (10.0, 15.0, 20.0)
+STOP_LOSS_PCT = 10.0
+TAKE_PROFITS = (10.0, 15.0, 20.0)
+ACTIVATED_TRAILS = ((10.0, 10.0), (15.0, 10.0))
+TOP_K = 3
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -410,9 +414,9 @@ def entry_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
         "Return_20D_Net_pct": np.nan, "Return_40D_Net_pct": np.nan,
         "MFE_20D_Raw_pct": np.nan, "MAE_20D_Raw_pct": np.nan,
         "MFE_40D_Raw_pct": np.nan, "MAE_40D_Raw_pct": np.nan,
-        "First_Hit_10_vs_Minus10_W12": "", "First_Hit_10_Date_W12": "",
-        "First_Hit_15_vs_Minus10_W12": "", "First_Hit_15_Date_W12": "",
-        "First_Hit_20_vs_Minus10_W12": "", "First_Hit_20_Date_W12": "",
+        "First_Hit_10_vs_Minus10_W8": "", "First_Hit_10_Date_W8": "",
+        "First_Hit_15_vs_Minus10_W8": "", "First_Hit_15_Date_W8": "",
+        "First_Hit_20_vs_Minus10_W8": "", "First_Hit_20_Date_W8": "",
     }
     for week in range(1, AUDIT_WEEKS + 1):
         out.update({
@@ -468,8 +472,8 @@ def entry_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
             for profit_pct in FIRST_HIT_PROFIT_LEVELS:
                 label, hit_date = first_hit_label(path, raw_entry, profit_pct)
                 key = int(profit_pct)
-                out[f"First_Hit_{key}_vs_Minus10_W12"] = label
-                out[f"First_Hit_{key}_Date_W12"] = hit_date
+                out[f"First_Hit_{key}_vs_Minus10_W8"] = label
+                out[f"First_Hit_{key}_Date_W8"] = hit_date
 
     for days in (HOLD_20D, HOLD_40D):
         end_pos = entry_market_pos + days - 1
@@ -486,6 +490,146 @@ def entry_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
     if not out[f"Has_W{AUDIT_WEEKS}"]:
         out["Reason"] = f"可买但未来不足{AUDIT_WEEKS}个完整市场周"
     return out
+
+
+def trade_factors(config: dict[str, Any]) -> tuple[float, float]:
+    """Return buy/sell multipliers including slippage and explicit fees."""
+    buy_cost = (config["commission_pct"] + config["transfer_fee_pct"]) / 100.0
+    sell_cost = (
+        config["commission_pct"] + config["transfer_fee_pct"]
+        + config["stamp_duty_pct"]
+    ) / 100.0
+    return (
+        (1.0 + config["buy_slippage_pct"] / 100.0) * (1.0 + buy_cost),
+        (1.0 - config["sell_slippage_pct"] / 100.0) * (1.0 - sell_cost),
+    )
+
+
+def exit_fields(path: pd.DataFrame, raw_entry: float, raw_exit: float,
+                exit_date: str, trigger: str, config: dict[str, Any]) -> dict[str, Any]:
+    buy_factor, sell_factor = trade_factors(config)
+    net_return = (raw_exit * sell_factor / (raw_entry * buy_factor) - 1.0) * 100.0
+    holding_days = 0
+    if not path.empty:
+        dates = path["trade_date"].astype(str).tolist()
+        holding_days = dates.index(exit_date) + 1 if exit_date in dates else len(dates)
+    return {
+        "Available": True, "Exit_Date": exit_date, "Raw_Exit_Price": raw_exit,
+        "Trigger": trigger, "Holding_Trading_Days": holding_days,
+        "Net_Return_pct": net_return,
+    }
+
+
+def unavailable_exit(reason: str) -> dict[str, Any]:
+    return {
+        "Available": False, "Exit_Date": "", "Raw_Exit_Price": np.nan,
+        "Trigger": reason, "Holding_Trading_Days": np.nan,
+        "Net_Return_pct": np.nan,
+    }
+
+
+def simulate_bracket(path: pd.DataFrame, raw_entry: float, take_profit: float,
+                     config: dict[str, Any]) -> dict[str, Any]:
+    """Fixed -10% stop and take-profit; same-day double hit is conservatively a stop."""
+    if path.empty:
+        return unavailable_exit("无W8路径")
+    stop_price = raw_entry * (1.0 - STOP_LOSS_PCT / 100.0)
+    target_price = raw_entry * (1.0 + take_profit / 100.0)
+    for row in path.itertuples(index=False):
+        trade_date = str(row.trade_date)
+        day_open, day_low, day_high = float(row.open), float(row.low), float(row.high)
+        stop_hit, target_hit = day_low <= stop_price, day_high >= target_price
+        if stop_hit:
+            raw_exit = day_open if day_open < stop_price else stop_price
+            label = (
+                f"同日双触发_保守止损-{int(STOP_LOSS_PCT)}%"
+                if target_hit else f"止损-{int(STOP_LOSS_PCT)}%"
+            )
+            return exit_fields(path, raw_entry, raw_exit, trade_date, label, config)
+        if target_hit:
+            raw_exit = day_open if day_open > target_price else target_price
+            return exit_fields(
+                path, raw_entry, raw_exit, trade_date,
+                f"止盈+{int(take_profit)}%", config)
+    last = path.iloc[-1]
+    return exit_fields(
+        path, raw_entry, float(last["close"]), str(last["trade_date"]),
+        f"W{AUDIT_WEEKS}期末", config)
+
+
+def simulate_activated_trail(path: pd.DataFrame, raw_entry: float, activation: float,
+                             trail: float, config: dict[str, Any]) -> dict[str, Any]:
+    """Use a fixed -10% stop until activated, then trail from prior-day peak only."""
+    if path.empty:
+        return unavailable_exit("无W8路径")
+    fixed_stop = raw_entry * (1.0 - STOP_LOSS_PCT / 100.0)
+    activation_price = raw_entry * (1.0 + activation / 100.0)
+    prior_peak = raw_entry
+    armed = False
+    for row in path.itertuples(index=False):
+        trade_date = str(row.trade_date)
+        day_open, day_low, day_high = float(row.open), float(row.low), float(row.high)
+        if armed:
+            stop_price = max(raw_entry, prior_peak * (1.0 - trail / 100.0))
+        else:
+            stop_price = fixed_stop
+        if day_low <= stop_price:
+            raw_exit = day_open if day_open < stop_price else stop_price
+            trigger = (
+                f"激活+{int(activation)}%后回撤{int(trail)}%"
+                if armed else f"激活前止损-{int(STOP_LOSS_PCT)}%"
+            )
+            return exit_fields(path, raw_entry, raw_exit, trade_date, trigger, config)
+        prior_peak = max(prior_peak, day_high)
+        if prior_peak >= activation_price:
+            armed = True
+    last = path.iloc[-1]
+    return exit_fields(
+        path, raw_entry, float(last["close"]), str(last["trade_date"]),
+        f"W{AUDIT_WEEKS}期末", config)
+
+
+def simulate_exit_policies(daily: pd.DataFrame, outcome: dict[str, Any],
+                           config: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if not to_bool(outcome.get("Tradable")):
+        for policy in (
+            "Fixed_W5", "Fixed_W8", "SL10_TP10", "SL10_TP15", "SL10_TP20",
+            "Activate10_Trail10", "Activate15_Trail10",
+        ):
+            result.update(prefix_keys(unavailable_exit("不可交易"), policy))
+        return result
+    raw_entry = finite_num(outcome.get("Raw_Entry_Open"))
+    entry_date = str(outcome.get("Entry_Date", ""))
+    for week in (5, AUDIT_WEEKS):
+        policy = f"Fixed_W{week}"
+        if not to_bool(outcome.get(f"Has_W{week}")):
+            result.update(prefix_keys(unavailable_exit(f"未来不足W{week}"), policy))
+            continue
+        end_date = str(outcome[f"W{week}_End_Date"])
+        path = daily[daily["trade_date"].astype(str).between(entry_date, end_date)].sort_values("trade_date")
+        last = path.iloc[-1]
+        result.update(prefix_keys(exit_fields(
+            path, raw_entry, float(last["close"]), str(last["trade_date"]),
+            f"固定W{week}期末", config), policy))
+    if not to_bool(outcome.get(f"Has_W{AUDIT_WEEKS}")):
+        for policy in (
+            "SL10_TP10", "SL10_TP15", "SL10_TP20",
+            "Activate10_Trail10", "Activate15_Trail10",
+        ):
+            result.update(prefix_keys(unavailable_exit(f"未来不足W{AUDIT_WEEKS}"), policy))
+        return result
+    end_date = str(outcome[f"W{AUDIT_WEEKS}_End_Date"])
+    path = daily[daily["trade_date"].astype(str).between(entry_date, end_date)].sort_values("trade_date")
+    for take_profit in TAKE_PROFITS:
+        policy = f"SL10_TP{int(take_profit)}"
+        result.update(prefix_keys(
+            simulate_bracket(path, raw_entry, take_profit, config), policy))
+    for activation, trail in ACTIVATED_TRAILS:
+        policy = f"Activate{int(activation)}_Trail{int(trail)}"
+        result.update(prefix_keys(
+            simulate_activated_trail(path, raw_entry, activation, trail, config), policy))
+    return result
 
 
 def completed_golden_swings(weekly: pd.DataFrame) -> list[dict[str, Any]]:
@@ -598,7 +742,7 @@ def prior_swing_features(swings: list[dict[str, Any]], anchor_position: int) -> 
 
 
 def post_confirmation_features(weekly: pd.DataFrame, trigger_position: int) -> dict[str, Any]:
-    """Future W1/W2 fields are diagnostics only and must never enter buy-time filters."""
+    """W1 is the delayed entry confirmation; W2 remains a future diagnostic only."""
     result: dict[str, Any] = {}
     previous_position = trigger_position
     for offset in (1, 2):
@@ -660,16 +804,17 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
                   daily_basic: pd.DataFrame, week_last_map: dict[pd.Timestamp, str],
                   open_dates: list[str], open_pos: dict[str, int],
                   market_weeks: list[tuple[pd.Period, str]], config: dict[str, Any]
-                  ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                  ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     weekly = build_complete_weekly(daily_raw, week_last_map)
     if len(weekly) < INDICATOR_WARMUP_WEEKS:
         config["rejects"]["周线不足"] = config["rejects"].get("周线不足", 0) + 1
-        return [], []
+        return [], [], []
     daily = add_daily_features(daily_raw)
     cycles = build_bottom_cycles(weekly)
     swings = completed_golden_swings(weekly)
     cycle_rows: list[dict[str, Any]] = []
-    confirmed_events: list[dict[str, Any]] = []
+    preliminary_rows: list[dict[str, Any]] = []
+    entry_events: list[dict[str, Any]] = []
     code, board = str(stock["ts_code"]), sample_board(stock)
 
     for cycle_number, cycle in enumerate(cycles, start=1):
@@ -695,10 +840,14 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
                 "当时不在历史科技池" if anchor_membership is None else "当时未上市或已退市")
         history_features = prior_swing_features(swings, anchor_position)
         low_level = (float(anchor["SKDJ_K"]) + float(anchor["SKDJ_D"])) / 2.0
-
+        post = (
+            post_confirmation_features(weekly, int(trigger_position))
+            if trigger_position is not None else {})
+        separation_date = str(post.get("Post_Confirm_W1_Date", ""))
         include_cycle = (
             config["signal_start"] <= anchor_date <= config["signal_end"]
-            or bool(trigger_date and config["signal_start"] <= trigger_date <= config["signal_end"]))
+            or bool(trigger_date and config["signal_start"] <= trigger_date <= config["signal_end"])
+            or bool(separation_date and config["signal_start"] <= separation_date <= config["signal_end"]))
         if include_cycle:
             cycle_rows.append({
                 "ts_code": code, "name": str(stock["name"]), "Sample_Board": board,
@@ -711,79 +860,130 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
                 "Bottom_Max_Depth_From25": SKDJ_BOTTOM - float(cycle["Bottom_Min_Level"]),
                 "Weeks_Both_Below25": cycle["Weeks_Both_Below25"],
                 "Bottom_Golden_Cross_Count": cycle["Bottom_Golden_Cross_Count"],
-                "Confirmed_Event": trigger_position is not None,
-                "Confirm_Date": trigger_date, "Wait_Weeks": wait_weeks,
+                "Preconfirmed": trigger_position is not None,
+                "Preconfirm_Date": trigger_date, "Wait_Weeks_To_Preconfirm": wait_weeks,
+                "Separation_Check_Date": separation_date,
+                "W1_Strong_Separation": to_bool(post.get("Post_Confirm_W1_Strong_Separation")),
                 "Observation_Ended_At": str(weekly.iloc[-1]["trade_date"]),
                 "Eligible_Low_Cross_Pool": anchor_eligible,
                 "Low_Cross_Filter_Reason": reject_reason,
                 **anchor_snapshot, **history_features,
             })
 
-        if trigger_position is None or not (config["signal_start"] <= trigger_date <= config["signal_end"]):
+        if trigger_position is None or not separation_date:
             continue
-        if not anchor_eligible:
-            key = f"确认规则的低位金叉:{reject_reason}"
-            config["rejects"][key] = config["rejects"].get(key, 0) + 1
+        if not (config["signal_start"] <= separation_date <= config["signal_end"]):
             continue
-        if not (str(stock["list_date"]) <= trigger_date < str(stock["delist_date"])):
-            config["rejects"]["确认日未上市或已退市"] = config["rejects"].get("确认日未上市或已退市", 0) + 1
-            continue
-        trigger_membership = membership_on_date(periods, trigger_date)
-        if trigger_membership is None:
-            config["rejects"]["确认日不在历史科技池"] = config["rejects"].get("确认日不在历史科技池", 0) + 1
-            continue
+        trigger = weekly.iloc[int(trigger_position)]
+        previous = weekly.iloc[int(trigger_position) - 1]
         trigger_snapshot = market_snapshot(daily_basic, trigger_date)
+        trigger_membership = membership_on_date(periods, trigger_date)
         trigger_passed, trigger_reason = signal_filter(
             trigger_snapshot, config["min_price"], config["min_mv"])
-        if not trigger_passed:
-            key = f"确认日:{trigger_reason}"
+        preliminary_eligible = bool(
+            anchor_eligible
+            and trigger_membership is not None
+            and str(stock["list_date"]) <= trigger_date < str(stock["delist_date"])
+            and trigger_passed)
+        prelim_reason = ""
+        if not preliminary_eligible:
+            prelim_reason = reject_reason or trigger_reason or (
+                "预确认日不在历史科技池" if trigger_membership is None else "预确认日上市状态无效")
+
+        preliminary = {
+            "ts_code": code, "name": str(stock["name"]), "Sample_Board": board,
+            "Low_Cross_Date": anchor_date, "Preconfirm_Date": trigger_date,
+            "Separation_Check_Date": separation_date,
+            "Wait_Weeks_To_Preconfirm": wait_weeks,
+            "Low_Cross_K": float(anchor["SKDJ_K"]), "Low_Cross_D": float(anchor["SKDJ_D"]),
+            "Low_Cross_Gap_To25": SKDJ_BOTTOM - low_level,
+            "Preconfirm_K": float(trigger["SKDJ_K"]), "Preconfirm_D": float(trigger["SKDJ_D"]),
+            "Preconfirm_KD_Spread": float(trigger["SKDJ_KD_Spread"]),
+            "Preconfirm_K_Change_1W": float(trigger["SKDJ_K"] - previous["SKDJ_K"]),
+            "Preconfirm_D_Change_1W": float(trigger["SKDJ_D"] - previous["SKDJ_D"]),
+            "W1_Strong_Separation": to_bool(post.get("Post_Confirm_W1_Strong_Separation")),
+            "W1_K": post.get("Post_Confirm_W1_K", np.nan),
+            "W1_D": post.get("Post_Confirm_W1_D", np.nan),
+            "W1_KD_Spread": post.get("Post_Confirm_W1_KD_Spread", np.nan),
+            "W1_K_Change": post.get("Post_Confirm_W1_K_Change", np.nan),
+            "W1_D_Change": post.get("Post_Confirm_W1_D_Change", np.nan),
+            "W1_Spread_Change": post.get("Post_Confirm_W1_Spread_Change", np.nan),
+            "Eligible_Preliminary": preliminary_eligible,
+            "Preliminary_Filter_Reason": prelim_reason,
+            **history_features,
+        }
+        preliminary_rows.append(preliminary)
+        if not preliminary_eligible:
+            key = f"预确认:{prelim_reason}"
+            config["rejects"][key] = config["rejects"].get(key, 0) + 1
+            continue
+        if not to_bool(post.get("Post_Confirm_W1_Strong_Separation")):
+            continue
+
+        separation_position = int(trigger_position) + 1
+        if not (str(stock["list_date"]) <= separation_date < str(stock["delist_date"])):
+            config["rejects"]["持续分离日未上市或已退市"] = (
+                config["rejects"].get("持续分离日未上市或已退市", 0) + 1)
+            continue
+        separation_membership = membership_on_date(periods, separation_date)
+        if separation_membership is None:
+            config["rejects"]["持续分离日不在历史科技池"] = (
+                config["rejects"].get("持续分离日不在历史科技池", 0) + 1)
+            continue
+        separation_snapshot = market_snapshot(daily_basic, separation_date)
+        separation_passed, separation_reason = signal_filter(
+            separation_snapshot, config["min_price"], config["min_mv"])
+        if not separation_passed:
+            key = f"持续分离日:{separation_reason}"
             config["rejects"][key] = config["rejects"].get(key, 0) + 1
             continue
 
-        trigger = weekly.iloc[int(trigger_position)]
-        previous = weekly.iloc[int(trigger_position) - 1]
-        confirmed = {
-            "Rule": "独立低位金叉后不限周数首次上穿25确认买",
+        count65 = int(history_features.get("Prior_3_Count_Peak_GE65", 0))
+        count70 = int(history_features.get("Prior_3_Count_Peak_GE70", 0))
+        count75 = int(history_features.get("Prior_3_Count_Peak_GE75", 0))
+        entry = {
+            "Rule": "上穿25后W1持续分离，次周开盘买",
             "ts_code": code, "name": str(stock["name"]), "Sample_Board": board,
-            "SW_L1": trigger_membership["l1"], "SW_L2": trigger_membership["l2"],
-            "SW_L3": trigger_membership["l3"], "Signal_Date": trigger_date,
-            "Low_Cross_Date": anchor_date, "Confirm_Date": trigger_date,
-            "Wait_Weeks": wait_weeks,
+            "SW_L1": separation_membership["l1"], "SW_L2": separation_membership["l2"],
+            "SW_L3": separation_membership["l3"], "Signal_Date": separation_date,
+            "Low_Cross_Date": anchor_date, "Preconfirm_Date": trigger_date,
+            "Separation_Confirm_Date": separation_date,
+            "Wait_Weeks_To_Preconfirm": wait_weeks,
+            "Total_Wait_Weeks": int(wait_weeks) + 1,
             "Low_Cross_K": float(anchor["SKDJ_K"]), "Low_Cross_D": float(anchor["SKDJ_D"]),
             "Low_Cross_Level": low_level, "Low_Cross_Gap_To25": SKDJ_BOTTOM - low_level,
             "Bottom_Min_K": cycle["Bottom_Min_K"], "Bottom_Min_D": cycle["Bottom_Min_D"],
             "Bottom_Min_Level": cycle["Bottom_Min_Level"],
-            "Bottom_Max_Depth_From25": SKDJ_BOTTOM - float(cycle["Bottom_Min_Level"]),
             "Weeks_Both_Below25": cycle["Weeks_Both_Below25"],
             "Bottom_Golden_Cross_Count": cycle["Bottom_Golden_Cross_Count"],
-            "Confirm_K": float(trigger["SKDJ_K"]), "Confirm_D": float(trigger["SKDJ_D"]),
-            "Confirm_Level": float(trigger["SKDJ_Level"]),
-            "Confirm_KD_Spread": float(trigger["SKDJ_KD_Spread"]),
-            "Confirm_K_Change_1W": float(trigger["SKDJ_K"] - previous["SKDJ_K"]),
-            "Confirm_D_Change_1W": float(trigger["SKDJ_D"] - previous["SKDJ_D"]),
-            "Confirm_Spread_Change_1W": float(
-                trigger["SKDJ_KD_Spread"] - previous["SKDJ_KD_Spread"]),
-            "Confirm_Both_Rising": bool(
-                trigger["SKDJ_K"] > previous["SKDJ_K"]
-                and trigger["SKDJ_D"] > previous["SKDJ_D"]),
+            "Preconfirm_K": float(trigger["SKDJ_K"]), "Preconfirm_D": float(trigger["SKDJ_D"]),
+            "Preconfirm_KD_Spread": float(trigger["SKDJ_KD_Spread"]),
+            "Separation_K": post["Post_Confirm_W1_K"],
+            "Separation_D": post["Post_Confirm_W1_D"],
+            "Separation_KD_Spread": post["Post_Confirm_W1_KD_Spread"],
+            "Separation_K_Change": post["Post_Confirm_W1_K_Change"],
+            "Separation_D_Change": post["Post_Confirm_W1_D_Change"],
+            "Separation_Spread_Change": post["Post_Confirm_W1_Spread_Change"],
             "Low_Cross_Raw_Close": anchor_snapshot["Raw_Close"],
-            "Confirm_Raw_Close": trigger_snapshot["Raw_Close"],
-            "Circ_MV_Billion": trigger_snapshot["Circ_MV_Billion"],
-            "Turnover_Rate": trigger_snapshot["Turnover_Rate"],
-            "Price_Change_Cross_to_Confirm_pct": (
-                (trigger_snapshot["Raw_Close"] / anchor_snapshot["Raw_Close"] - 1.0) * 100.0
+            "Preconfirm_Raw_Close": trigger_snapshot["Raw_Close"],
+            "Signal_Raw_Close": separation_snapshot["Raw_Close"],
+            "Circ_MV_Billion": separation_snapshot["Circ_MV_Billion"],
+            "Turnover_Rate": separation_snapshot["Turnover_Rate"],
+            "Price_Change_Cross_to_Entry_Signal_pct": (
+                (separation_snapshot["Raw_Close"] / anchor_snapshot["Raw_Close"] - 1.0) * 100.0
                 if anchor_snapshot["Raw_Close"] > 0 else np.nan),
+            "History_Rank_Score": count75 * 100 + count70 * 10 + count65,
             "Period_Group": (
-                "2025-06以后" if trigger_date >= config["split_date"] else "2025-06以前"),
+                "2025-06以后" if separation_date >= config["split_date"] else "2025-06以前"),
             **history_features,
-            **stock_trend(weekly, int(trigger_position), daily, trigger_date),
-            **post_confirmation_features(weekly, int(trigger_position)),
+            **stock_trend(weekly, separation_position, daily, separation_date),
         }
         outcome = entry_outcomes(
-            daily, trigger_date, code, open_dates, open_pos, market_weeks, config)
-        confirmed.update(prefix_keys(outcome, "Confirmed"))
-        confirmed_events.append(confirmed)
-    return cycle_rows, confirmed_events
+            daily, separation_date, code, open_dates, open_pos, market_weeks, config)
+        entry.update(prefix_keys(outcome, "Entry"))
+        entry.update(prefix_keys(simulate_exit_policies(daily, outcome, config), "Entry"))
+        entry_events.append(entry)
+    return cycle_rows, preliminary_rows, entry_events
 
 def max_empty_run(counts: pd.Series) -> int:
     longest = current = 0
@@ -793,13 +993,37 @@ def max_empty_run(counts: pd.Series) -> int:
     return longest
 
 
-def mature_confirmed(events: pd.DataFrame) -> pd.DataFrame:
+def numeric(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    return pd.to_numeric(frame[column], errors="coerce")
+
+
+def mature_entries(events: pd.DataFrame) -> pd.DataFrame:
     if events.empty:
-        return events
+        return events.copy()
     return events[
-        events["Confirmed_Tradable"].map(to_bool)
-        & events[f"Confirmed_Has_W{AUDIT_WEEKS}"].map(to_bool)
+        events["Entry_Tradable"].map(to_bool)
+        & events[f"Entry_Has_W{AUDIT_WEEKS}"].map(to_bool)
     ].copy()
+
+
+def rank_same_week(events: pd.DataFrame) -> pd.DataFrame:
+    """Rank with final-signal-date observable fields only."""
+    if events.empty:
+        return events.copy()
+    work = events.copy()
+    order = [
+        "Signal_Date", "Prior_3_Count_Peak_GE75", "Prior_3_Count_Peak_GE70",
+        "Prior_3_Count_Peak_GE65", "Separation_Spread_Change",
+        "Separation_K_Change", "ts_code",
+    ]
+    work = work.sort_values(
+        order, ascending=[True, False, False, False, False, False, True],
+        kind="mergesort")
+    work["Same_Week_Rank"] = work.groupby("Signal_Date", sort=False).cumcount() + 1
+    work["Selected_Top3"] = work["Same_Week_Rank"].le(TOP_K)
+    return work.sort_values(["Signal_Date", "Same_Week_Rank", "ts_code"]).reset_index(drop=True)
 
 
 def signal_week_calendar(open_dates: list[str], start: str, end: str,
@@ -808,39 +1032,32 @@ def signal_week_calendar(open_dates: list[str], start: str, end: str,
     frame["period"] = pd.to_datetime(frame["trade_date"]).dt.to_period("W-FRI")
     calendar = frame.groupby("period", as_index=False)["trade_date"].max().rename(
         columns={"trade_date": "Week_Last_Trade_Date"})
-    counts = events.groupby("Signal_Date").size() if not events.empty else pd.Series(dtype=int)
-    mature = mature_confirmed(events)
-    mature_counts = mature.groupby("Signal_Date").size() if not mature.empty else pd.Series(dtype=int)
-    calendar["Confirmed_Signals"] = calendar["Week_Last_Trade_Date"].map(counts).fillna(0).astype(int)
-    calendar["Confirmed_W12_Mature"] = (
-        calendar["Week_Last_Trade_Date"].map(mature_counts).fillna(0).astype(int))
+    all_counts = events.groupby("Signal_Date").size() if not events.empty else pd.Series(dtype=int)
+    top3 = events[events["Selected_Top3"].map(to_bool)] if not events.empty else events
+    top_counts = top3.groupby("Signal_Date").size() if not top3.empty else pd.Series(dtype=int)
+    calendar["Final_Entry_Signals"] = (
+        calendar["Week_Last_Trade_Date"].map(all_counts).fillna(0).astype(int))
+    calendar["Same_Week_Top3"] = (
+        calendar["Week_Last_Trade_Date"].map(top_counts).fillna(0).astype(int))
     return calendar
 
 
-def numeric(frame: pd.DataFrame, column: str) -> pd.Series:
-    if column not in frame.columns:
-        return pd.Series(np.nan, index=frame.index, dtype=float)
-    return pd.to_numeric(frame[column], errors="coerce")
-
-
 def outcome_summary(events: pd.DataFrame) -> pd.DataFrame:
-    mature = mature_confirmed(events)
+    mature = mature_entries(events)
     if mature.empty:
         return pd.DataFrame()
     row: dict[str, Any] = {
-        "买入规则": "独立低位金叉后不限周数首次上穿25，次周开盘买",
-        "全部确认事件": len(events),
-        "可交易事件": int(events["Confirmed_Tradable"].map(to_bool).sum()),
-        "W12成熟事件": len(mature),
-        "不同股票": mature["ts_code"].nunique(),
+        "买入规则": "首次上穿25后再等1周持续分离，次周开盘买",
+        "最终信号事件": len(events),
+        "可交易事件": int(events["Entry_Tradable"].map(to_bool).sum()),
+        "W8成熟事件": len(mature), "不同股票": mature["ts_code"].nunique(),
         "信号周": mature["Signal_Date"].nunique(),
-        "等待周数中位数": numeric(mature, "Wait_Weeks").median(),
-        "等待周数最大值": numeric(mature, "Wait_Weeks").max(),
+        "总等待周数中位数": numeric(mature, "Total_Wait_Weeks").median(),
     }
-    for week in (5, 8, 12):
-        mfe = numeric(mature, f"Confirmed_W{week}_Cum_MFE_Net_pct")
-        mae = numeric(mature, f"Confirmed_W{week}_Cum_MAE_Raw_pct")
-        close_ret = numeric(mature, f"Confirmed_W{week}_Close_Return_Net_pct")
+    for week in (5, 8):
+        mfe = numeric(mature, f"Entry_W{week}_Cum_MFE_Net_pct")
+        mae = numeric(mature, f"Entry_W{week}_Cum_MAE_Raw_pct")
+        close_ret = numeric(mature, f"Entry_W{week}_Close_Return_Net_pct")
         row.update({
             f"W{week}最大浮盈均值%": mfe.mean(),
             f"W{week}最大浮盈中位数%": mfe.median(),
@@ -855,17 +1072,16 @@ def outcome_summary(events: pd.DataFrame) -> pd.DataFrame:
 
 
 def weekly_path_audit(events: pd.DataFrame) -> pd.DataFrame:
-    mature = mature_confirmed(events)
-    rows = []
+    mature = mature_entries(events)
+    rows: list[dict[str, Any]] = []
     for week in range(1, AUDIT_WEEKS + 1):
-        available = mature[mature[f"Confirmed_Has_W{week}"].map(to_bool)].copy()
-        mfe = numeric(available, f"Confirmed_W{week}_Cum_MFE_Net_pct")
-        mae = numeric(available, f"Confirmed_W{week}_Cum_MAE_Raw_pct")
-        close_ret = numeric(available, f"Confirmed_W{week}_Close_Return_Net_pct")
+        available = mature[mature[f"Entry_Has_W{week}"].map(to_bool)].copy()
+        mfe = numeric(available, f"Entry_W{week}_Cum_MFE_Net_pct")
+        mae = numeric(available, f"Entry_W{week}_Cum_MAE_Raw_pct")
+        close_ret = numeric(available, f"Entry_W{week}_Close_Return_Net_pct")
         rows.append({
             "持有周": f"W{week}", "成熟事件": len(available),
             "最大浮盈均值%": mfe.mean(), "最大浮盈中位数%": mfe.median(),
-            "达到5%比例%": mfe.ge(5).mean() * 100 if len(mfe) else np.nan,
             "达到10%比例%": mfe.ge(10).mean() * 100 if len(mfe) else np.nan,
             "达到15%比例%": mfe.ge(15).mean() * 100 if len(mfe) else np.nan,
             "达到20%比例%": mfe.ge(20).mean() * 100 if len(mfe) else np.nan,
@@ -877,151 +1093,195 @@ def weekly_path_audit(events: pd.DataFrame) -> pd.DataFrame:
 
 
 def grouped_outcome_audit(events: pd.DataFrame, columns: str | list[str]) -> pd.DataFrame:
-    mature = mature_confirmed(events)
+    mature = mature_entries(events)
     if mature.empty:
         return pd.DataFrame()
     group_columns = [columns] if isinstance(columns, str) else list(columns)
-    rows: list[dict[str, Any]] = []
     grouper: Any = group_columns[0] if len(group_columns) == 1 else group_columns
+    rows: list[dict[str, Any]] = []
     for keys, group in mature.groupby(grouper, dropna=False, observed=False, sort=True):
         values = (keys,) if len(group_columns) == 1 else tuple(keys)
         row = {column: value for column, value in zip(group_columns, values)}
-        mfe12 = numeric(group, "Confirmed_W12_Cum_MFE_Net_pct")
-        mae12 = numeric(group, "Confirmed_W12_Cum_MAE_Raw_pct")
-        close5 = numeric(group, "Confirmed_W5_Close_Return_Net_pct")
-        close8 = numeric(group, "Confirmed_W8_Close_Return_Net_pct")
-        close12 = numeric(group, "Confirmed_W12_Close_Return_Net_pct")
-        hit10 = group["Confirmed_First_Hit_10_vs_Minus10_W12"].astype(str)
+        mfe8 = numeric(group, "Entry_W8_Cum_MFE_Net_pct")
+        mae8 = numeric(group, "Entry_W8_Cum_MAE_Raw_pct")
+        fixed5 = numeric(group, "Entry_Fixed_W5_Net_Return_pct")
+        fixed8 = numeric(group, "Entry_Fixed_W8_Net_Return_pct")
+        labels = group["Entry_First_Hit_10_vs_Minus10_W8"].astype(str)
         row.update({
             "事件数": len(group), "不同股票": group["ts_code"].nunique(),
             "信号周": group["Signal_Date"].nunique(),
-            "W12最大浮盈均值%": mfe12.mean(), "W12最大浮盈中位数%": mfe12.median(),
-            "W12达到5%比例%": mfe12.ge(5).mean() * 100,
-            "W12达到10%比例%": mfe12.ge(10).mean() * 100,
-            "W12达到20%比例%": mfe12.ge(20).mean() * 100,
-            "W12最大回撤中位数%": mae12.median(),
-            "W5期末平均收益%": close5.mean(), "W5期末中位收益%": close5.median(),
-            "W8期末平均收益%": close8.mean(), "W8期末中位收益%": close8.median(),
-            "W12期末平均收益%": close12.mean(), "W12期末中位收益%": close12.median(),
-            "W12期末胜率%": close12.gt(0).mean() * 100,
-            "W12先到+10比例%": hit10.str.contains(r"先到\+10", regex=True).mean() * 100,
-            "W12先到-10比例%": hit10.str.contains("先到-10", regex=False).mean() * 100,
+            "W8最大浮盈均值%": mfe8.mean(), "W8最大浮盈中位数%": mfe8.median(),
+            "W8达到10%比例%": mfe8.ge(10).mean() * 100,
+            "W8达到20%比例%": mfe8.ge(20).mean() * 100,
+            "W8最大回撤中位数%": mae8.median(),
+            "固定W5平均净收益%": fixed5.mean(), "固定W5中位净收益%": fixed5.median(),
+            "固定W5胜率%": fixed5.gt(0).mean() * 100,
+            "固定W8平均净收益%": fixed8.mean(), "固定W8中位净收益%": fixed8.median(),
+            "固定W8胜率%": fixed8.gt(0).mean() * 100,
+            "W8先到+10比例%": labels.str.contains("先到+10%", regex=False).mean() * 100,
+            "W8先到-10比例%": labels.str.contains("-10%", regex=False).mean() * 100,
         })
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def first_hit_audit(events: pd.DataFrame) -> pd.DataFrame:
-    mature = mature_confirmed(events)
-    rows = []
+    mature = mature_entries(events)
+    rows: list[dict[str, Any]] = []
     for threshold in FIRST_HIT_PROFIT_LEVELS:
         key = int(threshold)
-        labels = mature[f"Confirmed_First_Hit_{key}_vs_Minus10_W12"].astype(str)
+        labels = mature[f"Entry_First_Hit_{key}_vs_Minus10_W8"].astype(str)
         rows.append({
-            "盈利阈值": f"+{key}%", "成熟事件": len(mature),
+            "盈利阈值": f"+{key}%", "W8成熟事件": len(mature),
             "先到盈利阈值": labels.str.contains(f"先到+{key}%", regex=False).sum(),
             "先到-10%": labels.str.contains("先到-10%", regex=False).sum(),
-            "同日双触发保守按止损": labels.str.contains("同日同时触发", regex=False).sum(),
-            "W12均未触发": labels.str.contains("均未触发", regex=False).sum(),
+            "同日双触发保守止损": labels.str.contains("同日同时触发", regex=False).sum(),
+            "W8均未触发": labels.str.contains("均未触发", regex=False).sum(),
             "先到盈利阈值比例%": labels.str.contains(f"先到+{key}%", regex=False).mean() * 100,
             "先到-10%比例%": labels.str.contains("先到-10%", regex=False).mean() * 100,
         })
     return pd.DataFrame(rows)
 
 
-def add_audit_groups(events: pd.DataFrame) -> pd.DataFrame:
+EXIT_POLICIES = {
+    "Fixed_W5": "固定持有5周", "Fixed_W8": "固定持有8周",
+    "SL10_TP10": "止损10%+止盈10%", "SL10_TP15": "止损10%+止盈15%",
+    "SL10_TP20": "止损10%+止盈20%",
+    "Activate10_Trail10": "浮盈10%后回撤10%",
+    "Activate15_Trail10": "浮盈15%后回撤10%",
+}
+
+
+def exit_policy_audit(events: pd.DataFrame, group_column: str | None = None) -> pd.DataFrame:
+    mature = mature_entries(events)
+    if mature.empty:
+        return pd.DataFrame()
+    groups = [("全部", mature)] if group_column is None else list(
+        mature.groupby(group_column, dropna=False, observed=False, sort=True))
+    rows: list[dict[str, Any]] = []
+    for group_value, group in groups:
+        for policy, label in EXIT_POLICIES.items():
+            available = group[group[f"Entry_{policy}_Available"].map(to_bool)].copy()
+            returns = numeric(available, f"Entry_{policy}_Net_Return_pct")
+            triggers = available[f"Entry_{policy}_Trigger"].astype(str)
+            row = {
+                "分组": group_value, "退出规则": label, "样本": len(available),
+                "平均净收益%": returns.mean(), "中位净收益%": returns.median(),
+                "胜率%": returns.gt(0).mean() * 100 if len(returns) else np.nan,
+                "亏损10%以上比例%": returns.le(-10).mean() * 100 if len(returns) else np.nan,
+                "平均持有交易日": numeric(available, f"Entry_{policy}_Holding_Trading_Days").mean(),
+                "止损触发比例%": triggers.str.contains("止损", regex=False).mean() * 100 if len(triggers) else np.nan,
+                "止盈或回撤退出比例%": (
+                    triggers.str.contains("止盈|回撤", regex=True).mean() * 100 if len(triggers) else np.nan),
+            }
+            if group_column is not None:
+                row["分组字段"] = group_column
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def selection_metrics(frame: pd.DataFrame, label: str) -> dict[str, Any]:
+    returns = numeric(frame, "Entry_Fixed_W5_Net_Return_pct")
+    weekly = frame.assign(_return=returns).groupby("Signal_Date", sort=True)["_return"].mean()
+    return {
+        "方案": label, "事件数": len(frame), "信号周": frame["Signal_Date"].nunique(),
+        "事件平均净收益%": returns.mean(), "事件中位净收益%": returns.median(),
+        "事件胜率%": returns.gt(0).mean() * 100,
+        "等权周平均净收益%": weekly.mean(), "等权周中位净收益%": weekly.median(),
+        "盈利周比例%": weekly.gt(0).mean() * 100,
+    }
+
+
+def top3_random_audit(events: pd.DataFrame, trials: int = 500,
+                      seed: int = 20260814) -> tuple[pd.DataFrame, pd.DataFrame]:
+    mature = mature_entries(events)
+    top3 = mature[mature["Selected_Top3"].map(to_bool)].copy()
+    comparison = [selection_metrics(mature, "全部成熟事件"), selection_metrics(top3, "历史股性同周Top3")]
+    rng = np.random.default_rng(seed)
+    # Random selection is also made from the signal-date candidate set first;
+    # maturity/tradability is applied afterwards, matching the real Top3 audit.
+    grouped = [group.index.to_numpy() for _, group in events.groupby("Signal_Date", sort=True)]
+    trial_rows: list[dict[str, Any]] = []
+    for trial in range(1, trials + 1):
+        chosen: list[Any] = []
+        for indices in grouped:
+            size = min(TOP_K, len(indices))
+            chosen.extend(rng.choice(indices, size=size, replace=False).tolist())
+        selected = mature_entries(events.loc[chosen].copy())
+        metrics = selection_metrics(selected, f"随机Top3_{trial}")
+        metrics["试验编号"] = trial
+        trial_rows.append(metrics)
+    trials_frame = pd.DataFrame(trial_rows)
+    if not trials_frame.empty:
+        for quantile, label in ((0.05, "随机Top3_P05"), (0.50, "随机Top3_中位"), (0.95, "随机Top3_P95")):
+            row: dict[str, Any] = {"方案": label}
+            for column in trials_frame.select_dtypes(include=[np.number]).columns:
+                if column != "试验编号":
+                    row[column] = trials_frame[column].quantile(quantile)
+            comparison.append(row)
+    return pd.DataFrame(comparison), trials_frame
+
+
+def add_groups(events: pd.DataFrame) -> pd.DataFrame:
     work = events.copy()
-    work["Wait_Group"] = pd.cut(
-        numeric(work, "Wait_Weeks"),
-        bins=[0, 2, 6, 12, 18, 26, 52, np.inf],
-        labels=["1–2周", "3–6周", "7–12周", "13–18周", "19–26周", "27–52周", "超过52周"],
+    work["Total_Wait_Group"] = pd.cut(
+        numeric(work, "Total_Wait_Weeks"), bins=[0, 3, 7, 13, 19, 27, 53, np.inf],
+        labels=["2–3周", "4–7周", "8–13周", "14–19周", "20–27周", "28–53周", "超过53周"],
         include_lowest=True)
-    work["Low_Cross_Gap_Group"] = pd.cut(
-        numeric(work, "Low_Cross_Gap_To25"),
-        bins=[-np.inf, 2.5, 5, 10, 15, np.inf],
-        labels=["≤2.5", "2.5–5", "5–10", "10–15", ">15"])
-    work["Bottom_Depth_Group"] = pd.cut(
-        numeric(work, "Bottom_Max_Depth_From25"),
-        bins=[-np.inf, 5, 10, 15, 20, np.inf],
-        labels=["≤5", "5–10", "10–15", "15–20", ">20"])
-    work["Bottom_Weeks_Group"] = pd.cut(
-        numeric(work, "Weeks_Both_Below25"),
-        bins=[0, 2, 6, 12, 18, 26, np.inf],
-        labels=["1–2周", "3–6周", "7–12周", "13–18周", "19–26周", "超过26周"],
-        include_lowest=True)
-    work["Confirm_Spread_Group"] = pd.cut(
-        numeric(work, "Confirm_KD_Spread"),
-        bins=[-np.inf, 2, 5, 10, np.inf],
-        labels=["≤2", "2–5", "5–10", ">10"])
-    work["Prev_Swing1_Peak_Group"] = pd.cut(
-        numeric(work, "Prev_Swing1_Peak_K"),
-        bins=[-np.inf, 50, 65, 70, 75, np.inf],
-        labels=["<50", "50–65", "65–70", "70–75", "≥75"])
-    work["Prior_History_Completeness"] = np.select(
-        [
-            numeric(work, "Prior_Swings_Available").ge(3),
-            numeric(work, "Prior_Swings_Available").eq(2),
-            numeric(work, "Prior_Swings_Available").eq(1),
-        ],
-        ["有3次历史波段", "有2次历史波段", "仅1次历史波段"],
-        default="无已完成历史波段")
+    work["History75_Count_Group"] = numeric(work, "Prior_3_Count_Peak_GE75").fillna(0).astype(int)
     return work
 
 
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线SKDJ确认结构审计 V4.3", layout="wide")
+    st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
-    st.caption("低位金叉只建立观察状态；不限6周等待首次上穿25；验证底部结构、历史股性和确认后K/D分离。")
-    with st.expander("V4.3验证规则", expanded=True):
+    st.caption("首次上穿25只是预确认；再等一周持续分离后才生成可买信号，并从下一交易日开盘重新判卷。")
+    with st.expander("V4.4验证规则", expanded=True):
         st.markdown(f"""
-- **唯一买入规则**：完整周线K、D均≤25时首次低位金叉，进入观察状态；25以下反复金叉死叉合并为同一个底部周期。
-- **不限等待周数**：从底部周期开始，等待K首次由25下方上穿25，同时K>D且K继续上升；确认周后下一市场交易日开盘买入。
-- **买入前特征**：低位金叉距25的距离、等待周数、25以下停留周数、底部最低K/D、确认周K-D差值及变化速度。
-- **历史股性**：只使用当前底部金叉之前已经完成的普通金叉—死叉波段，记录最近1～3次最高K值及达到65/70/75的次数。
-- **持仓确认诊断**：确认后的第1、2周K、D是否同时上升且差值继续扩大。这是未来诊断字段，不参与当周买入筛选。
-- **收益判卷**：确认后次周开盘买入，输出W1～W12累计最大浮盈、最大回撤和期末净收益，并比较先到+10/+15/+20还是先到-10%。
-- **股票池**：申万历史科技行业，主板/创业板/科创板；低位金叉日和确认日均要求原始股价≥10元、流通市值≥100亿元。
-- **严禁未来泄漏**：本版不根据未来是否继续分离筛选买入事件，不自动挑选最优阈值，也不把最高价当作实际卖出价。
+- **观察池**：完整周线K、D均≤25时首次金叉，进入底部观察状态；25以下反复交叉合并为一个周期。
+- **预确认**：K首次从25下方上穿25且K>D、K上升；此时不买。
+- **最终买点**：再观察一个完整周，要求K、D同时上升、K>D、K≥25、K-D差值扩大；该周结束后的下一市场交易日开盘买。
+- **历史排序**：同周先按前3个已完成波段中触及75、70、65的次数排序，再按确认周差值扩大和K上升幅度排序，只取Top{TOP_K}做独立审计。
+- **退出对照**：固定持有5/8周；止损10%搭配止盈10/15/20%；浮盈10%或15%激活、从此前最高价回撤10%。所有动态退出最长观察W{AUDIT_WEEKS}。
+- **执行保守性**：同日止盈止损双触发按止损；跳空越过止损按开盘价；移动止损只使用前一日已知最高价。
+- **股票池**：申万历史科技行业，主板/创业板/科创板；低位金叉、预确认、最终确认均检查股价≥10元、流通市值≥100亿元。
+- **边界**：同周Top3是排名能力审计，不等同于“最多持有3只”的跨周组合回测；最终退出规则确定后再做持仓占位模拟。
 """)
     with st.sidebar:
         st.header("运行参数")
-        signal_start_date = st.date_input("确认信号开始", date(2023, 6, 5), key="v43_start")
-        signal_end_date = st.date_input("确认信号截止", date(2026, 6, 5), key="v43_end")
-        market_end_date = st.date_input("行情观察截止", date.today(), key="v43_market_end")
-        split_date_value = st.date_input("近期行情分界", date(2025, 6, 1), key="v43_split")
-        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v43_pause")
-        use_cache = st.checkbox("复用逐股票缓存", True, key="v43_cache")
+        signal_start_date = st.date_input("最终信号开始", date(2023, 6, 5), key="v44_start")
+        signal_end_date = st.date_input("最终信号截止", date(2026, 6, 5), key="v44_end")
+        market_end_date = st.date_input("行情观察截止", date.today(), key="v44_market_end")
+        split_date_value = st.date_input("近期行情分界", date(2025, 6, 1), key="v44_split")
+        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v44_pause")
+        use_cache = st.checkbox("复用逐股票缓存", True, key="v44_cache")
         st.divider()
-        commission_pct = st.number_input(
-            "佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v43_commission")
-        stamp_duty_pct = st.number_input(
-            "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v43_stamp")
-        transfer_fee_pct = st.number_input(
-            "过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v43_transfer")
-        if st.button("清除本程序行情缓存", key="v43_clear"):
+        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v44_commission")
+        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v44_stamp")
+        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v44_transfer")
+        if st.button("清除本程序行情缓存", key="v44_clear"):
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
             st.success("缓存已清除")
 
-    token = st.text_input("Tushare Token", type="password", key="v43_token")
-    session_key = "weekly_skdj_confirmation_structure_v43_zip"
+    token = st.text_input("Tushare Token", type="password", key="v44_token")
+    session_key = "weekly_skdj_persistent_separation_v44_zip"
+    result_name = "weekly_skdj_persistent_separation_entry_v4_4_all_results.zip"
     if not token:
-        st.info("请输入Tushare Token；日期范围一致时可复用V4.2逐股票缓存。")
+        st.info("请输入Tushare Token；日期范围一致时可复用旧版逐股票行情缓存。")
         return
-    if not st.button("开始V4.3确认结构审计", type="primary", key="v43_run"):
+    if not st.button("开始V4.4持续分离买点审计", type="primary", key="v44_run"):
         if session_key in st.session_state:
-            st.download_button(
-                "下载上一次结果ZIP", st.session_state[session_key],
-                file_name="weekly_skdj_confirmation_structure_audit_v4_3_all_results.zip",
-                mime="application/zip", on_click="ignore")
+            st.download_button("下载上一次结果ZIP", st.session_state[session_key],
+                               file_name=result_name, mime="application/zip", on_click="ignore")
         return
 
     error = validate_dates(signal_start_date, signal_end_date, market_end_date)
     if error:
         st.error(error)
         return
-    if (market_end_date - signal_end_date).days < 100:
-        st.warning("观察截止日距离确认信号截止日不足100天，末端事件可能没有完整W12；程序仍会继续并单独标记成熟样本。")
+    if (market_end_date - signal_end_date).days < 70:
+        st.warning("观察截止日距离最终信号截止日不足70天，末端事件可能没有完整W8；程序会单独标记成熟样本。")
 
     API_ERRORS = []
     ts.set_token(token)
@@ -1042,8 +1302,7 @@ def main() -> None:
         with st.spinner("加载交易日历与申万历史科技池..."):
             open_dates = load_trade_calendar(preload, market_end)
             extended_end = (market_end_date + timedelta(days=7)).strftime("%Y%m%d")
-            full_open_dates = load_trade_calendar(preload, extended_end)
-            week_last_map = complete_week_last_dates(full_open_dates)
+            week_last_map = complete_week_last_dates(load_trade_calendar(preload, extended_end))
             market_weeks = market_week_sequence(open_dates)
             stock_basic = load_stock_basic()
             memberships = load_tech_memberships(float(pause))
@@ -1054,8 +1313,7 @@ def main() -> None:
     period_index = build_period_index(memberships)
     codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
     stocks = stock_basic[stock_basic["ts_code"].isin(codes)].copy()
-    stocks = stocks[
-        ~stocks["list_date"].gt(signal_end) & ~stocks["delist_date"].lt(preload)].copy()
+    stocks = stocks[~stocks["list_date"].gt(signal_end) & ~stocks["delist_date"].lt(preload)].copy()
     stocks["Sample_Board"] = stocks.apply(sample_board, axis=1)
     stocks = stocks.sort_values("ts_code").reset_index(drop=True)
     population = stocks.groupby("Sample_Board").size().reindex(
@@ -1063,15 +1321,15 @@ def main() -> None:
     open_pos = {day: position for position, day in enumerate(open_dates)}
 
     cycle_rows: list[dict[str, Any]] = []
-    confirmed_rows: list[dict[str, Any]] = []
+    preliminary_rows: list[dict[str, Any]] = []
+    entry_rows: list[dict[str, Any]] = []
     cache_hits = data_failures = 0
     progress, status = st.progress(0.0), st.empty()
     for number, stock in stocks.iterrows():
         code = str(stock["ts_code"])
-        progress.progress(
-            (number + 1) / max(len(stocks), 1), text=f"{number + 1}/{len(stocks)} {code}")
+        progress.progress((number + 1) / max(len(stocks), 1), text=f"{number + 1}/{len(stocks)} {code}")
         status.caption(
-            f"底部周期 {len(cycle_rows)}；上穿25确认 {len(confirmed_rows)}；"
+            f"底部周期 {len(cycle_rows)}；预确认 {len(preliminary_rows)}；最终信号 {len(entry_rows)}；"
             f"缓存 {cache_hits}；失败 {data_failures}")
         daily, daily_basic, cache_hit = fetch_stock_history(
             code, preload, market_end, bool(use_cache), float(pause))
@@ -1079,147 +1337,128 @@ def main() -> None:
         if daily.empty:
             data_failures += 1
             continue
-        cycle_part, confirmed_part = analyze_stock(
+        cycle_part, preliminary_part, entry_part = analyze_stock(
             stock, period_index.get(code, []), daily, daily_basic, week_last_map,
             open_dates, open_pos, market_weeks, config)
         cycle_rows.extend(cycle_part)
-        confirmed_rows.extend(confirmed_part)
+        preliminary_rows.extend(preliminary_part)
+        entry_rows.extend(entry_part)
     progress.empty()
     status.empty()
 
     cycles = pd.DataFrame(cycle_rows)
-    confirmed = pd.DataFrame(confirmed_rows)
-    if confirmed.empty:
-        st.error("研究区间没有生成符合股票池的上穿25确认事件。")
+    preliminary = pd.DataFrame(preliminary_rows)
+    entries = pd.DataFrame(entry_rows)
+    if entries.empty:
+        st.error("研究区间没有生成符合股票池且通过W1持续分离的最终买入信号。")
         return
-    dt = pd.to_datetime(confirmed["Signal_Date"].astype(str), format="%Y%m%d", errors="coerce")
-    confirmed["Signal_Year"] = confirmed["Signal_Date"].astype(str).str[:4]
-    confirmed["Signal_Half_Year"] = (
-        confirmed["Signal_Year"] + "H" + np.where(dt.dt.month.le(6), "1", "2"))
-    confirmed = add_audit_groups(confirmed)
+    dt = pd.to_datetime(entries["Signal_Date"].astype(str), format="%Y%m%d", errors="coerce")
+    entries["Signal_Year"] = entries["Signal_Date"].astype(str).str[:4]
+    entries["Signal_Half_Year"] = entries["Signal_Year"] + "H" + np.where(dt.dt.month.le(6), "1", "2")
+    entries = rank_same_week(add_groups(entries))
 
-    quality = outcome_summary(confirmed)
-    path = weekly_path_audit(confirmed)
-    first_hit = first_hit_audit(confirmed)
-    wait_audit = grouped_outcome_audit(confirmed, "Wait_Group")
-    gap_audit = grouped_outcome_audit(confirmed, "Low_Cross_Gap_Group")
-    gap_wait_audit = grouped_outcome_audit(
-        confirmed, ["Low_Cross_Gap_Group", "Wait_Group"])
-    bottom_depth_audit = grouped_outcome_audit(confirmed, "Bottom_Depth_Group")
-    bottom_weeks_audit = grouped_outcome_audit(confirmed, "Bottom_Weeks_Group")
-    prior1_audit = grouped_outcome_audit(confirmed, "Prev_Swing1_Peak_Group")
-    history_completeness = grouped_outcome_audit(confirmed, "Prior_History_Completeness")
-    prior_threshold_parts = []
-    for level in HISTORY_PEAK_LEVELS:
-        column = f"Prior_3_Count_Peak_GE{int(level)}"
-        part = grouped_outcome_audit(confirmed, column)
-        if not part.empty:
-            part.insert(0, "历史峰值门槛", int(level))
-            prior_threshold_parts.append(part)
-    prior_threshold_audit = (
-        pd.concat(prior_threshold_parts, ignore_index=True)
-        if prior_threshold_parts else pd.DataFrame())
-    confirm_spread_audit = grouped_outcome_audit(confirmed, "Confirm_Spread_Group")
-    confirm_rising_audit = grouped_outcome_audit(confirmed, "Confirm_Both_Rising")
-    post_w1_audit = grouped_outcome_audit(confirmed, "Post_Confirm_W1_Strong_Separation")
-    post_w2_audit = grouped_outcome_audit(confirmed, "Post_Confirm_W2_Strong_Separation")
-    year_audit = grouped_outcome_audit(confirmed, "Signal_Year")
-    half_year_audit = grouped_outcome_audit(confirmed, "Signal_Half_Year")
-    trend_audit = grouped_outcome_audit(confirmed, "Individual_Trend")
-    calendar = signal_week_calendar(open_dates, signal_start, signal_end, confirmed)
-    counts = calendar["Confirmed_Signals"]
-    mature = mature_confirmed(confirmed)
-    unresolved = (
-        cycles[
-            cycles["Eligible_Low_Cross_Pool"].map(to_bool)
-            & ~cycles["Confirmed_Event"].map(to_bool)
-        ].copy() if not cycles.empty else pd.DataFrame())
+    quality = outcome_summary(entries)
+    path = weekly_path_audit(entries)
+    first_hit = first_hit_audit(entries)
+    exits_all = exit_policy_audit(entries)
+    exits_year = exit_policy_audit(entries, "Signal_Year")
+    exits_top3 = exit_policy_audit(entries[entries["Selected_Top3"].map(to_bool)])
+    history75 = grouped_outcome_audit(entries, "History75_Count_Group")
+    year_audit = grouped_outcome_audit(entries, "Signal_Year")
+    half_year_audit = grouped_outcome_audit(entries, "Signal_Half_Year")
+    trend_audit = grouped_outcome_audit(entries, "Individual_Trend")
+    wait_audit = grouped_outcome_audit(entries, "Total_Wait_Group")
+    rank_compare, random_trials = top3_random_audit(entries)
+    calendar = signal_week_calendar(open_dates, signal_start, signal_end, entries)
+    counts = calendar["Final_Entry_Signals"]
+    mature = mature_entries(entries)
+    prelim_eligible = (
+        preliminary[preliminary["Eligible_Preliminary"].map(to_bool)].copy()
+        if not preliminary.empty else pd.DataFrame())
+    prelim_summary = pd.DataFrame([{
+        "全部预确认": len(preliminary), "股票池合格预确认": len(prelim_eligible),
+        "W1持续分离": int(prelim_eligible["W1_Strong_Separation"].map(to_bool).sum()) if not prelim_eligible.empty else 0,
+        "W1未持续分离": int((~prelim_eligible["W1_Strong_Separation"].map(to_bool)).sum()) if not prelim_eligible.empty else 0,
+        "持续分离通过率%": (
+            prelim_eligible["W1_Strong_Separation"].map(to_bool).mean() * 100 if not prelim_eligible.empty else np.nan),
+    }])
 
     run_summary = pd.DataFrame([{
-        "程序": TITLE, "版本": VERSION, "确认信号开始": signal_start,
-        "确认信号截止": signal_end, "观察截止": market_end,
-        "底部周期明细": len(cycles), "未确认观察状态": len(unresolved),
-        "确认买事件": len(confirmed), "确认买不同股票": confirmed["ts_code"].nunique(),
-        "W12成熟事件": len(mature), "自然周": len(calendar),
-        "有确认信号周": int(counts.gt(0).sum()), "空窗周": int(counts.eq(0).sum()),
-        "最长空窗周": max_empty_run(counts), "每周确认数均值": counts.mean(),
-        "每周确认数中位数": counts.median(), "单周最多": counts.max(),
-        "等待周数中位数": numeric(confirmed, "Wait_Weeks").median(),
-        "等待周数最大值": numeric(confirmed, "Wait_Weeks").max(),
+        "程序": TITLE, "版本": VERSION, "最终信号开始": signal_start,
+        "最终信号截止": signal_end, "观察截止": market_end,
+        "底部周期": len(cycles), "预确认事件": len(preliminary),
+        "最终买入信号": len(entries), "不同股票": entries["ts_code"].nunique(),
+        "W8成熟事件": len(mature), "自然周": len(calendar),
+        "有信号周": int(counts.gt(0).sum()), "空窗周": int(counts.eq(0).sum()),
+        "最长连续空窗周": max_empty_run(counts), "每周信号均值": counts.mean(),
+        "每周信号中位数": counts.median(), "单周最多": counts.max(),
+        "同周Top3事件": int(entries["Selected_Top3"].map(to_bool).sum()),
         "行情失败": data_failures, "缓存命中": cache_hits,
     }])
 
     metadata = pd.DataFrame([
-        ("底部周期", "K、D均≤25时首次低位金叉启动观察；上穿25前的反复金叉死叉合并，不重复生成买入事件"),
-        ("确认买入", "不设6周失效期；K首次从25下方上穿25、K>D且K继续上升；完整确认周后下一市场交易日开盘买入"),
-        ("历史波段", "普通SKDJ金叉至随后死叉为一个已完成波段；当前底部金叉之前已经完成的最近1～3个波段才可用于买入时特征"),
-        ("历史峰值阈值", "同时报告65、70、75三个门槛，不按本次全样本结果自动挑选"),
-        ("确认周分离", "Confirm_KD_Spread及K/D一周变化在买入前已知，可用于特征分析"),
-        ("确认后分离", "Post_Confirm_W1/W2是买入后的未来持仓诊断，严禁回填到买入筛选或排序"),
-        ("W1至W12", "W1为买入所在市场周；累计最大浮盈、最大回撤和期末收益均从次周开盘成交后计算"),
-        ("最高价", "最大浮盈仅描述机会，不视为可实现卖出价；实际退出规则留待结构验证后单独审计"),
+        ("预确认", "K首次从25下方上穿25且K>D、K上升；此周不买"),
+        ("最终买点", "预确认后再等一个完整周；K、D均上升、K>D、K≥25且差值扩大；下一市场交易日开盘买"),
+        ("排名", "同周依次按过去3个已完成波段触及75/70/65次数、确认周差值扩大、K上升排序"),
+        ("历史信息边界", "只有最终信号日前已经完成的金叉—死叉波段进入历史评分"),
+        ("Top3边界", "同周Top3只验证排序，不处理前一周持仓尚未退出造成的仓位占用"),
+        ("动态退出上限", f"止盈止损和移动回撤最长观察W{AUDIT_WEEKS}，未触发则W8收盘退出"),
+        ("移动止损", "先用固定-10%止损；达到激活浮盈后，从前一交易日已知最高价回撤10%，且保护价不低于成本原价"),
+        ("同日歧义", "止盈与止损同日触发时保守按止损；跳空跌破保护价按开盘价"),
         ("成本", "买卖均计0.2%滑点、佣金和过户费，卖出另计印花税"),
-        ("股票池", "申万历史科技行业；主板/创业板/科创板；低位金叉日及确认日股价≥10元、流通市值≥100亿元"),
-        ("观察上限", "没有人为等待周数上限；尚未确认事件只表示截至行情观察日仍在观察，不能称为永久失败"),
-        ("未使用", "月线、分钟线、未来分离筛选、自动评分、事后最优参数、最高价卖出"),
+        ("股票池", "申万历史科技行业；主板/创业板/科创板；三个信号节点均检查股价≥10元、流通市值≥100亿元"),
+        ("未使用", "月线、分钟线、未来W2信息、最高价卖出、全样本自动调参"),
     ], columns=["项目", "说明"])
 
     files = {
-        "01_run_summary_v4_3.csv": run_summary,
-        "02_confirmed_buy_rule_quality_v4_3.csv": quality,
-        "03_confirmed_w1_w12_path_v4_3.csv": path,
-        "04_first_hit_profit_vs_stop_v4_3.csv": first_hit,
-        "05_wait_week_group_v4_3.csv": wait_audit,
-        "06_low_cross_gap_group_v4_3.csv": gap_audit,
-        "07_gap_x_wait_interaction_v4_3.csv": gap_wait_audit,
-        "08_bottom_depth_group_v4_3.csv": bottom_depth_audit,
-        "09_bottom_duration_group_v4_3.csv": bottom_weeks_audit,
-        "10_previous_swing1_peak_group_v4_3.csv": prior1_audit,
-        "11_prior_history_completeness_v4_3.csv": history_completeness,
-        "12_prior_3_swing_threshold_counts_v4_3.csv": prior_threshold_audit,
-        "13_confirm_week_spread_group_v4_3.csv": confirm_spread_audit,
-        "14_confirm_week_both_rising_v4_3.csv": confirm_rising_audit,
-        "15_post_confirm_w1_separation_diagnostic_v4_3.csv": post_w1_audit,
-        "16_post_confirm_w2_separation_diagnostic_v4_3.csv": post_w2_audit,
-        "17_year_stability_v4_3.csv": year_audit,
-        "18_half_year_stability_v4_3.csv": half_year_audit,
-        "19_individual_trend_v4_3.csv": trend_audit,
-        "20_weekly_signal_calendar_v4_3.csv": calendar,
-        "21_all_confirmed_events_v4_3.csv": confirmed,
-        "22_all_bottom_cycles_v4_3.csv": cycles,
-        "23_unresolved_bottom_cycles_v4_3.csv": unresolved,
-        "24_full_tech_universe_v4_3.csv": stocks,
-        "25_board_population_v4_3.csv": population,
-        "26_rejection_audit_v4_3.csv": pd.DataFrame(
+        "01_run_summary_v4_4.csv": run_summary,
+        "02_final_entry_rule_quality_v4_4.csv": quality,
+        "03_entry_w1_w8_path_v4_4.csv": path,
+        "04_first_hit_profit_vs_stop_w8_v4_4.csv": first_hit,
+        "05_exit_policy_comparison_all_v4_4.csv": exits_all,
+        "06_exit_policy_by_year_v4_4.csv": exits_year,
+        "07_exit_policy_same_week_top3_v4_4.csv": exits_top3,
+        "08_history75_count_group_v4_4.csv": history75,
+        "09_top3_vs_random_top3_v4_4.csv": rank_compare,
+        "10_random_top3_500_trials_v4_4.csv": random_trials,
+        "11_year_stability_v4_4.csv": year_audit,
+        "12_half_year_stability_v4_4.csv": half_year_audit,
+        "13_individual_trend_v4_4.csv": trend_audit,
+        "14_total_wait_group_v4_4.csv": wait_audit,
+        "15_weekly_signal_calendar_v4_4.csv": calendar,
+        "16_preconfirmation_to_separation_summary_v4_4.csv": prelim_summary,
+        "17_all_final_entry_events_v4_4.csv": entries,
+        "18_same_week_top3_events_v4_4.csv": entries[entries["Selected_Top3"].map(to_bool)].copy(),
+        "19_all_preconfirmation_events_v4_4.csv": preliminary,
+        "20_all_bottom_cycles_v4_4.csv": cycles,
+        "21_full_tech_universe_v4_4.csv": stocks,
+        "22_board_population_v4_4.csv": population,
+        "23_rejection_audit_v4_4.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "27_api_errors_v4_3.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "28_metadata_v4_3.csv": metadata,
+        "24_api_errors_v4_4.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "25_metadata_v4_4.csv": metadata,
     }
     result_zip = make_zip(files)
     st.session_state[session_key] = result_zip
     st.success(
-        f"完成：上穿25确认{len(confirmed)}个，W12成熟{len(mature)}个；"
+        f"完成：最终信号{len(entries)}个，W8成熟{len(mature)}个；"
         f"有信号周{int(counts.gt(0).sum())}，空窗{int(counts.eq(0).sum())}周。")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("确认买事件", len(confirmed))
-    c2.metric("W12成熟事件", len(mature))
+    c1.metric("最终买入信号", len(entries))
+    c2.metric("W8成熟事件", len(mature))
     c3.metric("有信号周", int(counts.gt(0).sum()))
     c4.metric("空窗周", int(counts.eq(0).sum()))
-    st.subheader("唯一可执行买入规则")
+    st.subheader("最终买点整体表现")
     st.dataframe(quality, use_container_width=True, hide_index=True)
-    st.subheader("等待周数分组")
-    st.dataframe(wait_audit, use_container_width=True, hide_index=True)
-    st.subheader("金叉深度×等待时间")
-    st.dataframe(gap_wait_audit, use_container_width=True, hide_index=True)
-    st.subheader("前1～3次历史波段冲击65/70/75")
-    st.dataframe(prior_threshold_audit, use_container_width=True, hide_index=True)
-    st.subheader("确认后第1周K/D继续分离（仅持仓诊断）")
-    st.dataframe(post_w1_audit, use_container_width=True, hide_index=True)
-    st.download_button(
-        "下载V4.3全部结果ZIP", result_zip,
-        file_name="weekly_skdj_confirmation_structure_audit_v4_3_all_results.zip",
-        mime="application/zip", type="primary", key="v43_download", on_click="ignore")
-    st.info("优先查看07验证“金叉深度×底部等待时间”，查看12验证历史1～3次波段是否冲到65/70/75，查看15～16判断买入后K/D持续分离能否作为持仓确认。")
+    st.subheader("退出规则对照")
+    st.dataframe(exits_all, use_container_width=True, hide_index=True)
+    st.subheader("历史股性同周Top3与随机Top3")
+    st.dataframe(rank_compare, use_container_width=True, hide_index=True)
+    st.subheader("过去3个波段触及75的次数")
+    st.dataframe(history75, use_container_width=True, hide_index=True)
+    st.download_button("下载V4.4全部结果ZIP", result_zip, file_name=result_name,
+                       mime="application/zip", type="primary", key="v44_download", on_click="ignore")
+    st.info("优先看05判断退出方式，09判断历史股性Top3是否稳定优于随机，15检查信号覆盖与扎堆，17可逐笔核对真实买入价。")
 
 
 if __name__ == "__main__":
