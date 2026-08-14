@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-科技股周线SKDJ周级环境与同周排序审计 V3.9
+科技股周线SKDJ宽池、少硬筛与状态分层特征审计 V4.0
 
 目的：
-1. 硬候选池冻结为：完整周线SKDJ金叉位置20~35，并排除下跌趋势。
-2. 最近3周触及25为第一梯队；未触及25为第二梯队，仅在第一梯队不足时补位。
-3. 先检验同周候选广度、第一梯队数量和行业覆盖能否判断“本周是否值得买”。
-4. 梯队内部只比较板块共振、周波动收缩及二者等权，不再调整旧量价评分权重。
-5. Top2为主观察口径，同时保留Top1/Top3，并与遵守相同周级门槛和梯队顺序的随机选择比较。
+1. 恢复全部完整周线SKDJ金叉，不再用20~35、最近触底或周环境分截断候选池。
+2. 基础宽池只排除明确个股下跌趋势；其余旧条件全部降为待验证特征。
+3. 用上证指数完整周线把市场标记为上涨、震荡或下跌，只分层研究，不作为硬门槛。
+4. 在每周候选股内部审计相对强度、量价、波动收缩、SKDJ结构和上次金叉股性。
+5. 同时输出单特征Top3、反向Top3、随机基准、年度稳定性、覆盖率和三仓位容量诊断。
 6. 所有事件统一在周线确认后的下一市场交易日开盘买入，以20/40日固定终点、MFE和MAE判卷。
 
-注意：分层规则来自同一三年历史，本版是复核审计，不是独立样本外证明。
+注意：本版是特征发现审计，不生成最终评分公式；同一三年中表现好的特征仍需新时期验证。
 周线只使用完整周，所有特征只使用信号日及以前数据，未来结果只用于判卷。
 
 运行：streamlit run app.py
@@ -31,8 +31,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tushare as ts
-TITLE = "科技股周线SKDJ周级环境与同周排序审计 V3.9"
-VERSION = "V3.9-WEEKLY-SKDJ-WEEK-STATE-AND-RANK-AUDIT"
+TITLE = "科技股周线SKDJ宽池与状态分层特征审计 V4.0"
+VERSION = "V4.0-WEEKLY-SKDJ-WIDE-POOL-REGIME-FEATURE-AUDIT"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 
@@ -45,10 +45,10 @@ CROSS_ZONE_HIGH = 35.0
 INDICATOR_WARMUP_WEEKS = 40
 HOLD_20D = 20
 HOLD_40D = 40
-RANDOM_SEED = 20260813
+RANDOM_SEED = 20260814
 RANDOM_RUNS = 300
-HISTORY_WINDOW_WEEKS = 52
-MIN_HISTORY_WEEKS = 12
+BENCHMARK_CODE = "000001.SH"
+PORTFOLIO_SLOTS = 3
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -250,6 +250,57 @@ def load_trade_calendar(start_date: str, end_date: str) -> list[str]:
     return sorted(frame.loc[frame["is_open"].eq(1), "cal_date"].astype(str).tolist())
 
 
+@st.cache_data(ttl=24 * 3600)
+def load_benchmark_daily(start_date: str, end_date: str) -> pd.DataFrame:
+    frame = safe_get(
+        "index_daily", ts_code=BENCHMARK_CODE, start_date=start_date, end_date=end_date,
+        fields="ts_code,trade_date,open,high,low,close,vol")
+    if frame.empty:
+        record_error(f"基准指数{BENCHMARK_CODE}为空，市场状态将标记为未知")
+        return pd.DataFrame()
+    for column in ("open", "high", "low", "close", "vol"):
+        frame[column] = pd.to_numeric(frame.get(column), errors="coerce")
+    frame["trade_date"] = frame["trade_date"].astype(str)
+    return frame.dropna(subset=["trade_date", "open", "high", "low", "close"]).drop_duplicates(
+        "trade_date", keep="last").sort_values("trade_date").reset_index(drop=True)
+
+
+def build_market_week_state(daily: pd.DataFrame,
+                            week_last_map: dict[pd.Timestamp, str]) -> pd.DataFrame:
+    columns = [
+        "Signal_Date", "Market_State", "Market_Weekly_Close", "Market_MA20_Bias_pct",
+        "Market_MA20_Slope_4W_pct", "Market_Return_4W_pct", "Market_Return_12W_pct",
+    ]
+    if daily.empty:
+        return pd.DataFrame(columns=columns)
+    weekly = aggregate_weekly(daily)
+    weekly["calendar_week_last"] = weekly["week_label"].map(week_last_map)
+    weekly = weekly[
+        weekly["calendar_week_last"].notna()
+        & weekly["trade_date"].astype(str).eq(weekly["calendar_week_last"].astype(str))
+    ].copy().reset_index(drop=True)
+    close = weekly["close"]
+    ma20 = close.rolling(20).mean()
+    weekly["Market_MA20_Bias_pct"] = (close / ma20 - 1.0) * 100.0
+    weekly["Market_MA20_Slope_4W_pct"] = (ma20 / ma20.shift(4) - 1.0) * 100.0
+    weekly["Market_Return_4W_pct"] = close.pct_change(4, fill_method=None) * 100.0
+    weekly["Market_Return_12W_pct"] = close.pct_change(12, fill_method=None) * 100.0
+    up = (
+        weekly["Market_MA20_Bias_pct"].gt(0)
+        & weekly["Market_MA20_Slope_4W_pct"].gt(0)
+        & weekly["Market_Return_12W_pct"].gt(0)
+    )
+    down = (
+        weekly["Market_MA20_Bias_pct"].lt(0)
+        & weekly["Market_MA20_Slope_4W_pct"].lt(0)
+        & weekly["Market_Return_12W_pct"].lt(0)
+    )
+    weekly["Market_State"] = np.select([up, down], ["上涨", "下跌"], default="震荡")
+    weekly["Signal_Date"] = weekly["trade_date"].astype(str)
+    weekly["Market_Weekly_Close"] = weekly["close"]
+    return weekly[columns]
+
+
 def stock_cache_path(ts_code: str, start_date: str, end_date: str) -> str:
     return os.path.join(CACHE_DIR, f"{ts_code.replace('.', '_')}_{start_date}_{end_date}.pkl")
 
@@ -431,6 +482,8 @@ def weekly_features(weekly: pd.DataFrame, position: int) -> dict[str, Any]:
     recent6_min = float(recent6[["SKDJ_K", "SKDJ_D"]].min().min())
     level = (float(row["SKDJ_K"]) + float(row["SKDJ_D"])) / 2.0
     range_pct = (weekly["high"] / weekly["low"].replace(0, np.nan) - 1.0) * 100.0
+    ma10 = close.rolling(10).mean()
+    ma20 = close.rolling(20).mean()
     return {
         "Weekly_SKDJ_K": float(row["SKDJ_K"]), "Weekly_SKDJ_D": float(row["SKDJ_D"]),
         "Weekly_Cross_Level": level, "Weekly_Cross_Level_Bin": weekly_cross_bin(level),
@@ -443,10 +496,50 @@ def weekly_features(weekly: pd.DataFrame, position: int) -> dict[str, Any]:
         "Weekly_Return_1W_pct": float(close.pct_change(1, fill_method=None).iloc[position] * 100.0),
         "Weekly_Return_4W_pct": float(close.pct_change(4, fill_method=None).iloc[position] * 100.0),
         "Weekly_Return_12W_pct": float(close.pct_change(12, fill_method=None).iloc[position] * 100.0),
-        "Weekly_MA20_Bias_pct": float((close / close.rolling(20).mean() - 1.0).iloc[position] * 100.0),
+        "Weekly_MA10_Bias_pct": float((close / ma10 - 1.0).iloc[position] * 100.0),
+        "Weekly_MA20_Bias_pct": float((close / ma20 - 1.0).iloc[position] * 100.0),
+        "Weekly_MA20_Slope_4W_pct": float((ma20 / ma20.shift(4) - 1.0).iloc[position] * 100.0),
         "Weekly_Volume_Ratio_4_12": float((vol.rolling(4).mean() / vol.rolling(12).mean().replace(0, np.nan)).iloc[position]),
         "Weekly_Contraction_4_12": float((range_pct.rolling(4).mean() / range_pct.rolling(12).mean().replace(0, np.nan)).iloc[position]),
     }
+
+
+def previous_cross_features(weekly: pd.DataFrame, position: int, daily: pd.DataFrame,
+                            signal_date: str) -> dict[str, Any]:
+    """只使用当前信号日以前行情，刻画该股上一次周线SKDJ金叉后的真实股性。"""
+    defaults = {
+        "Previous_Cross_Date": "", "Weeks_Since_Previous_Cross": np.nan,
+        "Previous_Cross_Observed_Days": np.nan, "Previous_Cross_End_Return_pct": np.nan,
+        "Previous_Cross_MFE_pct": np.nan, "Previous_Cross_MAE_pct": np.nan,
+    }
+    prior_positions = [
+        idx for idx in range(INDICATOR_WARMUP_WEEKS, position)
+        if to_bool(weekly.iloc[idx].get("SKDJ_Golden_Cross"))
+    ]
+    if not prior_positions:
+        return defaults
+    previous_position = int(prior_positions[-1])
+    previous_date = str(weekly.iloc[previous_position]["trade_date"])
+    after_previous = daily[
+        daily["trade_date"].astype(str).gt(previous_date)
+        & daily["trade_date"].astype(str).le(signal_date)
+    ].sort_values("trade_date").head(HOLD_40D)
+    result = defaults.copy()
+    result["Previous_Cross_Date"] = previous_date
+    result["Weeks_Since_Previous_Cross"] = float(position - previous_position)
+    if after_previous.empty:
+        return result
+    entry = finite_num(after_previous.iloc[0].get("open"))
+    if not math.isfinite(entry) or entry <= 0:
+        return result
+    observed = len(after_previous)
+    result.update({
+        "Previous_Cross_Observed_Days": float(observed),
+        "Previous_Cross_End_Return_pct": (finite_num(after_previous.iloc[-1].get("close")) / entry - 1.0) * 100.0,
+        "Previous_Cross_MFE_pct": (pd.to_numeric(after_previous["high"], errors="coerce").max() / entry - 1.0) * 100.0,
+        "Previous_Cross_MAE_pct": (pd.to_numeric(after_previous["low"], errors="coerce").min() / entry - 1.0) * 100.0,
+    })
+    return result
 
 
 def daily_features_at_signal(daily: pd.DataFrame, signal_date: str) -> dict[str, Any]:
@@ -556,6 +649,7 @@ def build_event(stock: pd.Series, membership: dict[str, str], weekly: pd.DataFra
         "Board_STAR": float(board == "科创板"),
     }
     event.update(daily_features_at_signal(daily, signal_date))
+    event.update(previous_cross_features(weekly, position, daily, signal_date))
     event.update(direct_outcomes(daily, signal_date, str(stock["ts_code"]), open_dates, open_pos, config))
     return event
 
@@ -588,394 +682,480 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
     return records
 
 
-def add_cross_section_features(events: pd.DataFrame) -> pd.DataFrame:
-    frame = events.copy()
-    frame["Week_Signal_Count"] = frame.groupby("Signal_Date")["ts_code"].transform("size").astype(float)
-    frame["Industry_Signal_Count"] = frame.groupby(["Signal_Date", "SW_L1"])["ts_code"].transform("size").astype(float)
-    frame["Signal_Date_dt"] = pd.to_datetime(frame["Signal_Date"], format="%Y%m%d", errors="coerce")
-    frame["Outcome_40D_End_dt"] = pd.to_datetime(frame["Outcome_40D_End_Date"], format="%Y%m%d", errors="coerce")
-    frame["Half_Year"] = frame["Signal_Date_dt"].dt.year.astype("Int64").astype(str) + "H" + np.where(frame["Signal_Date_dt"].dt.month.le(6), "1", "2")
-    weekly_bias = pd.to_numeric(frame["Weekly_MA20_Bias_pct"], errors="coerce")
-    weekly_return = pd.to_numeric(frame["Weekly_Return_12W_pct"], errors="coerce")
-    daily_bias = pd.to_numeric(frame["Daily_MA60_Bias_pct"], errors="coerce")
-    downtrend = weekly_bias.lt(0) & weekly_return.lt(0) & daily_bias.lt(0)
-    uptrend = weekly_bias.gt(0) & weekly_return.gt(0) & daily_bias.gt(0)
-    frame["Trend_State"] = np.select(
-        [uptrend, downtrend], ["上涨趋势", "下跌趋势"], default="震荡或转换")
-    frame["Downtrend_Hard_Excluded"] = downtrend
-    frame["Tiered_Hard_Pool"] = (
-        frame["Cross_In_20_35"].map(to_bool)
-        & ~downtrend
-        & frame["Tradable"].map(to_bool)
-        & frame["Has_40D_Future"].map(to_bool)
-    )
-    frame["Tier_Number"] = np.where(
-        frame["Recent_3W_Touched_25"].map(to_bool), 1, 2).astype(int)
-    frame["Tier_Label"] = np.where(
-        frame["Tier_Number"].eq(1), "第一梯队_近3周触及25", "第二梯队_未触及25补位")
-    return frame
-
-
-def pool_calendar(open_dates: list[str], start: str, end: str, events: pd.DataFrame) -> pd.DataFrame:
-    days = pd.DataFrame({"trade_date": [day for day in open_dates if start <= day <= end]})
-    days["dt"] = pd.to_datetime(days["trade_date"])
-    days["week"] = days["dt"].dt.to_period("W-FRI")
-    weeks = days.groupby("week")["trade_date"].max().rename("Week_Last_Trade_Date").reset_index(drop=True).to_frame()
-    counts = events.groupby("Signal_Date").size()
-    core_counts = events[events["Bottom_Reset_Core"].map(to_bool)].groupby("Signal_Date").size()
-    weeks["All_Cross_Count"] = weeks["Week_Last_Trade_Date"].map(counts).fillna(0).astype(int)
-    weeks["Original_Core_Count"] = weeks["Week_Last_Trade_Date"].map(core_counts).fillna(0).astype(int)
-    weeks["All_Empty"] = weeks["All_Cross_Count"].eq(0)
-    weeks["Original_Core_Empty"] = weeks["Original_Core_Count"].eq(0)
-    return weeks
-
-
-def build_tiered_pool(events: pd.DataFrame) -> pd.DataFrame:
-    pool = events[events["Tiered_Hard_Pool"].map(to_bool)].copy()
-    if pool.empty:
-        return pool
-    group_keys = [pool["Signal_Date"], pool["Tier_Number"]]
-    resonance = pd.to_numeric(pool["Industry_Signal_Count"], errors="coerce")
-    contraction = pd.to_numeric(pool["Weekly_Contraction_4_12"], errors="coerce")
-    pool["Score_Industry_Resonance"] = resonance.groupby(group_keys).rank(
-        pct=True, method="average", ascending=True).fillna(0.0)
-    pool["Score_Weekly_Contraction"] = contraction.groupby(group_keys).rank(
-        pct=True, method="average", ascending=False).fillna(0.0)
-    pool["Score_Resonance_Contraction"] = pool[
-        ["Score_Industry_Resonance", "Score_Weekly_Contraction"]
-    ].mean(axis=1)
-    pool["Hard_Pool_Weekly_Count"] = pool.groupby("Signal_Date")["ts_code"].transform("size")
-    tier1_counts = pool[pool["Tier_Number"].eq(1)].groupby("Signal_Date").size()
-    pool["Tier1_Weekly_Count"] = pool["Signal_Date"].map(tier1_counts).fillna(0).astype(int)
-    return pool.sort_values(["Signal_Date", "Tier_Number", "ts_code"]).reset_index(drop=True)
-
-
-RANK_METHODS = {
-    "板块共振": "Score_Industry_Resonance",
-    "周波动收缩": "Score_Weekly_Contraction",
-    "板块共振+周波动收缩等权": "Score_Resonance_Contraction",
+V40_FEATURE_SPECS: dict[str, str] = {
+    "周线SKDJ金叉位置": "Weekly_Cross_Level",
+    "近3周SKDJ最低值": "Recent_3W_Min_SKDJ",
+    "周K一周斜率": "Weekly_SKDJ_K_Change_1W",
+    "周D一周斜率": "Weekly_SKDJ_D_Change_1W",
+    "周线4周涨幅": "Weekly_Return_4W_pct",
+    "周线12周涨幅": "Weekly_Return_12W_pct",
+    "周线MA10偏离": "Weekly_MA10_Bias_pct",
+    "周线MA20偏离": "Weekly_MA20_Bias_pct",
+    "周线MA20四周斜率": "Weekly_MA20_Slope_4W_pct",
+    "周成交量4比12": "Weekly_Volume_Ratio_4_12",
+    "周波动收缩4比12": "Weekly_Contraction_4_12",
+    "日线SKDJ位置": "Daily_SKDJ_Level_At_Cross",
+    "日线5日涨幅": "Daily_Return_5D_pct",
+    "日线20日涨幅": "Daily_Return_20D_pct",
+    "日线60日涨幅": "Daily_Return_60D_pct",
+    "日线MA20偏离": "Daily_MA20_Bias_pct",
+    "日线MA60偏离": "Daily_MA60_Bias_pct",
+    "日成交量5比20": "Daily_Volume_Ratio_5_20",
+    "换手率": "Turnover_Rate",
+    "日ATR14": "Daily_ATR14_pct",
+    "日线10日振幅": "Daily_Amplitude_10D_pct",
+    "距离60日高点": "Distance_60D_High_pct",
+    "同周候选20日相对强度": "Candidate_RS20_Pct",
+    "同周候选60日相对强度": "Candidate_RS60_Pct",
+    "相对同周同行业20日强度": "Industry_Relative_RS20_pct",
+    "同周行业共振强度": "Industry_Resonance_Pct",
+    "同周量比排名": "Candidate_Volume_Rank_Pct",
+    "距上次周线金叉周数": "Weeks_Since_Previous_Cross",
+    "上次金叉后最多40日收益": "Previous_Cross_End_Return_pct",
+    "上次金叉后最多40日最大涨幅": "Previous_Cross_MFE_pct",
+    "上次金叉后最多40日最大回撤": "Previous_Cross_MAE_pct",
 }
 
 
-WEEK_GATES = (
-    "全部硬池周",
-    "第一梯队存在",
-    "硬池候选至少2只",
-    "历史周环境分≥50",
-    "历史周环境分≥70",
-)
+def v40_add_research_features(events: pd.DataFrame, market_state: pd.DataFrame) -> pd.DataFrame:
+    frame = events.copy()
+    frame["Signal_Date"] = frame["Signal_Date"].astype(str)
+    frame["Signal_Date_dt"] = pd.to_datetime(frame["Signal_Date"], format="%Y%m%d", errors="coerce")
+    frame["Year"] = frame["Signal_Date"].str[:4]
+    frame["Half_Year"] = frame["Year"] + "H" + np.where(frame["Signal_Date_dt"].dt.month.le(6), "1", "2")
+    frame["Week_Signal_Count"] = frame.groupby("Signal_Date")["ts_code"].transform("size").astype(float)
+    frame["Industry_Signal_Count"] = frame.groupby(["Signal_Date", "SW_L1"])["ts_code"].transform("size").astype(float)
+    if market_state.empty:
+        frame["Market_State"] = "未知"
+        for column in (
+            "Market_Weekly_Close", "Market_MA20_Bias_pct", "Market_MA20_Slope_4W_pct",
+            "Market_Return_4W_pct", "Market_Return_12W_pct",
+        ):
+            frame[column] = np.nan
+    else:
+        frame = frame.merge(market_state, on="Signal_Date", how="left")
+        frame["Market_State"] = frame["Market_State"].fillna("未知")
 
+    weekly_bias = pd.to_numeric(frame["Weekly_MA20_Bias_pct"], errors="coerce")
+    weekly_slope = pd.to_numeric(frame["Weekly_MA20_Slope_4W_pct"], errors="coerce")
+    weekly_return = pd.to_numeric(frame["Weekly_Return_12W_pct"], errors="coerce")
+    daily_bias = pd.to_numeric(frame["Daily_MA60_Bias_pct"], errors="coerce")
+    downtrend = weekly_bias.lt(0) & weekly_slope.lt(0) & weekly_return.lt(0) & daily_bias.lt(0)
+    uptrend = weekly_bias.gt(0) & weekly_slope.gt(0) & weekly_return.gt(0) & daily_bias.gt(0)
+    frame["Individual_Trend_State"] = np.select([uptrend, downtrend], ["上涨", "下跌"], default="震荡或转换")
+    frame["Individual_Downtrend"] = downtrend
+    frame["Mature_Tradable"] = frame["Tradable"].map(to_bool) & frame["Has_40D_Future"].map(to_bool)
+    frame["Wide_Pool"] = frame["Mature_Tradable"] & ~frame["Individual_Downtrend"]
 
-def trailing_percentile(values: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(values, errors="coerce").fillna(0.0)
-    result = pd.Series(np.nan, index=numeric.index, dtype=float)
-    for position, current in enumerate(numeric):
-        history = numeric.iloc[max(0, position - HISTORY_WINDOW_WEEKS):position]
-        if len(history) >= MIN_HISTORY_WEEKS:
-            result.iloc[position] = float(history.le(current).mean() * 100.0)
-    return result
-
-
-def build_week_state(calendar: pd.DataFrame, events: pd.DataFrame,
-                     pool: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    state = calendar[["Week_Last_Trade_Date"]].copy()
-    state["Week_Last_Trade_Date"] = state["Week_Last_Trade_Date"].astype(str)
-    all_counts = events.groupby(events["Signal_Date"].astype(str)).size()
-    hard_counts = pool.groupby(pool["Signal_Date"].astype(str)).size()
-    tier1_counts = pool[pool["Tier_Number"].eq(1)].groupby(
-        pool.loc[pool["Tier_Number"].eq(1), "Signal_Date"].astype(str)).size()
-    industry_counts = pool.groupby(pool["Signal_Date"].astype(str))["SW_L1"].nunique()
-    state["All_Cross_Count"] = state["Week_Last_Trade_Date"].map(all_counts).fillna(0).astype(int)
-    state["Hard_Pool_Count"] = state["Week_Last_Trade_Date"].map(hard_counts).fillna(0).astype(int)
-    state["Tier1_Count"] = state["Week_Last_Trade_Date"].map(tier1_counts).fillna(0).astype(int)
-    state["Tier2_Count"] = state["Hard_Pool_Count"] - state["Tier1_Count"]
-    state["Industry_Breadth"] = state["Week_Last_Trade_Date"].map(industry_counts).fillna(0).astype(int)
-    state["Tier1_Ratio_pct"] = np.where(
-        state["Hard_Pool_Count"].gt(0), state["Tier1_Count"] / state["Hard_Pool_Count"] * 100.0, np.nan)
     for source, target in (
-        ("All_Cross_Count", "All_Cross_History_Pct"),
-        ("Hard_Pool_Count", "Hard_Pool_History_Pct"),
-        ("Industry_Breadth", "Industry_Breadth_History_Pct"),
+        ("Daily_Return_20D_pct", "Candidate_RS20_Pct"),
+        ("Daily_Return_60D_pct", "Candidate_RS60_Pct"),
+        ("Daily_Volume_Ratio_5_20", "Candidate_Volume_Rank_Pct"),
     ):
-        state[target] = trailing_percentile(state[source])
-    state["Week_State_Score"] = state[
-        ["All_Cross_History_Pct", "Hard_Pool_History_Pct", "Industry_Breadth_History_Pct"]
-    ].mean(axis=1, skipna=False)
-    merge_columns = [
-        "Week_Last_Trade_Date", "All_Cross_Count", "Hard_Pool_Count", "Tier1_Count",
-        "Tier2_Count", "Industry_Breadth", "Tier1_Ratio_pct", "All_Cross_History_Pct",
-        "Hard_Pool_History_Pct", "Industry_Breadth_History_Pct", "Week_State_Score",
-    ]
-    enriched = pool.merge(
-        state[merge_columns], left_on=pool["Signal_Date"].astype(str),
-        right_on="Week_Last_Trade_Date", how="left").drop(columns=["key_0", "Week_Last_Trade_Date"], errors="ignore")
-    return state, enriched
+        values = pd.to_numeric(frame[source], errors="coerce")
+        frame[target] = values.groupby(frame["Signal_Date"]).rank(pct=True, method="average") * 100.0
+    industry_median = pd.to_numeric(frame["Daily_Return_20D_pct"], errors="coerce").groupby(
+        [frame["Signal_Date"], frame["SW_L1"]]).transform("median")
+    frame["Industry_Relative_RS20_pct"] = pd.to_numeric(
+        frame["Daily_Return_20D_pct"], errors="coerce") - industry_median
+    frame["Industry_Resonance_Pct"] = frame["Industry_Signal_Count"].groupby(
+        frame["Signal_Date"]).rank(pct=True, method="average") * 100.0
+
+    previous_observed = pd.to_numeric(frame["Previous_Cross_Observed_Days"], errors="coerce")
+    frame["Previous_Cross_Feature_Valid"] = previous_observed.ge(20)
+    frame["Extreme_Overextension"] = (
+        pd.to_numeric(frame["Weekly_Return_4W_pct"], errors="coerce").gt(30)
+        | pd.to_numeric(frame["Daily_MA20_Bias_pct"], errors="coerce").gt(20)
+    )
+    frame["Weak_Volume_Cross"] = (
+        pd.to_numeric(frame["Weekly_Volume_Ratio_4_12"], errors="coerce").lt(0.75)
+        & pd.to_numeric(frame["Daily_Volume_Ratio_5_20"], errors="coerce").lt(0.80)
+    )
+    frame["Previous_Cross_Weak"] = (
+        frame["Previous_Cross_Feature_Valid"]
+        & pd.to_numeric(frame["Previous_Cross_End_Return_pct"], errors="coerce").lt(0)
+        & pd.to_numeric(frame["Previous_Cross_MFE_pct"], errors="coerce").lt(10)
+    )
+    returns = pd.to_numeric(frame["Return_40D_pct"], errors="coerce")
+    frame["Outcome_Class_40D"] = np.select(
+        [returns.isna(), returns.ge(10), returns.gt(0), returns.gt(-10)],
+        ["未成熟", "盈利≥10%", "盈利0～10%", "亏损0～10%"], default="亏损≥10%")
+    return frame.sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True)
 
 
-def gate_mask(pool: pd.DataFrame, gate: str) -> pd.Series:
-    if gate == "全部硬池周":
-        return pd.Series(True, index=pool.index)
-    if gate == "第一梯队存在":
-        return pd.to_numeric(pool["Tier1_Count"], errors="coerce").ge(1)
-    if gate == "硬池候选至少2只":
-        return pd.to_numeric(pool["Hard_Pool_Count"], errors="coerce").ge(2)
-    if gate == "历史周环境分≥50":
-        return pd.to_numeric(pool["Week_State_Score"], errors="coerce").ge(50)
-    if gate == "历史周环境分≥70":
-        return pd.to_numeric(pool["Week_State_Score"], errors="coerce").ge(70)
-    raise ValueError(f"未知周级门槛: {gate}")
-
-
-def selected_event_stats(frame: pd.DataFrame, method: str, topk: int,
-                         gate: str = "") -> dict[str, Any]:
+def v40_event_stats(frame: pd.DataFrame) -> dict[str, Any]:
     returns20 = pd.to_numeric(frame.get("Return_20D_pct"), errors="coerce").dropna()
     returns = pd.to_numeric(frame.get("Return_40D_pct"), errors="coerce").dropna()
     mfe = pd.to_numeric(frame.get("MFE_40D_pct"), errors="coerce").dropna()
     mae = pd.to_numeric(frame.get("MAE_40D_pct"), errors="coerce").dropna()
-    tier2 = frame.get("Tier_Number", pd.Series(dtype=float)).eq(2)
     return {
-        "周级门槛": gate, "排序方法": method, "TopK": topk, "选择事件": len(frame),
-        "覆盖信号周": frame["Signal_Date"].nunique() if len(frame) else 0,
-        "第二梯队补位数": int(tier2.sum()) if len(frame) else 0,
-        "第二梯队占比(%)": tier2.mean() * 100.0 if len(frame) else np.nan,
-        "20日平均收益(%)": returns20.mean(), "20日收益中位数(%)": returns20.median(),
-        "40日平均收益(%)": returns.mean(), "40日收益中位数(%)": returns.median(),
+        "事件数": len(returns), "股票数": frame["ts_code"].nunique() if len(frame) else 0,
+        "信号周": frame["Signal_Date"].nunique() if len(frame) else 0,
+        "20日平均收益(%)": returns20.mean(), "20日中位数(%)": returns20.median(),
+        "40日平均收益(%)": returns.mean(), "40日中位数(%)": returns.median(),
         "正收益比例(%)": returns.gt(0).mean() * 100.0 if len(returns) else np.nan,
         "收益≥10%比例(%)": returns.ge(10).mean() * 100.0 if len(returns) else np.nan,
-        "收益≥20%比例(%)": returns.ge(20).mean() * 100.0 if len(returns) else np.nan,
         "亏损≤-10%比例(%)": returns.le(-10).mean() * 100.0 if len(returns) else np.nan,
-        "亏损≤-20%比例(%)": returns.le(-20).mean() * 100.0 if len(returns) else np.nan,
-        "MFE中位数(%)": mfe.median(), "MFE≥10%比例(%)": mfe.ge(10).mean() * 100.0 if len(mfe) else np.nan,
-        "MFE≥20%比例(%)": mfe.ge(20).mean() * 100.0 if len(mfe) else np.nan,
-        "平均MAE(%)": mae.mean(), "MAE≤-15%比例(%)": mae.le(-15).mean() * 100.0 if len(mae) else np.nan,
+        "MFE中位数(%)": mfe.median(), "MAE中位数(%)": mae.median(),
+        "平均MAE(%)": mae.mean(),
     }
 
 
-def select_tiered_topk(pool: pd.DataFrame, score_column: str, topk: int) -> pd.DataFrame:
-    if pool.empty:
-        return pool.copy()
-    ranked = pool.sort_values(
-        ["Signal_Date", "Tier_Number", score_column, "ts_code"],
-        ascending=[True, True, False, True], kind="mergesort")
-    return ranked.groupby("Signal_Date", sort=False).head(topk).copy()
+def v40_max_empty_run(counts: pd.Series) -> int:
+    longest = current = 0
+    for empty in counts.eq(0).tolist():
+        current = current + 1 if empty else 0
+        longest = max(longest, current)
+    return int(longest)
 
 
-def deterministic_rank_audit(pool: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    summaries: list[dict[str, Any]] = []
-    details: list[pd.DataFrame] = []
-    yearly: list[dict[str, Any]] = []
-    half_yearly: list[dict[str, Any]] = []
-    for gate in WEEK_GATES:
-        gated = pool[gate_mask(pool, gate)].copy()
-        for method, score_column in RANK_METHODS.items():
-            for topk in (1, 2, 3):
-                selected = select_tiered_topk(gated, score_column, topk)
-                selected.insert(0, "周级门槛", gate)
-                selected.insert(1, "排序方法", method)
-                selected.insert(2, "TopK", topk)
-                selected.insert(3, "排序分数", pd.to_numeric(selected[score_column], errors="coerce"))
-                summaries.append(selected_event_stats(selected, method, topk, gate))
-                details.append(selected)
-                for year, group in selected.groupby(selected["Signal_Date"].astype(str).str[:4], sort=True):
-                    row = selected_event_stats(group, method, topk, gate)
-                    row["年份"] = year
-                    yearly.append(row)
-                for period, group in selected.groupby("Half_Year", sort=True):
-                    row = selected_event_stats(group, method, topk, gate)
-                    row["半年"] = period
-                    half_yearly.append(row)
-    return (
-        pd.DataFrame(summaries),
-        pd.concat(details, ignore_index=True) if details else pd.DataFrame(),
-        pd.DataFrame(yearly), pd.DataFrame(half_yearly),
-    )
+def v40_week_calendar(open_dates: list[str], start: str, end: str) -> pd.DataFrame:
+    days = pd.DataFrame({"trade_date": [day for day in open_dates if start <= day <= end]})
+    days["dt"] = pd.to_datetime(days["trade_date"])
+    days["week"] = days["dt"].dt.to_period("W-FRI")
+    return days.groupby("week")["trade_date"].max().rename(
+        "Week_Last_Trade_Date").reset_index(drop=True).to_frame()
 
 
-def random_tier_audit(pool: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rows: list[dict[str, Any]] = []
-    if pool.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    for gate_number, gate in enumerate(WEEK_GATES):
-        gated = pool[gate_mask(pool, gate)].copy()
-        for run in range(RANDOM_RUNS):
-            rng = np.random.default_rng(RANDOM_SEED + gate_number * 10_000 + run)
-            work = gated.copy()
-            work["Random_Score"] = rng.random(len(work))
-            for topk in (1, 2, 3):
-                selected = select_tiered_topk(work, "Random_Score", topk)
-                row = selected_event_stats(selected, "分层随机", topk, gate)
-                row["随机轮次"] = run
-                rows.append(row)
-    detail = pd.DataFrame(rows)
-    summary_rows = []
-    metrics = [
-        "40日平均收益(%)", "40日收益中位数(%)", "正收益比例(%)",
-        "亏损≤-10%比例(%)", "亏损≤-20%比例(%)", "平均MAE(%)",
-    ]
-    for (gate, topk), group in detail.groupby(["周级门槛", "TopK"], sort=True):
-        row: dict[str, Any] = {"周级门槛": gate, "TopK": topk, "随机轮数": len(group)}
-        for metric in metrics:
-            values = pd.to_numeric(group[metric], errors="coerce")
-            row[f"{metric}_随机均值"] = values.mean()
-            row[f"{metric}_P05"] = values.quantile(0.05)
-            row[f"{metric}_P50"] = values.quantile(0.50)
-            row[f"{metric}_P95"] = values.quantile(0.95)
-        summary_rows.append(row)
-    return pd.DataFrame(summary_rows), detail
-
-
-def compare_with_random(deterministic: pd.DataFrame, random_detail: pd.DataFrame) -> pd.DataFrame:
-    result = deterministic.copy()
-    if result.empty or random_detail.empty:
-        return result
-    random_means, random_medians, random_wins, random_loss10 = [], [], [], []
-    for _, row in result.iterrows():
-        group = random_detail[
-            random_detail["TopK"].eq(row["TopK"])
-            & random_detail["周级门槛"].eq(row["周级门槛"])
-        ]
-        random_means.append((group["40日平均收益(%)"] <= row["40日平均收益(%)"]).mean() * 100.0)
-        random_medians.append((group["40日收益中位数(%)"] <= row["40日收益中位数(%)"]).mean() * 100.0)
-        random_wins.append((group["正收益比例(%)"] <= row["正收益比例(%)"]).mean() * 100.0)
-        random_loss10.append((group["亏损≤-10%比例(%)"] >= row["亏损≤-10%比例(%)"]).mean() * 100.0)
-    result["平均收益随机百分位"] = random_means
-    result["收益中位数随机百分位"] = random_medians
-    result["胜率随机百分位"] = random_wins
-    result["控制10%亏损随机百分位"] = random_loss10
-    return result
-
-
-def week_state_bucket_audit(state: pd.DataFrame, pool: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    signal_state = state[state["Hard_Pool_Count"].gt(0)].copy()
-    signal_state["硬池数量分组"] = pd.cut(
-        signal_state["Hard_Pool_Count"], bins=[0, 1, 2, 5, 9, np.inf],
-        labels=["1只", "2只", "3～5只", "6～9只", "至少10只"])
-    signal_state["历史周环境分组"] = pd.cut(
-        signal_state["Week_State_Score"], bins=[0, 20, 40, 60, 80, 100],
-        labels=["0～20", "20～40", "40～60", "60～80", "80～100"], include_lowest=True)
-    for dimension, column in (("硬池候选数量", "硬池数量分组"), ("历史周环境分", "历史周环境分组")):
-        for bucket, weeks in signal_state.groupby(column, observed=True, sort=False):
-            dates = set(weeks["Week_Last_Trade_Date"].astype(str))
-            events = pool[pool["Signal_Date"].astype(str).isin(dates)]
-            row = selected_event_stats(events, dimension, 0, str(bucket))
-            weekly_returns = events.groupby(events["Signal_Date"].astype(str))["Return_40D_pct"].mean()
-            row.update({
-                "维度": dimension, "分组": str(bucket), "周数": len(weeks),
-                "周等权平均收益(%)": weekly_returns.mean(),
-                "周等权收益中位数(%)": weekly_returns.median(),
-                "正收益周比例(%)": weekly_returns.gt(0).mean() * 100.0 if len(weekly_returns) else np.nan,
-            })
-            rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def scenario_and_coverage(events: pd.DataFrame, weeks: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame]:
-    mature = events["Tradable"].map(to_bool) & events["Has_40D_Future"].map(to_bool)
-    non_down = ~events["Downtrend_Hard_Excluded"].map(to_bool)
+def v40_coverage_audit(events: pd.DataFrame, calendar: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    mature = events["Mature_Tradable"].map(to_bool)
+    non_down = ~events["Individual_Downtrend"].map(to_bool)
     touched = events["Recent_3W_Touched_25"].map(to_bool)
     zone = events["Cross_In_20_35"].map(to_bool)
     scenarios = {
-        "仅排除下跌趋势": mature & non_down,
-        "触底25硬条件＋排除下跌": mature & non_down & touched,
-        "20～35硬条件＋排除下跌": mature & non_down & zone,
-        "两个硬条件＋排除下跌": mature & non_down & touched & zone,
+        "完整SKDJ金叉成熟池": mature,
+        "宽池_仅排除明确个股下跌": mature & non_down,
+        "旧条件_触底25并排除下跌": mature & non_down & touched,
+        "旧条件_金叉20至35并排除下跌": mature & non_down & zone,
+        "旧条件_触底且20至35并排除下跌": mature & non_down & touched & zone,
     }
-    summary_rows: list[dict[str, Any]] = []
-    count_maps: dict[str, pd.Series] = {}
+    detail = calendar.copy()
+    rows: list[dict[str, Any]] = []
+    weeks = detail["Week_Last_Trade_Date"].astype(str)
     for name, mask in scenarios.items():
         group = events[mask]
-        counts = group.groupby(group["Signal_Date"].astype(str)).size().reindex(weeks, fill_value=0)
-        count_maps[name] = counts
-        row = selected_event_stats(group, name, 0)
+        counts = group.groupby("Signal_Date").size().reindex(weeks, fill_value=0)
+        detail[name] = counts.to_numpy()
+        nonzero = counts[counts.gt(0)]
+        row = {"候选池": name, **v40_event_stats(group)}
         row.update({
-            "自然周": len(counts), "平均每周事件": counts.mean(), "每周中位数": counts.median(),
-            "有信号周": int(counts.gt(0).sum()), "空窗周": int(counts.eq(0).sum()),
-            "至少3只候选周": int(counts.ge(3).sum()), "至少10只候选周": int(counts.ge(10).sum()),
-            "最大单周候选": int(counts.max()), "最多三只理论可选事件": int(counts.clip(upper=3).sum()),
+            "自然周": len(counts), "有信号周": int(counts.gt(0).sum()),
+            "覆盖率(%)": counts.gt(0).mean() * 100.0, "空窗周": int(counts.eq(0).sum()),
+            "最长连续空窗周": v40_max_empty_run(counts), "平均每周候选": counts.mean(),
+            "有信号周平均候选": nonzero.mean() if len(nonzero) else np.nan,
+            "每周候选中位数": counts.median(), "至少3只候选周": int(counts.ge(3).sum()),
+            "最大单周候选": int(counts.max()) if len(counts) else 0,
         })
-        summary_rows.append(row)
-    calendar = pd.DataFrame({"Week_Last_Trade_Date": weeks})
-    for name, counts in count_maps.items():
-        calendar[name] = counts.to_numpy()
-    calendar["第一梯队事件"] = count_maps["两个硬条件＋排除下跌"].to_numpy()
-    calendar["第二梯队补位事件"] = (
-        count_maps["20～35硬条件＋排除下跌"] - count_maps["两个硬条件＋排除下跌"]).to_numpy()
-    return pd.DataFrame(summary_rows), calendar
+        rows.append(row)
+    return pd.DataFrame(rows), detail
 
 
-def profit_concentration(detail: pd.DataFrame) -> pd.DataFrame:
+def v40_market_state_audit(pool: pd.DataFrame, calendar: pd.DataFrame,
+                           market_state: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    state_calendar = calendar.merge(
+        market_state, left_on="Week_Last_Trade_Date", right_on="Signal_Date", how="left")
+    state_calendar["Market_State"] = state_calendar["Market_State"].fillna("未知")
+    counts = pool.groupby("Signal_Date").size()
+    state_calendar["Wide_Pool_Count"] = state_calendar["Week_Last_Trade_Date"].map(counts).fillna(0).astype(int)
+    rows = []
+    for state, weeks in state_calendar.groupby("Market_State", sort=False):
+        dates = set(weeks["Week_Last_Trade_Date"].astype(str))
+        group = pool[pool["Signal_Date"].isin(dates)]
+        row = {"大盘周线状态": state, **v40_event_stats(group)}
+        row.update({
+            "自然周": len(weeks), "有信号周": int(weeks["Wide_Pool_Count"].gt(0).sum()),
+            "空窗周": int(weeks["Wide_Pool_Count"].eq(0).sum()),
+            "平均每周候选": weeks["Wide_Pool_Count"].mean(),
+        })
+        rows.append(row)
+    return pd.DataFrame(rows), state_calendar
+
+
+def v40_veto_candidate_audit(events: pd.DataFrame, calendar: pd.DataFrame) -> pd.DataFrame:
+    base = events[events["Mature_Tradable"].map(to_bool)].copy()
+    weeks = calendar["Week_Last_Trade_Date"].astype(str)
+    vetoes = {
+        "明确个股下跌趋势": base["Individual_Downtrend"].map(to_bool),
+        "极端追高_4周涨幅大于30或日线偏离MA20大于20": base["Extreme_Overextension"].map(to_bool),
+        "周日线同时明显缩量": base["Weak_Volume_Cross"].map(to_bool),
+        "上次金叉表现弱且历史观察至少20日": base["Previous_Cross_Weak"].map(to_bool),
+        "旧规则_最近3周未触及25": ~base["Recent_3W_Touched_25"].map(to_bool),
+        "旧规则_金叉不在20至35": ~base["Cross_In_20_35"].map(to_bool),
+    }
+    total_losses = pd.to_numeric(base["Return_40D_pct"], errors="coerce").le(0).sum()
+    total_winners = pd.to_numeric(base["Return_40D_pct"], errors="coerce").gt(0).sum()
+    rows = []
+    for name, veto_mask in vetoes.items():
+        removed, retained = base[veto_mask], base[~veto_mask]
+        counts = retained.groupby("Signal_Date").size().reindex(weeks, fill_value=0)
+        removed_returns = pd.to_numeric(removed["Return_40D_pct"], errors="coerce")
+        row = {
+            "候选剔除条件": name, "基础成熟事件": len(base), "剔除事件": len(removed),
+            "剔除比例(%)": len(removed) / len(base) * 100.0 if len(base) else np.nan,
+            "捕获全部亏损事件比例(%)": removed_returns.le(0).sum() / total_losses * 100.0 if total_losses else np.nan,
+            "误杀全部盈利事件比例(%)": removed_returns.gt(0).sum() / total_winners * 100.0 if total_winners else np.nan,
+            "被剔除40日平均(%)": removed_returns.mean(), "被剔除40日中位数(%)": removed_returns.median(),
+            "被剔除正收益比例(%)": removed_returns.gt(0).mean() * 100.0 if len(removed_returns) else np.nan,
+            **{f"保留_{key}": value for key, value in v40_event_stats(retained).items()},
+            "保留有信号周": int(counts.gt(0).sum()), "保留空窗周": int(counts.eq(0).sum()),
+            "保留覆盖率(%)": counts.gt(0).mean() * 100.0, "保留最长连续空窗周": v40_max_empty_run(counts),
+        }
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def v40_feature_profile(pool: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
+    for state in ("全部", "上涨", "震荡", "下跌"):
+        state_pool = pool if state == "全部" else pool[pool["Market_State"].eq(state)]
+        for label, column in V40_FEATURE_SPECS.items():
+            values = pd.to_numeric(state_pool.get(column), errors="coerce")
+            returns = pd.to_numeric(state_pool.get("Return_40D_pct"), errors="coerce")
+            valid = pd.DataFrame({"x": values, "r": returns}).dropna()
+            if len(valid) < 30 or valid["x"].nunique() < 5:
+                continue
+            q20, q80 = valid["x"].quantile([0.20, 0.80])
+            bottom, top = valid[valid["x"].le(q20)], valid[valid["x"].ge(q80)]
+            top_median, bottom_median = top["r"].median(), bottom["r"].median()
+            direction = "数值越高越好" if top_median >= bottom_median else "数值越低越好"
+            rows.append({
+                "大盘状态": state, "特征": label, "字段": column, "有效样本": len(valid),
+                "特征中位数": valid["x"].median(), "收益秩相关": valid["x"].rank().corr(valid["r"].rank()),
+                "底部20%样本": len(bottom), "底部20%收益平均(%)": bottom["r"].mean(),
+                "底部20%收益中位数(%)": bottom_median,
+                "底部20%胜率(%)": bottom["r"].gt(0).mean() * 100.0,
+                "顶部20%样本": len(top), "顶部20%收益平均(%)": top["r"].mean(),
+                "顶部20%收益中位数(%)": top_median,
+                "顶部20%胜率(%)": top["r"].gt(0).mean() * 100.0,
+                "顶部减底部中位数差(百分点)": top_median - bottom_median,
+                "探索性建议方向": direction,
+            })
+    return pd.DataFrame(rows)
+
+
+def v40_profit_loss_feature_compare(pool: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for state in ("上涨", "震荡", "下跌", "全部"):
+        group = pool if state == "全部" else pool[pool["Market_State"].eq(state)]
+        returns = pd.to_numeric(group["Return_40D_pct"], errors="coerce")
+        for label, column in V40_FEATURE_SPECS.items():
+            values = pd.to_numeric(group.get(column), errors="coerce")
+            valid = pd.DataFrame({"x": values, "r": returns}).dropna()
+            winners, losers = valid[valid["r"].gt(0)], valid[valid["r"].le(0)]
+            if min(len(winners), len(losers)) < 10:
+                continue
+            rows.append({
+                "大盘状态": state, "特征": label, "字段": column,
+                "盈利样本": len(winners), "亏损样本": len(losers),
+                "盈利股特征中位数": winners["x"].median(),
+                "亏损股特征中位数": losers["x"].median(),
+                "盈利减亏损中位数": winners["x"].median() - losers["x"].median(),
+                "盈利股特征均值": winners["x"].mean(), "亏损股特征均值": losers["x"].mean(),
+            })
+    return pd.DataFrame(rows)
+
+
+def v40_direction_lookup(profile: pd.DataFrame) -> dict[tuple[str, str], str]:
+    return {
+        (str(row["大盘状态"]), str(row["字段"])): str(row["探索性建议方向"])
+        for _, row in profile.iterrows()
+    }
+
+
+def v40_select_weekly_top3(pool: pd.DataFrame, column: str, direction: str) -> pd.DataFrame:
+    work = pool.copy()
+    work["Feature_Value"] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["Feature_Value"])
+    ascending = direction == "数值越低越好"
+    selected = work.sort_values(
+        ["Signal_Date", "Feature_Value", "ts_code"],
+        ascending=[True, ascending, True], kind="mergesort").groupby(
+        "Signal_Date", sort=False).head(3).copy()
+    selected["Selection_Priority"] = selected.groupby("Signal_Date").cumcount() * -1.0
+    return selected
+
+
+def v40_random_top3_distribution(pool: pd.DataFrame, state: str) -> pd.DataFrame:
+    state_pool = pool if state == "全部" else pool[pool["Market_State"].eq(state)]
+    rows = []
+    for run in range(RANDOM_RUNS):
+        rng = np.random.default_rng(RANDOM_SEED + run + sum(ord(ch) for ch in state) * 1000)
+        work = state_pool.copy()
+        work["Random_Score"] = rng.random(len(work))
+        selected = work.sort_values(
+            ["Signal_Date", "Random_Score", "ts_code"],
+            ascending=[True, False, True], kind="mergesort").groupby(
+            "Signal_Date", sort=False).head(3)
+        row = v40_event_stats(selected)
+        row["随机轮次"] = run
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def v40_capacity_diagnostic(selected: pd.DataFrame) -> dict[str, Any]:
+    if selected.empty:
+        return {"三仓接受事件": 0, "因仓位错过": 0, "三仓接受信号周": 0,
+                "三仓40日平均(%)": np.nan, "三仓40日中位数(%)": np.nan, "三仓胜率(%)": np.nan}
+    active: list[dict[str, str]] = []
+    accepted_rows: list[pd.Series] = []
+    rejected = 0
+    ordered = selected.sort_values(
+        ["Entry_Date", "Selection_Priority", "ts_code"], ascending=[True, False, True], kind="mergesort")
+    for entry_date, day_group in ordered.groupby("Entry_Date", sort=True):
+        active = [position for position in active if position["end_date"] >= str(entry_date)]
+        active_codes = {position["ts_code"] for position in active}
+        slots = PORTFOLIO_SLOTS - len(active)
+        for _, row in day_group.iterrows():
+            code = str(row["ts_code"])
+            if slots <= 0 or code in active_codes:
+                rejected += 1
+                continue
+            end_date = str(row.get("Outcome_40D_End_Date", ""))
+            if not end_date:
+                rejected += 1
+                continue
+            accepted_rows.append(row)
+            active.append({"ts_code": code, "end_date": end_date})
+            active_codes.add(code)
+            slots -= 1
+    accepted = pd.DataFrame(accepted_rows)
+    returns = pd.to_numeric(accepted.get("Return_40D_pct"), errors="coerce").dropna()
+    return {
+        "三仓接受事件": len(accepted), "因仓位错过": rejected,
+        "三仓接受信号周": accepted["Signal_Date"].nunique() if len(accepted) else 0,
+        "三仓40日平均(%)": returns.mean(), "三仓40日中位数(%)": returns.median(),
+        "三仓胜率(%)": returns.gt(0).mean() * 100.0 if len(returns) else np.nan,
+    }
+
+
+def v40_single_feature_top3_audit(pool: pd.DataFrame, profile: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    directions = v40_direction_lookup(profile)
+    random_by_state = {state: v40_random_top3_distribution(pool, state) for state in ("全部", "上涨", "震荡", "下跌")}
+    rows, detail_frames, yearly_rows = [], [], []
+    for state in ("全部", "上涨", "震荡", "下跌"):
+        state_pool = pool if state == "全部" else pool[pool["Market_State"].eq(state)]
+        random_detail = random_by_state[state]
+        for label, column in V40_FEATURE_SPECS.items():
+            direction = directions.get((state, column))
+            if direction is None or column not in state_pool.columns:
+                continue
+            selected = v40_select_weekly_top3(state_pool, column, direction)
+            if selected.empty:
+                continue
+            selected.insert(0, "审计大盘状态", state)
+            selected.insert(1, "特征", label)
+            selected.insert(2, "探索方向", direction)
+            detail_frames.append(selected)
+            stat = {"大盘状态": state, "特征": label, "字段": column, "方向": direction, **v40_event_stats(selected)}
+            stat.update(v40_capacity_diagnostic(selected))
+            if not random_detail.empty:
+                stat["平均收益随机百分位"] = (
+                    pd.to_numeric(random_detail["40日平均收益(%)"], errors="coerce")
+                    .le(stat["40日平均收益(%)"]).mean() * 100.0)
+                stat["中位数随机百分位"] = (
+                    pd.to_numeric(random_detail["40日中位数(%)"], errors="coerce")
+                    .le(stat["40日中位数(%)"]).mean() * 100.0)
+                stat["胜率随机百分位"] = (
+                    pd.to_numeric(random_detail["正收益比例(%)"], errors="coerce")
+                    .le(stat["正收益比例(%)"]).mean() * 100.0)
+            rows.append(stat)
+            for year, year_group in selected.groupby("Year", sort=True):
+                yearly_rows.append({
+                    "大盘状态": state, "特征": label, "字段": column, "方向": direction,
+                    "年份": year, **v40_event_stats(year_group),
+                })
+    random_all = pd.concat(
+        [frame.assign(大盘状态=state) for state, frame in random_by_state.items()], ignore_index=True)
+    detail = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame()
+    return pd.DataFrame(rows), pd.DataFrame(yearly_rows), pd.concat([detail], ignore_index=True), random_all
+
+
+def v40_feature_year_stability(profile: pd.DataFrame, yearly: pd.DataFrame) -> pd.DataFrame:
+    if yearly.empty:
+        return pd.DataFrame()
+    rows = []
+    for (state, label, column, direction), group in yearly.groupby(
+            ["大盘状态", "特征", "字段", "方向"], sort=False):
+        medians = pd.to_numeric(group["40日中位数(%)"], errors="coerce")
+        wins = pd.to_numeric(group["正收益比例(%)"], errors="coerce")
+        rows.append({
+            "大盘状态": state, "特征": label, "字段": column, "方向": direction,
+            "有样本年份": len(group), "正中位数年份": int(medians.gt(0).sum()),
+            "正中位数年份占比(%)": medians.gt(0).mean() * 100.0,
+            "年度中位数最差值(%)": medians.min(), "年度中位数平均值(%)": medians.mean(),
+            "年度胜率最低值(%)": wins.min(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v40_profit_concentration(detail: pd.DataFrame) -> pd.DataFrame:
     if detail.empty:
         return pd.DataFrame()
-    for (gate, method, topk), group in detail.groupby(["周级门槛", "排序方法", "TopK"], sort=False):
+    rows = []
+    for (state, feature), group in detail.groupby(["审计大盘状态", "特征"], sort=False):
         ordered = group.sort_values("Return_40D_pct", ascending=False)
         original = pd.to_numeric(ordered["Return_40D_pct"], errors="coerce").dropna()
-        for remove_n in (0, 1, 3, 5, 10, 20):
+        for remove_n in (0, 5, 10, 20):
             remaining = original.iloc[min(remove_n, len(original)):]
-            removed = ordered.head(remove_n)
             rows.append({
-                "周级门槛": gate, "排序方法": method, "TopK": topk, "排除最赚钱事件数": remove_n,
-                "原始事件数": len(original), "剩余事件数": len(remaining),
+                "大盘状态": state, "特征": feature, "排除最赚钱事件数": remove_n,
+                "原始事件": len(original), "剩余事件": len(remaining),
                 "原始平均收益(%)": original.mean(), "剩余平均收益(%)": remaining.mean(),
-                "剩余收益中位数(%)": remaining.median(),
-                "剩余正收益比例(%)": remaining.gt(0).mean() * 100.0 if len(remaining) else np.nan,
-                "被排除股票": "；".join(
-                    f"{row.get('name', '')}({row.get('ts_code', '')},{finite_num(row.get('Return_40D_pct')):.1f}%)"
-                    for _, row in removed.iterrows()) if remove_n else "未排除",
+                "剩余中位数(%)": remaining.median(),
+                "剩余胜率(%)": remaining.gt(0).mean() * 100.0 if len(remaining) else np.nan,
             })
     return pd.DataFrame(rows)
 
 
 def main() -> None:
     global pro, API_ERRORS
-    st.set_page_config(page_title="周线SKDJ周级环境审计 V3.9", layout="wide")
+    st.set_page_config(page_title="周线SKDJ宽池特征审计 V4.0", layout="wide")
     st.title(TITLE)
-    st.caption("先判断这个星期是否值得买，再判断同周买哪只；Top2为主观察口径，Top1/Top3只作敏感性对照。")
-    with st.expander("冻结规则与评价顺序", expanded=True):
+    st.caption("恢复完整周线SKDJ金叉宽池；少量硬筛只清除明显风险，其余条件全部进入上涨/震荡/下跌状态下的特征审计。")
+    with st.expander("V4.0研究规则", expanded=True):
         st.markdown(f"""
-- **唯一信号**：完整周线SKDJ金叉，参数冻结 `N={SKDJ_N}, M={SKDJ_M}`。
-- **硬条件一**：金叉位置>{CROSS_ZONE_LOW:.0f}且≤{CROSS_ZONE_HIGH:.0f}。
-- **硬条件二**：排除“周线低于MA20、近12周收益<0、日线低于MA60”三项同时成立的下跌趋势。
-- **第一梯队**：最近{RESET_LOOKBACK_WEEKS}个完整周K或D曾≤{SKDJ_BOTTOM:.0f}。
-- **第二梯队**：未触及25，仅在第一梯队不足TopK时补位；分层优先级高于任何个股分数。
-- **周级环境**：同周全部金叉数、硬池候选数、行业覆盖数；历史百分位只使用此前最多{HISTORY_WINDOW_WEEKS}个自然周，至少{MIN_HISTORY_WEEKS}周后启用。
-- **梯队内排序**：板块共振、周波动4/12周收缩、二者同周等权；不再使用V3.8旧量价评分。
-- **评价**：五种周级门槛×三种排序×Top1/Top2/Top3，分别与{RANDOM_RUNS}轮遵守相同周级门槛和梯队顺序的随机选择比较。
-- **统一执行**：周线收盘确认后下一市场交易日开盘买入；固定20/40个市场交易日判卷并计入成本。
-- **不使用**：月线、市场月线门槛、机器学习、退出参数、资金曲线和事后优化权重。
-- **限制**：分层规则由同一三年结果提出；即使优于随机，也必须再经过新的时间样本验证。
+- **唯一原始信号**：完整周线SKDJ金叉，参数冻结 `N={SKDJ_N}, M={SKDJ_M}`。
+- **基础股票池**：申万历史科技池，主板/创业板/科创板；信号日原始股价≥10元、流通市值≥100亿元。
+- **主要宽池**：只排除“周线低于MA20、MA20四周斜率<0、近12周收益<0、日线低于MA60”四项同时成立的个股下跌趋势。
+- **不再硬筛**：金叉20～35、最近3周触及25、周环境分≥50/70；这些全部降为普通特征或对照场景。
+- **大盘状态**：只用{BENCHMARK_CODE}完整周线；上涨/震荡/下跌只用于分层研究，不决定是否允许买入。
+- **重点特征**：个股相对同周候选强度、相对同行业强度、量比、板块共振、波动收缩、均线位置、SKDJ结构、上次金叉股性。
+- **排序审计**：每项特征分别选同周Top3，与{RANDOM_RUNS}轮同状态随机Top3比较；不把未来收益训练成综合评分。
+- **执行与判卷**：周线确认后下一市场交易日开盘，固定20/40日，计入滑点和成本，并附最多{PORTFOLIO_SLOTS}仓的容量诊断。
+- **限制**：探索方向由同一三年样本产生，Top3结果是特征发现，不是独立样本外证明。
 """)
     with st.sidebar:
         st.header("运行参数")
-        signal_start_date = st.date_input("信号开始", date(2023, 6, 5), key="v39_start")
-        signal_end_date = st.date_input("信号截止", date(2026, 6, 5), key="v39_end")
-        market_end_date = st.date_input("行情观察截止", date.today(), key="v39_market_end")
-        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v39_pause")
-        use_cache = st.checkbox("复用逐股票缓存", True, key="v39_cache")
+        signal_start_date = st.date_input("信号开始", date(2023, 6, 5), key="v40_start")
+        signal_end_date = st.date_input("信号截止", date(2026, 6, 5), key="v40_end")
+        market_end_date = st.date_input("行情观察截止", date.today(), key="v40_market_end")
+        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v40_pause")
+        use_cache = st.checkbox("复用逐股票缓存", True, key="v40_cache")
         st.divider()
-        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f")
-        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f")
-        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f")
-        if st.button("清除本程序行情缓存", key="v39_clear"):
+        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v40_commission")
+        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v40_stamp")
+        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v40_transfer")
+        if st.button("清除本程序行情缓存", key="v40_clear"):
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
             st.success("缓存已清除")
-    token = st.text_input("Tushare Token", type="password", key="v39_token")
-    session_key = "weekly_skdj_week_state_rank_v39_zip"
+
+    token = st.text_input("Tushare Token", type="password", key="v40_token")
+    session_key = "weekly_skdj_wide_pool_feature_v40_zip"
     if not token:
-        st.info("请输入Tushare Token；V3.4至V3.8相同日期范围的逐股票缓存可以直接复用。")
+        st.info("请输入Tushare Token；V3.4至V3.9相同日期范围的逐股票缓存可以直接复用。")
         return
-    if not st.button("开始V3.9周级环境与同周排序审计", type="primary", key="v39_run"):
+    if not st.button("开始V4.0宽池与分状态特征审计", type="primary", key="v40_run"):
         if session_key in st.session_state:
             st.download_button(
                 "下载上一次结果ZIP", st.session_state[session_key],
-                file_name="weekly_skdj_week_state_rank_audit_v3_9_all_results.zip",
+                file_name="weekly_skdj_wide_pool_feature_audit_v4_0_all_results.zip",
                 mime="application/zip", on_click="ignore")
         return
     error = validate_dates(signal_start_date, signal_end_date, market_end_date)
     if error:
         st.error(error)
         return
+
     API_ERRORS = []
     ts.set_token(token)
     pro = ts.pro_api()
@@ -992,16 +1172,19 @@ def main() -> None:
         "transfer_fee_pct": float(transfer_fee_pct), "rejects": rejects,
     }
     try:
-        with st.spinner("加载交易日历与历史科技股池..."):
+        with st.spinner("加载交易日历、上证指数周状态与历史科技股池..."):
             open_dates = load_trade_calendar(preload, market_end)
             extended_end = (market_end_date + timedelta(days=7)).strftime("%Y%m%d")
             full_open_dates = load_trade_calendar(preload, extended_end)
             week_last_map = complete_week_last_dates(full_open_dates)
+            benchmark_daily = load_benchmark_daily(preload, market_end)
+            market_state = build_market_week_state(benchmark_daily, week_last_map)
             stock_basic = load_stock_basic()
             memberships = load_tech_memberships(float(pause))
     except Exception as exc:
         st.error(f"基础数据加载失败：{exc}")
         return
+
     period_index = build_period_index(memberships)
     codes = sorted(set(period_index) & set(stock_basic["ts_code"].astype(str)))
     stocks = stock_basic[stock_basic["ts_code"].isin(codes)].copy()
@@ -1011,13 +1194,14 @@ def main() -> None:
     population = stocks.groupby("Sample_Board").size().reindex(BOARDS, fill_value=0).rename(
         "股票数").reset_index()
     open_pos = {day: position for position, day in enumerate(open_dates)}
+
     events: list[dict[str, Any]] = []
     cache_hits = data_failures = 0
     progress, status = st.progress(0.0), st.empty()
     for number, stock in stocks.iterrows():
         code = str(stock["ts_code"])
         progress.progress((number + 1) / max(len(stocks), 1), text=f"{number + 1}/{len(stocks)} {code}")
-        status.caption(f"全量金叉 {len(events)}；缓存 {cache_hits}；失败 {data_failures}")
+        status.caption(f"完整金叉 {len(events)}；缓存 {cache_hits}；失败 {data_failures}")
         daily, daily_basic, cache_hit = fetch_stock_history(
             code, preload, market_end, bool(use_cache), float(pause))
         cache_hits += int(cache_hit)
@@ -1032,101 +1216,110 @@ def main() -> None:
     if not events:
         st.error("研究区间没有生成符合历史科技池、价格和市值条件的完整周线SKDJ金叉。")
         return
+
     try:
-        with st.spinner("构建周级环境、双梯队与严格匹配的随机基准..."):
-            event_frame = add_cross_section_features(
-                pd.DataFrame(events).sort_values(["Signal_Date", "ts_code"]).reset_index(drop=True))
-            pool = build_tiered_pool(event_frame)
-            base_calendar = pool_calendar(open_dates, signal_start, signal_end, event_frame)
-            weeks = base_calendar["Week_Last_Trade_Date"].astype(str)
-            scenarios, calendar = scenario_and_coverage(event_frame, weeks)
-            week_state, pool = build_week_state(base_calendar, event_frame, pool)
-            state_buckets = week_state_bucket_audit(week_state, pool)
-            comparison_raw, selected_detail, yearly, half_yearly = deterministic_rank_audit(pool)
-            random_summary, random_detail = random_tier_audit(pool)
-            comparison = compare_with_random(comparison_raw, random_detail)
-            concentration = profit_concentration(selected_detail)
+        with st.spinner("构建宽池覆盖率、市场状态与单特征Top3审计..."):
+            event_frame = v40_add_research_features(pd.DataFrame(events), market_state)
+            calendar = v40_week_calendar(open_dates, signal_start, signal_end)
+            coverage, coverage_calendar = v40_coverage_audit(event_frame, calendar)
+            wide_pool = event_frame[event_frame["Wide_Pool"].map(to_bool)].copy()
+            state_audit, state_calendar = v40_market_state_audit(wide_pool, calendar, market_state)
+            veto_audit = v40_veto_candidate_audit(event_frame, calendar)
+            feature_profile = v40_feature_profile(wide_pool)
+            profit_loss_compare = v40_profit_loss_feature_compare(wide_pool)
+            top3_audit, top3_yearly, top3_detail, random_detail = v40_single_feature_top3_audit(
+                wide_pool, feature_profile)
+            stability = v40_feature_year_stability(feature_profile, top3_yearly)
+            concentration = v40_profit_concentration(top3_detail)
     except Exception as exc:
         st.exception(exc)
         return
+
+    wide_counts = wide_pool.groupby("Signal_Date").size().reindex(
+        calendar["Week_Last_Trade_Date"].astype(str), fill_value=0)
     run_summary = pd.DataFrame([{
         "程序": TITLE, "版本": VERSION, "信号开始": signal_start, "信号截止": signal_end,
-        "观察截止": market_end, "全部周线SKDJ金叉": len(event_frame),
-        "40日成熟事件": int(event_frame["Has_40D_Future"].map(to_bool).sum()),
-        "20～35且非下跌成熟事件": len(pool), "第一梯队事件": int(pool["Tier_Number"].eq(1).sum()),
-        "第二梯队补位事件": int(pool["Tier_Number"].eq(2).sum()),
-        "硬池不同股票": pool["ts_code"].nunique(), "自然周": len(calendar),
-        "硬池有信号周": pool["Signal_Date"].nunique(),
-        "硬池空窗周": int(calendar["20～35硬条件＋排除下跌"].eq(0).sum()),
-        "Top2主观察": True, "周环境历史窗口": HISTORY_WINDOW_WEEKS,
-        "随机轮数": RANDOM_RUNS, "行情失败": data_failures, "缓存命中": cache_hits,
+        "观察截止": market_end, "全部完整周线SKDJ金叉": len(event_frame),
+        "40日成熟可买事件": int(event_frame["Mature_Tradable"].sum()),
+        "仅排除明确下跌后的宽池事件": len(wide_pool), "宽池不同股票": wide_pool["ts_code"].nunique(),
+        "自然周": len(calendar), "宽池有信号周": int(wide_counts.gt(0).sum()),
+        "宽池空窗周": int(wide_counts.eq(0).sum()), "最长连续空窗周": v40_max_empty_run(wide_counts),
+        "平均每周宽池候选": wide_counts.mean(), "每周宽池候选中位数": wide_counts.median(),
+        "至少3只候选周": int(wide_counts.ge(3).sum()), "特征数": len(V40_FEATURE_SPECS),
+        "随机轮数": RANDOM_RUNS, "最多仓位": PORTFOLIO_SLOTS,
+        "行情失败": data_failures, "缓存命中": cache_hits,
     }])
+    feature_dictionary = pd.DataFrame([
+        {"特征": label, "字段": column, "说明": "信号周收盘时已知；按大盘状态分别审计"}
+        for label, column in V40_FEATURE_SPECS.items()
+    ])
     metadata = pd.DataFrame([
-        ("硬候选", "完整周线SKDJ金叉位置>20且≤35，并排除下跌趋势"),
-        ("下跌趋势", "信号日周线MA20偏离<0、近12周收益<0、日线MA60偏离<0三项同时成立"),
-        ("第一梯队", "最近3个完整周K或D最低值≤25；始终优先于第二梯队"),
-        ("第二梯队", "最近3周未触及25；仅在第一梯队不足TopK时补位"),
-        ("周级环境", f"全部金叉数、硬池数、行业覆盖数分别相对此前最多{HISTORY_WINDOW_WEEKS}周计算百分位；至少{MIN_HISTORY_WEEKS}周后启用"),
-        ("周级门槛", "全部硬池周、第一梯队存在、硬池至少2只、历史周环境分≥50、历史周环境分≥70；均为并列审计，不事后择优"),
-        ("梯队内因子", "板块共振、周振幅4/12周收缩、二者同周等权；分层优先于分数"),
-        ("随机基准", f"{RANDOM_RUNS}轮；每轮遵守相同周级门槛、第一梯队优先和第二梯队补位，再随机Top1/2/3"),
-        ("SKDJ参数", f"N={SKDJ_N},M={SKDJ_M}，冻结不寻优"),
-        ("股票池", "申万2021历史科技池；主板/创业板/科创板；排除北交所"),
+        ("原始信号", f"完整周线SKDJ金叉；N={SKDJ_N},M={SKDJ_M}，参数冻结"),
+        ("主要宽池", "成熟可买事件只排除明确个股下跌趋势；不再要求触底25、金叉20至35或高环境分"),
+        ("明确个股下跌", "周线MA20偏离<0、MA20四周斜率<0、近12周收益<0、日线MA60偏离<0四项同时成立"),
+        ("大盘状态", f"{BENCHMARK_CODE}完整周线：MA20位置、MA20四周斜率和12周收益同正为上涨，同负为下跌，其余为震荡；只分层不硬筛"),
+        ("相对强度限制", "同周候选20/60日强度是SKDJ候选池内百分位；相对同行业20日强度是同周同行业候选的相对值，不冒充全市场标准RPS"),
+        ("上次金叉股性", "只截取上次金叉之后、当前信号日之前最多40个交易日；超过40日固定取前40日，至少观察20日才标记有效，绝不使用当前信号后的行情"),
+        ("候选硬筛审计", "明确下跌、极端追高、明显缩量、上次金叉弱及两个旧规则均单独展示剔除亏损能力和覆盖率损失；除明确下跌外均未正式启用"),
+        ("单特征Top3", "每个大盘状态内用全样本顶部/底部20%中位数确定探索方向，再在每周选Top3；属于同样本探索，不是样本外结论"),
+        ("随机基准", f"每种大盘状态{RANDOM_RUNS}轮，每周从同一宽池随机最多3只"),
+        ("三仓诊断", "按固定40日终点释放仓位，最多3只；仅检查信号拥堵和可接受事件收益，不是完整逐日净值曲线"),
         ("价格市值", "信号日原始收盘价≥10元；历史流通市值≥100亿元"),
         ("买入", "完整周线确认后下一市场交易日开盘；主板一字板不买"),
         ("判卷", "固定20/40个市场交易日收益、MFE与MAE；计入滑点和交易成本"),
-        ("防前视", "周线只用完整周；所有排名特征只用信号日及以前；未来40日只用于判卷"),
-        ("月线", "完全不使用"),
-        ("主观察口径", "Top2；Top1和Top3仅作敏感性对照；不生成资金曲线"),
-        ("限制", "候选数量分组来自V3.8发现，本版仍是同一历史复核；历史百分位防止使用未来周，但不是独立新时期证明"),
+        ("不使用", "月线、机器学习、未来行情特征、环境分硬门槛、事后综合权重"),
     ], columns=["项目", "值"])
+
     files = {
-        "01_run_summary_v3_9.csv": run_summary,
-        "02_pool_scenario_coverage_quality_v3_9.csv": scenarios,
-        "03_week_state_bucket_audit_v3_9.csv": state_buckets,
-        "04_gate_rank_vs_matched_random_v3_9.csv": comparison,
-        "05_gate_rank_yearly_stability_v3_9.csv": yearly,
-        "06_gate_rank_half_year_stability_v3_9.csv": half_yearly,
-        "07_matched_random_distribution_summary_v3_9.csv": random_summary,
-        "08_matched_random_all_runs_v3_9.csv": random_detail,
-        "09_profit_concentration_remove_top_v3_9.csv": concentration,
-        "10_selected_event_detail_v3_9.csv": selected_detail,
-        "11_tiered_hard_pool_with_week_state_v3_9.csv": pool,
-        "12_week_state_calendar_v3_9.csv": week_state,
-        "13_weekly_tier_coverage_calendar_v3_9.csv": calendar,
-        "14_all_weekly_skdj_events_v3_9.csv": event_frame,
-        "15_full_tech_universe_v3_9.csv": stocks,
-        "16_board_population_v3_9.csv": population,
-        "17_rejection_audit_v3_9.csv": pd.DataFrame(
+        "01_run_summary_v4_0.csv": run_summary,
+        "02_pool_coverage_and_quality_v4_0.csv": coverage,
+        "03_weekly_coverage_calendar_v4_0.csv": coverage_calendar,
+        "04_market_state_quality_v4_0.csv": state_audit,
+        "05_market_state_calendar_v4_0.csv": state_calendar,
+        "06_candidate_veto_audit_v4_0.csv": veto_audit,
+        "07_feature_top_bottom_profile_v4_0.csv": feature_profile,
+        "08_profit_vs_loss_feature_compare_v4_0.csv": profit_loss_compare,
+        "09_single_feature_weekly_top3_vs_random_v4_0.csv": top3_audit,
+        "10_single_feature_yearly_stability_v4_0.csv": top3_yearly,
+        "11_feature_year_stability_summary_v4_0.csv": stability,
+        "12_single_feature_top3_profit_concentration_v4_0.csv": concentration,
+        "13_single_feature_selected_event_detail_v4_0.csv": top3_detail,
+        "14_matched_random_all_runs_v4_0.csv": random_detail,
+        "15_wide_pool_all_events_v4_0.csv": wide_pool,
+        "16_all_weekly_skdj_events_v4_0.csv": event_frame,
+        "17_feature_dictionary_v4_0.csv": feature_dictionary,
+        "18_full_tech_universe_v4_0.csv": stocks,
+        "19_board_population_v4_0.csv": population,
+        "20_rejection_audit_v4_0.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "18_api_errors_v3_9.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "19_metadata_v3_9.csv": metadata,
+        "21_api_errors_v4_0.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "22_metadata_v4_0.csv": metadata,
     }
     result_zip = make_zip(files)
     st.session_state[session_key] = result_zip
     st.success(
-        f"完成：全量金叉{len(event_frame)}个；20～35且非下跌硬池{len(pool)}个；"
-        f"第一梯队{pool['Tier_Number'].eq(1).sum()}个，第二梯队{pool['Tier_Number'].eq(2).sum()}个。")
+        f"完成：全部完整金叉{len(event_frame)}个；成熟可买{int(event_frame['Mature_Tradable'].sum())}个；"
+        f"仅排除明确下跌后的宽池{len(wide_pool)}个，覆盖{int(wide_counts.gt(0).sum())}/{len(calendar)}周。")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("硬池事件", len(pool))
-    c2.metric("第一梯队", int(pool["Tier_Number"].eq(1).sum()))
-    c3.metric("第二梯队补位", int(pool["Tier_Number"].eq(2).sum()))
-    c4.metric("硬池空窗周", int(calendar["20～35硬条件＋排除下跌"].eq(0).sum()))
+    c1.metric("宽池事件", len(wide_pool))
+    c2.metric("有信号周", int(wide_counts.gt(0).sum()))
+    c3.metric("空窗周", int(wide_counts.eq(0).sum()))
+    c4.metric("每周候选中位数", f"{wide_counts.median():.1f}")
     st.subheader("候选池覆盖率与质量")
-    st.dataframe(scenarios, use_container_width=True, hide_index=True)
-    st.subheader("周级环境分组审计")
-    st.dataframe(state_buckets, use_container_width=True, hide_index=True)
-    st.subheader("周级门槛＋同周排序相对严格匹配随机")
-    st.dataframe(comparison, use_container_width=True, hide_index=True)
-    st.subheader("Top2年度稳定性（主观察）")
-    st.dataframe(yearly[yearly["TopK"].eq(2)], use_container_width=True, hide_index=True)
-    st.subheader("剔除最赚钱事件后的稳健性")
-    st.dataframe(concentration, use_container_width=True, hide_index=True)
+    st.dataframe(coverage, use_container_width=True, hide_index=True)
+    st.subheader("大盘上涨/震荡/下跌分层")
+    st.dataframe(state_audit, use_container_width=True, hide_index=True)
+    st.subheader("候选硬筛：剔除亏损能力与覆盖率代价")
+    st.dataframe(veto_audit, use_container_width=True, hide_index=True)
+    st.subheader("单特征每周Top3与随机基准")
+    st.dataframe(top3_audit, use_container_width=True, hide_index=True)
+    st.subheader("特征年度稳定性")
+    st.dataframe(stability, use_container_width=True, hide_index=True)
     st.download_button(
-        "下载V3.9全部结果ZIP", result_zip,
-        file_name="weekly_skdj_week_state_rank_audit_v3_9_all_results.zip",
-        mime="application/zip", type="primary", key="v39_download", on_click="ignore")
-    st.info("先看03确认周级环境是否跨分组呈稳定改善；再以04中的Top2为主，要求平均收益、中位数、胜率和10%亏损控制同时优于匹配随机；最后用05、06、09排除单一年份和少数牛股支撑。")
+        "下载V4.0全部结果ZIP", result_zip,
+        file_name="weekly_skdj_wide_pool_feature_audit_v4_0_all_results.zip",
+        mime="application/zip", type="primary", key="v40_download", on_click="ignore")
+    st.info("先看02确认宽池是否恢复足够覆盖；再看06决定第二个硬条件是否值得启用；最后用07～12寻找上涨和震荡状态下跨年份稳定、三仓位仍有效且不依赖少数牛股的排序特征。")
 
 
 if __name__ == "__main__":
