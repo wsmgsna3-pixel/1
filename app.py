@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""科技股周线SKDJ上穿25样本外预测、排序与三仓审计 V4.5。
+"""科技股周线SKDJ上穿25直接收益排序与三仓审计 V4.6。
 
 本版恢复较早的可执行买点：周线K首次从25下方上穿25且K>D、K上升，
-下一市场交易日开盘买入。下一周是否继续强分离只作为历史训练标签，
-绝不作为当期买入条件。每个目标年度只使用此前三年的已知标签训练，
-并依次验证事件质量、同周Top1/3/5排序、稳健性和总共三个仓位的占位组合。
+下一市场交易日开盘买入。模型不再把下一周是否继续强分离当作最终目标，
+而是直接预测买入后固定W5净收益（训练标签缩尾至-15%～+20%），并辅以
+同周收益百分位和W5盈利概率。每个目标年度只使用此前三年已经完整发生的
+历史结果训练，再验证Top1/3/5、随机基准、稳健性和真实三仓占位组合。
 """
 from __future__ import annotations
 
@@ -22,8 +23,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tushare as ts
-TITLE = "科技股周线SKDJ样本外排序与真实三仓审计 V4.5"
-VERSION = "V4.5-WEEKLY-SKDJ-OOS-RANK-THREE-SLOT"
+TITLE = "科技股周线SKDJ直接收益排序与真实三仓审计 V4.6"
+VERSION = "V4.6-WEEKLY-SKDJ-DIRECT-RETURN-RANK"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 
@@ -42,6 +43,9 @@ TOP_KS = (1, 3, 5)
 MODEL_LOOKBACK_YEARS = 3
 MODEL_MIN_TRAIN = 240
 MODEL_L2 = 2.0
+RETURN_MODEL_L2 = 8.0
+RETURN_TARGET_FLOOR = -15.0
+RETURN_TARGET_CAP = 20.0
 RANDOM_TRIALS = 500
 PORTFOLIO_RANDOM_TRIALS = 300
 MODEL_FEATURES = (
@@ -56,6 +60,7 @@ MODEL_FEATURES = (
     "Daily_MA60_Bias_pct", "Circ_MV_Billion", "Turnover_Rate",
     "Price_Change_Cross_to_Preconfirm_pct",
 )
+DIRECT_MODEL_FEATURES = MODEL_FEATURES + ("Model_Predicted_W1_Feature",)
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -919,7 +924,15 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
             "Future_W1_Spread_Change": post.get("Post_Confirm_W1_Spread_Change", np.nan),
             **history_features, **trend_features,
         }
-        model_rows.append(row)
+        # 历史训练事件也必须使用与目标期完全相同的下一交易日开盘买入口径。
+        # 这里只计算当时已经发生的收益路径；年度训练时还会用W5结束日再次
+        # 截断，保证目标年度看不到任何跨年后的结果。
+        outcome: dict[str, Any] = {}
+        if eligible:
+            outcome = entry_outcomes(
+                daily, trigger_date, code, open_dates, open_pos, market_weeks, config)
+            row.update(prefix_keys(outcome, "Entry"))
+        model_rows.append(row.copy())
         if not eligible:
             if config["signal_start"] <= trigger_date <= config["signal_end"]:
                 key = f"上穿25:{filter_reason}"
@@ -934,9 +947,6 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
             "Period_Group": (
                 "2025-06以后" if trigger_date >= config["split_date"] else "2025-06以前"),
         }
-        outcome = entry_outcomes(
-            daily, trigger_date, code, open_dates, open_pos, market_weeks, config)
-        event.update(prefix_keys(outcome, "Entry"))
         event.update(prefix_keys(simulate_exit_policies(daily, outcome, config), "Entry"))
         live_events.append(event)
     return cycle_rows, model_rows, live_events
@@ -975,8 +985,9 @@ def sigmoid(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(values, -35.0, 35.0)))
 
 
-def fit_logistic_model(train: pd.DataFrame) -> dict[str, Any]:
-    raw = train.loc[:, MODEL_FEATURES].apply(pd.to_numeric, errors="coerce")
+def fit_logistic_model(train: pd.DataFrame, target_column: str,
+                       features: tuple[str, ...] = MODEL_FEATURES) -> dict[str, Any]:
+    raw = train.loc[:, features].apply(pd.to_numeric, errors="coerce")
     medians = raw.median(axis=0).fillna(0.0)
     filled = raw.fillna(medians)
     lower = filled.quantile(0.01).fillna(medians)
@@ -986,7 +997,7 @@ def fit_logistic_model(train: pd.DataFrame) -> dict[str, Any]:
     stds = clipped.std(axis=0, ddof=0).replace(0, 1.0).fillna(1.0)
     scaled = (clipped - means) / stds
     x = np.column_stack([np.ones(len(scaled)), scaled.to_numpy(dtype=float)])
-    y = true_mask(train, "Future_W1_Strong_Separation").astype(float).to_numpy()
+    y = true_mask(train, target_column).astype(float).to_numpy()
     beta = np.zeros(x.shape[1], dtype=float)
     beta[0] = math.log((y.mean() + 1e-4) / (1.0 - y.mean() + 1e-4))
     penalty = np.eye(x.shape[1], dtype=float) * MODEL_L2
@@ -1006,16 +1017,75 @@ def fit_logistic_model(train: pd.DataFrame) -> dict[str, Any]:
     return {
         "beta": beta, "medians": medians, "lower": lower, "upper": upper,
         "means": means, "stds": stds, "base_rate": float(y.mean()),
+        "features": features,
     }
 
 
 def predict_logistic(frame: pd.DataFrame, model: dict[str, Any]) -> np.ndarray:
-    raw = frame.loc[:, MODEL_FEATURES].apply(pd.to_numeric, errors="coerce")
+    raw = frame.loc[:, model["features"]].apply(pd.to_numeric, errors="coerce")
     filled = raw.fillna(model["medians"])
     clipped = filled.clip(lower=model["lower"], upper=model["upper"], axis=1)
     scaled = (clipped - model["means"]) / model["stds"]
     x = np.column_stack([np.ones(len(scaled)), scaled.to_numpy(dtype=float)])
     return sigmoid(x @ model["beta"])
+
+
+def fit_ridge_model(train: pd.DataFrame, target_column: str,
+                    features: tuple[str, ...] = DIRECT_MODEL_FEATURES) -> dict[str, Any]:
+    raw = train.loc[:, features].apply(pd.to_numeric, errors="coerce")
+    medians = raw.median(axis=0).fillna(0.0)
+    filled = raw.fillna(medians)
+    lower = filled.quantile(0.01).fillna(medians)
+    upper = filled.quantile(0.99).fillna(medians)
+    clipped = filled.clip(lower=lower, upper=upper, axis=1)
+    means = clipped.mean(axis=0).fillna(0.0)
+    stds = clipped.std(axis=0, ddof=0).replace(0, 1.0).fillna(1.0)
+    scaled = (clipped - means) / stds
+    x = np.column_stack([np.ones(len(scaled)), scaled.to_numpy(dtype=float)])
+    y = numeric(train, target_column).to_numpy(dtype=float)
+    penalty = np.eye(x.shape[1], dtype=float) * RETURN_MODEL_L2
+    penalty[0, 0] = 0.0
+    try:
+        beta = np.linalg.solve(x.T @ x + penalty, x.T @ y)
+    except np.linalg.LinAlgError:
+        beta = np.linalg.pinv(x.T @ x + penalty) @ (x.T @ y)
+    return {
+        "beta": beta, "medians": medians, "lower": lower, "upper": upper,
+        "means": means, "stds": stds, "target_mean": float(np.mean(y)),
+        "features": features,
+    }
+
+
+def predict_ridge(frame: pd.DataFrame, model: dict[str, Any]) -> np.ndarray:
+    raw = frame.loc[:, model["features"]].apply(pd.to_numeric, errors="coerce")
+    filled = raw.fillna(model["medians"])
+    clipped = filled.clip(lower=model["lower"], upper=model["upper"], axis=1)
+    scaled = (clipped - model["means"]) / model["stds"]
+    x = np.column_stack([np.ones(len(scaled)), scaled.to_numpy(dtype=float)])
+    return x @ model["beta"]
+
+
+def add_direct_training_targets(frame: pd.DataFrame) -> pd.DataFrame:
+    work = frame.copy()
+    actual = numeric(work, "Entry_W5_Close_Return_Net_pct")
+    work["Direct_Target_Clipped_W5_pct"] = actual.clip(
+        RETURN_TARGET_FLOOR, RETURN_TARGET_CAP)
+    work["Direct_Target_W5_Positive"] = actual.gt(0)
+
+    def percentile(values: pd.Series) -> pd.Series:
+        valid = values.notna()
+        result = pd.Series(np.nan, index=values.index, dtype=float)
+        count = int(valid.sum())
+        if count == 1:
+            result.loc[valid] = 0.5
+        elif count > 1:
+            ranks = values.loc[valid].rank(method="average")
+            result.loc[valid] = (ranks - 1.0) / (count - 1.0)
+        return result
+
+    work["Direct_Target_Week_Percentile"] = work.groupby(
+        "Signal_Date", sort=False)["Direct_Target_Clipped_W5_pct"].transform(percentile)
+    return work
 
 
 def auc_score(labels: pd.Series, scores: pd.Series) -> float:
@@ -1031,14 +1101,26 @@ def apply_annual_oos_models(history: pd.DataFrame, events: pd.DataFrame
                             ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     work = events.copy()
     work["OOS_Predicted_W1_Probability"] = np.nan
+    work["OOS_Predicted_Clipped_W5_Return_pct"] = np.nan
+    work["OOS_Predicted_Week_Percentile"] = np.nan
+    work["OOS_Predicted_W5_Positive_Probability"] = np.nan
+    work["OOS_Direct_Return_Score"] = np.nan
     work["Model_Train_Start"] = ""
     work["Model_Train_End"] = ""
     work["Model_Train_N"] = 0
     work["Model_Train_Base_Rate"] = np.nan
+    work["Model_Train_W5_Mean"] = np.nan
     work["Model_Status"] = "未训练"
-    eligible_history = history[
-        true_mask(history, "Eligible_Preliminary")
-        & true_mask(history, "Future_W1_Available")
+    history_targets = add_direct_training_targets(history)
+    eligible_history = history_targets[
+        true_mask(history_targets, "Eligible_Preliminary")
+        & true_mask(history_targets, "Entry_Tradable")
+        & true_mask(history_targets, "Entry_Has_W5")
+        & numeric(history_targets, "Direct_Target_Clipped_W5_pct").notna()
+    ].copy()
+    separation_history = history_targets[
+        true_mask(history_targets, "Eligible_Preliminary")
+        & true_mask(history_targets, "Future_W1_Available")
     ].copy()
     coefficient_rows: list[dict[str, Any]] = []
     model_rows: list[dict[str, Any]] = []
@@ -1046,46 +1128,108 @@ def apply_annual_oos_models(history: pd.DataFrame, events: pd.DataFrame
         year_number = int(year)
         train_start = f"{year_number - MODEL_LOOKBACK_YEARS}0101"
         train_end = f"{year_number - 1}1231"
+        separation_train = separation_history[
+            separation_history["Future_W1_Check_Date"].astype(str).between(
+                train_start, train_end)
+        ].copy()
+        # 直接收益标签必须在训练截止日前已经完整结束；不能只凭信号日期截断。
         train = eligible_history[
-            eligible_history["Future_W1_Check_Date"].astype(str).between(train_start, train_end)
+            eligible_history["Entry_W5_End_Date"].astype(str).between(train_start, train_end)
         ].copy()
         target_index = work.index[work["Signal_Year"].astype(str).eq(year)]
-        if len(train) < MODEL_MIN_TRAIN or true_mask(train, "Future_W1_Strong_Separation").nunique() < 2:
-            base_rate = float(true_mask(train, "Future_W1_Strong_Separation").mean()) if len(train) else 0.5
-            work.loc[target_index, "OOS_Predicted_W1_Probability"] = base_rate
-            work.loc[target_index, "Model_Train_Start"] = train_start
-            work.loc[target_index, "Model_Train_End"] = train_end
-            work.loc[target_index, "Model_Train_N"] = len(train)
-            work.loc[target_index, "Model_Train_Base_Rate"] = base_rate
-            work.loc[target_index, "Model_Status"] = "训练样本不足_仅历史基准率"
-            model_rows.append({
-                "目标年度": year, "训练开始": train_start, "训练截止": train_end,
-                "实际最早训练标签": str(train["Future_W1_Check_Date"].min()) if len(train) else "",
-                "实际最晚训练标签": str(train["Future_W1_Check_Date"].max()) if len(train) else "",
-                "训练样本": len(train), "历史持续分离率%": base_rate * 100,
-                "模型状态": "训练样本不足_仅历史基准率",
-            })
-            continue
-        model = fit_logistic_model(train)
-        probabilities = predict_logistic(work.loc[target_index], model)
-        work.loc[target_index, "OOS_Predicted_W1_Probability"] = probabilities
+        target_frame = work.loc[target_index].copy()
+
+        if (len(separation_train) >= MODEL_MIN_TRAIN
+                and true_mask(separation_train, "Future_W1_Strong_Separation").nunique() >= 2):
+            separation_model = fit_logistic_model(
+                separation_train, "Future_W1_Strong_Separation", MODEL_FEATURES)
+            target_w1_probability = predict_logistic(target_frame, separation_model)
+            train_w1_probability = predict_logistic(train, separation_model) if len(train) else np.array([])
+            separation_status = "年度样本外Logistic"
+            for feature, coefficient in zip(("截距",) + MODEL_FEATURES,
+                                            separation_model["beta"]):
+                coefficient_rows.append({
+                    "目标年度": year, "模型": "辅助_W1持续分离Logistic",
+                    "训练开始": train_start, "训练截止": train_end,
+                    "训练样本": len(separation_train), "特征": feature,
+                    "标准化系数": float(coefficient),
+                })
+            separation_base = separation_model["base_rate"]
+        else:
+            separation_base = (
+                float(true_mask(separation_train, "Future_W1_Strong_Separation").mean())
+                if len(separation_train) else 0.5)
+            target_w1_probability = np.full(len(target_frame), separation_base)
+            train_w1_probability = np.full(len(train), separation_base)
+            separation_status = "W1样本不足_历史基准率"
+
+        work.loc[target_index, "OOS_Predicted_W1_Probability"] = target_w1_probability
+        target_frame["Model_Predicted_W1_Feature"] = target_w1_probability
+        train["Model_Predicted_W1_Feature"] = train_w1_probability
+
+        enough_return_samples = (
+            len(train) >= MODEL_MIN_TRAIN
+            and true_mask(train, "Direct_Target_W5_Positive").nunique() >= 2)
+        if enough_return_samples:
+            return_model = fit_ridge_model(
+                train, "Direct_Target_Clipped_W5_pct", DIRECT_MODEL_FEATURES)
+            percentile_model = fit_ridge_model(
+                train, "Direct_Target_Week_Percentile", DIRECT_MODEL_FEATURES)
+            positive_model = fit_logistic_model(
+                train, "Direct_Target_W5_Positive", DIRECT_MODEL_FEATURES)
+            predicted_return = np.clip(
+                predict_ridge(target_frame, return_model),
+                RETURN_TARGET_FLOOR, RETURN_TARGET_CAP)
+            predicted_percentile = np.clip(
+                predict_ridge(target_frame, percentile_model), 0.0, 1.0)
+            predicted_positive = predict_logistic(target_frame, positive_model)
+            status = "年度样本外_直接收益Ridge+盈利Logistic"
+            for model_name, fitted in (
+                ("主模型_W5缩尾收益Ridge", return_model),
+                ("辅助_同周W5百分位Ridge", percentile_model),
+                ("辅助_W5盈利Logistic", positive_model),
+            ):
+                for feature, coefficient in zip(("截距",) + DIRECT_MODEL_FEATURES,
+                                                fitted["beta"]):
+                    coefficient_rows.append({
+                        "目标年度": year, "模型": model_name,
+                        "训练开始": train_start, "训练截止": train_end,
+                        "训练样本": len(train), "特征": feature,
+                        "标准化系数": float(coefficient),
+                    })
+        else:
+            predicted_return = np.full(
+                len(target_frame), numeric(train, "Direct_Target_Clipped_W5_pct").mean()
+                if len(train) else 0.0)
+            predicted_percentile = np.full(
+                len(target_frame), numeric(train, "Direct_Target_Week_Percentile").mean()
+                if len(train) else 0.5)
+            predicted_positive = np.full(
+                len(target_frame), true_mask(train, "Direct_Target_W5_Positive").mean()
+                if len(train) else 0.5)
+            status = "收益样本不足_仅历史均值"
+
+        work.loc[target_index, "OOS_Predicted_Clipped_W5_Return_pct"] = predicted_return
+        work.loc[target_index, "OOS_Predicted_Week_Percentile"] = predicted_percentile
+        work.loc[target_index, "OOS_Predicted_W5_Positive_Probability"] = predicted_positive
+        work.loc[target_index, "OOS_Direct_Return_Score"] = predicted_return
         work.loc[target_index, "Model_Train_Start"] = train_start
         work.loc[target_index, "Model_Train_End"] = train_end
         work.loc[target_index, "Model_Train_N"] = len(train)
-        work.loc[target_index, "Model_Train_Base_Rate"] = model["base_rate"]
-        work.loc[target_index, "Model_Status"] = "年度样本外Logistic"
-        for feature, coefficient in zip(("截距",) + MODEL_FEATURES, model["beta"]):
-            coefficient_rows.append({
-                "目标年度": year, "训练开始": train_start, "训练截止": train_end,
-                "训练样本": len(train), "特征": feature,
-                "标准化系数": float(coefficient),
-            })
+        work.loc[target_index, "Model_Train_Base_Rate"] = separation_base
+        work.loc[target_index, "Model_Train_W5_Mean"] = numeric(
+            train, "Direct_Target_Clipped_W5_pct").mean()
+        work.loc[target_index, "Model_Status"] = status
         model_rows.append({
             "目标年度": year, "训练开始": train_start, "训练截止": train_end,
-            "实际最早训练标签": str(train["Future_W1_Check_Date"].min()),
-            "实际最晚训练标签": str(train["Future_W1_Check_Date"].max()),
-            "训练样本": len(train), "历史持续分离率%": model["base_rate"] * 100,
-            "模型状态": "年度样本外Logistic",
+            "实际最早W5结束日": str(train["Entry_W5_End_Date"].min()) if len(train) else "",
+            "实际最晚W5结束日": str(train["Entry_W5_End_Date"].max()) if len(train) else "",
+            "直接收益训练样本": len(train),
+            "历史W5缩尾平均收益%": numeric(train, "Direct_Target_Clipped_W5_pct").mean(),
+            "历史W5盈利率%": true_mask(train, "Direct_Target_W5_Positive").mean() * 100 if len(train) else np.nan,
+            "W1辅助训练样本": len(separation_train),
+            "历史持续分离率%": separation_base * 100,
+            "W1辅助模型状态": separation_status, "模型状态": status,
         })
     return work, pd.DataFrame(model_rows), pd.DataFrame(coefficient_rows)
 
@@ -1095,11 +1239,15 @@ def rank_same_week(events: pd.DataFrame) -> pd.DataFrame:
     trend_rank = work["Individual_Trend"].map({"上涨": 2, "震荡/过渡": 1, "下跌": 0}).fillna(0)
     work["Observable_Trend_Rank"] = trend_rank.astype(int)
     work = work.sort_values([
-        "Signal_Date", "OOS_Predicted_W1_Probability",
+        "Signal_Date", "OOS_Direct_Return_Score",
+        "OOS_Predicted_Week_Percentile",
+        "OOS_Predicted_W5_Positive_Probability",
+        "OOS_Predicted_W1_Probability",
         "Prior_3_Count_Peak_GE75", "Observable_Trend_Rank",
         "Prior_3_Count_Peak_GE70", "Prior_3_Count_Peak_GE65",
         "Preconfirm_KD_Spread", "ts_code",
-    ], ascending=[True, False, False, False, False, False, False, True], kind="mergesort")
+    ], ascending=[True, False, False, False, False, False, False, False, False,
+                  False, True], kind="mergesort")
     work["Same_Week_Rank"] = work.groupby("Signal_Date", sort=False).cumcount() + 1
     for top_k in TOP_KS:
         work[f"Selected_Top{top_k}"] = work["Same_Week_Rank"].le(top_k)
@@ -1141,6 +1289,10 @@ def selection_metrics(frame: pd.DataFrame, label: str) -> dict[str, Any]:
     return {
         "选择组": label, "事件数": len(frame), "不同股票": frame["ts_code"].nunique(),
         "信号周": frame["Signal_Date"].nunique(),
+        "预测W5缩尾收益均值%": numeric(
+            frame, "OOS_Predicted_Clipped_W5_Return_pct").mean(),
+        "预测W5盈利概率均值%": numeric(
+            frame, "OOS_Predicted_W5_Positive_Probability").mean() * 100,
         "未来W1持续分离率%": target.mean() * 100 if len(target) else np.nan,
         "固定W5平均净收益%": w5.mean(), "固定W5中位净收益%": w5.median(),
         "固定W5胜率%": w5.gt(0).mean() * 100 if len(w5) else np.nan,
@@ -1197,15 +1349,41 @@ def classification_audit(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def direct_prediction_quality_audit(events: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    groups = [("全部样本外", events)] + list(events.groupby("Signal_Year", sort=True))
+    for group_name, group in groups:
+        actual_raw = numeric(group, "Entry_Fixed_W5_Net_Return_pct")
+        actual = actual_raw.clip(RETURN_TARGET_FLOOR, RETURN_TARGET_CAP)
+        predicted = numeric(group, "OOS_Predicted_Clipped_W5_Return_pct")
+        predicted_positive = numeric(
+            group, "OOS_Predicted_W5_Positive_Probability").clip(1e-6, 1 - 1e-6)
+        valid = actual.notna() & predicted.notna()
+        y_positive = actual_raw.gt(0)
+        error = predicted[valid] - actual[valid]
+        rows.append({
+            "分组": group_name, "样本": int(valid.sum()),
+            "实际W5缩尾平均收益%": actual[valid].mean(),
+            "预测W5缩尾平均收益%": predicted[valid].mean(),
+            "MAE": error.abs().mean(), "RMSE": np.sqrt((error ** 2).mean()),
+            "Pearson": predicted[valid].corr(actual[valid], method="pearson"),
+            "Spearman": predicted[valid].corr(actual[valid], method="spearman"),
+            "实际W5盈利率%": y_positive[valid].mean() * 100,
+            "预测W5盈利概率均值%": predicted_positive[valid].mean() * 100,
+            "W5盈利概率AUC": auc_score(y_positive[valid], predicted_positive[valid]),
+        })
+    return pd.DataFrame(rows)
+
+
 def score_decile_audit(events: pd.DataFrame) -> pd.DataFrame:
     work = events.copy()
-    ranks = numeric(work, "OOS_Predicted_W1_Probability").rank(method="first")
+    ranks = numeric(work, "OOS_Direct_Return_Score").rank(method="first")
     work["OOS_Score_Decile"] = pd.qcut(
         ranks, 10, labels=[f"D{i}" for i in range(1, 11)], duplicates="drop")
     rows = []
     for decile, group in work.groupby("OOS_Score_Decile", observed=True, sort=True):
         row = selection_metrics(group, str(decile))
-        row["预测概率均值%"] = numeric(group, "OOS_Predicted_W1_Probability").mean() * 100
+        row["预测W5缩尾收益均值%"] = numeric(group, "OOS_Direct_Return_Score").mean()
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1473,13 +1651,14 @@ def main() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
-    st.caption("上穿25后立即执行；未来W1持续分离只作训练标签；逐年样本外排序后再进行真实三仓占位。")
-    with st.expander("V4.5验证框架", expanded=True):
+    st.caption("上穿25后立即执行；按历史真实W5收益逐年样本外训练；直接收益排序后再进行真实三仓占位。")
+    with st.expander("V4.6验证框架", expanded=True):
         st.markdown(f"""
 - **可执行买点**：周线低位金叉进入观察；K首次从25下方上穿25、K>D且K上升，该完整周结束后的下一市场交易日开盘买入。
-- **训练目标**：预测买入后的下一完整周是否满足K、D同时上升、K>D、K≥25且K-D差值扩大。该未来标签不参与当期硬筛选。
-- **严格样本外**：每个目标年度只使用此前{MODEL_LOOKBACK_YEARS}个完整年度、且标签已经发生的样本训练；不使用本年度结果重新拟合本年度。
-- **排序**：样本外持续分离概率优先；历史3个已完成波段触及75次数、个股趋势、触及70/65次数依次作为可观测次级排序。
+- **主训练目标**：直接预测固定W5净收益，训练标签限制在{RETURN_TARGET_FLOOR:.0f}%～+{RETURN_TARGET_CAP:.0f}%，降低少数牛股对模型的支配。
+- **辅助目标**：同时预测同周W5收益百分位、W5盈利概率以及未来W1持续分离概率；未来字段只属于过去训练样本，绝不作为当期已知事实。
+- **严格样本外**：每个目标年度只使用此前{MODEL_LOOKBACK_YEARS}个完整年度、并且W5观察期已经结束的样本；不使用本年度结果重新拟合本年度。
+- **排序**：预测W5缩尾收益为第一顺序；预测同周百分位、盈利概率、W1分离概率及历史波段特征只负责破同分。
 - **准确性审计**：同时报告Top1、Top3、Top5、全部候选、同周随机选择、得分十分位和排名位置，不用三仓总收益代替评分准确率。
 - **稳健性审计**：报告中位数、截尾/缩尾、去掉前1/3/5/10赢家、每股仅首次信号、排除2025年。
 - **真实三仓**：总资金30万元、三个独立10万元槽位；仓位未退出时不接收新信号，同一股票持仓期间不重复买入；按同周排名依次补空位。
@@ -1487,27 +1666,27 @@ def main() -> None:
 """)
     with st.sidebar:
         st.header("运行参数")
-        signal_start_date = st.date_input("买入信号开始", date(2023, 6, 5), key="v45_start")
-        signal_end_date = st.date_input("买入信号截止", date(2026, 6, 5), key="v45_end")
-        market_end_date = st.date_input("行情观察截止", date.today(), key="v45_market_end")
-        split_date_value = st.date_input("近期行情分界", date(2025, 6, 1), key="v45_split")
-        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v45_pause")
-        use_cache = st.checkbox("复用逐股票缓存", True, key="v45_cache")
+        signal_start_date = st.date_input("买入信号开始", date(2023, 6, 5), key="v46_start")
+        signal_end_date = st.date_input("买入信号截止", date(2026, 6, 5), key="v46_end")
+        market_end_date = st.date_input("行情观察截止", date.today(), key="v46_market_end")
+        split_date_value = st.date_input("近期行情分界", date(2025, 6, 1), key="v46_split")
+        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v46_pause")
+        use_cache = st.checkbox("复用逐股票缓存", True, key="v46_cache")
         st.divider()
-        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v45_commission")
-        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v45_stamp")
-        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v45_transfer")
-        if st.button("清除本程序行情缓存", key="v45_clear"):
+        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v46_commission")
+        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v46_stamp")
+        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v46_transfer")
+        if st.button("清除本程序行情缓存", key="v46_clear"):
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
             st.success("缓存已清除")
 
-    token = st.text_input("Tushare Token", type="password", key="v45_token")
-    session_key = "weekly_skdj_oos_rank_v45_zip"
-    result_name = "weekly_skdj_oos_rank_three_slot_v4_5_all_results.zip"
+    token = st.text_input("Tushare Token", type="password", key="v46_token")
+    session_key = "weekly_skdj_direct_return_rank_v46_zip"
+    result_name = "weekly_skdj_direct_return_rank_v4_6_all_results.zip"
     if not token:
         st.info("请输入Tushare Token；本版没有增加新的Python依赖。")
         return
-    if not st.button("开始V4.5样本外排序审计", type="primary", key="v45_run"):
+    if not st.button("开始V4.6直接收益排序审计", type="primary", key="v46_run"):
         if session_key in st.session_state:
             st.download_button("下载上一次结果ZIP", st.session_state[session_key],
                                file_name=result_name, mime="application/zip", on_click="ignore")
@@ -1603,6 +1782,7 @@ def main() -> None:
         return
 
     classification = classification_audit(events_all)
+    direct_quality = direct_prediction_quality_audit(events)
     label_value = future_label_value_audit(events)
     topk = topk_selection_audit(events)
     deciles = score_decile_audit(events)
@@ -1627,54 +1807,58 @@ def main() -> None:
         "有信号周": int(counts.gt(0).sum()), "空窗周": int(counts.eq(0).sum()),
         "最长连续空窗周": max_empty_run(counts), "每周候选均值": counts.mean(),
         "每周候选中位数": counts.median(), "单周最多": counts.max(),
-        "模型样本不足年度数": int(events["Model_Status"].ne("年度样本外Logistic").groupby(events["Signal_Year"]).any().sum()),
+        "模型样本不足年度数": int(events["Model_Status"].ne(
+            "年度样本外_直接收益Ridge+盈利Logistic").groupby(
+                events["Signal_Year"]).any().sum()),
         "行情失败": data_failures, "缓存命中": cache_hits,
     }])
     metadata = pd.DataFrame([
         ("买点", "低位金叉观察后，K首次从25下方上穿25且K>D、K上升；下一市场交易日开盘买"),
-        ("未来标签", "下一完整周K、D同时上升、K>D、K≥25且差值扩大；只用于过去样本训练和事后评价"),
-        ("年度样本外", f"目标年度仅使用此前{MODEL_LOOKBACK_YEARS}个完整年度且标签已发生的样本"),
-        ("预测模型", f"纯NumPy L2 Logistic，标准化特征，1%/99%训练期缩尾，最少训练样本{MODEL_MIN_TRAIN}"),
-        ("排序", "预测持续分离概率优先；历史触及75次数、上涨趋势、触及70/65次数和当周K-D差值依次破同分"),
+        ("主训练目标", f"固定W5净收益缩尾至{RETURN_TARGET_FLOOR:.0f}%～+{RETURN_TARGET_CAP:.0f}%；直接预测可交易结果"),
+        ("辅助训练目标", "同周W5收益百分位、W5盈利概率、未来W1持续分离概率"),
+        ("年度样本外", f"目标年度仅使用此前{MODEL_LOOKBACK_YEARS}个完整年度，且W5结束日不晚于训练截止日的样本"),
+        ("预测模型", f"纯NumPy L2 Ridge+Logistic；特征1%/99%训练期缩尾；最少训练样本{MODEL_MIN_TRAIN}"),
+        ("排序", "预测W5缩尾收益优先；同周百分位、盈利概率、W1分离概率及历史波段特征依次破同分"),
         ("随机检验", f"同周随机Top1/3/5各{RANDOM_TRIALS}次；三仓随机排名各退出规则{PORTFOLIO_RANDOM_TRIALS}次"),
         ("真实三仓", "三个10万元独立槽位；退出日当天保守地不能在开盘释放槽位；仓位满则跳过后续候选"),
         ("组合限制", "只输出交易级复利期末权益；没有逐日组合净值，不报告最大回撤"),
         ("成本", "买卖均计0.2%滑点、佣金和过户费，卖出另计印花税"),
         ("股票池", "申万历史科技行业；主板/创业板/科创板；低位金叉及上穿25日股价≥10元、流通市值≥100亿元"),
-        ("严禁使用", "未来W1字段、未来收益、最高价、目标年度标签均不进入目标年度评分"),
+        ("严禁使用", "目标年度未来W1字段、未来收益、最高价及本年度训练结果均不进入当期评分"),
     ], columns=["项目", "说明"])
 
     files = {
-        "01_run_summary_v4_5.csv": run_summary,
-        "02_oos_model_summary_v4_5.csv": model_summary,
-        "03_oos_model_coefficients_v4_5.csv": coefficients,
-        "04_oos_classification_quality_v4_5.csv": classification,
-        "05_future_w1_label_value_v4_5.csv": label_value,
-        "06_top1_top3_top5_selection_quality_v4_5.csv": topk,
-        "07_score_decile_monotonicity_v4_5.csv": deciles,
-        "08_same_week_rank_position_v4_5.csv": rank_positions,
-        "09_topk_vs_random_summary_v4_5.csv": random_summary,
-        "10_topk_random_trials_v4_5.csv": random_trials,
-        "11_weekly_topk_lift_summary_v4_5.csv": weekly_lift,
-        "12_weekly_topk_lift_details_v4_5.csv": weekly_lift_details,
-        "13_robustness_remove_winners_v4_5.csv": robustness,
-        "14_exit_policy_by_selection_v4_5.csv": exits,
-        "15_year_oos_stability_v4_5.csv": yearly,
-        "16_half_year_oos_stability_v4_5.csv": half_yearly,
-        "17_true_three_slot_portfolio_v4_5.csv": portfolio,
-        "18_true_three_slot_trades_v4_5.csv": portfolio_trades,
-        "19_three_slot_vs_random_rank_v4_5.csv": portfolio_random,
-        "20_weekly_signal_calendar_v4_5.csv": calendar,
-        "21_all_ranked_signal_events_v4_5.csv": events_all,
-        "22_all_ranked_mature_events_v4_5.csv": events,
-        "23_all_model_history_events_v4_5.csv": model_history,
-        "24_all_bottom_cycles_v4_5.csv": cycles,
-        "25_full_tech_universe_v4_5.csv": stocks,
-        "26_board_population_v4_5.csv": population,
-        "27_rejection_audit_v4_5.csv": pd.DataFrame(
+        "01_run_summary_v4_6.csv": run_summary,
+        "02_oos_model_summary_v4_6.csv": model_summary,
+        "03_oos_model_coefficients_v4_6.csv": coefficients,
+        "04_oos_direct_return_quality_v4_6.csv": direct_quality,
+        "05_oos_w1_auxiliary_quality_v4_6.csv": classification,
+        "06_future_w1_label_value_v4_6.csv": label_value,
+        "07_top1_top3_top5_selection_quality_v4_6.csv": topk,
+        "08_direct_score_decile_monotonicity_v4_6.csv": deciles,
+        "09_same_week_rank_position_v4_6.csv": rank_positions,
+        "10_topk_vs_random_summary_v4_6.csv": random_summary,
+        "11_topk_random_trials_v4_6.csv": random_trials,
+        "12_weekly_topk_lift_summary_v4_6.csv": weekly_lift,
+        "13_weekly_topk_lift_details_v4_6.csv": weekly_lift_details,
+        "14_robustness_remove_winners_v4_6.csv": robustness,
+        "15_exit_policy_by_selection_v4_6.csv": exits,
+        "16_year_oos_stability_v4_6.csv": yearly,
+        "17_half_year_oos_stability_v4_6.csv": half_yearly,
+        "18_true_three_slot_portfolio_v4_6.csv": portfolio,
+        "19_true_three_slot_trades_v4_6.csv": portfolio_trades,
+        "20_three_slot_vs_random_rank_v4_6.csv": portfolio_random,
+        "21_weekly_signal_calendar_v4_6.csv": calendar,
+        "22_all_ranked_signal_events_v4_6.csv": events_all,
+        "23_all_ranked_mature_events_v4_6.csv": events,
+        "24_all_model_history_events_v4_6.csv": model_history,
+        "25_all_bottom_cycles_v4_6.csv": cycles,
+        "26_full_tech_universe_v4_6.csv": stocks,
+        "27_board_population_v4_6.csv": population,
+        "28_rejection_audit_v4_6.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "28_api_errors_v4_5.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "29_metadata_v4_5.csv": metadata,
+        "29_api_errors_v4_6.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "30_metadata_v4_6.csv": metadata,
     }
     result_zip = make_zip(files)
     st.session_state[session_key] = result_zip
@@ -1686,8 +1870,8 @@ def main() -> None:
     c2.metric("有信号周", int(counts.gt(0).sum()))
     c3.metric("空窗周", int(counts.eq(0).sum()))
     c4.metric("单周最多", int(counts.max()))
-    st.subheader("样本外预测质量")
-    st.dataframe(classification, use_container_width=True, hide_index=True)
+    st.subheader("样本外直接收益预测质量")
+    st.dataframe(direct_quality, use_container_width=True, hide_index=True)
     st.subheader("Top1 / Top3 / Top5准确性")
     st.dataframe(topk, use_container_width=True, hide_index=True)
     st.subheader("TopK与同周随机选择")
@@ -1696,9 +1880,9 @@ def main() -> None:
     st.dataframe(portfolio, use_container_width=True, hide_index=True)
     st.subheader("真实三仓与随机排名")
     st.dataframe(portfolio_random, use_container_width=True, hide_index=True)
-    st.download_button("下载V4.5全部结果ZIP", result_zip, file_name=result_name,
-                       mime="application/zip", type="primary", key="v45_download", on_click="ignore")
-    st.info("先看04–05判断模型及训练标签是否有效；06–13判断评分准确性和牛股依赖；最后看17–19判断真实三仓是否仍优于随机。")
+    st.download_button("下载V4.6全部结果ZIP", result_zip, file_name=result_name,
+                       mime="application/zip", type="primary", key="v46_download", on_click="ignore")
+    st.info("先看04判断直接收益预测；07–14判断TopK、随机基准和牛股依赖；最后看18–20判断真实三仓是否稳定优于随机。")
 
 
 if __name__ == "__main__":
