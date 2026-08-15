@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V5.1 永久缓存继承·全功能完整版)
+周线 SKDJ 底部脱离定型版 (V6 趋势识别·综合评分定型版)
 ------------------------------------------------
-1. 【永久缓存继承】：统一采用 master 缓存机制，自动向上兼容并无缝继承历史下载数据，后续改版免重复下载。
-2. 【全链路防崩】：Token 自动清洗、连接预检探针、全接口异常拦截，彻底杜绝手机端白屏。
-3. 【时间轴校准】：交易日历本地强制升序排列，准确回测最近 N 个交易日。
-4. 【交易闭环】：周末锁定定型周线 -> 次周一开盘竞价买入 -> 差异化开盘拦截。
+1. 【周线趋势识别引擎】：新增周线 上升/震荡/下跌 趋势分类与多级打分，软性压制空头反抽。
+2. 【全新评分排序体系】：周线趋势分 + K值动能甜区分 + 量能健康分，优选前3名真龙头。
+3. 【永久缓存继承】：自动继承历史下载数据，支持多周期反复回测防过拟合。
+4. 【全链路防崩溃】：Token 自动清洗、连接预检探针、全接口异常拦截，杜绝白屏。
 5. 【阶梯风控】：-10% 认栽出局 / +12% 阶段保本 / +25% 移动跟踪止盈。
 ------------------------------------------------
 """
@@ -24,12 +24,11 @@ import pickle
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 全局持久化缓存配置 (自动继承历史版本)
+# 全局持久化缓存配置
 # ---------------------------
 CHECKPOINT_FILE = "skdj_robust_checkpoint.csv"
 MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 
-# 自动继承历史版本的缓存文件
 if not os.path.exists(MARKET_CACHE_FILE):
     for legacy_file in [
         "skdj_market_data_v5.pkl", 
@@ -48,21 +47,17 @@ if not os.path.exists(MARKET_CACHE_FILE):
 # 页面基础配置
 # ---------------------------
 st.set_page_config(page_title="SKDJ 底部突破实战版", layout="wide")
-st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (持久缓存版)")
-st.markdown("🔒 **底座已固化：支持版本间缓存继承，代码迭代无需重复拉取历史行情。**")
+st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (V6 趋势增强版)")
+st.markdown("🔒 **趋势雷达已装载：集成周线趋势识别与综合评分体系，全链路防崩。**")
 
 # ---------------------------
 # Token 清洗与预检模块
 # ---------------------------
 def clean_token_str(raw_token: str) -> str:
-    """剔除手机端复制时混入的换行符、不可见字符及全角空格"""
-    if not raw_token:
-        return ""
-    cleaned = re.sub(r'[\s\u3000\ufeff\xa0\r\n]+', '', str(raw_token))
-    return cleaned.strip()
+    if not raw_token: return ""
+    return re.sub(r'[\s\u3000\ufeff\xa0\r\n]+', '', str(raw_token)).strip()
 
 def verify_token_connection(token_str: str):
-    """0.1秒极速预检 Token 有效性"""
     if not token_str:
         return False, "Token 为空，请在侧边栏填入 Token。"
     try:
@@ -79,7 +74,6 @@ def verify_token_connection(token_str: str):
         return False, f"接口校验失败: {err_msg}"
 
 def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
-    """全异常保护的 Tushare 安全调用"""
     for attempt in range(max_retries):
         try:
             df = func(**kwargs)
@@ -123,7 +117,7 @@ def load_industry_mapping(token):
     return dict(zip(full_df['con_code'], full_df['industry_code']))
 
 # ---------------------------
-# 增量下载引擎 (持久化存盘 + 节流保护)
+# 增量下载引擎
 # ---------------------------
 def sync_market_data_incrementally(start_date, end_date, token):
     token_c = clean_token_str(token)
@@ -224,7 +218,7 @@ def get_qfq_data(ts_code, start_date, end_date, daily_raw, adj_raw):
     return df
 
 # ---------------------------
-# 核心引擎：突破 25 线算法
+# 核心引擎：突破 25 线算法 + 趋势识别 + 综合评分
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, daily_raw, adj_raw):
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=550)).strftime("%Y%m%d")
@@ -257,6 +251,9 @@ def compute_breakout_signal(ts_code, end_date, daily_raw, adj_raw):
     weekly_df['k'] = weekly_df['rsv'].ewm(span=m, adjust=False).mean()
     weekly_df['d'] = weekly_df['k'].rolling(window=m).mean()
     weekly_df['ma5_vol'] = weekly_df['vol'].shift(1).rolling(window=5).mean()
+    
+    # 计算周线均线
+    weekly_df['ma20'] = weekly_df['close'].rolling(window=20).mean()
 
     curr_w = weekly_df.iloc[-1]
     prev_w = weekly_df.iloc[-2]
@@ -275,11 +272,65 @@ def compute_breakout_signal(ts_code, end_date, daily_raw, adj_raw):
         is_vol_ok = curr_w['vol'] >= curr_w['ma5_vol'] * 0.85
 
     res['is_buy_signal'] = is_breakout_25 and is_bullish and has_bottom_gene and is_yang and is_vol_ok
+    if not res['is_buy_signal']: return res
+
     res['k'] = round(curr_w['k'], 2)
     res['d'] = round(curr_w['d'], 2)
     res['recent_d_min'] = round(recent_d_min, 2)
     res['signal_close'] = curr_w['close'] 
-    res['vol_ratio'] = round(curr_w['vol'] / curr_w['ma5_vol'], 2) if curr_w['ma5_vol'] > 0 else 1.0
+    
+    vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
+    res['vol_ratio'] = round(vol_ratio, 2)
+
+    # ---------------------------
+    # 核心升级：周线趋势识别算法
+    # ---------------------------
+    ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
+    ma20_prev = prev_w['ma20'] if pd.notna(prev_w['ma20']) else curr_w['close']
+    ma20_slope = (ma20_curr - ma20_prev) / (ma20_prev + 1e-5)
+    
+    low_recent_3w = weekly_df['low'].tail(3).min()
+    low_prev_10w = weekly_df['low'].tail(10).min()
+    is_higher_low = low_recent_3w > low_prev_10w * 1.01
+
+    if curr_w['close'] >= ma20_curr and ma20_slope >= -0.003:
+        trend_type = "上升趋势"
+        score_trend = 30.0
+    elif is_higher_low or abs(curr_w['close'] - ma20_curr) / ma20_curr <= 0.08:
+        trend_type = "震荡筑底"
+        score_trend = 15.0
+    else:
+        trend_type = "下跌中继"
+        score_trend = -25.0
+        
+    res['trend_type'] = trend_type
+
+    # ---------------------------
+    # 核心升级：新版综合评分模型
+    # ---------------------------
+    # 1. K值动能甜区打分 (28~38高分)
+    k_val = curr_w['k']
+    if k_val < 28.0:
+        score_k = (k_val - 25.0) * 2.0
+    elif 28.0 <= k_val <= 38.0:
+        score_k = 15.0 + (k_val - 28.0) * 3.5
+    else:
+        score_k = 50.0 - (k_val - 38.0) * 2.0
+
+    # 2. 量能健康度打分 (1.3~3.0黄金放量)
+    if vol_ratio < 1.0:
+        score_vol = -20.0
+    elif 1.0 <= vol_ratio < 1.3:
+        score_vol = 10.0
+    elif 1.3 <= vol_ratio <= 3.0:
+        score_vol = 35.0
+    elif 3.0 < vol_ratio <= 4.5:
+        score_vol = 20.0
+    else:
+        score_vol = 5.0
+
+    total_score = score_k + score_vol + score_trend
+    res['Total_Score'] = round(total_score, 1)
 
     return res
 
@@ -481,7 +532,7 @@ if st.button("🚀 启动周末定型回测"):
                             stock_basic = safe_tushare_call(pro.stock_basic, list_status='L', fields='ts_code,name')
                             stock_industry_map = load_industry_mapping(token_clean)
                             
-                            bar = st.progress(0, text="执行周末精选引擎...")
+                            bar = st.progress(0, text="执行周末趋势与精选引擎...")
                             
                             for i, date in enumerate(dates_to_run):
                                 try:
@@ -511,16 +562,13 @@ if st.button("🚀 启动周末定型回测"):
                                     ind = compute_breakout_signal(row.ts_code, date, daily_raw, adj_raw)
                                     if not ind or not ind.get('is_buy_signal'): continue
                                         
-                                    score_k_break = (ind['k'] - 25.0) * 5.0
-                                    score_vol = ind['vol_ratio'] * 10.0
-                                    total_score = score_k_break + score_vol
-                                        
                                     future_returns = track_future_performance(row.ts_code, date, ind['signal_close'], daily_raw, adj_raw, hold_weeks=8)
                                     
                                     record_dict = {
                                         'ts_code': row.ts_code, 'name': row.name, 'Signal_Close': ind['signal_close'], 
                                         'SKDJ_K': ind['k'], 'SKDJ_D': ind['d'], 'D_Min(10W)': ind['recent_d_min'],
-                                        'circ_mv': round(row.circ_mv_billion, 2), 'Total_Score': round(total_score, 1)
+                                        'Trend_Type': ind['trend_type'], 'vol_ratio': ind['vol_ratio'],
+                                        'circ_mv': round(row.circ_mv_billion, 2), 'Total_Score': ind['Total_Score']
                                     }
                                     record_dict.update(future_returns)
                                     records.append(record_dict)
@@ -548,7 +596,7 @@ if os.path.exists(CHECKPOINT_FILE):
         all_res = pd.read_csv(CHECKPOINT_FILE)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header("📊 定型版战绩追踪")
+        st.header("📊 V6 趋势增强版战绩追踪")
         st.subheader("🗓️ 周度胜率分布 (严格对齐周末信号)")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -570,8 +618,8 @@ if os.path.exists(CHECKPOINT_FILE):
                         
         st.subheader("📋 详细真实回测轨迹")
         display_cols = [
-            'Rank', 'Trade_Date', 'name', 'ts_code', 'SKDJ_K', 'SKDJ_D', 'D_Min(10W)', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
-            'Total_Score', 'circ_mv', 'Exit_Reason'
+            'Rank', 'Trade_Date', 'name', 'ts_code', 'Trend_Type', 'SKDJ_K', 'SKDJ_D', 'D_Min(10W)', 'vol_ratio', 'Total_Score',
+            'Signal_Close', 'Buy_Price', 'Gap_pct (%)', 'circ_mv', 'Exit_Reason'
         ] + [f'Return_W{w} (%)' for w in range(1, 9)]
         final_cols = [c for c in display_cols if c in all_res.columns]
     
@@ -585,17 +633,29 @@ if os.path.exists(CHECKPOINT_FILE):
                 elif '移动止盈' in val: return 'color: green'
                 elif '期满' in val: return 'color: blue'
             return ''
+            
+        def color_trend(val):
+            if val == '上升趋势': return 'color: green; font-weight: bold'
+            elif val == '震荡筑底': return 'color: orange; font-weight: bold'
+            elif val == '下跌中继': return 'color: red; font-weight: bold'
+            return ''
+        
+        styled_df = display_df.style
+        if 'Exit_Reason' in display_df.columns:
+            styled_df = styled_df.map(color_exit, subset=['Exit_Reason'])
+        if 'Trend_Type' in display_df.columns:
+            styled_df = styled_df.map(color_trend, subset=['Trend_Type'])
         
         try:
-            st.dataframe(display_df.style.map(color_exit, subset=['Exit_Reason']), use_container_width=True)
+            st.dataframe(styled_df, use_container_width=True)
         except AttributeError:
-            st.dataframe(display_df.style.applymap(color_exit, subset=['Exit_Reason']), use_container_width=True)
+            st.dataframe(styled_df, width="stretch")
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="📥 导出完整回测记录 (CSV)", 
             data=csv, 
-            file_name="skdj_final_v5_1_export.csv", 
+            file_name="skdj_final_v6_export.csv", 
             mime="text/csv"
         )
     except pd.errors.EmptyDataError:
