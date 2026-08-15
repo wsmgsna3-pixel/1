@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V3 终极防卡死·增量断点版)
+周线 SKDJ 底部脱离定型版 (V4 终极实战版)
 ------------------------------------------------
-【核心修复】：
-1. 采用“原子化增量落地”引擎：每下载 10 天数据自动存盘，卡死刷新后直接接续下载进度！
-2. 加入 Tushare 限流节流阀，彻底解决因请求过快导致的前端卡死问题。
-3. 完美保留：周末选股 + 周一开盘竞价买入 + 差异化竞价拦截。
+1. 修复限流 Bug：加入严格验真机制，杜绝 Tushare 限流导致的“空数据假装下载”问题。
+2. 修复 UI 刷新 Bug：解耦回测运行与结果展示逻辑，点击下载不再丢失页面状态。
+3. 纯净交易逻辑：周末定格周线信号 -> 次周一真实开盘价买入 -> 差异化开盘拦截。
+4. 阶梯风控：-10%认栽出局 / +12%阶段保本 / +25%开启15%移动止盈。
 ------------------------------------------------
 """
 
@@ -21,14 +21,14 @@ import pickle
 
 warnings.filterwarnings("ignore")
 CHECKPOINT_FILE = "skdj_robust_checkpoint.csv"
-MARKET_CACHE_FILE = "skdj_market_data_v3.pkl"
+MARKET_CACHE_FILE = "skdj_market_data_v4.pkl"
 
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 底部突破定型版", layout="wide")
-st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (稳健断点版)")
-st.markdown("🔒 **增量引擎已启动：支持行情下载断点续传，彻底告别卡死与重复下载！**")
+st.set_page_config(page_title="SKDJ 底部突破实战版", layout="wide")
+st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (稳健版)")
+st.markdown("🔒 **增量引擎已启动：支持断点续传，页面刷新状态不丢失。**")
 
 # ---------------------------
 # 硬科技白名单 (内存缓存)
@@ -59,7 +59,7 @@ def load_industry_mapping(token):
     return dict(zip(full_df['con_code'], full_df['industry_code']))
 
 # ---------------------------
-# 增量下载引擎 (解决卡死与重传的核心)
+# 增量下载引擎 (修复限流与静默丢失 Bug)
 # ---------------------------
 def sync_market_data_incrementally(start_date, end_date, token):
     ts.set_token(token)
@@ -67,64 +67,65 @@ def sync_market_data_incrementally(start_date, end_date, token):
     cal = pro.trade_cal(start_date=start_date, end_date=end_date, is_open='1')
     all_dates = cal['cal_date'].tolist()
     
-    # 1. 安全读取本地进度
     cache = {'daily': [], 'adj': [], 'fetched_dates': set()}
     if os.path.exists(MARKET_CACHE_FILE):
         try:
             with open(MARKET_CACHE_FILE, 'rb') as f:
                 cache = pickle.load(f)
         except Exception:
-            pass # 如果文件损坏，自动重新开始
+            pass 
             
-    # 2. 计算需要补充下载的日期
     missing_dates = [d for d in all_dates if d not in cache['fetched_dates']]
     
     if missing_dates:
-        my_bar = st.progress(0, text=f"📥 发现 {len(missing_dates)} 天缺失数据，启动断点续传...")
+        my_bar = st.progress(0, text=f"📥 发现 {len(missing_dates)} 天缺失数据，启动受控下载引擎...")
         
         for i, d in enumerate(missing_dates):
-            # 获取日线
+            # 获取日线 (增加失败休眠机制)
             df_d = pd.DataFrame()
-            for _ in range(3):
+            for _ in range(5):
                 try:
                     df_d = pro.daily(trade_date=d)
                     break
-                except Exception: time.sleep(0.5)
+                except Exception: 
+                    time.sleep(1.0) # 触发限流时强制冷静
             
             # 获取复权因子
             df_a = pd.DataFrame()
-            for _ in range(3):
+            for _ in range(5):
                 try:
                     df_a = pro.adj_factor(trade_date=d)
                     break
-                except Exception: time.sleep(0.5)
+                except Exception: 
+                    time.sleep(1.0)
                 
-            if not df_d.empty: cache['daily'].append(df_d)
-            if not df_a.empty: cache['adj'].append(df_a)
-            cache['fetched_dates'].add(d)
+            # 【核心修复】：必须确保真正获取到了数据，才允许加入缓存和进度标记
+            if not df_d.empty and not df_a.empty:
+                cache['daily'].append(df_d)
+                cache['adj'].append(df_a)
+                cache['fetched_dates'].add(d)
+            else:
+                st.error(f"❌ 警告：Tushare 接口在 {d} 拒绝响应。已自动暂停并保存进度，请稍后再试。")
+                break # 强行中断，绝不录入空数据
             
-            # 【核心安全机制】：每 10 天或结束时，安全存盘一次
             if (i + 1) % 10 == 0 or i == len(missing_dates) - 1:
-                my_bar.progress((i+1)/len(missing_dates), text=f"📥 增量下载中: {i+1}/{len(missing_dates)} (进度已存盘)")
+                my_bar.progress((i+1)/len(missing_dates), text=f"📥 下载中: {i+1}/{len(missing_dates)} (进度已存盘)")
                 try:
-                    # 原子写入：先写入临时文件，再替换，防止写入中途卡死导致文件损坏
                     with open(MARKET_CACHE_FILE + ".tmp", 'wb') as f:
                         pickle.dump(cache, f)
                     os.replace(MARKET_CACHE_FILE + ".tmp", MARKET_CACHE_FILE)
                 except Exception:
                     pass
             
-            # 【节流阀】：强制休眠，防止 Tushare 限流卡死前端
-            time.sleep(0.2) 
+            # 【动态节流阀】：平稳下载
+            time.sleep(0.4) 
             
         my_bar.empty()
         
     return cache
 
-# 使用内存加速，避免每次交互都去合并巨大的 DataFrame
 @st.cache_data(ttl=3600*12, show_spinner=False)
 def load_and_process_market_data(start_date, end_date, token, _dummy_trigger):
-    # 先运行增量落地引擎确保数据完整
     cache = sync_market_data_incrementally(start_date, end_date, token)
     
     with st.spinner("正在构建高速索引..."):
@@ -203,7 +204,7 @@ def compute_breakout_signal(ts_code, end_date, daily_raw, adj_raw):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']): return res
 
-    # --- 突破核心 ---
+    # --- 突破核心法则 ---
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     is_bullish = curr_w['k'] > curr_w['d']
     recent_d_min = weekly_df['d'].tail(10).min()
@@ -329,16 +330,16 @@ def track_future_performance(ts_code, selection_date, signal_close, daily_raw, a
 with st.sidebar:
     st.header("⚙️ 系统配置参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("追溯自然天数", value=180, step=30)
+    BACKTEST_DAYS = st.number_input("追溯交易天数", value=300, step=30)
     TOP_BACKTEST = st.number_input("每周优选 TopK", value=3)
     
     st.markdown("---")
-    if st.button("🗑️ 清理行情重新下载"):
+    if st.button("🗑️ 强行清空本地行情 (重新下载)"):
         if os.path.exists(MARKET_CACHE_FILE):
             os.remove(MARKET_CACHE_FILE)
-            st.success("底层数据已清空，下次运行将重新拉取！")
+            st.success("底层数据已清空，下次运行将重新全量拉取！")
             
-    if st.button("🗑️ 清除断点重新回测"):
+    if st.button("🗑️ 清除所有回测记录"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
             st.success("回测进度已清理！")
@@ -352,113 +353,114 @@ with st.sidebar:
 
 TS_TOKEN = st.text_input("🔑 Tushare Token", type="password")
 if not TS_TOKEN: 
-    st.info("👈 请填入 Token 激活程序")
+    st.info("👈 请在侧边栏填入 Token 激活程序")
     st.stop()
 
+# 定义触发事件：点击“启动回测”
 if st.button("🚀 启动周末定型回测"):
     pro = ts.pro_api(TS_TOKEN)
     
-    lookback_days = max(int(BACKTEST_DAYS) * 3, 365) 
+    lookback_days = max(int(BACKTEST_DAYS) * 2, 365) 
     start_cal = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
     cal_df = pro.trade_cal(start_date=start_cal, end_date=backtest_date_end.strftime("%Y%m%d"), is_open='1')
     trade_days_list = cal_df['cal_date'].tolist()
-    if not trade_days_list: st.stop()
     
-    # 智能提取每周最后一个交易日
-    td_df = pd.DataFrame({'cal_date': trade_days_list})
-    td_df['dt'] = pd.to_datetime(td_df['cal_date'])
-    td_df['year_week'] = td_df['dt'].dt.strftime('%G_%V')
-    valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
-    
-    processed_dates = set()
-    if os.path.exists(CHECKPOINT_FILE):
-        try:
-            existing_df = pd.read_csv(CHECKPOINT_FILE)
-            existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
-            processed_dates = set(existing_df['Trade_Date'].unique())
-        except: pass
-            
-    dates_to_run = [d for d in trade_days_list[-int(BACKTEST_DAYS):] if d not in processed_dates and d in valid_scan_dates]
-    dates_to_run.sort()
-    
-    if not dates_to_run:
-        st.success("🎉 指定区间的数据已回测完毕！查看下方榜单即可。")
-    else:
-        # 1. 触发增量下载引擎获取全量数据 (带进度保存与节流)
-        fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=550)).strftime("%Y%m%d")
-        fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=150)).strftime("%Y%m%d")
+    if trade_days_list:
+        # 智能提取每周最后一个交易日
+        td_df = pd.DataFrame({'cal_date': trade_days_list})
+        td_df['dt'] = pd.to_datetime(td_df['cal_date'])
+        td_df['year_week'] = td_df['dt'].dt.strftime('%G_%V')
+        valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
         
-        # 使用虚拟触发器确保每次点击都能刷新内存
-        dummy_trigger = time.time()
-        daily_raw, adj_raw = load_and_process_market_data(fetch_start, fetch_end, TS_TOKEN, dummy_trigger)
-        stock_industry_map = load_industry_mapping(TS_TOKEN)
-    
-        bar = st.progress(0, text="执行周末精筛引擎...")
-        results = []
-        
-        for i, date in enumerate(dates_to_run):
+        processed_dates = set()
+        if os.path.exists(CHECKPOINT_FILE):
             try:
-                daily_all = daily_raw.xs(date, level='trade_date').reset_index()
-            except KeyError:
-                bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date}")
-                continue
+                existing_df = pd.read_csv(CHECKPOINT_FILE)
+                existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
+                processed_dates = set(existing_df['Trade_Date'].unique())
+            except: pass
                 
-            stock_basic = pro.stock_basic(list_status='L', fields='ts_code,name')
-            df = daily_all.merge(stock_basic, on='ts_code', how='inner')
+        # 由于输入的是“交易天数”，为了严谨，切片取实际的天数，然后再过滤
+        dates_to_run = [d for d in trade_days_list[-int(BACKTEST_DAYS):] if d not in processed_dates and d in valid_scan_dates]
+        dates_to_run.sort()
+        
+        if not dates_to_run:
+            st.success("🎉 指定区间的数据已全部回测完毕！查看下方榜单即可。")
+        else:
+            fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=550)).strftime("%Y%m%d")
+            fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=150)).strftime("%Y%m%d")
             
-            # 使用 try-except 处理单日 daily_basic 可能的缺失
-            for _ in range(3):
+            dummy_trigger = time.time()
+            daily_raw, adj_raw = load_and_process_market_data(fetch_start, fetch_end, TS_TOKEN, dummy_trigger)
+            stock_industry_map = load_industry_mapping(TS_TOKEN)
+        
+            bar = st.progress(0, text="执行周末精筛引擎...")
+            
+            for i, date in enumerate(dates_to_run):
                 try:
-                    daily_basic = pro.daily_basic(trade_date=date)[['ts_code','circ_mv']]
-                    break
-                except Exception: time.sleep(0.5)
+                    daily_all = daily_raw.xs(date, level='trade_date').reset_index()
+                except KeyError:
+                    bar.progress((i+1)/len(dates_to_run), text=f"跳过无数据日期: {date}")
+                    continue
+                    
+                stock_basic = pro.stock_basic(list_status='L', fields='ts_code,name')
+                df = daily_all.merge(stock_basic, on='ts_code', how='inner')
                 
-            if daily_basic.empty: continue
-            
-            df = df.merge(daily_basic, on='ts_code', how='inner')
-            df['circ_mv_billion'] = df['circ_mv'] / 10000 
-            
-            df = df[~df['name'].str.contains('ST|退', na=False)]
-            df = df[~df['ts_code'].str.startswith('92')] 
-            df = df[(df['close'] >= MIN_PRICE)]
-            df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
-            
-            records = []
-            for row in df.itertuples():
-                if stock_industry_map and row.ts_code not in stock_industry_map: continue
+                for _ in range(3):
+                    try:
+                        daily_basic = pro.daily_basic(trade_date=date)[['ts_code','circ_mv']]
+                        break
+                    except Exception: time.sleep(0.5)
                     
-                ind = compute_breakout_signal(row.ts_code, date, daily_raw, adj_raw)
-                if not ind or not ind.get('is_buy_signal'): continue
-                    
-                score_k_break = (ind['k'] - 25.0) * 5.0
-                score_vol = ind['vol_ratio'] * 10.0
-                total_score = score_k_break + score_vol
-                    
-                future_returns = track_future_performance(row.ts_code, date, ind['signal_close'], daily_raw, adj_raw, hold_weeks=8)
+                if daily_basic.empty: continue
                 
-                record_dict = {
-                    'ts_code': row.ts_code, 'name': row.name, 'Signal_Close': ind['signal_close'], 
-                    'SKDJ_K': ind['k'], 'SKDJ_D': ind['d'], 'D_Min(10W)': ind['recent_d_min'],
-                    'circ_mv': round(row.circ_mv_billion, 2), 'Total_Score': round(total_score, 1)
-                }
-                record_dict.update(future_returns)
-                records.append(record_dict)
-                    
-            if records:
-                fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False).head(TOP_BACKTEST)
-                fdf.insert(0, 'Rank', range(1, len(fdf) + 1))
-                fdf['Trade_Date'] = date
-                is_first = not os.path.exists(CHECKPOINT_FILE)
-                fdf.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
-                results.append(fdf)
+                df = df.merge(daily_basic, on='ts_code', how='inner')
+                df['circ_mv_billion'] = df['circ_mv'] / 10000 
                 
-            bar.progress((i+1)/len(dates_to_run), text=f"回测中: {date} (找到 {len(records)} 只符合)")
-            
-        bar.empty()
-        st.success("🎉 本次扫描已顺利完成！")
-    
-    # 结果呈现
-    if os.path.exists(CHECKPOINT_FILE):
+                df = df[~df['name'].str.contains('ST|退', na=False)]
+                df = df[~df['ts_code'].str.startswith('92')] 
+                df = df[(df['close'] >= MIN_PRICE)]
+                df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
+                
+                records = []
+                for row in df.itertuples():
+                    if stock_industry_map and row.ts_code not in stock_industry_map: continue
+                        
+                    ind = compute_breakout_signal(row.ts_code, date, daily_raw, adj_raw)
+                    if not ind or not ind.get('is_buy_signal'): continue
+                        
+                    score_k_break = (ind['k'] - 25.0) * 5.0
+                    score_vol = ind['vol_ratio'] * 10.0
+                    total_score = score_k_break + score_vol
+                        
+                    future_returns = track_future_performance(row.ts_code, date, ind['signal_close'], daily_raw, adj_raw, hold_weeks=8)
+                    
+                    record_dict = {
+                        'ts_code': row.ts_code, 'name': row.name, 'Signal_Close': ind['signal_close'], 
+                        'SKDJ_K': ind['k'], 'SKDJ_D': ind['d'], 'D_Min(10W)': ind['recent_d_min'],
+                        'circ_mv': round(row.circ_mv_billion, 2), 'Total_Score': round(total_score, 1)
+                    }
+                    record_dict.update(future_returns)
+                    records.append(record_dict)
+                        
+                if records:
+                    fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False).head(TOP_BACKTEST)
+                    fdf.insert(0, 'Rank', range(1, len(fdf) + 1))
+                    fdf['Trade_Date'] = date
+                    is_first = not os.path.exists(CHECKPOINT_FILE)
+                    fdf.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
+                    
+                bar.progress((i+1)/len(dates_to_run), text=f"回测中: {date} (捕获 {len(records)} 只目标)")
+                
+            bar.empty()
+            st.success("🎉 指定区间的行情已经扫描完毕！")
+
+# ---------------------------
+# 结果呈现模块 (脱离运行按钮的独立作用域，解决页面刷新丢失数据的问题)
+# ---------------------------
+if os.path.exists(CHECKPOINT_FILE):
+    st.markdown("---")
+    try:
         all_res = pd.read_csv(CHECKPOINT_FILE)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
@@ -505,5 +507,13 @@ if st.button("🚀 启动周末定型回测"):
         except AttributeError:
             st.dataframe(display_df.style.applymap(color_exit, subset=['Exit_Reason']), use_container_width=True)
         
+        # 下载按钮被提到了外层，点击时无论怎么刷新都不会导致 DataFrame 消失
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 导出完整回测记录 (CSV)", csv, "skdj_robust_export.csv", "text/csv")
+        st.download_button(
+            label="📥 导出完整回测记录 (CSV)", 
+            data=csv, 
+            file_name="skdj_final_v4_export.csv", 
+            mime="text/csv"
+        )
+    except pd.errors.EmptyDataError:
+        st.info("🕒 当前暂无满足条件的回测记录，请调整参数后重试。")
