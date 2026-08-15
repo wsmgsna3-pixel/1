@@ -1,22 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-周线波段选股王 · SKDJ 底部突破右侧确认版
+周线 SKDJ(W22) 底部脱离定型版
 ------------------------------------------------
-核心策略架构:
-1. [股票池底座]:
-   - 申万一级 6 大硬科技赛道 (电子/计算机/通信/医药生物/国防军工/机械设备)
-   - 流通市值锁定: 100亿 ~ 1000亿
-   - 股价门槛: >= 10.0 元
-2. [脱离底部确认模型]:
-   - 周期: 周线 SKDJ (N=22, M=3)
-   - 核心触发: 本周 K 值正式上穿 25 线 (本周 > 25 且 上周 <= 25)
-   - 底部基因: 过去 10 周内，D 值曾到达过 20 及以下的极度超卖区
-   - 多头确认: 当前必须处于金叉状态 (K > D)
-   - 量价配合: 周线收阳，且周成交量 >= 5周均量 * 0.85
-3. [阶梯出局机制]:
-   - 认栽出局: 严格执行 -10% 硬止损 (跌破买入价 -10% 即刻出局)
-   - 保本阶段: 浮盈峰值达到 +12% 后，回落至成本线保本离场
-   - 止盈阶段: 浮盈峰值达到 +25% 后，自最高点回撤 15% 止盈
+核心实战闭环设计:
+1. 扫描时机锁定: 仅在每周最后一个交易日(周五)运行，确认 K 线定型。
+2. 买入时机延后: 信号确立后，统一按次周第一天的【开盘价】执行买入。
+3. 差异化开盘拦截: 
+   - 科创/创业板高开 > 8% 放弃
+   - 主板高开 > 5% 放弃
+   - 遭遇核按钮低开 < -4% 放弃
+4. 右侧脱离确认 (突破25线法):
+   - K值本周 > 25 且 上周 <= 25
+   - 近10周D值触及过 <= 20
+   - 金叉多头 (K > D) 且 周线收阳、量能配合。
+5. 铁律出局系统:
+   - 认栽出局: 跌破真实买入价 -10% 无条件止损。
+   - 保本/止盈: 浮盈 12% 设保本，浮盈 25% 后开启 15% 移动止盈。
 ------------------------------------------------
 """
 
@@ -34,8 +33,8 @@ import pickle
 
 warnings.filterwarnings("ignore")
 
-CACHE_FILE_NAME = "skdj_breakout_cache.pkl" 
-CHECKPOINT_FILE = "skdj_breakout_checkpoint.csv"
+CACHE_FILE_NAME = "skdj_final_cache.pkl" 
+CHECKPOINT_FILE = "skdj_final_checkpoint.csv"
 
 # ---------------------------
 # 全局变量
@@ -45,49 +44,13 @@ GLOBAL_ADJ_FACTOR = pd.DataFrame()
 GLOBAL_DAILY_RAW = pd.DataFrame() 
 GLOBAL_QFQ_BASE_FACTORS = {} 
 GLOBAL_STOCK_INDUSTRY = {} 
-SINA_STATUS = {'success': 0, 'fail': 0} 
 
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 底部突破选股系统", layout="wide")
-st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (25线突破法)")
-st.markdown("⚠️ **最佳执行时间：每周五下午 14:50 运行（此时周K线基本定型，彻底杜绝周中信号漂移）**")
-
-# ---------------------------
-# 新浪实时行情引擎
-# ---------------------------
-def get_sina_realtime_kline(ts_code):
-    global SINA_STATUS
-    code_split = ts_code.split('.')
-    if len(code_split) != 2: return None
-    sina_code = code_split[1].lower() + code_split[0]
-    
-    url = f"http://hq.sinajs.cn/list={sina_code}"
-    headers = {'Referer': 'https://finance.sina.com.cn'}
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        response.encoding = 'gbk'
-        data_str = response.text.split('="')[1].split('";')[0]
-        if not data_str: 
-            SINA_STATUS['fail'] += 1
-            return None
-        data_list = data_str.split(',')
-        
-        SINA_STATUS['success'] += 1
-        return {
-            'trade_date_str': datetime.now().strftime('%Y%m%d'),
-            'open': float(data_list[1]),
-            'pre_close': float(data_list[2]),
-            'close': float(data_list[3]),
-            'high': float(data_list[4]),
-            'low': float(data_list[5]),
-            'vol': (float(data_list[8]) / 100) * (240 / 225) 
-        }
-    except Exception:
-        SINA_STATUS['fail'] += 1
-        return None
+st.set_page_config(page_title="SKDJ 底部突破定型版", layout="wide")
+st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (周末选股·周一执行)")
+st.markdown("🔒 **回测引擎已加锁：严格过滤周中假信号，100% 模拟周末选股 + 周一开盘竞价买入的实战流程。**")
 
 # ---------------------------
 # 基础 API 与数据管理
@@ -161,7 +124,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
         GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
 
     if use_cache and os.path.exists(CACHE_FILE_NAME):
-        st.success("⚡ 本地缓存加载完成。")
+        st.success("⚡ 本地行情引擎已就绪。")
         try:
             with open(CACHE_FILE_NAME, 'rb') as f:
                 cached_data = pickle.load(f)
@@ -188,7 +151,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
     if all_trade_dates_df.empty: return False
     all_dates = all_trade_dates_df['cal_date'].tolist()
     
-    my_bar = st.progress(0, text="Tushare 极速下载中...")
+    my_bar = st.progress(0, text="Tushare 数据极速下载中...")
     adj_factor_data_list, daily_data_list = [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future_to_date = {executor.submit(fetch_and_cache_daily_data, date): date for date in all_dates}
@@ -226,7 +189,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
             
     return True
 
-def get_qfq_data(ts_code, start_date, end_date, use_sina=False):
+def get_qfq_data(ts_code, start_date, end_date):
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
     if GLOBAL_DAILY_RAW.empty: return pd.DataFrame()
     
@@ -256,27 +219,15 @@ def get_qfq_data(ts_code, start_date, end_date, use_sina=False):
         df[col] = df[col + '_qfq']
         
     final_df = df[['open', 'high', 'low', 'close', 'pre_close', 'vol']].copy() 
-
-    if use_sina:
-        today_str = datetime.now().strftime('%Y%m%d')
-        if end_date == today_str:
-            sina_data = get_sina_realtime_kline(ts_code)
-            if sina_data and sina_data['close'] > 0:
-                sina_row = pd.DataFrame([sina_data]).set_index('trade_date_str')
-                if today_str in final_df.index:
-                    final_df.loc[today_str] = sina_row.iloc[0]
-                else:
-                    final_df = pd.concat([final_df, sina_row])
-                    
     return final_df
 
 # ---------------------------
 # 核心引擎：上穿 25 线突破判断
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
-def compute_breakout_signal(ts_code, end_date, use_sina=False):
+def compute_breakout_signal(ts_code, end_date):
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=550)).strftime("%Y%m%d")
-    df_daily = get_qfq_data(ts_code, start_date, end_date, use_sina=use_sina)
+    df_daily = get_qfq_data(ts_code, start_date, end_date)
     res = {}
     if df_daily.empty or len(df_daily) < 100: return res
 
@@ -314,18 +265,18 @@ def compute_breakout_signal(ts_code, end_date, use_sina=False):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']): return res
 
-    # --- 右侧突破逻辑 ---
+    # --- 右侧突破核心法则 ---
     # 1. 本周 K 突破 25，且上周仍在 25 及以下
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     
     # 2. 多头排列：确保 K > D
     is_bullish = curr_w['k'] > curr_w['d']
     
-    # 3. 底部基因：过去 10 周内，D 值曾低于 20 (证明是从纠缠泥潭里走出来的)
+    # 3. 底部基因：过去 10 周内，D 值曾去过 20 极度超卖区
     recent_d_min = weekly_df['d'].tail(10).min()
     has_bottom_gene = recent_d_min <= 20.0
     
-    # 4. 形态与量能：周线收实体阳线，成交量温和
+    # 4. 形态与量能：周线收实体阳线，成交量达到均量 85% 以上
     is_yang = curr_w['close'] > curr_w['open']
     is_vol_ok = True
     if pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0:
@@ -337,21 +288,20 @@ def compute_breakout_signal(ts_code, end_date, use_sina=False):
     res['k'] = round(curr_w['k'], 2)
     res['d'] = round(curr_w['d'], 2)
     res['recent_d_min'] = round(recent_d_min, 2)
-    res['signal_close'] = curr_w['close']
-    res['pre_close'] = prev_w['close']
+    res['signal_close'] = curr_w['close'] # 周五收盘价
     res['vol_ratio'] = round(curr_w['vol'] / curr_w['ma5_vol'], 2) if curr_w['ma5_vol'] > 0 else 1.0
 
     return res
 
 # ---------------------------
-# 严格出局跟踪系统 (-10%铁律 + 阶梯止盈)
+# 严格出局跟踪系统 (次周一买入执行)
 # ---------------------------
-def track_future_performance(ts_code, selection_date, signal_close, hold_weeks=8, use_sina=False):
+def track_future_performance(ts_code, selection_date, signal_close, hold_weeks=8):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_fetch = (d0 - timedelta(days=30)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=150)).strftime("%Y%m%d") 
     
-    hist_full = get_qfq_data(ts_code, start_date=start_fetch, end_date=end_future, use_sina=use_sina)
+    hist_full = get_qfq_data(ts_code, start_date=start_fetch, end_date=end_future)
     results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
     results['Exit_Reason'] = "持仓中"
     results['Buy_Price'] = np.nan
@@ -362,39 +312,51 @@ def track_future_performance(ts_code, selection_date, signal_close, hold_weeks=8
     for col in ['open', 'high', 'low', 'close']:
         hist_full[col] = pd.to_numeric(hist_full[col], errors='coerce')
         
+    # 获取选股日(周五)之后的未来数据，第一条记录即为次周第一天(通常为周一)
     hist_future = hist_full[hist_full.index > selection_date]
     if hist_future.empty: return results
 
     next_row = hist_future.iloc[0]
-
-    # 一字涨停剔除
-    is_main_board = not any(ts_code.startswith(prefix) for prefix in ['300', '301', '688', '689'])
-    if is_main_board and next_row['open'] == next_row['high'] == next_row['low']:
-        results['Exit_Reason'] = "一字板无法买入(剔除)"
-        results['Buy_Price'] = round(next_row['open'], 2)  
-        return results
-
     buy_price = next_row['open']
     if pd.isna(buy_price) or buy_price <= 0: return results
 
-    # T+1 开盘竞价跳空幅度风控 [-3%, +5%]
-    if signal_close and signal_close > 0:
-        gap_pct = (buy_price - signal_close) / signal_close * 100
-        results['Gap_pct (%)'] = round(gap_pct, 2)
-        if gap_pct < -3.0 or gap_pct > 5.0:
-            results['Exit_Reason'] = f"竞价不符(剔除: {round(gap_pct, 2)}%)"
-            results['Buy_Price'] = round(buy_price, 2)
-            return results
+    # 1. 剔除开盘一字涨停/跌停无法买入的情况
+    if next_row['open'] == next_row['high'] == next_row['low']:
+        results['Exit_Reason'] = "一字板无法买入(剔除)"
+        results['Buy_Price'] = round(buy_price, 2)  
+        return results
 
+    # 2. 差异化开盘跳空拦截
+    is_20cm = any(ts_code.startswith(prefix) for prefix in ['300', '301', '688', '689'])
+    gap_pct = (buy_price - signal_close) / signal_close * 100
+    results['Gap_pct (%)'] = round(gap_pct, 2)
+    
+    # 科创/创业板高开 > 8% 放弃
+    if is_20cm and gap_pct > 8.0:
+        results['Exit_Reason'] = f"双创高开过大(剔除: {round(gap_pct, 2)}%)"
+        results['Buy_Price'] = round(buy_price, 2)
+        return results
+        
+    # 主板高开 > 5% 放弃
+    elif not is_20cm and gap_pct > 5.0:
+        results['Exit_Reason'] = f"主板高开过大(剔除: {round(gap_pct, 2)}%)"
+        results['Buy_Price'] = round(buy_price, 2)
+        return results
+        
+    # 遭遇恶劣核按钮低开 < -4% 放弃
+    if gap_pct < -4.0:
+        results['Exit_Reason'] = f"恶劣低开(剔除: {round(gap_pct, 2)}%)"
+        results['Buy_Price'] = round(buy_price, 2)
+        return results
+
+    # --- 顺利在周一开盘买入 ---
     results['Buy_Price'] = round(buy_price, 2)
 
     exit_triggered = False
     tier = 0  
     peak_close = buy_price
     pending_exit_reason = None  
-    
-    # 统一设定 -10% 硬止损
-    hard_stop_limit = -0.10
+    hard_stop_limit = -0.10 # 统一的认栽出局线
     
     for i in range(len(hist_future)):
         if i >= hold_weeks * 5: break 
@@ -415,7 +377,7 @@ def track_future_performance(ts_code, selection_date, signal_close, hold_weeks=8
         peak_close = max(peak_close, curr_high)
         peak_profit_pct = (peak_close - buy_price) / buy_price
         
-        # 1. 认栽出局：触及 -10% 硬止损
+        # 1. 认栽出局：触及买入价的 -10% 硬止损
         if (curr_low - buy_price) / buy_price <= hard_stop_limit:
             final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
             exit_triggered = True
@@ -423,7 +385,7 @@ def track_future_performance(ts_code, selection_date, signal_close, hold_weeks=8
             results[f'Return_W{current_week} (%)'] = final_return
             break
         
-        # 2. 保本控制机制：超过 +12% 后保本
+        # 2. 阶段保本：浮盈超 +12%
         if tier == 0 and peak_profit_pct >= 0.12:
             tier = 1
                 
@@ -433,7 +395,7 @@ def track_future_performance(ts_code, selection_date, signal_close, hold_weeks=8
             elif peak_profit_pct >= 0.25:
                 tier = 2
                 
-        # 3. 移动止盈机制：最高点回撤 15%
+        # 3. 移动止盈：最高点回撤 15%
         if tier == 2:
             giveback = (peak_close - curr_close) / peak_close
             if giveback >= 0.15:
@@ -450,22 +412,12 @@ def track_future_performance(ts_code, selection_date, signal_close, hold_weeks=8
     return results
 
 # ---------------------------
-# 单日全市场扫描流程
+# 周线定格全市场扫描流程
 # ---------------------------
-def run_scan(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False):
+def run_weekly_scan(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
 
-    query_date = last_trade
-    daily_all = safe_get('daily', trade_date=query_date) 
-    
-    if use_sina and daily_all.empty:
-        for i in range(1, 10):
-            temp_date = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=i)).strftime("%Y%m%d")
-            daily_all = safe_get('daily', trade_date=temp_date)
-            if not daily_all.empty:
-                query_date = temp_date
-                break
-                
+    daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty: return pd.DataFrame(), "数据缺失"
 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name')
@@ -473,7 +425,7 @@ def run_scan(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False
         
     df = daily_all.merge(stock_basic, on='ts_code', how='left')
     
-    daily_basic = safe_get('daily_basic', trade_date=query_date)
+    daily_basic = safe_get('daily_basic', trade_date=last_trade)
     if not daily_basic.empty:
         df = df.merge(daily_basic[['ts_code','circ_mv']], on='ts_code', how='left')
     else: 
@@ -481,6 +433,7 @@ def run_scan(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False
     
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     
+    # 基础门槛
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')] 
     df = df[(df['close'] >= MIN_PRICE)]
@@ -491,19 +444,16 @@ def run_scan(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False
         if GLOBAL_STOCK_INDUSTRY and row.ts_code not in GLOBAL_STOCK_INDUSTRY: 
             continue
             
-        ind = compute_breakout_signal(row.ts_code, last_trade, use_sina=use_sina)
+        ind = compute_breakout_signal(row.ts_code, last_trade)
         if not ind or not ind.get('is_buy_signal'): 
             continue
             
-        if use_sina and ind['signal_close'] < MIN_PRICE:
-            continue
-            
-        # 打分排序逻辑: K 线脱离力度 + 量能放大倍数
         score_k_break = (ind['k'] - 25.0) * 5.0
         score_vol = ind['vol_ratio'] * 10.0
         total_score = score_k_break + score_vol
             
-        future_returns = track_future_performance(row.ts_code, last_trade, ind['signal_close'], hold_weeks=8, use_sina=use_sina)
+        # 传递周五定格的收盘价 signal_close 给未来的周一作对比
+        future_returns = track_future_performance(row.ts_code, last_trade, ind['signal_close'], hold_weeks=8)
         
         record_dict = {
             'ts_code': row.ts_code, 'name': row.name, 'Signal_Close': ind['signal_close'], 
@@ -525,12 +475,10 @@ def run_scan(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False
 # UI 控制流
 # ---------------------------
 with st.sidebar:
-    st.header("⚙️ 右侧确认系统参数")
+    st.header("⚙️ 周末确认系统参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    
-    st.warning("💡 回测建议：选择连续的**星期五**作为扫描日，以体验策略真实的信号数量。")
-    BACKTEST_DAYS = st.number_input("追溯交易天数 (设为 1 即为本周五实盘雷达)", value=60, step=5)
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=3)
+    BACKTEST_DAYS = st.number_input("追溯自然天数", value=180, step=30)
+    TOP_BACKTEST = st.number_input("每周优选 TopK", value=3)
     
     st.markdown("---")
     if st.button("🗑️ 清除断点重新回测"):
@@ -547,13 +495,12 @@ with st.sidebar:
 
 TS_TOKEN = st.text_input("🔑 Tushare Token", type="password")
 if not TS_TOKEN: 
-    st.info("👈 请在左侧侧边栏填入 Token 激活程序")
+    st.info("👈 请在左侧填入 Token 激活程序")
     st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button("🚀 启动周线 SKDJ 突破 25 线扫描"):
-    SINA_STATUS = {'success': 0, 'fail': 0}
+if st.button("🚀 启动周线 SKDJ 突破 25 定型回测"):
     processed_dates = set()
     results = []
     
@@ -571,18 +518,22 @@ if st.button("🚀 启动周线 SKDJ 突破 25 线扫描"):
     
     if not get_all_historical_data(trade_days_list, use_cache=True): st.stop()
             
-    dates_to_run = [d for d in trade_days_list if d not in processed_dates]
+    # 【核心修正】：智能提取每周最后一个交易日，跳过周一至周四
+    td_df = pd.DataFrame({'cal_date': trade_days_list})
+    td_df['dt'] = pd.to_datetime(td_df['cal_date'])
+    td_df['year_week'] = td_df['dt'].dt.isocalendar().year.astype(str) + "_" + td_df['dt'].dt.isocalendar().week.astype(str).str.zfill(2)
+    valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
+    
+    dates_to_run = [d for d in trade_days_list if d not in processed_dates and d in valid_scan_dates]
+    dates_to_run.sort() 
+    
     if not dates_to_run:
         st.success("🎉 数据全部拉取完毕！")
     else:
-        bar = st.progress(0, text="执行核心过滤引擎...")
+        bar = st.progress(0, text="严格过滤周中数据，执行周末扫描引擎...")
         for i, date in enumerate(dates_to_run):
-            # 实盘判断：分析天数为 1 且当天为交易日
-            is_realtime_radar = (int(BACKTEST_DAYS) == 1 and date == datetime.now().strftime("%Y%m%d"))
-            
-            res, err = run_scan(
-                date, int(TOP_BACKTEST), MIN_MV, MAX_MV, MIN_PRICE,
-                use_sina=is_realtime_radar
+            res, err = run_weekly_scan(
+                date, int(TOP_BACKTEST), MIN_MV, MAX_MV, MIN_PRICE
             )
             
             if not res.empty:
@@ -590,18 +541,15 @@ if st.button("🚀 启动周线 SKDJ 突破 25 线扫描"):
                 is_first = not os.path.exists(CHECKPOINT_FILE)
                 res.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
                 results.append(res)
-            bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date}")
+            bar.progress((i+1)/len(dates_to_run), text=f"处理周线数据: {date}")
         bar.empty()
-    
-    if int(BACKTEST_DAYS) == 1 and SINA_STATUS['success'] > 0:
-        st.success(f"✅ **盘中探针就绪**：成功拉取实时数据 {SINA_STATUS['success']} 次。")
     
     if results:
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header("📊 突破 25 线战绩追踪")
-        st.subheader("🗓️ 周度胜率分布 (已剔除竞价异常)")
+        st.header("📊 定型版战绩追踪")
+        st.subheader("🗓️ 周度胜率分布 (已精准剔除周一至周四所有假信号)")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
         
@@ -620,7 +568,7 @@ if st.button("🚀 启动周线 SKDJ 突破 25 线扫描"):
                     else:
                         st.metric(f"W{w}", "空缺")
                         
-        st.subheader("📋 详细回测轨迹")
+        st.subheader("📋 详细真实回测轨迹")
         display_cols = [
             'Rank', 'Trade_Date', 'name', 'ts_code', 'SKDJ_K', 'SKDJ_D', 'D_Min(10W)', 'Signal_Close', 'Buy_Price', 'Gap_pct (%)',
             'Total_Score', 'circ_mv', 'Exit_Reason'
@@ -644,6 +592,6 @@ if st.button("🚀 启动周线 SKDJ 突破 25 线扫描"):
             st.dataframe(display_df.style.applymap(color_exit, subset=['Exit_Reason']), use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 导出完整回测记录 (CSV)", csv, "skdj_breakout_25_export.csv", "text/csv")
+        st.download_button("📥 导出完整回测记录 (CSV)", csv, "skdj_final_v1_export.csv", "text/csv")
     else:
-        st.warning("⚠️ 此区间内无股票满足 [脱离泥潭，上穿 25 线] 的右侧确认条件，这是高标准系统的正常表现。")
+        st.warning("⚠️ 此区间内无标的触发真实周末脱离信号。")
