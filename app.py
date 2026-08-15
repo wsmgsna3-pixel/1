@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V5 终极防白屏·全异常拦截版)
+周线 SKDJ 底部脱离定型版 (V5.1 永久缓存继承·全功能完整版)
 ------------------------------------------------
-1. 【防白屏崩溃盾】：全链路异常拦截，彻底杜绝手机端因 Token 报错导致侧边栏消失的问题。
-2. 【Token 深度清洗】：自动剔除手机复制带来的隐藏空格、换行与特殊字符，并增加秒级预检探针。
-3. 【时间轴校准】：交易日历严格升序排列，准确回测最近 N 个交易日。
-4. 【UI 状态锁】：结果呈现脱离交互按钮，导出下载不重置视图。
+1. 【永久缓存继承】：统一采用 master 缓存机制，自动向上兼容并无缝继承历史下载数据，后续改版免重复下载。
+2. 【全链路防崩】：Token 自动清洗、连接预检探针、全接口异常拦截，彻底杜绝手机端白屏。
+3. 【时间轴校准】：交易日历本地强制升序排列，准确回测最近 N 个交易日。
+4. 【交易闭环】：周末锁定定型周线 -> 次周一开盘竞价买入 -> 差异化开盘拦截。
+5. 【阶梯风控】：-10% 认栽出局 / +12% 阶段保本 / +25% 移动跟踪止盈。
 ------------------------------------------------
 """
 
@@ -21,44 +22,60 @@ import re
 import pickle
 
 warnings.filterwarnings("ignore")
-CHECKPOINT_FILE = "skdj_robust_checkpoint.csv"
-MARKET_CACHE_FILE = "skdj_market_data_v5.pkl"
 
 # ---------------------------
-# 页面配置 (必须首先渲染，确保 UI 骨架永远存在)
+# 全局持久化缓存配置 (自动继承历史版本)
+# ---------------------------
+CHECKPOINT_FILE = "skdj_robust_checkpoint.csv"
+MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
+
+# 自动继承历史版本的缓存文件
+if not os.path.exists(MARKET_CACHE_FILE):
+    for legacy_file in [
+        "skdj_market_data_v5.pkl", 
+        "skdj_market_data_v4.pkl", 
+        "skdj_market_data_v3.pkl",
+        "skdj_market_data.pkl"
+    ]:
+        if os.path.exists(legacy_file):
+            try:
+                os.rename(legacy_file, MARKET_CACHE_FILE)
+                break
+            except Exception:
+                pass
+
+# ---------------------------
+# 页面基础配置
 # ---------------------------
 st.set_page_config(page_title="SKDJ 底部突破实战版", layout="wide")
-st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (稳健版)")
-st.markdown("🔒 **全防护引擎已启动：具备 Token 自动清洗、极速预检及全链路防崩溃机制。**")
+st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (持久缓存版)")
+st.markdown("🔒 **底座已固化：支持版本间缓存继承，代码迭代无需重复拉取历史行情。**")
 
 # ---------------------------
 # Token 清洗与预检模块
 # ---------------------------
 def clean_token_str(raw_token: str) -> str:
-    """剔除首尾可能混入的换行符、不可见字符、全角空格等"""
+    """剔除手机端复制时混入的换行符、不可见字符及全角空格"""
     if not raw_token:
         return ""
-    # 过滤所有空白字符、换行与非打印字符
     cleaned = re.sub(r'[\s\u3000\ufeff\xa0\r\n]+', '', str(raw_token))
     return cleaned.strip()
 
 def verify_token_connection(token_str: str):
-    """0.1秒极速预检 Token 是否真实有效"""
+    """0.1秒极速预检 Token 有效性"""
     if not token_str:
-        return False, "Token 不能为空，请先在侧边栏填入 Token。"
+        return False, "Token 为空，请在侧边栏填入 Token。"
     try:
         ts.set_token(token_str)
         pro = ts.pro_api(token_str)
-        # 用极轻量的接口测试连接
         test_df = pro.trade_cal(exchange='SSE', start_date='20260801', end_date='20260805')
         if test_df is not None and not test_df.empty:
             return True, "验证通过"
-        else:
-            return False, "Token 校验未返回数据，请确认网络是否畅通。"
+        return False, "Token 校验未返回数据，请检查网络连接。"
     except Exception as e:
         err_msg = str(e)
         if "token不对" in err_msg or "-40001" in err_msg:
-            return False, "您的 Token 不正确，请检查是否在手机端复制了不完整的字符。"
+            return False, "您的 Token 不正确，请检查复制内容。"
         return False, f"接口校验失败: {err_msg}"
 
 def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
@@ -91,7 +108,7 @@ def load_industry_mapping(token):
     index_codes = target_indices['index_code'].tolist()
     
     all_members = []
-    load_bar = st.progress(0, text="正在加载硬科技白名单...")
+    load_bar = st.progress(0, text="正在同步硬科技白名单...")
     for i, idx_code in enumerate(index_codes):
         df = safe_tushare_call(pro.index_member, index_code=idx_code, is_new='Y')
         if not df.empty: 
@@ -106,7 +123,7 @@ def load_industry_mapping(token):
     return dict(zip(full_df['con_code'], full_df['industry_code']))
 
 # ---------------------------
-# 增量下载引擎 (防未来穿越 + 节流存盘)
+# 增量下载引擎 (持久化存盘 + 节流保护)
 # ---------------------------
 def sync_market_data_incrementally(start_date, end_date, token):
     token_c = clean_token_str(token)
@@ -134,7 +151,7 @@ def sync_market_data_incrementally(start_date, end_date, token):
     missing_dates = [d for d in valid_dates if d not in cache['fetched_dates']]
     
     if missing_dates:
-        my_bar = st.progress(0, text=f"📥 发现 {len(missing_dates)} 天缺失行情，启动增量引擎...")
+        my_bar = st.progress(0, text=f"📥 检测到 {len(missing_dates)} 天增量行情需要同步...")
         
         for i, d in enumerate(missing_dates):
             df_d = safe_tushare_call(pro.daily, max_retries=3, sleep_time=0.8, trade_date=d)
@@ -146,7 +163,7 @@ def sync_market_data_incrementally(start_date, end_date, token):
                 cache['fetched_dates'].add(d)
             
             if (i + 1) % 10 == 0 or i == len(missing_dates) - 1:
-                my_bar.progress((i+1)/len(missing_dates), text=f"📥 行情同步中: {i+1}/{len(missing_dates)} (已存盘)")
+                my_bar.progress((i+1)/len(missing_dates), text=f"📥 行情同步中: {i+1}/{len(missing_dates)} (进度已落盘)")
                 try:
                     with open(MARKET_CACHE_FILE + ".tmp", 'wb') as f:
                         pickle.dump(cache, f)
@@ -165,7 +182,7 @@ def load_and_process_market_data(start_date, end_date, token, _dummy_trigger):
     token_c = clean_token_str(token)
     cache = sync_market_data_incrementally(start_date, end_date, token_c)
     
-    with st.spinner("正在构建全市场前复权多重索引..."):
+    with st.spinner("正在加载本地前复权行情索引..."):
         daily_raw = pd.concat(cache['daily']) if cache['daily'] else pd.DataFrame()
         adj_raw = pd.concat(cache['adj']) if cache['adj'] else pd.DataFrame()
         
@@ -246,7 +263,7 @@ def compute_breakout_signal(ts_code, end_date, daily_raw, adj_raw):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']): return res
 
-    # --- 突破判定法则 ---
+    # 突破条件确认
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     is_bullish = curr_w['k'] > curr_w['d']
     recent_d_min = weekly_df['d'].tail(10).min()
@@ -372,19 +389,20 @@ def track_future_performance(ts_code, selection_date, signal_close, daily_raw, a
 with st.sidebar:
     st.header("⚙️ 系统配置参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("追溯交易天数", value=100, step=20)
+    BACKTEST_DAYS = st.number_input("追溯交易天数", value=250, step=30)
     TOP_BACKTEST = st.number_input("每周优选 TopK", value=3)
     
     st.markdown("---")
-    if st.button("🗑️ 清空行情缓存 (重新下载)"):
+    if st.button("🗑️ 清空行情缓存 (重新全量下载)"):
         if os.path.exists(MARKET_CACHE_FILE):
             os.remove(MARKET_CACHE_FILE)
-            st.success("底层行情缓存已清空！")
+        st.cache_data.clear()
+        st.success("底层行情缓存已彻底清空！下次运行将重新拉取。")
             
     if st.button("🗑️ 清除所有回测记录"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
-            st.success("回测历史记录已清理！")
+        st.success("回测记录已清理！")
             
     st.markdown("---")
     st.subheader("💰 护城河底座")
@@ -394,7 +412,6 @@ with st.sidebar:
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
-    # 优先读取 Secrets，未配置则读取输入框
     secret_token = st.secrets.get("TUSHARE_TOKEN", "") if hasattr(st, "secrets") else ""
     TS_TOKEN_INPUT = st.text_input(
         "🔑 Tushare Token", 
@@ -406,10 +423,9 @@ with st.sidebar:
 token_clean = clean_token_str(TS_TOKEN_INPUT)
 
 # ---------------------------
-# 主流程：启动回测 (全局异常包裹，绝不闪退)
+# 主流程：启动回测
 # ---------------------------
 if st.button("🚀 启动周末定型回测"):
-    # 1. 预检 Token 状态
     is_valid, msg = verify_token_connection(token_clean)
     if not is_valid:
         st.error(f"❌ **Token 预检拦截**：{msg}")
@@ -424,7 +440,7 @@ if st.button("🚀 启动周末定型回测"):
             
             cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_cal, end_date=end_cal)
             if cal_raw.empty:
-                st.error("❌ 无法获取交易日历，请检查网络或 Token 积分是否充足。")
+                st.error("❌ 无法获取交易日历，请检查网络或 Token 积分。")
             else:
                 cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
                 trade_days_list = cal_open['cal_date'].tolist()
@@ -524,7 +540,7 @@ if st.button("🚀 启动周末定型回测"):
             st.error(f"❌ **运行过程异常拦截（界面已安全保护）**：{str(e)}")
 
 # ---------------------------
-# 结果呈现模块 (脱离按钮作用域，保证任何时候都稳稳展示)
+# 结果呈现模块 (独立展示区)
 # ---------------------------
 if os.path.exists(CHECKPOINT_FILE):
     st.markdown("---")
@@ -579,7 +595,7 @@ if os.path.exists(CHECKPOINT_FILE):
         st.download_button(
             label="📥 导出完整回测记录 (CSV)", 
             data=csv, 
-            file_name="skdj_final_v5_export.csv", 
+            file_name="skdj_final_v5_1_export.csv", 
             mime="text/csv"
         )
     except pd.errors.EmptyDataError:
