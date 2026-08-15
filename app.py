@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V4 终极实战版)
+周线 SKDJ 底部脱离定型版 (V4.1 彻底防崩溃版)
 ------------------------------------------------
-1. 修复限流 Bug：加入严格验真机制，杜绝 Tushare 限流导致的“空数据假装下载”问题。
-2. 修复 UI 刷新 Bug：解耦回测运行与结果展示逻辑，点击下载不再丢失页面状态。
+1. 【核心修复】：修复“时间穿越”Bug，禁止向 Tushare 请求未来(>今天)的日期，防止假死。
+2. 【核心修复】：修复 DataFrame 索引缺失导致的 MultiIndex TypeError 页面白屏问题。
 3. 纯净交易逻辑：周末定格周线信号 -> 次周一真实开盘价买入 -> 差异化开盘拦截。
 4. 阶梯风控：-10%认栽出局 / +12%阶段保本 / +25%开启15%移动止盈。
 ------------------------------------------------
@@ -28,7 +28,7 @@ MARKET_CACHE_FILE = "skdj_market_data_v4.pkl"
 # ---------------------------
 st.set_page_config(page_title="SKDJ 底部突破实战版", layout="wide")
 st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (稳健版)")
-st.markdown("🔒 **增量引擎已启动：支持断点续传，页面刷新状态不丢失。**")
+st.markdown("🔒 **时间锁已部署：禁止获取未来数据，修复索引丢失崩溃 Bug。**")
 
 # ---------------------------
 # 硬科技白名单 (内存缓存)
@@ -59,13 +59,17 @@ def load_industry_mapping(token):
     return dict(zip(full_df['con_code'], full_df['industry_code']))
 
 # ---------------------------
-# 增量下载引擎 (修复限流与静默丢失 Bug)
+# 增量下载引擎 (修复未来日期穿越 Bug)
 # ---------------------------
 def sync_market_data_incrementally(start_date, end_date, token):
     ts.set_token(token)
     pro = ts.pro_api()
     cal = pro.trade_cal(start_date=start_date, end_date=end_date, is_open='1')
     all_dates = cal['cal_date'].tolist()
+    
+    # 【核心修复1】：剔除未来日期，避免向 Tushare 请求还没发生的行情
+    today_str = datetime.now().strftime("%Y%m%d")
+    valid_dates = [d for d in all_dates if d <= today_str]
     
     cache = {'daily': [], 'adj': [], 'fetched_dates': set()}
     if os.path.exists(MARKET_CACHE_FILE):
@@ -75,7 +79,7 @@ def sync_market_data_incrementally(start_date, end_date, token):
         except Exception:
             pass 
             
-    missing_dates = [d for d in all_dates if d not in cache['fetched_dates']]
+    missing_dates = [d for d in valid_dates if d not in cache['fetched_dates']]
     
     if missing_dates:
         my_bar = st.progress(0, text=f"📥 发现 {len(missing_dates)} 天缺失数据，启动受控下载引擎...")
@@ -83,30 +87,28 @@ def sync_market_data_incrementally(start_date, end_date, token):
         for i, d in enumerate(missing_dates):
             # 获取日线 (增加失败休眠机制)
             df_d = pd.DataFrame()
-            for _ in range(5):
+            for _ in range(3):
                 try:
                     df_d = pro.daily(trade_date=d)
                     break
-                except Exception: 
-                    time.sleep(1.0) # 触发限流时强制冷静
+                except Exception: time.sleep(1.0)
             
             # 获取复权因子
             df_a = pd.DataFrame()
-            for _ in range(5):
+            for _ in range(3):
                 try:
                     df_a = pro.adj_factor(trade_date=d)
                     break
-                except Exception: 
-                    time.sleep(1.0)
+                except Exception: time.sleep(1.0)
                 
-            # 【核心修复】：必须确保真正获取到了数据，才允许加入缓存和进度标记
+            # 确保真正获取到了数据，才允许加入缓存和进度标记
             if not df_d.empty and not df_a.empty:
                 cache['daily'].append(df_d)
                 cache['adj'].append(df_a)
                 cache['fetched_dates'].add(d)
             else:
-                st.error(f"❌ 警告：Tushare 接口在 {d} 拒绝响应。已自动暂停并保存进度，请稍后再试。")
-                break # 强行中断，绝不录入空数据
+                st.error(f"❌ 警告：无法获取 {d} 的数据(可能处于限流期)。进度已保存，请稍后刷新重试。")
+                break # 强行中断，防止写空数据
             
             if (i + 1) % 10 == 0 or i == len(missing_dates) - 1:
                 my_bar.progress((i+1)/len(missing_dates), text=f"📥 下载中: {i+1}/{len(missing_dates)} (进度已存盘)")
@@ -118,7 +120,7 @@ def sync_market_data_incrementally(start_date, end_date, token):
                     pass
             
             # 【动态节流阀】：平稳下载
-            time.sleep(0.4) 
+            time.sleep(0.3) 
             
         my_bar.empty()
         
@@ -132,10 +134,18 @@ def load_and_process_market_data(start_date, end_date, token, _dummy_trigger):
         daily_raw = pd.concat(cache['daily']) if cache['daily'] else pd.DataFrame()
         adj_raw = pd.concat(cache['adj']) if cache['adj'] else pd.DataFrame()
         
+        # 【核心修复2】：防止因为空数据导致的 MultiIndex 错误
         if not daily_raw.empty:
             daily_raw = daily_raw.set_index(['ts_code', 'trade_date']).sort_index()
+        else:
+            daily_raw = pd.DataFrame(columns=['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol'])
+            daily_raw = daily_raw.set_index(['ts_code', 'trade_date'])
+            
         if not adj_raw.empty:
             adj_raw = adj_raw.set_index(['ts_code', 'trade_date']).sort_index()
+        else:
+            adj_raw = pd.DataFrame(columns=['ts_code', 'trade_date', 'adj_factor'])
+            adj_raw = adj_raw.set_index(['ts_code', 'trade_date'])
             
     return daily_raw, adj_raw
 
@@ -356,7 +366,6 @@ if not TS_TOKEN:
     st.info("👈 请在侧边栏填入 Token 激活程序")
     st.stop()
 
-# 定义触发事件：点击“启动回测”
 if st.button("🚀 启动周末定型回测"):
     pro = ts.pro_api(TS_TOKEN)
     
@@ -366,7 +375,6 @@ if st.button("🚀 启动周末定型回测"):
     trade_days_list = cal_df['cal_date'].tolist()
     
     if trade_days_list:
-        # 智能提取每周最后一个交易日
         td_df = pd.DataFrame({'cal_date': trade_days_list})
         td_df['dt'] = pd.to_datetime(td_df['cal_date'])
         td_df['year_week'] = td_df['dt'].dt.strftime('%G_%V')
@@ -380,7 +388,6 @@ if st.button("🚀 启动周末定型回测"):
                 processed_dates = set(existing_df['Trade_Date'].unique())
             except: pass
                 
-        # 由于输入的是“交易天数”，为了严谨，切片取实际的天数，然后再过滤
         dates_to_run = [d for d in trade_days_list[-int(BACKTEST_DAYS):] if d not in processed_dates and d in valid_scan_dates]
         dates_to_run.sort()
         
@@ -388,18 +395,23 @@ if st.button("🚀 启动周末定型回测"):
             st.success("🎉 指定区间的数据已全部回测完毕！查看下方榜单即可。")
         else:
             fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=550)).strftime("%Y%m%d")
+            # 这里是历史表现评估期，最大允许探究 150 天，由 track_future_performance 的内部切片来限制不穿越
             fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=150)).strftime("%Y%m%d")
             
             dummy_trigger = time.time()
             daily_raw, adj_raw = load_and_process_market_data(fetch_start, fetch_end, TS_TOKEN, dummy_trigger)
+            
+            if daily_raw.empty:
+                st.warning("⚠️ 未能加载到任何行情数据，请稍后再试。")
+                st.stop()
+                
             stock_industry_map = load_industry_mapping(TS_TOKEN)
-        
             bar = st.progress(0, text="执行周末精筛引擎...")
             
             for i, date in enumerate(dates_to_run):
                 try:
                     daily_all = daily_raw.xs(date, level='trade_date').reset_index()
-                except KeyError:
+                except (KeyError, TypeError):
                     bar.progress((i+1)/len(dates_to_run), text=f"跳过无数据日期: {date}")
                     continue
                     
@@ -456,7 +468,7 @@ if st.button("🚀 启动周末定型回测"):
             st.success("🎉 指定区间的行情已经扫描完毕！")
 
 # ---------------------------
-# 结果呈现模块 (脱离运行按钮的独立作用域，解决页面刷新丢失数据的问题)
+# 结果呈现模块
 # ---------------------------
 if os.path.exists(CHECKPOINT_FILE):
     st.markdown("---")
@@ -507,7 +519,6 @@ if os.path.exists(CHECKPOINT_FILE):
         except AttributeError:
             st.dataframe(display_df.style.applymap(color_exit, subset=['Exit_Reason']), use_container_width=True)
         
-        # 下载按钮被提到了外层，点击时无论怎么刷新都不会导致 DataFrame 消失
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="📥 导出完整回测记录 (CSV)", 
