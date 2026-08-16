@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V7.0 实战资金回测·三仓动态轮动版)
+周线 SKDJ 底部脱离定型版 (V7.1 三仓实战资金修复定型版)
 ------------------------------------------------
-1. 【三仓 30万动态轮动】：初始本金 30万（3仓各10万），真实模拟现金流、仓位冻结与组合净值曲线。
-2. 【A股 T+1 实战执行】：周一买入锁仓，周二起盘中实时监控 -10%硬止损、+2%保本锁、15%移动止盈。
-3. 【首周五 14:50 截断】：首周五收盘浮亏 <= -3% 且周K收阴时果断平仓，将潜在亏损减半截断。
-4. 【12周最大波段跨度】：最长持仓扩展至 12 周（60个交易日），吃满大牛股二浪主升。
-5. 【资金冻结防乱开仓】：周中平仓释放的资金严格冻结至下周一开盘参与新 Top3 标的。
+1. 【兼容历史数据容错】：内置自动修复引擎，无缝兼容所有历史版本 checkpoint 数据，彻底杜绝 KeyError。
+2. 【三仓 30万动态轮动】：初始本金 30万（3仓各10万），真实模拟现金流、仓位冻结与组合净值曲线。
+3. 【A股 T+1 实战执行】：周一买入锁仓，周二起盘中实时监控 -10%硬止损、+2%保本锁、15%移动止盈。
+4. 【首周五 14:50 截断】：首周五收盘浮亏 <= -3% 且周K收阴时尾盘果断平仓，将潜在亏损截断减半。
+5. 【12周最大波段跨度】：最长持仓扩展至 12 周（60个交易日），吃满大牛股二浪主升。
 ------------------------------------------------
 """
 
@@ -48,8 +48,8 @@ if not os.path.exists(MARKET_CACHE_FILE):
 # 页面基础配置
 # ---------------------------
 st.set_page_config(page_title="SKDJ 三仓实战资金回测系统", layout="wide")
-st.title("💼 周线 SKDJ 底部脱离系统 (V7.0 三仓实战资金版)")
-st.markdown("🔒 **30万初始本金 · 三仓等额配置 · 首周五 -3% 截断 · +2% 保本 · 15% 移动止盈 · 12 周大波段**")
+st.title("💼 周线 SKDJ 底部脱离系统 (V7.1 三仓实战资金定型版)")
+st.markdown("🔒 **30万初始本金 · 三仓等额轮动 · 首周五 -3% 截断 · +2% 保本 · 15% 移动止盈 · 12 周大波段**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -313,7 +313,6 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']): return res
 
-    # 1. 突破判定与深坑基因 (上限放宽至 25.0 以防长空窗)
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     is_bullish = curr_w['k'] > curr_w['d']
     recent_d_min = weekly_df['d'].tail(10).min()
@@ -327,7 +326,6 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     base_signal = is_breakout_25 and is_bullish and has_bottom_gene and is_yang and is_vol_ok
     if not base_signal: return res
 
-    # 2. 周线趋势硬过滤（排除 20 周均线下方且下行的空头标的）
     ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
     ma20_prev = prev_w['ma20'] if pd.notna(prev_w['ma20']) else curr_w['close']
     ma20_slope = (ma20_curr - ma20_prev) / (ma20_prev + 1e-5)
@@ -350,7 +348,6 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
     res['vol_ratio'] = round(vol_ratio, 2)
 
-    # 3. 释放真龙头爆发力评分模型
     k_val = curr_w['k']
     if k_val < 28.0:
         score_k = (k_val - 25.0) * 2.0
@@ -376,25 +373,21 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     return res
 
 # ---------------------------
-# 🚀【V7.0 全新出局系统】：T+1 + 首周五截断 + +2%保本 + 15%移动止盈 + 12周跨度
+# 出局系统：T+1 + 首周五截断 + +2%保本 + 15%移动止盈 + 12周跨度
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
+    default_res = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
+    default_res.update({
+        'Exit_Reason': '持仓中', 'Buy_Price': np.nan, 'Gap_pct (%)': np.nan, 
+        'Exit_Date': None, 'Final_Return (%)': np.nan, 'Hold_Days': 0
+    })
+    
     if ts_code not in stock_qfq_dict: 
-        return {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)} | {
-            'Exit_Reason': '持仓中', 'Buy_Price': np.nan, 'Gap_pct (%)': np.nan, 
-            'Exit_Date': None, 'Final_Return (%)': np.nan, 'Hold_Days': 0
-        }
+        return default_res
 
     df_full = stock_qfq_dict[ts_code]
     hist_future = df_full[df_full.index > selection_date]
-    
-    results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
-    results['Exit_Reason'] = "持仓中"
-    results['Buy_Price'] = np.nan
-    results['Gap_pct (%)'] = np.nan
-    results['Exit_Date'] = None
-    results['Final_Return (%)'] = np.nan
-    results['Hold_Days'] = 0
+    results = default_res.copy()
     
     if hist_future.empty: return results
 
@@ -428,7 +421,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
 
     results['Buy_Price'] = round(buy_price, 2)
     exit_triggered = False
-    tier = 0  # 0:初始, 1:保本锁定(+2%), 2:移动止盈(15%)
+    tier = 0  
     peak_price = buy_price
     pending_exit_reason = None  
     hard_stop_limit = -0.10 
@@ -444,10 +437,9 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         curr_open, curr_close, curr_high, curr_low = row['open'], row['close'], row['high'], row['low']
         curr_date = hist_future.index[i]
         
-        # 1. 执行前一日的挂单离场 (T+1 开盘执行)
         if pending_exit_reason is not None and day_count >= 2:
             if "保本" in pending_exit_reason:
-                final_return = 2.0  # 锁定 +2% 保本离场
+                final_return = 2.0  
             else:
                 final_return = (curr_open - buy_price) / buy_price * 100.0
                 
@@ -459,11 +451,9 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
             results[f'Return_W{current_week} (%)'] = round(final_return, 2)
             break
         
-        # 2. T+0 当天锁仓（周一仅记录峰值，不执行卖出）
         peak_price = max(peak_price, curr_high)
         peak_profit_pct = (peak_price - buy_price) / buy_price
         
-        # 3. T+1 起盘中底线硬止损 (-10%)
         if day_count >= 2:
             if (curr_low - buy_price) / buy_price <= hard_stop_limit:
                 final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
@@ -475,22 +465,20 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
                 results[f'Return_W{current_week} (%)'] = round(final_return, 2)
                 break
         
-        # 4. 动态阶梯状态机
         if tier == 0 and peak_profit_pct >= 0.10: 
-            tier = 1  # 涨幅达 10%，激活保本模式
+            tier = 1  
             
         if tier == 1:
-            if curr_close <= buy_price * 1.02:  # 回落至 +2% 触发保本
+            if curr_close <= buy_price * 1.02:  
                 pending_exit_reason = "保本离场(+2%)"
             elif peak_profit_pct >= 0.20: 
-                tier = 2  # 涨幅达 20%，激活移动止盈模式
+                tier = 2  
                 
         if tier == 2:
             giveback = (peak_price - curr_close) / peak_price
-            if giveback >= 0.15:  # 从最高点回撤 15% 止盈
+            if giveback >= 0.15:  
                 pending_exit_reason = "移动止盈(回撤15%)"
         
-        # 5. 🚀【首周五 14:50 截断机制】：首周末浮亏 <= -3% 且收阴，尾盘直接出局
         if day_count == 5 and not exit_triggered and pending_exit_reason is None:
             w1_ret = (curr_close - buy_price) / buy_price * 100.0
             if w1_ret <= -3.0:
@@ -505,7 +493,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = round((curr_close - buy_price) / buy_price * 100.0, 2)
             
-    # 6. 12 周期满平仓
     if not exit_triggered and len(hist_future) >= max_days:
         last_price = hist_future.iloc[max_days - 1]['close']
         final_return = (last_price - buy_price) / buy_price * 100.0
@@ -516,6 +503,34 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         results['Hold_Days'] = max_days
         
     return results
+
+# ---------------------------
+# 🚀 历史数据自动兼容与修复引擎
+# ---------------------------
+def repair_checkpoint_df(df_in):
+    df_out = df_in.copy()
+    w_cols = [c for c in df_out.columns if c.startswith('Return_W') and c.endswith('(%)')]
+    if w_cols:
+        w_cols = sorted(w_cols, key=lambda x: int(x.replace('Return_W', '').replace(' (%)', '')))
+    
+    if 'Final_Return (%)' not in df_out.columns:
+        def get_final_ret(r):
+            if not w_cols: return 0.0
+            rets = r[w_cols].dropna()
+            return rets.iloc[-1] if not rets.empty else 0.0
+        df_out['Final_Return (%)'] = df_out.apply(get_final_ret, axis=1)
+        
+    if 'Exit_Date' not in df_out.columns:
+        df_out['Exit_Date'] = None
+        
+    if 'Hold_Days' not in df_out.columns:
+        def get_hold_days(r):
+            if not w_cols: return 0
+            rets = r[w_cols].dropna()
+            return len(rets) * 5 if not rets.empty else 0
+        df_out['Hold_Days'] = df_out.apply(get_hold_days, axis=1)
+        
+    return df_out
 
 # ---------------------------
 # UI 控制流与输入侧边栏
@@ -625,7 +640,7 @@ if st.button("🚀 启动实战资金组合回测"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V7.0 实战信号扫描...")
+                                bar = st.progress(0, text="执行 V7.1 实战信号扫描...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -686,35 +701,38 @@ if st.button("🚀 启动实战资金组合回测"):
             st.error(f"❌ **运行异常拦截**：{str(e)}")
 
 # ---------------------------
-# 🚀 实战资金曲线与三仓模拟展示区
+# 实战资金曲线与三仓模拟展示区
 # ---------------------------
 if os.path.exists(CHECKPOINT_FILE):
     st.markdown("---")
     try:
         raw_res = pd.read_csv(CHECKPOINT_FILE)
         raw_res['Trade_Date'] = raw_res['Trade_Date'].astype(str)
-        valid_signals = raw_res[~raw_res['Exit_Reason'].str.contains('剔除', na=False)].copy()
+        
+        # 🚀 自动执行历史数据修复与容错补齐
+        repaired_res = repair_checkpoint_df(raw_res)
+        valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
         st.header("📈 三仓实战账户模拟报告 (本金 300,000 元)")
         
-        # 资金账户模拟引擎
         slot_cash = [INIT_TOTAL_CAPITAL / MAX_SLOTS] * int(MAX_SLOTS)
         slot_occupied_until = ["" for _ in range(int(MAX_SLOTS))]
         portfolio_trades = []
         
-        unique_dates = sorted(valid_signals['Trade_Date'].unique())
+        unique_dates = sorted(valid_signals['Trade_Date'].astype(str).unique())
         
         for date_str in unique_dates:
-            day_candidates = valid_signals[valid_signals['Trade_Date'] == date_str].sort_values('Rank', ascending=True)
+            clean_d_str = str(date_str).replace("-", "")
+            day_candidates = valid_signals[valid_signals['Trade_Date'].astype(str) == date_str].sort_values('Rank', ascending=True)
             
-            # 检查哪些槽位在今天之前已经释放 (平仓发生在该周五或之前)
             free_slots = []
             for s_idx in range(int(MAX_SLOTS)):
-                if slot_occupied_until[s_idx] == "" or slot_occupied_until[s_idx] <= date_str:
+                occ = str(slot_occupied_until[s_idx]).replace("-", "")
+                if occ == "" or occ <= clean_d_str:
                     free_slots.append(s_idx)
                     
             if not free_slots:
-                continue  # 槽位已满，资金全部在仓
+                continue
                 
             for _, row in day_candidates.iterrows():
                 if not free_slots:
@@ -722,13 +740,28 @@ if os.path.exists(CHECKPOINT_FILE):
                     
                 target_slot = free_slots.pop(0)
                 alloc_capital = slot_cash[target_slot]
-                final_pct = row['Final_Return (%)'] if pd.notna(row['Final_Return (%)']) else 0.0
+                
+                final_pct = row.get('Final_Return (%)', np.nan)
+                if pd.isna(final_pct):
+                    final_pct = 0.0
+                    
                 profit_amount = alloc_capital * (final_pct / 100.0)
                 end_capital = alloc_capital + profit_amount
                 slot_cash[target_slot] = end_capital
                 
-                # 记录该槽位被占用到哪一天
-                exit_date_str = str(row['Exit_Date']) if pd.notna(row['Exit_Date']) else "20991231"
+                if pd.notna(row.get('Exit_Date')) and str(row['Exit_Date']).strip() != "":
+                    exit_date_str = str(row['Exit_Date']).replace("-", "")
+                else:
+                    hold_days = row.get('Hold_Days', 40)
+                    if pd.isna(hold_days) or hold_days <= 0:
+                        hold_days = 40
+                    try:
+                        td_dt = datetime.strptime(clean_d_str, "%Y%m%d")
+                        exit_dt = td_dt + timedelta(days=int(hold_days * 7 / 5))
+                        exit_date_str = exit_dt.strftime("%Y%m%d")
+                    except Exception:
+                        exit_date_str = "20991231"
+                        
                 slot_occupied_until[target_slot] = exit_date_str
                 
                 trade_record = row.to_dict()
@@ -736,6 +769,7 @@ if os.path.exists(CHECKPOINT_FILE):
                 trade_record['Alloc_Capital'] = round(alloc_capital, 2)
                 trade_record['End_Capital'] = round(end_capital, 2)
                 trade_record['Net_Profit'] = round(profit_amount, 2)
+                trade_record['Exit_Date_Clean'] = exit_date_str
                 portfolio_trades.append(trade_record)
 
         if portfolio_trades:
@@ -801,7 +835,7 @@ if os.path.exists(CHECKPOINT_FILE):
             st.download_button(
                 label="📥 导出三仓实战流水 (CSV)", 
                 data=csv_data, 
-                file_name="portfolio_3slots_v7_export.csv", 
+                file_name="portfolio_3slots_v7_1_export.csv", 
                 mime="text/csv"
             )
         else:
