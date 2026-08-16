@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V6.6 深坑弹性评分·扩容定型版)
+周线 SKDJ 底部脱离定型版 (V6.7 防透支·精准甜区版)
 ------------------------------------------------
-1. 【池子扩容至 50亿】：流通市值底座调至 50 亿（股价保持 >= 10元），扩充一倍硬科技隐形冠军。
-2. 【深坑门槛放宽至 25】：D_Min 上限放宽至 25.0，大幅减少连续空窗周。
-3. 【新增深坑弹性分 (20分)】：离 25 线越远（砸坑越深）得分越高，优先捕获大底真龙头。
-4. 【空头趋势硬过滤】：物理剔除周线 20 周均线下方下行标的，杜绝接飞刀。
-5. 【持久化缓存与全链路防崩】：Token 自动清洗、连接预检、master 缓存向下兼容。
+1. 【K值黄金甜区收敛】：满分峰值精准收缩至 K in [28.0, 33.0]，压制短线冲得过猛标的。
+2. 【量能防透支降权】：温和建仓区锁定在 1.3~2.8 倍，量比 > 3.5 实施降权，规避周一买力衰竭。
+3. 【深坑弹性赋分】：D_min < 10 奖 20 分，10~15 奖 15 分，推动极度深坑真龙头挺进 Top 1~3。
+4. 【空头趋势硬过滤】：物理剔除周线 20 周均线下方且下行标的，杜绝接飞刀。
+5. 【50亿科技扩容】：流通市值 50 亿底座 + 股价 >= 10 元，兼顾标的充沛度与资产质量。
 ------------------------------------------------
 """
 
@@ -31,6 +31,7 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 
 if not os.path.exists(MARKET_CACHE_FILE):
     for legacy_file in [
+        "skdj_market_data_v6_6.pkl",
         "skdj_market_data_v6_5.pkl",
         "skdj_market_data_v6_4.pkl",
         "skdj_market_data_v6_3.pkl",
@@ -51,9 +52,9 @@ if not os.path.exists(MARKET_CACHE_FILE):
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 深坑弹性实战版", layout="wide")
-st.title("📈 周线 SKDJ 底部脱离系统 (V6.6 深坑弹性评分版)")
-st.markdown("🔒 **50亿市值底座 + 深坑弹性加权：砸坑越深权重越高，兼顾标的充沛度与起爆爆发力。**")
+st.set_page_config(page_title="SKDJ 精准甜区实战版", layout="wide")
+st.title("📈 周线 SKDJ 底部脱离系统 (V6.7 防透支·精准甜区版)")
+st.markdown("🔒 **精准动能甜区 + 防透支降权：锁定 K in [28, 33] 刚发力阶段，压制短线脉冲过热。**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -273,7 +274,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 核心引擎：突破 25 线 + 下跌硬过滤 + 三维评分(动能+量能+深坑弹性)
+# 核心引擎：突破 25 线 + 空头硬过滤 + 精准防透支评分
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -317,11 +318,11 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']): return res
 
-    # 1. 突破判定与深坑基因放宽至 25.0
+    # 1. 突破判定与深坑基因 (上限放宽至 25.0 以防长空窗)
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     is_bullish = curr_w['k'] > curr_w['d']
     recent_d_min = weekly_df['d'].tail(10).min()
-    has_bottom_gene = recent_d_min <= 25.0  # 🚀 门槛适度放宽至 25.0，消灭长空窗
+    has_bottom_gene = recent_d_min <= 25.0
     is_yang = curr_w['close'] > curr_w['open']
     
     is_vol_ok = True
@@ -331,12 +332,11 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     base_signal = is_breakout_25 and is_bullish and has_bottom_gene and is_yang and is_vol_ok
     if not base_signal: return res
 
-    # 2. 标准周线均线趋势硬过滤
+    # 2. 周线趋势硬过滤（排除 20 周均线下方且下行的空头标的）
     ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
     ma20_prev = prev_w['ma20'] if pd.notna(prev_w['ma20']) else curr_w['close']
     ma20_slope = (ma20_curr - ma20_prev) / (ma20_prev + 1e-5)
 
-    # 剔除下跌趋势（20周线下方且均线下行）
     if curr_w['close'] < ma20_curr and ma20_slope < -0.002:
         return res
 
@@ -355,29 +355,35 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
     res['vol_ratio'] = round(vol_ratio, 2)
 
-    # 3. 三维综合评分模型
-    # A. K 值动能分 (50分)
+    # ---------------------------
+    # 3. 🚀【全新】精准防透支三维评分模型
+    # ---------------------------
+    # A. K 值精准起爆甜区 (50分) - 满分锁定在 [28.0, 33.0]
     k_val = curr_w['k']
-    if k_val < 28.0:
-        score_k = (k_val - 25.0) * 2.0
-    elif 28.0 <= k_val <= 38.0:
-        score_k = 15.0 + (k_val - 28.0) * 3.5
+    if k_val < 25.0:
+        score_k = 0.0
+    elif 25.0 <= k_val < 28.0:
+        score_k = (k_val - 25.0) * 8.0  # 25~28 给 0~24 分
+    elif 28.0 <= k_val <= 33.0:
+        score_k = 40.0 + (k_val - 28.0) * 2.0  # 28~33 黄金起爆点，得 40~50 满分
+    elif 33.0 < k_val <= 36.0:
+        score_k = 50.0 - (k_val - 33.0) * 5.0  # 33~36 短线稍急，降至 35 分
     else:
-        score_k = 50.0 - (k_val - 38.0) * 2.0
+        score_k = max(10.0, 35.0 - (k_val - 36.0) * 4.0)  # > 36 短线超买防追高
 
-    # B. 量能健康分 (35分)
+    # B. 量能温和建仓区 (35分) - 满分锁定在 [1.3, 2.8]，量比 > 3.5 严格降权
     if vol_ratio < 1.0:
         score_vol = -20.0
     elif 1.0 <= vol_ratio < 1.3:
-        score_vol = 10.0
-    elif 1.3 <= vol_ratio <= 3.0:
-        score_vol = 35.0
-    elif 3.0 < vol_ratio <= 4.5:
+        score_vol = 15.0
+    elif 1.3 <= vol_ratio <= 2.8:
+        score_vol = 35.0  # 机构温和建仓黄金区
+    elif 2.8 < vol_ratio <= 3.5:
         score_vol = 20.0
     else:
-        score_vol = 5.0
+        score_vol = 10.0  # > 3.5 异常脉冲/对倒降权
 
-    # C. 🚀【全新】深坑蓄势弹性分 (20分)：砸坑越深、离 25 越远得分越高
+    # C. 深坑蓄势弹性分 (20分) - 砸坑越深、离 25 越远得分越高
     if recent_d_min < 10.0:
         score_depth = 20.0  # 极致深坑
     elif 10.0 <= recent_d_min < 15.0:
@@ -497,7 +503,7 @@ with st.sidebar:
     st.header("⚙️ 系统配置参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("追溯交易天数", value=250, step=30)
-    TOP_BACKTEST = st.number_input("每周优选 TopK", value=3, help="推荐配置为 3 只真龙头")
+    TOP_BACKTEST = st.number_input("每周优选 TopK", value=3, help="实战推荐配置为 3 只真龙头")
     
     st.markdown("---")
     if st.button("🗑️ 清空行情缓存 (重新全量下载)"):
@@ -515,7 +521,7 @@ with st.sidebar:
     st.subheader("💰 护城河底座")
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=50.0, help="已下调至50亿以扩充硬科技细分龙头") 
+    MIN_MV = col1.number_input("最小市值(亿)", value=50.0, help="下调至50亿扩充硬科技细分隐形冠军") 
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
@@ -594,7 +600,7 @@ if st.button("🚀 启动周末定型回测"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到有效白名单行情数据，请点击左侧清空缓存重试。")
                             else:
-                                bar = st.progress(0, text="执行科技股深坑弹性精选引擎...")
+                                bar = st.progress(0, text="执行防透支·精准甜区精选引擎...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -663,7 +669,7 @@ if os.path.exists(CHECKPOINT_FILE):
         all_res = pd.read_csv(CHECKPOINT_FILE)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header("📊 V6.6 深坑弹性定型版战绩追踪")
+        st.header("📊 V6.7 精准甜区版战绩追踪")
         st.subheader("🗓️ 周度胜率分布 (严格对齐周末信号)")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -721,7 +727,7 @@ if os.path.exists(CHECKPOINT_FILE):
         st.download_button(
             label="📥 导出完整回测记录 (CSV)", 
             data=csv, 
-            file_name="skdj_final_v6_6_export.csv", 
+            file_name="skdj_final_v6_7_export.csv", 
             mime="text/csv"
         )
     except pd.errors.EmptyDataError:
