@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V6.2 科技池定型·极速防崩版)
+周线 SKDJ 底部脱离定型版 (V6.3 趋势中立·客观分析版)
 ------------------------------------------------
-1. 【科技白名单前置过滤】：仅下载 主板/创业板/科创板 中核心与拓展科技标的，内存压降 85%。
-2. 【下载源头精准裁剪】：在 Tushare 接口返回的瞬间即刻过滤，彻底根治 1GB 内存溢出闪退。
-3. 【周线趋势识别引擎】：周线 上升趋势(+30) / 震荡筑底(+15) / 下跌中继(-25) 动态打分。
-4. 【综合评分体系】：周线趋势分 + K值动能甜区分 + 量能健康分，优选前3名真龙头。
-5. 【永久缓存继承】：自动兼容并清洗历史 master 缓存，多周期回测秒开。
+1. 【趋势中立客观记录】：周线趋势（上升/震荡/下跌）仅作形态标签与列记录，不参与任何加减分。
+2. 【纯动能与量能评分】：仅根据 K值黄金区间与量比健康度打分，确保各趋势标的公平竞争。
+3. 【科技白名单前置过滤】：仅下载 主板/创业板/科创板 中核心与拓展科技标的，源头节约 85% 内存。
+4. 【全链路防崩与免重复下载】：Token 自动清洗、连接预检、master 缓存永久继承。
+5. 【阶梯风控跟踪】：-10% 认栽出局 / +12% 阶段保本 / +25% 移动跟踪止盈。
 ------------------------------------------------
 """
 
@@ -31,6 +31,7 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 
 if not os.path.exists(MARKET_CACHE_FILE):
     for legacy_file in [
+        "skdj_market_data_v6_2.pkl",
         "skdj_market_data_v6_1.pkl",
         "skdj_market_data_v6.pkl",
         "skdj_market_data_v5.pkl", 
@@ -47,9 +48,9 @@ if not os.path.exists(MARKET_CACHE_FILE):
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 科技突破实战版", layout="wide")
-st.title("📈 周线 SKDJ 底部脱离右侧确认系统 (科技池定制版)")
-st.markdown("🔒 **科技白名单底座：已绑定主板/创业板/科创板核心科技赛道，源头过滤杜绝内存溢出。**")
+st.set_page_config(page_title="SKDJ 趋势中立验证版", layout="wide")
+st.title("📈 周线 SKDJ 底部脱离系统 (V6.3 趋势客观分析版)")
+st.markdown("🔒 **趋势中立模式：周线趋势不参与打分加减，全景保留三类形态以验证真实表现。**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -192,7 +193,6 @@ def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
             df_a = safe_tushare_call(pro.adj_factor, max_retries=3, sleep_time=0.8, trade_date=d)
             df_b = safe_tushare_call(pro.daily_basic, max_retries=3, sleep_time=0.8, trade_date=d, fields='ts_code,trade_date,circ_mv')
             
-            # 🚀 源头裁剪：只保留科技白名单股票
             if whitelist_set:
                 if not df_d.empty: df_d = df_d[df_d['ts_code'].isin(whitelist_set)]
                 if not df_a.empty: df_a = df_a[df_a['ts_code'].isin(whitelist_set)]
@@ -270,7 +270,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 核心引擎：突破 25 线算法 + 趋势识别 + 综合评分
+# 核心引擎：突破 25 线算法 + 客观趋势识别 + 趋势中立评分
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -335,7 +335,9 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
     res['vol_ratio'] = round(vol_ratio, 2)
 
-    # 周线趋势识别
+    # ---------------------------
+    # 周线趋势客观识别 (仅打标签，不赋分)
+    # ---------------------------
     ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
     ma20_prev = prev_w['ma20'] if pd.notna(prev_w['ma20']) else curr_w['close']
     ma20_slope = (ma20_curr - ma20_prev) / (ma20_prev + 1e-5)
@@ -346,17 +348,16 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
 
     if curr_w['close'] >= ma20_curr and ma20_slope >= -0.003:
         trend_type = "上升趋势"
-        score_trend = 30.0
     elif is_higher_low or abs(curr_w['close'] - ma20_curr) / ma20_curr <= 0.08:
         trend_type = "震荡筑底"
-        score_trend = 15.0
     else:
         trend_type = "下跌中继"
-        score_trend = -25.0
         
     res['trend_type'] = trend_type
 
-    # 综合评分模型
+    # ---------------------------
+    # 趋势中立评分模型 (趋势加分 = 0，纯动能与量能打分)
+    # ---------------------------
     k_val = curr_w['k']
     if k_val < 28.0:
         score_k = (k_val - 25.0) * 2.0
@@ -376,7 +377,8 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     else:
         score_vol = 5.0
 
-    total_score = score_k + score_vol + score_trend
+    # 核心：完全不加入趋势分（确保各形态标的公平自然竞争）
+    total_score = score_k + score_vol
     res['Total_Score'] = round(total_score, 1)
 
     return res
@@ -486,7 +488,7 @@ with st.sidebar:
     st.header("⚙️ 系统配置参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("追溯交易天数", value=250, step=30)
-    TOP_BACKTEST = st.number_input("每周优选 TopK", value=3)
+    TOP_BACKTEST = st.number_input("每周优选 TopK", value=20, help="设为 20 可导出每周所有达标标的以便全景分析")
     
     st.markdown("---")
     if st.button("🗑️ 清空行情缓存 (重新全量下载)"):
@@ -583,7 +585,7 @@ if st.button("🚀 启动周末定型回测"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到有效白名单行情数据，请点击左侧清空缓存重试。")
                             else:
-                                bar = st.progress(0, text="执行科技股周末定型与趋势扫描引擎...")
+                                bar = st.progress(0, text="执行科技股客观扫描引擎 (趋势中立)...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -652,7 +654,7 @@ if os.path.exists(CHECKPOINT_FILE):
         all_res = pd.read_csv(CHECKPOINT_FILE)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header("📊 V6.2 科技定制版战绩追踪")
+        st.header("📊 V6.3 趋势中立版战绩追踪")
         st.subheader("🗓️ 周度胜率分布 (严格对齐周末信号)")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -711,7 +713,7 @@ if os.path.exists(CHECKPOINT_FILE):
         st.download_button(
             label="📥 导出完整回测记录 (CSV)", 
             data=csv, 
-            file_name="skdj_final_v6_2_export.csv", 
+            file_name="skdj_final_v6_3_export.csv", 
             mime="text/csv"
         )
     except pd.errors.EmptyDataError:
