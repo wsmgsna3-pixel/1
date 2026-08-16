@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V6.3 趋势中立·客观分析版)
+周线 SKDJ 底部脱离定型版 (V6.4 标准趋势量化校准版)
 ------------------------------------------------
-1. 【趋势中立客观记录】：周线趋势（上升/震荡/下跌）仅作形态标签与列记录，不参与任何加减分。
-2. 【纯动能与量能评分】：仅根据 K值黄金区间与量比健康度打分，确保各趋势标的公平竞争。
+1. 【标准周线趋势校准】：纯几何均线判定（上升/震荡转换/下跌），彻底消除条件吞噬。
+2. 【趋势中立客观验证】：趋势形态仅记录标签，不参与加减分，客观检验各形态收益。
 3. 【科技白名单前置过滤】：仅下载 主板/创业板/科创板 中核心与拓展科技标的，源头节约 85% 内存。
-4. 【全链路防崩与免重复下载】：Token 自动清洗、连接预检、master 缓存永久继承。
+4. 【全链路防崩与持久缓存】：Token 自动清洗、连接预检、master 缓存永久向下兼容。
 5. 【阶梯风控跟踪】：-10% 认栽出局 / +12% 阶段保本 / +25% 移动跟踪止盈。
 ------------------------------------------------
 """
@@ -31,6 +31,7 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 
 if not os.path.exists(MARKET_CACHE_FILE):
     for legacy_file in [
+        "skdj_market_data_v6_3.pkl",
         "skdj_market_data_v6_2.pkl",
         "skdj_market_data_v6_1.pkl",
         "skdj_market_data_v6.pkl",
@@ -48,9 +49,9 @@ if not os.path.exists(MARKET_CACHE_FILE):
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 趋势中立验证版", layout="wide")
-st.title("📈 周线 SKDJ 底部脱离系统 (V6.3 趋势客观分析版)")
-st.markdown("🔒 **趋势中立模式：周线趋势不参与打分加减，全景保留三类形态以验证真实表现。**")
+st.set_page_config(page_title="SKDJ 标准趋势验证版", layout="wide")
+st.title("📈 周线 SKDJ 底部脱离系统 (V6.4 标准趋势校准版)")
+st.markdown("🔒 **标准趋势模式：已应用纯均线几何趋势引擎，客观验证 上升 / 震荡转换 / 下跌 表现。**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -270,7 +271,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 核心引擎：突破 25 线算法 + 客观趋势识别 + 趋势中立评分
+# 核心引擎：突破 25 线算法 + 标准周线趋势识别 + 趋势中立评分
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -336,22 +337,21 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     res['vol_ratio'] = round(vol_ratio, 2)
 
     # ---------------------------
-    # 周线趋势客观识别 (仅打标签，不赋分)
+    # 标准周线趋势识别引擎（纯几何定义·无条件吞噬）
     # ---------------------------
     ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
     ma20_prev = prev_w['ma20'] if pd.notna(prev_w['ma20']) else curr_w['close']
     ma20_slope = (ma20_curr - ma20_prev) / (ma20_prev + 1e-5)
-    
-    low_recent_3w = weekly_df['low'].tail(3).min()
-    low_prev_10w = weekly_df['low'].tail(10).min()
-    is_higher_low = low_recent_3w > low_prev_10w * 1.01
 
-    if curr_w['close'] >= ma20_curr and ma20_slope >= -0.003:
+    # 1. 上升趋势：价格在 20周均线上方 且 20周均线拐头走平或向上
+    if curr_w['close'] >= ma20_curr and ma20_slope >= -0.002:
         trend_type = "上升趋势"
-    elif is_higher_low or abs(curr_w['close'] - ma20_curr) / ma20_curr <= 0.08:
-        trend_type = "震荡筑底"
+    # 2. 下跌趋势：价格在 20周均线下方 且 20周均线持续向下（空头压制）
+    elif curr_w['close'] < ma20_curr and ma20_slope < -0.002:
+        trend_type = "下跌趋势"
+    # 3. 震荡/转换趋势：价格突破均线但均线未拐头、或价格回踩均线但均线仍向上等过渡状态
     else:
-        trend_type = "下跌中继"
+        trend_type = "震荡/转换趋势"
         
     res['trend_type'] = trend_type
 
@@ -377,7 +377,6 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     else:
         score_vol = 5.0
 
-    # 核心：完全不加入趋势分（确保各形态标的公平自然竞争）
     total_score = score_k + score_vol
     res['Total_Score'] = round(total_score, 1)
 
@@ -585,7 +584,7 @@ if st.button("🚀 启动周末定型回测"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到有效白名单行情数据，请点击左侧清空缓存重试。")
                             else:
-                                bar = st.progress(0, text="执行科技股客观扫描引擎 (趋势中立)...")
+                                bar = st.progress(0, text="执行科技股客观扫描引擎 (标准趋势)...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -654,7 +653,7 @@ if os.path.exists(CHECKPOINT_FILE):
         all_res = pd.read_csv(CHECKPOINT_FILE)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header("📊 V6.3 趋势中立版战绩追踪")
+        st.header("📊 V6.4 标准趋势校准版战绩追踪")
         st.subheader("🗓️ 周度胜率分布 (严格对齐周末信号)")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -694,8 +693,8 @@ if os.path.exists(CHECKPOINT_FILE):
             
         def color_trend(val):
             if val == '上升趋势': return 'color: green; font-weight: bold'
-            elif val == '震荡筑底': return 'color: orange; font-weight: bold'
-            elif val == '下跌中继': return 'color: red; font-weight: bold'
+            elif '震荡' in val: return 'color: orange; font-weight: bold'
+            elif val == '下跌趋势': return 'color: red; font-weight: bold'
             return ''
         
         styled_df = display_df.style
@@ -713,7 +712,7 @@ if os.path.exists(CHECKPOINT_FILE):
         st.download_button(
             label="📥 导出完整回测记录 (CSV)", 
             data=csv, 
-            file_name="skdj_final_v6_3_export.csv", 
+            file_name="skdj_final_v6_4_export.csv", 
             mime="text/csv"
         )
     except pd.errors.EmptyDataError:
