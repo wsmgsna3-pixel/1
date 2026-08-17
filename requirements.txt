@@ -1,10 +1,10 @@
 
-pandas
-numpy
-tushare
+
+
+
 joblib
 plotly
-tushare
+
 scipy
 matplotlib
 yfinance
