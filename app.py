@@ -645,7 +645,7 @@ if st.button("🧪 提取当前因子组合的独立样本"):
                         if not dates_to_run:
                             st.success("🎉 指定区间数据已扫描完毕！请查看下方验证报告。")
                         else:
-                            fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=800)).strftime("%Y%m%d")
+                            fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
                             fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
                             
                             dummy_trigger = time.time()
