@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离定型版 (V7.1 三仓实战资金修复定型版)
+周线 SKDJ 底部脱离纯粹定型版 (V8.0 纯粹信号·三仓实战资金版)
 ------------------------------------------------
-1. 【兼容历史数据容错】：内置自动修复引擎，无缝兼容所有历史版本 checkpoint 数据，彻底杜绝 KeyError。
-2. 【三仓 30万动态轮动】：初始本金 30万（3仓各10万），真实模拟现金流、仓位冻结与组合净值曲线。
-3. 【A股 T+1 实战执行】：周一买入锁仓，周二起盘中实时监控 -10%硬止损、+2%保本锁、15%移动止盈。
-4. 【首周五 14:50 截断】：首周五收盘浮亏 <= -3% 且周K收阴时尾盘果断平仓，将潜在亏损截断减半。
-5. 【12周最大波段跨度】：最长持仓扩展至 12 周（60个交易日），吃满大牛股二浪主升。
+1. 【唯一触发买入条件】：KD 曾双双沉入 25 线下方（无论纠缠多久），当周 K 首次突破 25 线且 K > D，即刻触发！
+2. 【彻底解绑所有人工限制】：坚决排除上涨/下跌/震荡趋势硬过滤，坚决废除“周K必须收阳”限制。
+3. 【次周一开盘执行买入】：信号发出后的次周一开盘价准时进场，绝无信号滞后（东富龙 11.70元准时抓取）。
+4. 【三仓 30万动态轮动】：初始本金 30万（3仓各10万），真实模拟现金流、仓位冻结与组合复利曲线。
+5. 【完备实战出局系统】：
+   - 首周五 14:50 截断：买入首周五收盘浮亏 <= -3% 且收阴时尾盘平仓，截断深套；
+   - 盘中底线硬止损：T+1 起跌破买入价 -10% 坚决认栽离场；
+   - 锁定 +2% 保本：最高浮盈曾 >= +10% 跌回 +2% 时止盈平仓；
+   - 锁定 15% 移动止盈：最高浮盈曾 >= +20% 较最高点回撤 15% 止盈平仓；
+   - 最长持仓跨度：12 周（60个交易日）期满平仓轮动。
+6. 【开盘顺位递补机制】：前三名若遇高开过大或恶劣低开，自动顺延启用第 4、5 名递补建仓。
 ------------------------------------------------
 """
 
@@ -31,10 +37,10 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 
 if not os.path.exists(MARKET_CACHE_FILE):
     for legacy_file in [
+        "skdj_market_data_v7_1.pkl",
+        "skdj_market_data_v7.pkl",
         "skdj_market_data_v6_8.pkl",
         "skdj_market_data_v6_7.pkl",
-        "skdj_market_data_v6_6.pkl",
-        "skdj_market_data_v6_5.pkl",
         "skdj_market_data_master.pkl"
     ]:
         if os.path.exists(legacy_file):
@@ -47,9 +53,9 @@ if not os.path.exists(MARKET_CACHE_FILE):
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 三仓实战资金回测系统", layout="wide")
-st.title("💼 周线 SKDJ 底部脱离系统 (V7.1 三仓实战资金定型版)")
-st.markdown("🔒 **30万初始本金 · 三仓等额轮动 · 首周五 -3% 截断 · +2% 保本 · 15% 移动止盈 · 12 周大波段**")
+st.set_page_config(page_title="SKDJ 纯粹信号实战系统", layout="wide")
+st.title("🎯 周线 SKDJ 底部脱离系统 (V8.0 纯粹信号·三仓实战定型版)")
+st.markdown("🔒 **纯粹 KD 破线即开仓 · 彻底废除趋势与形态枷锁 · 30万三仓轮动 · 首周 -3% 截断 + 15% 移动止盈**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -86,7 +92,7 @@ def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
     return pd.DataFrame()
 
 # ---------------------------
-# 科技白名单池构建 (50亿市值底座)
+# 科技白名单池构建 (50亿市值底座 + 10元股价)
 # ---------------------------
 @st.cache_data(ttl=3600*24*7, show_spinner=False)
 def load_custom_tech_whitelist(token):
@@ -228,7 +234,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     whitelist_set = set(_whitelist_keys)
     cache = sync_market_data_incrementally(start_date, end_date, token_c, whitelist_set)
     
-    with st.spinner("正在构建科技池轻量化前复权索引..."):
+    with st.spinner("正在构建科技白名单轻量化前复权索引..."):
         daily_list = cache.get('daily', [])
         adj_list = cache.get('adj', [])
         basic_list = cache.get('daily_basic', [])
@@ -269,7 +275,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 核心信号引擎 (自然动能与深坑共振)
+# 🚀【V8.0 纯粹信号引擎】：唯一触发买入条件 (无均线与阴阳限制)
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -313,30 +319,22 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']): return res
 
+    # 1. 唯一买入前置条件：过去 15 周内，K 和 D 曾双双沉入 25 线下方（充分出清）
+    recent_k_min = weekly_df['k'].tail(15).min()
+    recent_d_min = weekly_df['d'].tail(15).min()
+    has_bottom_gene = (recent_k_min <= 25.0) and (recent_d_min <= 25.0)
+
+    # 2. 唯一触发买入条件：当周周线 K 首次向上突破 25 线，且满足金叉 K > D
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     is_bullish = curr_w['k'] > curr_w['d']
-    recent_d_min = weekly_df['d'].tail(10).min()
-    has_bottom_gene = recent_d_min <= 25.0
-    is_yang = curr_w['close'] > curr_w['open']
-    
-    is_vol_ok = True
-    if pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0:
-        is_vol_ok = curr_w['vol'] >= curr_w['ma5_vol'] * 0.85
 
-    base_signal = is_breakout_25 and is_bullish and has_bottom_gene and is_yang and is_vol_ok
-    if not base_signal: return res
-
-    ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
-    ma20_prev = prev_w['ma20'] if pd.notna(prev_w['ma20']) else curr_w['close']
-    ma20_slope = (ma20_curr - ma20_prev) / (ma20_prev + 1e-5)
-
-    if curr_w['close'] < ma20_curr and ma20_slope < -0.002:
+    # 🚀 彻底排除趋势过滤与周K收阳限制，纯粹执行破线即开仓！
+    if not (is_breakout_25 and is_bullish and has_bottom_gene):
         return res
 
-    if curr_w['close'] >= ma20_curr and ma20_slope >= -0.002:
-        trend_type = "上升趋势"
-    else:
-        trend_type = "震荡/转换趋势"
+    # 仅作为状态描述展示，绝不拦截信号
+    ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
+    trend_type = "均线上方" if curr_w['close'] >= ma20_curr else "均线下方(超跌)"
 
     res['is_buy_signal'] = True
     res['k'] = round(curr_w['k'], 2)
@@ -348,32 +346,26 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
     res['vol_ratio'] = round(vol_ratio, 2)
 
+    # 3. 自然动能排序打分模型 (按突破动能与量能优选排序)
     k_val = curr_w['k']
-    if k_val < 28.0:
-        score_k = (k_val - 25.0) * 2.0
-    elif 28.0 <= k_val <= 38.0:
-        score_k = 15.0 + (k_val - 28.0) * 3.5
-    else:
-        score_k = 50.0 - (k_val - 38.0) * 2.0
+    score_k = k_val * 1.5  # 突破动能越大得分越高，不压制大阳线爆发龙头
 
     if vol_ratio < 1.0:
-        score_vol = -20.0
-    elif 1.0 <= vol_ratio < 1.3:
-        score_vol = 10.0
-    elif 1.3 <= vol_ratio <= 3.0:
-        score_vol = 35.0
-    elif 3.0 < vol_ratio <= 4.5:
-        score_vol = 20.0
+        score_vol = -10.0
+    elif 1.0 <= vol_ratio <= 3.5:
+        score_vol = vol_ratio * 10.0
     else:
-        score_vol = 5.0
+        score_vol = 25.0
 
-    total_score = score_k + score_vol
+    score_depth = (25.0 - recent_d_min) * 0.8 if recent_d_min < 25.0 else 0.0
+
+    total_score = score_k + score_vol + score_depth
     res['Total_Score'] = round(total_score, 1)
 
     return res
 
 # ---------------------------
-# 出局系统：T+1 + 首周五截断 + +2%保本 + 15%移动止盈 + 12周跨度
+# 实战出局系统：T+1 + 首周五截断 + +2%保本 + 15%移动止盈 + 12周跨度
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
     default_res = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
@@ -437,6 +429,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         curr_open, curr_close, curr_high, curr_low = row['open'], row['close'], row['high'], row['low']
         curr_date = hist_future.index[i]
         
+        # 1. 挂单止盈/保本执行 (T+1 开盘)
         if pending_exit_reason is not None and day_count >= 2:
             if "保本" in pending_exit_reason:
                 final_return = 2.0  
@@ -454,6 +447,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         peak_price = max(peak_price, curr_high)
         peak_profit_pct = (peak_price - buy_price) / buy_price
         
+        # 2. T+1 起底线硬止损 (-10%)
         if day_count >= 2:
             if (curr_low - buy_price) / buy_price <= hard_stop_limit:
                 final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
@@ -465,6 +459,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
                 results[f'Return_W{current_week} (%)'] = round(final_return, 2)
                 break
         
+        # 3. 动态阶梯状态机
         if tier == 0 and peak_profit_pct >= 0.10: 
             tier = 1  
             
@@ -479,6 +474,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
             if giveback >= 0.15:  
                 pending_exit_reason = "移动止盈(回撤15%)"
         
+        # 4. 首周五 14:50 截断机制：收盘浮亏 <= -3.0%，尾盘直接平仓
         if day_count == 5 and not exit_triggered and pending_exit_reason is None:
             w1_ret = (curr_close - buy_price) / buy_price * 100.0
             if w1_ret <= -3.0:
@@ -493,6 +489,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = round((curr_close - buy_price) / buy_price * 100.0, 2)
             
+    # 5. 12 周期满平仓
     if not exit_triggered and len(hist_future) >= max_days:
         last_price = hist_future.iloc[max_days - 1]['close']
         final_return = (last_price - buy_price) / buy_price * 100.0
@@ -505,7 +502,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     return results
 
 # ---------------------------
-# 🚀 历史数据自动兼容与修复引擎
+# 历史数据自动兼容与修复引擎
 # ---------------------------
 def repair_checkpoint_df(df_in):
     df_out = df_in.copy()
@@ -576,9 +573,9 @@ with st.sidebar:
 token_clean = clean_token_str(TS_TOKEN_INPUT)
 
 # ---------------------------
-# 主流程：启动回测
+# 主流程：启动纯粹回测
 # ---------------------------
-if st.button("🚀 启动实战资金组合回测"):
+if st.button("🚀 启动纯粹信号实战回测"):
     is_valid, msg = verify_token_connection(token_clean)
     if not is_valid:
         st.error(f"❌ **Token 预检拦截**：{msg}")
@@ -640,7 +637,7 @@ if st.button("🚀 启动实战资金组合回测"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V7.1 实战信号扫描...")
+                                bar = st.progress(0, text="执行纯粹周线突破扫描 (V8.0)...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -696,7 +693,7 @@ if st.button("🚀 启动实战资金组合回测"):
                                     bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date} (捕获 {len(records)} 只目标)")
                                     
                                 bar.empty()
-                                st.success("🎉 实战回测数据已全部处理完毕！")
+                                st.success("🎉 纯粹信号回测数据已全部处理完毕！")
         except Exception as e:
             st.error(f"❌ **运行异常拦截**：{str(e)}")
 
@@ -709,7 +706,6 @@ if os.path.exists(CHECKPOINT_FILE):
         raw_res = pd.read_csv(CHECKPOINT_FILE)
         raw_res['Trade_Date'] = raw_res['Trade_Date'].astype(str)
         
-        # 🚀 自动执行历史数据修复与容错补齐
         repaired_res = repair_checkpoint_df(raw_res)
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
@@ -835,7 +831,7 @@ if os.path.exists(CHECKPOINT_FILE):
             st.download_button(
                 label="📥 导出三仓实战流水 (CSV)", 
                 data=csv_data, 
-                file_name="portfolio_3slots_v7_1_export.csv", 
+                file_name="portfolio_3slots_pure_v8_export.csv", 
                 mime="text/csv"
             )
         else:
