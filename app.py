@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离纯粹定型版 (V8.0 纯粹信号·三仓实战资金版)
+周线 SKDJ 底部脱离纯粹定型版 (V8.2 周五放行·周一防一字板·三仓实战版)
 ------------------------------------------------
-1. 【唯一触发买入条件】：KD 曾双双沉入 25 线下方（无论纠缠多久），当周 K 首次突破 25 线且 K > D，即刻触发！
-2. 【彻底解绑所有人工限制】：坚决排除上涨/下跌/震荡趋势硬过滤，坚决废除“周K必须收阳”限制。
-3. 【次周一开盘执行买入】：信号发出后的次周一开盘价准时进场，绝无信号滞后（东富龙 11.70元准时抓取）。
-4. 【三仓 30万动态轮动】：初始本金 30万（3仓各10万），真实模拟现金流、仓位冻结与组合复利曲线。
-5. 【完备实战出局系统】：
+1. 【周五敞开准入】：周五收盘涨停板/一字板正常入选，只要 K 上穿 25 且 K > D 即发出信号。
+2. 【周一全域一字板拦截】：主板 10cm / 双创 20cm 若周一开盘封死一字板无法买入，直接剔除。
+3. 【智能顺位递补】：周一被剔除的标的不占仓位，空闲资金自动由 Rank 4、Rank 5 递补买入。
+4. 【三仓 30万动态轮动】：初始本金 30万（3仓各10万），模拟现金流、仓位冻结与组合复利曲线。
+5. 【实战出局防守体系】：
    - 首周五 14:50 截断：买入首周五收盘浮亏 <= -3% 且收阴时尾盘平仓，截断深套；
    - 盘中底线硬止损：T+1 起跌破买入价 -10% 坚决认栽离场；
    - 锁定 +2% 保本：最高浮盈曾 >= +10% 跌回 +2% 时止盈平仓；
    - 锁定 15% 移动止盈：最高浮盈曾 >= +20% 较最高点回撤 15% 止盈平仓；
    - 最长持仓跨度：12 周（60个交易日）期满平仓轮动。
-6. 【开盘顺位递补机制】：前三名若遇高开过大或恶劣低开，自动顺延启用第 4、5 名递补建仓。
 ------------------------------------------------
 """
 
@@ -30,17 +29,17 @@ import pickle
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 全局持久化缓存配置
+# 全局持久化缓存配置 (升级独立 V8.2 文件)
 # ---------------------------
-CHECKPOINT_FILE = "skdj_robust_checkpoint.csv"
+CHECKPOINT_FILE = "skdj_pure_v8_2_checkpoint.csv"
 MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 
 if not os.path.exists(MARKET_CACHE_FILE):
     for legacy_file in [
+        "skdj_market_data_v8_1.pkl",
+        "skdj_market_data_v8.pkl",
         "skdj_market_data_v7_1.pkl",
         "skdj_market_data_v7.pkl",
-        "skdj_market_data_v6_8.pkl",
-        "skdj_market_data_v6_7.pkl",
         "skdj_market_data_master.pkl"
     ]:
         if os.path.exists(legacy_file):
@@ -54,8 +53,8 @@ if not os.path.exists(MARKET_CACHE_FILE):
 # 页面基础配置
 # ---------------------------
 st.set_page_config(page_title="SKDJ 纯粹信号实战系统", layout="wide")
-st.title("🎯 周线 SKDJ 底部脱离系统 (V8.0 纯粹信号·三仓实战定型版)")
-st.markdown("🔒 **纯粹 KD 破线即开仓 · 彻底废除趋势与形态枷锁 · 30万三仓轮动 · 首周 -3% 截断 + 15% 移动止盈**")
+st.title("🎯 周线 SKDJ 底部脱离系统 (V8.2 周五放行·周一防一字板版)")
+st.markdown("🔒 **周五涨停正常入选 · 周一一字板自动剔除递补 · 30万三仓轮动 · 首周 -3% 截断 + 15% 移动止盈**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -275,7 +274,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 🚀【V8.0 纯粹信号引擎】：唯一触发买入条件 (无均线与阴阳限制)
+# 🚀【V8.2 纯粹信号引擎】：周五涨停/一字板正常入选
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -319,7 +318,7 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']): return res
 
-    # 1. 唯一买入前置条件：过去 15 周内，K 和 D 曾双双沉入 25 线下方（充分出清）
+    # 1. 唯一买入前置条件：过去 15 周内，K 和 D 曾进入 25 线下方（充分出清）
     recent_k_min = weekly_df['k'].tail(15).min()
     recent_d_min = weekly_df['d'].tail(15).min()
     has_bottom_gene = (recent_k_min <= 25.0) and (recent_d_min <= 25.0)
@@ -328,13 +327,11 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     is_bullish = curr_w['k'] > curr_w['d']
 
-    # 🚀 彻底排除趋势过滤与周K收阳限制，纯粹执行破线即开仓！
     if not (is_breakout_25 and is_bullish and has_bottom_gene):
         return res
 
-    # 仅作为状态描述展示，绝不拦截信号
     ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
-    trend_type = "均线上方" if curr_w['close'] >= ma20_curr else "均线下方(超跌)"
+    trend_type = "均线上方" if curr_w['close'] >= ma20_curr else "均线下方(超跌反转)"
 
     res['is_buy_signal'] = True
     res['k'] = round(curr_w['k'], 2)
@@ -346,9 +343,9 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
     res['vol_ratio'] = round(vol_ratio, 2)
 
-    # 3. 自然动能排序打分模型 (按突破动能与量能优选排序)
+    # 自然动能排序打分模型
     k_val = curr_w['k']
-    score_k = k_val * 1.5  # 突破动能越大得分越高，不压制大阳线爆发龙头
+    score_k = k_val * 1.5
 
     if vol_ratio < 1.0:
         score_vol = -10.0
@@ -365,7 +362,7 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     return res
 
 # ---------------------------
-# 实战出局系统：T+1 + 首周五截断 + +2%保本 + 15%移动止盈 + 12周跨度
+# 🚀 实战出局系统：周一全域一字板拦截 + 首周五截断 + +2%保本 + 15%移动止盈
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
     default_res = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
@@ -388,15 +385,17 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     if pd.isna(buy_price) or buy_price <= 0: return results
 
     is_20cm = any(ts_code.startswith(prefix) for prefix in ['300', '301', '688', '689'])
-    
-    if not is_20cm and next_row['open'] == next_row['high'] == next_row['low']:
-        results['Exit_Reason'] = "一字板无法买入(剔除)"
+    limit_rate_pct = 19.0 if is_20cm else 9.5
+    gap_pct = (buy_price - signal_close) / signal_close * 100.0
+    results['Gap_pct (%)'] = round(gap_pct, 2)
+
+    # 🚀【周一全域一字板无法买入拦截】：主板/双创开盘封死一字板直接剔除
+    is_monday_yiziban = (next_row['open'] == next_row['high'] == next_row['low']) and (gap_pct >= limit_rate_pct)
+    if is_monday_yiziban:
+        results['Exit_Reason'] = f"一字板无法买入(剔除: {round(gap_pct, 1)}%)"
         results['Buy_Price'] = round(buy_price, 2)  
         return results
 
-    gap_pct = (buy_price - signal_close) / signal_close * 100
-    results['Gap_pct (%)'] = round(gap_pct, 2)
-    
     if is_20cm and gap_pct > 8.0:
         results['Exit_Reason'] = f"双创高开过大(剔除: {round(gap_pct, 2)}%)"
         results['Buy_Price'] = round(buy_price, 2)
@@ -637,7 +636,7 @@ if st.button("🚀 启动纯粹信号实战回测"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行纯粹周线突破扫描 (V8.0)...")
+                                bar = st.progress(0, text="执行纯粹周线突破扫描 (V8.2)...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -789,18 +788,16 @@ if os.path.exists(CHECKPOINT_FILE):
             cols_row1 = st.columns(4)
             cols_row2 = st.columns(4)
             
-            for w in range(1, 9):
+            for w in range(1, 13):
                 col_name = f'Return_W{w} (%)'
                 if col_name in valid_signals.columns:
                     valid = valid_signals.dropna(subset=[col_name]) 
-                    target_col = cols_row1[w-1] if w <= 4 else cols_row2[w-5]
+                    target_col = cols_row1[(w-1)%4] if w <= 4 else (cols_row2[(w-5)%4] if w <= 8 else cols_row1[(w-9)%4])
                     with target_col:
                         if not valid.empty:
                             avg = valid[col_name].mean()
                             win = (valid[col_name] > 0).mean() * 100
                             st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
-                        else:
-                            st.metric(f"W{w}", "空缺")
             
             st.subheader("📋 三仓实操交割流水单")
             port_disp_cols = [
@@ -831,7 +828,7 @@ if os.path.exists(CHECKPOINT_FILE):
             st.download_button(
                 label="📥 导出三仓实战流水 (CSV)", 
                 data=csv_data, 
-                file_name="portfolio_3slots_pure_v8_export.csv", 
+                file_name="portfolio_3slots_v8_2_export.csv", 
                 mime="text/csv"
             )
         else:
