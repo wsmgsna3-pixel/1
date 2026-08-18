@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 翻转打分系统 (V14.3 终极实盘融合版)
+周线 SKDJ 翻转打分系统 (V14.4 真·周末锁定版)
 ------------------------------------------------
-1. 【双模引擎】：追溯天数设为 1 时，激活“盘中极速选股”模式，秒级出票，不写入数据库，不追踪未来。
-2. 【双模引擎】：追溯天数 > 1 时，激活“历史回测”模式，自动追踪12周收益并生成全景面板。
+1. 【真·周末锁定】：修复了周中运行回测会污染数据库的致命Bug。回测模式下，系统强制向未来探测15天日历，仅允许真正的周末（周五）数据进入历史库。
+2. 【双模引擎】：追溯天数设为 1 时，激活“盘中极速选股”模式，秒级出票，不写入数据库，不追踪未来。
 3. 【精简提速】：去除了高开低开分析模块，回归纯正的 V14.1 右侧突破交易纪律。
 4. 【优选截断】：保留 Top N 控制阀，过滤杂波。
 ------------------------------------------------
@@ -31,9 +31,9 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ V14.3 终极系统", layout="wide")
-st.title("🔬 周线 SKDJ 底部脱离系统 (V14.3 终极融合版)")
-st.markdown("🔒 **天数=1为极速选股，>1为历史回测 · 纯净剥离不污染数据库**")
+st.set_page_config(page_title="SKDJ V14.4 终极系统", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.4 终极融合版)")
+st.markdown("🔒 **天数=1为极速选股，>1为历史回测 · 独家修复周中回测污染Bug**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -328,7 +328,9 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
 
     res['Total_Score'] = round(score, 1)
     return res
-    # ---------------------------
+
+# === 第一部分结束，请等待粘贴第二部分 ===
+# ---------------------------
 # 🚀 独立出局系统 (仅限回测模式使用)
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
@@ -473,7 +475,7 @@ def repair_checkpoint_df(df_in):
 with st.sidebar:
     st.header("⚙️ 模式与分析配置")
     
-    st.info("💡 **双模引擎说明**：\n将追溯天数设为 **1**，即触发【盘中极速选股】模式（不保存数据）；设为 **>1** 则触发【历史回测】模式。")
+    st.info("💡 **双模引擎说明**：\n将追溯天数设为 **1**，触发【盘中极速选股】(不保存)；设为 **>1**，触发【历史回测】。系统已锁定回测模式仅在周末生效，防止污染。")
     
     BACKTEST_DAYS = st.number_input("追溯交易天数 (设为1为极速选股)", value=1, step=30, min_value=1)
     MAX_TOP_N = st.number_input("每周最多展示股票数 (Top N)", value=5, min_value=1, max_value=50, step=1)
@@ -526,29 +528,36 @@ if st.button(btn_label):
             else:
                 st.info(f"💡 成功锁定科技白名单股票池：共 **{len(whitelist_keys)}** 只标的。")
                 
+                # 🌟 修复关键点：强制系统多看 15 天的日历，确保准确识别未来的周末
                 lookback_days = max(int(BACKTEST_DAYS) * 3, 900) 
                 start_cal = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
-                end_cal = backtest_date_end.strftime("%Y%m%d")
+                end_cal_extended = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") + timedelta(days=15)).strftime("%Y%m%d")
                 
-                cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_cal, end_date=end_cal)
+                cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_cal, end_date=end_cal_extended)
                 if cal_raw.empty:
                     st.error("❌ 无法获取交易日历。")
                 else:
                     cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
-                    trade_days_list = cal_open['cal_date'].tolist()
+                    all_trade_days = cal_open['cal_date'].tolist()
+                    
+                    # 过滤出小于等于我们所选截止日期的真实可交易日列表
+                    end_str = backtest_date_end.strftime("%Y%m%d")
+                    trade_days_list = [d for d in all_trade_days if d <= end_str]
                     
                     if not trade_days_list:
                         st.error("❌ 未获取到有效交易日。")
                     else:
-                        td_df = pd.DataFrame({'cal_date': trade_days_list})
+                        td_df = pd.DataFrame({'cal_date': all_trade_days})
                         td_df['dt'] = pd.to_datetime(td_df['cal_date'])
                         td_df['year_week'] = td_df['dt'].dt.strftime('%G_%V')
                         
-                        # 🌟 核心模式分流
+                        # 🌟 核心模式分流与周末防线
                         if is_picking_mode:
-                            dates_to_run = [trade_days_list[-1]] # 仅取最后一天
+                            dates_to_run = [trade_days_list[-1]] 
                         else:
+                            # 找出所有包含在完整日历里的“真正的一周最后一天”
                             valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
+                            
                             processed_dates = set()
                             if os.path.exists(CHECKPOINT_FILE):
                                 try:
@@ -557,11 +566,13 @@ if st.button(btn_label):
                                     processed_dates = set(existing_df['Trade_Date'].unique())
                                 except Exception: pass
                             recent_trade_days = trade_days_list[-int(BACKTEST_DAYS):]
+                            
+                            # 只有这一天既在最近回测范围内，又是真正的周末，且没被处理过，才允许进入回测
                             dates_to_run = [d for d in recent_trade_days if d not in processed_dates and d in valid_scan_dates]
                             dates_to_run.sort()
                         
                         if not dates_to_run and not is_picking_mode:
-                            st.success("🎉 指定区间回测数据已全部跑完！请查看下方分析报告。")
+                            st.success("🎉 指定区间回测数据已全部跑完！(如果您选择了周中日期，系统已自动跳过以保护数据纯洁性)")
                         elif dates_to_run:
                             fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
                             fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
@@ -572,7 +583,7 @@ if st.button(btn_label):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V14.3 数据扫描...")
+                                bar = st.progress(0, text="执行 V14.4 数据扫描...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -607,7 +618,6 @@ if st.button(btn_label):
                                             'Total_Score': ind['Total_Score']
                                         }
                                         
-                                        # 如果是回测模式，附加追踪收益
                                         if not is_picking_mode:
                                             future_returns = track_future_performance(ts_code, date, ind['signal_close'], stock_qfq_dict, hold_weeks=12)
                                             record_dict.update(future_returns)
@@ -620,11 +630,9 @@ if st.button(btn_label):
                                         fdf['Trade_Date'] = date
                                         
                                         if is_picking_mode:
-                                            # 实盘模式：直接在页面展示，不写文件
                                             st.subheader(f"🎯 盘中极速选股结果 [{date}] - Top {MAX_TOP_N}")
                                             st.dataframe(fdf.style.background_gradient(subset=['Total_Score'], cmap='YlOrRd'), use_container_width=True)
                                         else:
-                                            # 回测模式：写盘
                                             is_first = not os.path.exists(CHECKPOINT_FILE)
                                             fdf.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
                                         
@@ -651,7 +659,7 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
         repaired_res = repair_checkpoint_df(raw_res)
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
-        st.header("📈 V14.3 历史回测全景分析报告")
+        st.header("📈 V14.4 历史回测全景分析报告")
         
         if not valid_signals.empty:
             comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
@@ -735,12 +743,11 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
             st.download_button(
                 label="📥 导出回测流水单 (CSV)", 
                 data=csv_data, 
-                file_name="skdj_v14_3_history_export.csv", 
+                file_name="skdj_v14_4_history_export.csv", 
                 mime="text/csv"
             )
         else:
             st.info("🕒 未发现符合条件的样本。")
     except pd.errors.EmptyDataError:
         st.info("🕒 当前暂无满足条件的回测记录。")
-
 
