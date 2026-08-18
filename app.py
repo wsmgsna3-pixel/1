@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 翻转打分系统 (V14.2 跳空透视版)
+周线 SKDJ 翻转打分系统 (V14.3 终极实盘融合版)
 ------------------------------------------------
-1. 【新增跳空追踪】：交割单全量展示 Signal_Close(周五收盘) 与 Gap_pct(周一跳空比例)。
-2. 【新增跳空归因】：UI 增加专属面板，统计高开/低开对最终胜率和收益的真实影响。
-3. 【优选截断控制】：在侧边栏新增“Top N”限制开关，每周仅展示得分最高的 N 只核心标的。
-4. 【周度面板重排】：强制规范 W1 ~ W12 的胜率/收益率面板顺序。
+1. 【双模引擎】：追溯天数设为 1 时，激活“盘中极速选股”模式，秒级出票，不写入数据库，不追踪未来。
+2. 【双模引擎】：追溯天数 > 1 时，激活“历史回测”模式，自动追踪12周收益并生成全景面板。
+3. 【精简提速】：去除了高开低开分析模块，回归纯正的 V14.1 右侧突破交易纪律。
+4. 【优选截断】：保留 Top N 控制阀，过滤杂波。
 ------------------------------------------------
 """
 
@@ -31,9 +31,9 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ TopN 优选打分系统", layout="wide")
-st.title("🔬 周线 SKDJ 底部脱离系统 (V14.2 跳空透视版)")
-st.markdown("🔒 **自带每周 Top N 截断阀 · 全维度解析周一开盘跳空博弈真相**")
+st.set_page_config(page_title="SKDJ V14.3 终极系统", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.3 终极融合版)")
+st.markdown("🔒 **天数=1为极速选股，>1为历史回测 · 纯净剥离不污染数据库**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -70,7 +70,7 @@ def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
     return pd.DataFrame()
 
 # ---------------------------
-# 科技白名单池构建 (50亿市值底座 + 10元股价)
+# 科技白名单池构建
 # ---------------------------
 @st.cache_data(ttl=3600*24*7, show_spinner=False)
 def load_custom_tech_whitelist(token):
@@ -81,8 +81,7 @@ def load_custom_tech_whitelist(token):
     pro = ts.pro_api(token_c)
     
     stock_basic = safe_tushare_call(pro.stock_basic, list_status='L', fields='ts_code,symbol,name,industry,market,list_date')
-    if stock_basic.empty:
-        return set(), {}
+    if stock_basic.empty: return set(), {}
         
     BOARDS = ("主板", "创业板", "科创板")
     valid_stocks = stock_basic[stock_basic['market'].isin(BOARDS)].copy()
@@ -122,18 +121,11 @@ def load_custom_tech_whitelist(token):
         ind_basic = str(row['industry']) if pd.notna(row['industry']) else ""
         sw_l1 = stock_sw_map.get(code, "")
         
-        if sw_l1 in CORE_TECH_L1:
-            whitelist_set.add(code)
-            continue
-            
+        if sw_l1 in CORE_TECH_L1: whitelist_set.add(code); continue
         if sw_l1 in EXTENDED_TECH_L1:
             if any(kw in ind_basic for kw in TECH_INDUSTRY_KEYWORDS) or ind_basic == "" or sw_l1 in {"机械设备", "电力设备", "医药生物"}:
-                whitelist_set.add(code)
-                continue
-                
-        if any(kw in ind_basic for kw in TECH_INDUSTRY_KEYWORDS):
-            whitelist_set.add(code)
-            continue
+                whitelist_set.add(code); continue
+        if any(kw in ind_basic for kw in TECH_INDUSTRY_KEYWORDS): whitelist_set.add(code); continue
 
     return whitelist_set, name_map
 
@@ -146,8 +138,7 @@ def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
     pro = ts.pro_api(token_c)
     
     cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_date, end_date=end_date)
-    if cal_raw.empty:
-        return {'daily': [], 'adj': [], 'daily_basic': [], 'fetched_dates': set()}
+    if cal_raw.empty: return {'daily': [], 'adj': [], 'daily_basic': [], 'fetched_dates': set()}
         
     cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
     all_dates = cal_open['cal_date'].tolist()
@@ -170,7 +161,6 @@ def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
     
     if missing_dates:
         my_bar = st.progress(0, text=f"📥 检测到 {len(missing_dates)} 天增量行情需要同步...")
-        
         for i, d in enumerate(missing_dates):
             df_d = safe_tushare_call(pro.daily, max_retries=3, sleep_time=0.8, trade_date=d)
             df_a = safe_tushare_call(pro.adj_factor, max_retries=3, sleep_time=0.8, trade_date=d)
@@ -184,8 +174,7 @@ def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
             if not df_d.empty and not df_a.empty:
                 cache['daily'].append(df_d)
                 cache['adj'].append(df_a)
-                if not df_b.empty:
-                    cache['daily_basic'].append(df_b)
+                if not df_b.empty: cache['daily_basic'].append(df_b)
                 cache['fetched_dates'].add(d)
             
             if (i + 1) % 10 == 0 or i == len(missing_dates) - 1:
@@ -194,13 +183,9 @@ def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
                     with open(MARKET_CACHE_FILE + ".tmp", 'wb') as f:
                         pickle.dump(cache, f)
                     os.replace(MARKET_CACHE_FILE + ".tmp", MARKET_CACHE_FILE)
-                except Exception:
-                    pass
-            
+                except Exception: pass
             time.sleep(0.25)
-            
         my_bar.empty()
-        
     return cache
 
 # ---------------------------
@@ -221,14 +206,12 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
         adj_raw = pd.concat(adj_list, ignore_index=True) if adj_list else pd.DataFrame()
         basic_raw = pd.concat(basic_list, ignore_index=True) if basic_list else pd.DataFrame()
         
-        if daily_raw.empty or adj_raw.empty:
-            return {}, pd.DataFrame()
+        if daily_raw.empty or adj_raw.empty: return {}, pd.DataFrame()
             
         if whitelist_set:
             daily_raw = daily_raw[daily_raw['ts_code'].isin(whitelist_set)]
             adj_raw = adj_raw[adj_raw['ts_code'].isin(whitelist_set)]
-            if not basic_raw.empty:
-                basic_raw = basic_raw[basic_raw['ts_code'].isin(whitelist_set)]
+            if not basic_raw.empty: basic_raw = basic_raw[basic_raw['ts_code'].isin(whitelist_set)]
 
         merged_all = daily_raw.merge(adj_raw[['ts_code', 'trade_date', 'adj_factor']], on=['ts_code', 'trade_date'], how='inner')
         merged_all['trade_date_str'] = merged_all['trade_date'].astype(str)
@@ -253,7 +236,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 🚀【V14.1 核心引擎】：翻转打分模型（无过滤）
+# 🚀 核心引擎：翻转打分模型（通用于选股与回测）
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -263,20 +246,15 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     res = {}
     if df_daily.empty or len(df_daily) < 100: return res
 
-    # 周五一字涨停拦截
     row_friday = df_daily.iloc[-1]
     is_20cm = any(ts_code.startswith(prefix) for prefix in ['300', '301', '688', '689'])
     limit_rate = 0.195 if is_20cm else 0.095
     pre_close_val = row_friday.get('pre_close', np.nan)
     if pd.isna(pre_close_val) or pre_close_val <= 0:
-        if len(df_daily) >= 2:
-            pre_close_val = df_daily.iloc[-2]['close']
-        else:
-            pre_close_val = row_friday['open']
+        pre_close_val = df_daily.iloc[-2]['close'] if len(df_daily) >= 2 else row_friday['open']
             
     is_friday_yiziban = (row_friday['high'] == row_friday['low']) and ((row_friday['close'] - pre_close_val) / pre_close_val >= limit_rate)
-    if is_friday_yiziban:
-        return res
+    if is_friday_yiziban: return res
 
     df = df_daily.copy().reset_index()
     df['dt'] = pd.to_datetime(df['trade_date_str'])
@@ -305,13 +283,10 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     
     if pd.isna(curr_w['k']) or pd.isna(prev_w['k']) or pd.isna(curr_w['d']): return res
 
-    # 基础突破条件：上穿 25，且 K > D
     is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
     is_bullish = curr_w['k'] > curr_w['d']
-    if not (is_breakout_25 and is_bullish):
-        return res
+    if not (is_breakout_25 and is_bullish): return res
 
-    # 提取特征
     recent_15_weeks = weekly_df.tail(15)
     k_history_before_breakout = recent_15_weeks['k'].iloc[:-1] 
     recent_k_min = k_history_before_breakout.min()
@@ -330,11 +305,7 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     res['trend_type'] = trend_type
     res['vol_ratio'] = round(vol_ratio, 2)
     
-    # ========================================================
-    # 🎯 终极翻转打分模型 (基于大数据倒推)
-    # ========================================================
     score = 0.0
-    
     if curr_w['close'] >= ma20_curr: score += 20.0
     else: score -= 5.0
         
@@ -357,9 +328,8 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
 
     res['Total_Score'] = round(score, 1)
     return res
-
-# ---------------------------
-# 🚀 独立出局系统：全域一字板拦截 + 首周五截断 + +2%保本 + 15%移动止盈
+    # ---------------------------
+# 🚀 独立出局系统 (仅限回测模式使用)
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
     default_res = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
@@ -368,9 +338,7 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         'Exit_Date': None, 'Final_Return (%)': np.nan, 'Hold_Days': 0
     })
     
-    if ts_code not in stock_qfq_dict: 
-        return default_res
-
+    if ts_code not in stock_qfq_dict: return default_res
     df_full = stock_qfq_dict[ts_code]
     hist_future = df_full[df_full.index > selection_date]
     results = default_res.copy()
@@ -385,9 +353,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     limit_rate_pct = 19.0 if is_20cm else 9.5
     gap_pct = (buy_price - signal_close) / signal_close * 100.0
     
-    # 🌟 跳空数据强绑定
-    results['Gap_pct (%)'] = round(gap_pct, 2)
-
     is_monday_yiziban = (next_row['open'] == next_row['high'] == next_row['low']) and (gap_pct >= limit_rate_pct)
     if is_monday_yiziban:
         results['Exit_Reason'] = f"一字板无法买入(剔除: {round(gap_pct, 1)}%)"
@@ -402,7 +367,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         results['Exit_Reason'] = f"主板高开过大(剔除: {round(gap_pct, 2)}%)"
         results['Buy_Price'] = round(buy_price, 2)
         return results
-        
     if gap_pct < -4.0:
         results['Exit_Reason'] = f"恶劣低开(剔除: {round(gap_pct, 2)}%)"
         results['Buy_Price'] = round(buy_price, 2)
@@ -416,7 +380,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     hard_stop_limit = -0.10 
     
     max_days = hold_weeks * 5
-    
     for i in range(len(hist_future)):
         if i >= max_days: break 
             
@@ -427,11 +390,8 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         curr_date = hist_future.index[i]
         
         if pending_exit_reason is not None and day_count >= 2:
-            if "保本" in pending_exit_reason:
-                final_return = 2.0  
-            else:
-                final_return = (curr_open - buy_price) / buy_price * 100.0
-                
+            if "保本" in pending_exit_reason: final_return = 2.0  
+            else: final_return = (curr_open - buy_price) / buy_price * 100.0
             exit_triggered = True
             results['Exit_Reason'] = pending_exit_reason
             results['Final_Return (%)'] = round(final_return, 2)
@@ -454,19 +414,13 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
                 results[f'Return_W{current_week} (%)'] = round(final_return, 2)
                 break
         
-        if tier == 0 and peak_profit_pct >= 0.10: 
-            tier = 1  
-            
+        if tier == 0 and peak_profit_pct >= 0.10: tier = 1  
         if tier == 1:
-            if curr_close <= buy_price * 1.02:  
-                pending_exit_reason = "保本离场(+2%)"
-            elif peak_profit_pct >= 0.20: 
-                tier = 2  
-                
+            if curr_close <= buy_price * 1.02: pending_exit_reason = "保本离场(+2%)"
+            elif peak_profit_pct >= 0.20: tier = 2  
         if tier == 2:
             giveback = (peak_price - curr_close) / peak_price
-            if giveback >= 0.15:  
-                pending_exit_reason = "移动止盈(回撤15%)"
+            if giveback >= 0.15: pending_exit_reason = "移动止盈(回撤15%)"
         
         if day_count == 5 and not exit_triggered and pending_exit_reason is None:
             w1_ret = (curr_close - buy_price) / buy_price * 100.0
@@ -493,14 +447,10 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         
     return results
 
-# ---------------------------
-# 历史数据自动兼容与修复引擎
-# ---------------------------
 def repair_checkpoint_df(df_in):
     df_out = df_in.copy()
     w_cols = [c for c in df_out.columns if c.startswith('Return_W') and c.endswith('(%)')]
-    if w_cols:
-        w_cols = sorted(w_cols, key=lambda x: int(x.replace('Return_W', '').replace(' (%)', '')))
+    if w_cols: w_cols = sorted(w_cols, key=lambda x: int(x.replace('Return_W', '').replace(' (%)', '')))
     
     if 'Final_Return (%)' not in df_out.columns:
         def get_final_ret(r):
@@ -508,42 +458,36 @@ def repair_checkpoint_df(df_in):
             rets = r[w_cols].dropna()
             return rets.iloc[-1] if not rets.empty else 0.0
         df_out['Final_Return (%)'] = df_out.apply(get_final_ret, axis=1)
-        
-    if 'Exit_Date' not in df_out.columns:
-        df_out['Exit_Date'] = None
-        
+    if 'Exit_Date' not in df_out.columns: df_out['Exit_Date'] = None
     if 'Hold_Days' not in df_out.columns:
         def get_hold_days(r):
             if not w_cols: return 0
             rets = r[w_cols].dropna()
             return len(rets) * 5 if not rets.empty else 0
         df_out['Hold_Days'] = df_out.apply(get_hold_days, axis=1)
-        
     return df_out
 
 # ---------------------------
 # UI 控制流与输入侧边栏
 # ---------------------------
 with st.sidebar:
-    st.header("⚙️ 全景分析配置 (优选展示)")
+    st.header("⚙️ 模式与分析配置")
     
-    st.markdown("---")
+    st.info("💡 **双模引擎说明**：\n将追溯天数设为 **1**，即触发【盘中极速选股】模式（不保存数据）；设为 **>1** 则触发【历史回测】模式。")
+    
+    BACKTEST_DAYS = st.number_input("追溯交易天数 (设为1为极速选股)", value=1, step=30, min_value=1)
     MAX_TOP_N = st.number_input("每周最多展示股票数 (Top N)", value=5, min_value=1, max_value=50, step=1)
-    
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("追溯交易天数", value=250, step=30)
     
     st.markdown("---")
     if st.button("🗑️ 清空行情缓存"):
-        if os.path.exists(MARKET_CACHE_FILE):
-            os.remove(MARKET_CACHE_FILE)
+        if os.path.exists(MARKET_CACHE_FILE): os.remove(MARKET_CACHE_FILE)
         st.cache_data.clear()
         st.success("底层行情缓存已清理！")
             
-    if st.button("🗑️ 清除历史分析记录"):
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-        st.success("分析记录已清理！下次运行将重新生成。")
+    if st.button("🗑️ 清除历史回测记录"):
+        if os.path.exists(CHECKPOINT_FILE): os.remove(CHECKPOINT_FILE)
+        st.success("历史记录已清理！")
             
     st.markdown("---")
     st.subheader("💰 护城河底座")
@@ -554,18 +498,17 @@ with st.sidebar:
     
     st.markdown("---")
     secret_token = st.secrets.get("TUSHARE_TOKEN", "") if hasattr(st, "secrets") else ""
-    TS_TOKEN_INPUT = st.text_input(
-        "🔑 Tushare Token", 
-        value=secret_token,
-        type="password"
-    )
+    TS_TOKEN_INPUT = st.text_input("🔑 Tushare Token", value=secret_token, type="password")
 
 token_clean = clean_token_str(TS_TOKEN_INPUT)
+is_picking_mode = (int(BACKTEST_DAYS) == 1)
 
 # ---------------------------
-# 主流程：启动全景信号扫描
+# 主流程：启动引擎
 # ---------------------------
-if st.button("🚀 提取 Top N 优选信号与翻转打分归因"):
+btn_label = "🚀 启动盘中极速选股 (天数=1)" if is_picking_mode else "🚀 启动历史回测分析 (天数>1)"
+
+if st.button(btn_label):
     is_valid, msg = verify_token_connection(token_clean)
     if not is_valid:
         st.error(f"❌ **Token 预检拦截**：{msg}")
@@ -600,24 +543,26 @@ if st.button("🚀 提取 Top N 优选信号与翻转打分归因"):
                         td_df = pd.DataFrame({'cal_date': trade_days_list})
                         td_df['dt'] = pd.to_datetime(td_df['cal_date'])
                         td_df['year_week'] = td_df['dt'].dt.strftime('%G_%V')
-                        valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
                         
-                        processed_dates = set()
-                        if os.path.exists(CHECKPOINT_FILE):
-                            try:
-                                existing_df = pd.read_csv(CHECKPOINT_FILE)
-                                existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
-                                processed_dates = set(existing_df['Trade_Date'].unique())
-                            except Exception:
-                                pass
-                                
-                        recent_trade_days = trade_days_list[-int(BACKTEST_DAYS):]
-                        dates_to_run = [d for d in recent_trade_days if d not in processed_dates and d in valid_scan_dates]
-                        dates_to_run.sort()
-                        
-                        if not dates_to_run:
-                            st.success("🎉 指定区间数据已扫描完毕！查看下方分析报告即可。")
+                        # 🌟 核心模式分流
+                        if is_picking_mode:
+                            dates_to_run = [trade_days_list[-1]] # 仅取最后一天
                         else:
+                            valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
+                            processed_dates = set()
+                            if os.path.exists(CHECKPOINT_FILE):
+                                try:
+                                    existing_df = pd.read_csv(CHECKPOINT_FILE)
+                                    existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
+                                    processed_dates = set(existing_df['Trade_Date'].unique())
+                                except Exception: pass
+                            recent_trade_days = trade_days_list[-int(BACKTEST_DAYS):]
+                            dates_to_run = [d for d in recent_trade_days if d not in processed_dates and d in valid_scan_dates]
+                            dates_to_run.sort()
+                        
+                        if not dates_to_run and not is_picking_mode:
+                            st.success("🎉 指定区间回测数据已全部跑完！请查看下方分析报告。")
+                        elif dates_to_run:
                             fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
                             fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
                             
@@ -627,72 +572,77 @@ if st.button("🚀 提取 Top N 优选信号与翻转打分归因"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V14.2 Top N 翻转扫描...")
+                                bar = st.progress(0, text="执行 V14.3 数据扫描...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
-                                    
                                     for ts_code in whitelist_keys:
-                                        if ts_code not in stock_qfq_dict:
-                                            continue
-                                            
+                                        if ts_code not in stock_qfq_dict: continue
                                         df_stock = stock_qfq_dict[ts_code]
-                                        if date not in df_stock.index:
-                                            continue
+                                        if date not in df_stock.index: continue
                                             
                                         row_latest = df_stock.loc[date]
-                                        if isinstance(row_latest, pd.DataFrame):
-                                            row_latest = row_latest.iloc[-1]
+                                        if isinstance(row_latest, pd.DataFrame): row_latest = row_latest.iloc[-1]
                                             
                                         curr_close = row_latest['close']
-                                        if curr_close < MIN_PRICE:
-                                            continue
+                                        if curr_close < MIN_PRICE: continue
                                             
                                         circ_mv_billion = np.nan
                                         if not basic_indexed.empty and (date, ts_code) in basic_indexed.index:
                                             circ_mv_billion = basic_indexed.loc[(date, ts_code)]['circ_mv'] / 10000.0
                                         
                                         if pd.notna(circ_mv_billion):
-                                            if circ_mv_billion < MIN_MV or circ_mv_billion > MAX_MV:
-                                                continue
+                                            if circ_mv_billion < MIN_MV or circ_mv_billion > MAX_MV: continue
                                         
                                         ind = compute_breakout_signal(ts_code, date, stock_qfq_dict)
-                                        if not ind or not ind.get('is_buy_signal'): 
-                                            continue
+                                        if not ind or not ind.get('is_buy_signal'): continue
                                             
-                                        future_returns = track_future_performance(ts_code, date, ind['signal_close'], stock_qfq_dict, hold_weeks=12)
-                                        
                                         stock_name = basic_name_map.get(ts_code, ts_code)
                                         record_dict = {
                                             'ts_code': ts_code, 'name': stock_name, 'Signal_Close': ind['signal_close'], 
                                             'SKDJ_K': ind['k'], 'SKDJ_D': ind['d'], 
-                                            'D_Min(10W)': ind['recent_k_min'],
-                                            'Weeks_Under': ind['weeks_under_25'],
+                                            'D_Min(10W)': ind['recent_k_min'], 'Weeks_Under': ind['weeks_under_25'],
                                             'Trend_Type': ind['trend_type'], 'vol_ratio': ind['vol_ratio'],
                                             'circ_mv': round(circ_mv_billion, 2) if pd.notna(circ_mv_billion) else np.nan, 
                                             'Total_Score': ind['Total_Score']
                                         }
-                                        record_dict.update(future_returns)
+                                        
+                                        # 如果是回测模式，附加追踪收益
+                                        if not is_picking_mode:
+                                            future_returns = track_future_performance(ts_code, date, ind['signal_close'], stock_qfq_dict, hold_weeks=12)
+                                            record_dict.update(future_returns)
+                                            
                                         records.append(record_dict)
                                             
                                     if records:
                                         fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False).head(int(MAX_TOP_N))
                                         fdf.insert(0, 'Rank', range(1, len(fdf) + 1))
                                         fdf['Trade_Date'] = date
-                                        is_first = not os.path.exists(CHECKPOINT_FILE)
-                                        fdf.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
+                                        
+                                        if is_picking_mode:
+                                            # 实盘模式：直接在页面展示，不写文件
+                                            st.subheader(f"🎯 盘中极速选股结果 [{date}] - Top {MAX_TOP_N}")
+                                            st.dataframe(fdf.style.background_gradient(subset=['Total_Score'], cmap='YlOrRd'), use_container_width=True)
+                                        else:
+                                            # 回测模式：写盘
+                                            is_first = not os.path.exists(CHECKPOINT_FILE)
+                                            fdf.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
                                         
                                     bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date} (捕获 {len(records)} 只目标)")
                                     
                                 bar.empty()
-                                st.success("🎉 全量优选数据已全部处理完毕！")
+                                if is_picking_mode:
+                                    st.success("🎉 今日极速选股完成！(当前为选股模式，数据未写入历史回测库)")
+                                else:
+                                    st.success("🎉 回测数据更新完毕！请查看下方报告。")
+                                    
         except Exception as e:
             st.error(f"❌ **运行异常拦截**：{str(e)}")
 
 # ---------------------------
-# 全景分析展示区
+# 全景分析展示区 (仅在有历史记录时展示)
 # ---------------------------
-if os.path.exists(CHECKPOINT_FILE):
+if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
     st.markdown("---")
     try:
         raw_res = pd.read_csv(CHECKPOINT_FILE)
@@ -701,7 +651,7 @@ if os.path.exists(CHECKPOINT_FILE):
         repaired_res = repair_checkpoint_df(raw_res)
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
-        st.header("📈 V14.2 Top N 翻转打分全景分析报告")
+        st.header("📈 V14.3 历史回测全景分析报告")
         
         if not valid_signals.empty:
             comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
@@ -717,28 +667,6 @@ if os.path.exists(CHECKPOINT_FILE):
                 col_m1.metric("优选截断总笔数", f"{total_executed} 笔")
                 col_m2.metric("无干预绝对胜率", f"{global_win_rate:.1f}%", f"{win_count}胜")
                 col_m3.metric("全样本平均单笔收益", f"{global_mean_ret:.2f}%")
-                
-                # 🌟 新增：跳空博弈专属分析看板
-                st.markdown("### 🪂 开盘跳空博弈分析 (周一买点复盘)")
-                def categorize_open(gap):
-                    if pd.isna(gap): return "未知"
-                    if gap > 2.0: return "🔴 大幅高开 (>2%)"
-                    elif 0 < gap <= 2.0: return "🟠 小幅高开 (0~2%)"
-                    elif gap < 0: return "🟢 水下低吸 (<0%)"
-                    else: return "⚪ 平开 (0%)"
-                
-                comp_trades['开盘定性'] = comp_trades['Gap_pct (%)'].apply(categorize_open)
-                gap_stats = comp_trades.groupby('开盘定性', observed=False).agg(
-                    样本数=('Final_Return (%)', 'count'),
-                    胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
-                    平均收益=('Final_Return (%)', 'mean')
-                ).reset_index()
-                
-                gap_stats['出现比例'] = (gap_stats['样本数'] / total_executed * 100).map('{:.1f}%'.format)
-                gap_stats['胜率'] = gap_stats['胜率'].map('{:.1f}%'.format)
-                gap_stats['平均收益'] = gap_stats['平均收益'].map('{:.2f}%'.format)
-                gap_stats = gap_stats[['开盘定性', '样本数', '出现比例', '胜率', '平均收益']]
-                st.dataframe(gap_stats, use_container_width=True)
                 
                 st.subheader("🗓️ 周度胜率分布 (强制有序排列 W1 - W12)")
                 cols_row1 = st.columns(4)
@@ -778,10 +706,10 @@ if os.path.exists(CHECKPOINT_FILE):
                 rank_stats['均水下周数'] = rank_stats['均水下周数'].map('{:.1f}'.format)
                 st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), use_container_width=True)
 
-            st.subheader("📋 Top N 优选信号交割流水单")
+            st.subheader("📋 历史回测交割流水单")
             disp_cols = [
                 'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'SKDJ_K', 'D_Min(10W)', 'Weeks_Under',
-                'Signal_Close', 'Gap_pct (%)', 'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
+                'Signal_Close', 'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
             ]
             final_disp = [c for c in disp_cols if c in valid_signals.columns]
             
@@ -805,12 +733,14 @@ if os.path.exists(CHECKPOINT_FILE):
                 
             csv_data = valid_signals.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 导出带跳空追踪流水 (CSV)", 
+                label="📥 导出回测流水单 (CSV)", 
                 data=csv_data, 
-                file_name="skdj_v14_2_top_n_export.csv", 
+                file_name="skdj_v14_3_history_export.csv", 
                 mime="text/csv"
             )
         else:
             st.info("🕒 未发现符合条件的样本。")
     except pd.errors.EmptyDataError:
         st.info("🕒 当前暂无满足条件的回测记录。")
+
+
