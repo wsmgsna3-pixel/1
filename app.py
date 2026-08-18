@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 翻转打分系统 (V14.0 全量一览版)
+周线 SKDJ 翻转打分系统 (V14.1 Top N 优选版)
 ------------------------------------------------
-1. 【去除仓位限制】：剥离三仓资金引擎，每周产生的所有突破信号全部记录展示，不遗漏任何一只牛股。
-2. 【保留强控盘打分】：继承 V13 的翻转打分逻辑，重奖浅坑（22-25）与短洗（1-2周）。
-3. 【周度面板重排】：强制规范 W1 ~ W12 的胜率/收益率面板顺序，确保展示逻辑清晰连贯。
+1. 【优选截断控制】：在侧边栏新增“Top N”限制开关，每周仅展示得分最高的 N 只核心标的，去除普涨杂波。
+2. 【保留强控盘打分】：继承翻转打分逻辑，重奖浅坑（22-25）与短洗（1-2周）。
+3. 【周度面板重排】：强制规范 W1 ~ W12 的胜率/收益率面板顺序。
 4. 【极速下载优化】：回测预热期缩短至 300 天，大幅降低内存与接口压力。
 ------------------------------------------------
 """
@@ -31,9 +31,9 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 全局一览打分系统", layout="wide")
-st.title("🔬 周线 SKDJ 底部脱离系统 (V14.0 翻转打分全量版)")
-st.markdown("🔒 **剥离资金槽位 · 全面展示周度高分信号 · 强制重排 W1-W12 胜率面板**")
+st.set_page_config(page_title="SKDJ TopN 优选打分系统", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.1 Top N 优选版)")
+st.markdown("🔒 **新增每周 Top N 截断阀 · 全面展示周度最高分核心信号**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -253,7 +253,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 🚀【V14.0 核心引擎】：翻转打分模型（无拦截）
+# 🚀【V14.1 核心引擎】：翻转打分模型（无过滤）
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -331,7 +331,7 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     res['vol_ratio'] = round(vol_ratio, 2)
     
     # ========================================================
-    # 🎯 终极翻转打分模型 (无拦截全量入库)
+    # 🎯 终极翻转打分模型 (基于大数据倒推)
     # ========================================================
     score = 0.0
     
@@ -533,9 +533,12 @@ def repair_checkpoint_df(df_in):
 # UI 控制流与输入侧边栏
 # ---------------------------
 with st.sidebar:
-    st.header("⚙️ 全景分析配置 (无资金限制)")
+    st.header("⚙️ 全景分析配置 (优选展示)")
     
     st.markdown("---")
+    # 🌟 新增：Top N 截断数
+    MAX_TOP_N = st.number_input("每周最多展示股票数 (Top N)", value=5, min_value=1, max_value=50, step=1, help="如果某周符合突破条件的股票很多，只截取打分排名前 N 的标的，去除杂波。")
+    
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("追溯交易天数", value=250, step=30)
     
@@ -572,7 +575,7 @@ token_clean = clean_token_str(TS_TOKEN_INPUT)
 # ---------------------------
 # 主流程：启动全景信号扫描
 # ---------------------------
-if st.button("🚀 提取全量信号与翻转打分归因"):
+if st.button("🚀 提取 Top N 优选信号与翻转打分归因"):
     is_valid, msg = verify_token_connection(token_clean)
     if not is_valid:
         st.error(f"❌ **Token 预检拦截**：{msg}")
@@ -635,7 +638,7 @@ if st.button("🚀 提取全量信号与翻转打分归因"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V14.0 全量翻转扫描...")
+                                bar = st.progress(0, text="执行 V14.1 Top N 翻转扫描...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -684,8 +687,8 @@ if st.button("🚀 提取全量信号与翻转打分归因"):
                                         records.append(record_dict)
                                             
                                     if records:
-                                        # 全量记录所有被选出的股票（不再截断前两只），只做排序
-                                        fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False)
+                                        # 🌟 关键修改：按分数排序后，只截取前 N 名
+                                        fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False).head(int(MAX_TOP_N))
                                         fdf.insert(0, 'Rank', range(1, len(fdf) + 1))
                                         fdf['Trade_Date'] = date
                                         is_first = not os.path.exists(CHECKPOINT_FILE)
@@ -694,7 +697,7 @@ if st.button("🚀 提取全量信号与翻转打分归因"):
                                     bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date} (捕获 {len(records)} 只目标)")
                                     
                                 bar.empty()
-                                st.success("🎉 全量信号数据已全部处理完毕！")
+                                st.success("🎉 全量优选数据已全部处理完毕！")
         except Exception as e:
             st.error(f"❌ **运行异常拦截**：{str(e)}")
 
@@ -711,7 +714,7 @@ if os.path.exists(CHECKPOINT_FILE):
         # 排除因为一字板没买进或者恶劣跳空的样本，只保留真实成交清单
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
-        st.header("📈 V14.0 翻转打分全景分析报告")
+        st.header("📈 V14.1 Top N 翻转打分全景分析报告")
         
         if not valid_signals.empty:
             comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
@@ -724,12 +727,12 @@ if os.path.exists(CHECKPOINT_FILE):
                 global_mean_ret = comp_trades['Final_Return (%)'].mean()
                 
                 col_m1, col_m2, col_m3 = st.columns(3)
-                col_m1.metric("全样本成交总笔数", f"{total_executed} 笔")
+                col_m1.metric("优选截断总笔数", f"{total_executed} 笔")
                 col_m2.metric("无干预绝对胜率", f"{global_win_rate:.1f}%", f"{win_count}胜")
                 col_m3.metric("全样本平均单笔收益", f"{global_mean_ret:.2f}%")
                 
+                # 🌟 关键修改：强制有序重排 W1 到 W12 面板
                 st.subheader("🗓️ 周度胜率分布 (强制有序排列 W1 - W12)")
-                # 重新规划为 3 行 4 列的布局，确保严格按照顺序显示
                 cols_row1 = st.columns(4)
                 cols_row2 = st.columns(4)
                 cols_row3 = st.columns(4)
@@ -738,7 +741,8 @@ if os.path.exists(CHECKPOINT_FILE):
                     col_name = f'Return_W{w} (%)'
                     if col_name in valid_signals.columns:
                         valid = valid_signals.dropna(subset=[col_name]) 
-                        # 严格分配到对应的列
+                        # 严格分配到对应的列：
+                        # W1-W4 在第一排，W5-W8 在第二排，W9-W12 在第三排
                         if w <= 4:
                             target_col = cols_row1[w - 1]
                         elif w <= 8:
@@ -752,7 +756,7 @@ if os.path.exists(CHECKPOINT_FILE):
                                 win = (valid[col_name] > 0).mean() * 100
                                 st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
                                 
-                st.markdown("### 🏆 评分层级横向对比验证 (Top 10)")
+                st.markdown("### 🏆 评分层级横向对比验证 (Top N)")
                 rank_stats = comp_trades.groupby('Rank', observed=False).agg(
                     样本数=('Final_Return (%)', 'count'),
                     平均分=('Total_Score', 'mean'),
@@ -772,7 +776,7 @@ if os.path.exists(CHECKPOINT_FILE):
                 rank_stats['均水下周数'] = rank_stats['均水下周数'].map('{:.1f}'.format)
                 st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), use_container_width=True)
 
-            st.subheader("📋 全量信号交割流水单")
+            st.subheader("📋 Top N 优选信号交割流水单")
             disp_cols = [
                 'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'SKDJ_K', 'D_Min(10W)', 'Weeks_Under',
                 'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
@@ -799,9 +803,9 @@ if os.path.exists(CHECKPOINT_FILE):
                 
             csv_data = valid_signals.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 导出全量一览流水 (CSV)", 
+                label="📥 导出优选一览流水 (CSV)", 
                 data=csv_data, 
-                file_name="skdj_v14_analysis_export.csv", 
+                file_name="skdj_v14_1_top_n_export.csv", 
                 mime="text/csv"
             )
         else:
