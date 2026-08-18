@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 翻转打分系统 (V14.4 真·周末锁定版)
+周线 SKDJ 翻转打分系统 (V14.5 终极实盘版)
 ------------------------------------------------
-1. 【真·周末锁定】：修复了周中运行回测会污染数据库的致命Bug。回测模式下，系统强制向未来探测15天日历，仅允许真正的周末（周五）数据进入历史库。
-2. 【双模引擎】：追溯天数设为 1 时，激活“盘中极速选股”模式，秒级出票，不写入数据库，不追踪未来。
-3. 【精简提速】：去除了高开低开分析模块，回归纯正的 V14.1 右侧突破交易纪律。
+1. 【消除警告】：全面适配 Streamlit 最新版接口规范，将 use_container_width 替换为 width='stretch'。
+2. 【真·周末锁定】：回测模式下，系统强制向未来探测15天日历，仅允许真正的周末（周五）数据进入历史库。
+3. 【双模引擎】：追溯天数设为 1 时，激活“盘中极速选股”模式，秒级出票，不写入数据库，不追踪未来。
 4. 【优选截断】：保留 Top N 控制阀，过滤杂波。
 ------------------------------------------------
 """
@@ -31,9 +31,9 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ V14.4 终极系统", layout="wide")
-st.title("🔬 周线 SKDJ 底部脱离系统 (V14.4 终极融合版)")
-st.markdown("🔒 **天数=1为极速选股，>1为历史回测 · 独家修复周中回测污染Bug**")
+st.set_page_config(page_title="SKDJ V14.5 终极系统", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.5 终极实盘版)")
+st.markdown("🔒 **天数=1为极速选股，>1为历史回测 · 纯净剥离 · 全面兼容新版UI**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -583,7 +583,7 @@ if st.button(btn_label):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V14.4 数据扫描...")
+                                bar = st.progress(0, text="执行 V14.5 数据扫描...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -631,7 +631,7 @@ if st.button(btn_label):
                                         
                                         if is_picking_mode:
                                             st.subheader(f"🎯 盘中极速选股结果 [{date}] - Top {MAX_TOP_N}")
-                                            st.dataframe(fdf.style.background_gradient(subset=['Total_Score'], cmap='YlOrRd'), use_container_width=True)
+                                            st.dataframe(fdf.style.background_gradient(subset=['Total_Score'], cmap='YlOrRd'), width='stretch')
                                         else:
                                             is_first = not os.path.exists(CHECKPOINT_FILE)
                                             fdf.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
@@ -659,7 +659,7 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
         repaired_res = repair_checkpoint_df(raw_res)
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
-        st.header("📈 V14.4 历史回测全景分析报告")
+        st.header("📈 V14.5 历史回测全景分析报告")
         
         if not valid_signals.empty:
             comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
@@ -712,7 +712,7 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
                 rank_stats['止损率'] = rank_stats['止损率'].map('{:.1f}%'.format)
                 rank_stats['超级大牛'] = rank_stats['超级大牛'].map('{:.1f}%'.format)
                 rank_stats['均水下周数'] = rank_stats['均水下周数'].map('{:.1f}'.format)
-                st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), use_container_width=True)
+                st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), width='stretch')
 
             st.subheader("📋 历史回测交割流水单")
             disp_cols = [
@@ -735,15 +735,15 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
                 styled_port = styled_port.map(color_exit_reason, subset=['Exit_Reason'])
                 
             try:
-                st.dataframe(styled_port, width="stretch")
+                st.dataframe(styled_port, width='stretch')
             except Exception:
-                st.dataframe(styled_port, use_container_width=True)
+                st.dataframe(styled_port, width='stretch')
                 
             csv_data = valid_signals.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
                 label="📥 导出回测流水单 (CSV)", 
                 data=csv_data, 
-                file_name="skdj_v14_4_history_export.csv", 
+                file_name="skdj_v14_5_history_export.csv", 
                 mime="text/csv"
             )
         else:
