@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 全量分析系统 (V13.0 强势基因打分翻转版)
+周线 SKDJ 翻转打分系统 (V14.0 全量一览版)
 ------------------------------------------------
-1. 【去除硬性拦截】：保留全量信号，让市场自我证明，消除主观过滤导致的牛股错杀。
-2. 【时间因子翻转】：重奖“潜水时间极短”的强势洗盘（1-2周），重罚沉底长达 10 周以上的僵尸股。
-3. 【空间因子翻转】：重奖“浅坑”（极值 22-25 之间），重罚“深坑”（极值 < 10 的深度套牢股）。
-4. 【恢复三仓轮动】：在强大的打分大脑加持下，重新接入 3 仓 30 万实盘模拟系统。
-5. 【极速下载优化】：回测预热期缩短至 300 天，大幅降低内存与接口压力。
+1. 【去除仓位限制】：剥离三仓资金引擎，每周产生的所有突破信号全部记录展示，不遗漏任何一只牛股。
+2. 【保留强控盘打分】：继承 V13 的翻转打分逻辑，重奖浅坑（22-25）与短洗（1-2周）。
+3. 【周度面板重排】：强制规范 W1 ~ W12 的胜率/收益率面板顺序，确保展示逻辑清晰连贯。
+4. 【极速下载优化】：回测预热期缩短至 300 天，大幅降低内存与接口压力。
 ------------------------------------------------
 """
 
@@ -24,17 +23,17 @@ import pickle
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 全局持久化缓存配置 (升级独立 V13 文件)
+# 全局持久化缓存配置
 # ---------------------------
-CHECKPOINT_FILE = "skdj_v13_real_trading_checkpoint.csv"
+CHECKPOINT_FILE = "skdj_v14_analysis_checkpoint.csv"
 MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ 强势打分系统", layout="wide")
-st.title("🏆 周线 SKDJ 底部脱离系统 (V13.0 强势翻转版)")
-st.markdown("🔒 **重构打分大脑 · 重奖浅坑短洗 · 重罚深水死猫跳 · 30万实盘轮动**")
+st.set_page_config(page_title="SKDJ 全局一览打分系统", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.0 翻转打分全量版)")
+st.markdown("🔒 **剥离资金槽位 · 全面展示周度高分信号 · 强制重排 W1-W12 胜率面板**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -254,7 +253,7 @@ def load_optimized_market_data(start_date, end_date, token, _whitelist_keys, _du
     return stock_qfq_dict, basic_indexed
 
 # ---------------------------
-# 🚀【V13.0 核心引擎】：基于大数据的翻转打分模型
+# 🚀【V14.0 核心引擎】：翻转打分模型（无拦截）
 # ---------------------------
 def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     if ts_code not in stock_qfq_dict: return {}
@@ -318,7 +317,6 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     recent_k_min = k_history_before_breakout.min()
     weeks_under_25 = (k_history_before_breakout < 25.0).sum()
     
-    # 【取消一刀切硬性过滤，全部放行交由打分系统裁决】
     ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
     trend_type = "均线上方" if curr_w['close'] >= ma20_curr else "均线下方(超跌)"
     vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
@@ -333,28 +331,27 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     res['vol_ratio'] = round(vol_ratio, 2)
     
     # ========================================================
-    # 🎯 终极翻转打分模型 (基于 V12 的 1800+ 大数据推导)
-    # 满分 100 分。用分数将“深水僵尸股”踢出前三仓。
+    # 🎯 终极翻转打分模型 (无拦截全量入库)
     # ========================================================
     score = 0.0
     
-    # 1. 均线趋势因子 (最高加 20 分)
+    # 1. 均线趋势因子
     if curr_w['close'] >= ma20_curr: score += 20.0
     else: score -= 5.0
         
-    # 2. 空间极值因子：浅坑加分，深水扣分 (最高加 30 分)
-    if 22.0 <= recent_k_min <= 25.0: score += 30.0    # 极浅坑（主升浪洗盘最强特征）
-    elif 15.0 <= recent_k_min < 22.0: score += 15.0   # 正常坑
-    elif 5.0 <= recent_k_min < 15.0: score -= 10.0    # 深水区
-    else: score -= 25.0                               # 跌破5的地狱坑，大概率骗线
+    # 2. 空间极值因子 (重赏浅坑)
+    if 22.0 <= recent_k_min <= 25.0: score += 30.0    
+    elif 15.0 <= recent_k_min < 22.0: score += 15.0   
+    elif 5.0 <= recent_k_min < 15.0: score -= 10.0    
+    else: score -= 25.0                               
         
-    # 3. 时间清洗因子：短洗重赏，长洗重罚 (最高加 30 分)
-    if 1 <= weeks_under_25 <= 2: score += 30.0        # 只趴了1-2周，洗盘极短的主力强控盘
-    elif 3 <= weeks_under_25 <= 5: score += 15.0      # 正常震荡
-    elif 6 <= weeks_under_25 <= 9: score -= 5.0       # 时间偏长，筹码涣散
-    else: score -= 20.0                               # 趴了10周以上，死鱼股
+    # 3. 时间清洗因子 (重赏短洗)
+    if 1 <= weeks_under_25 <= 2: score += 30.0        
+    elif 3 <= weeks_under_25 <= 5: score += 15.0      
+    elif 6 <= weeks_under_25 <= 9: score -= 5.0       
+    else: score -= 20.0                               
         
-    # 4. 起爆甜区与量能因子 (最高加 20 分)
+    # 4. 起爆甜区与量能因子
     k_val = curr_w['k']
     if 25.0 < k_val <= 32.0: score += 10.0
     elif k_val > 38.0: score -= 10.0
@@ -366,7 +363,7 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     return res
 
 # === # ---------------------------
-# 🚀 实战出局系统：全域一字板拦截 + 首周五截断 + +2%保本 + 15%移动止盈
+# 🚀 独立出局系统：全域一字板拦截 + 首周五截断 + +2%保本 + 15%移动止盈
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
     default_res = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
@@ -536,26 +533,23 @@ def repair_checkpoint_df(df_in):
 # UI 控制流与输入侧边栏
 # ---------------------------
 with st.sidebar:
-    st.header("⚙️ 实战账户配置")
-    INIT_TOTAL_CAPITAL = st.number_input("初始总资金 (元)", value=300000, step=50000)
-    MAX_SLOTS = st.number_input("持仓槽位数 (仓位)", value=3, min_value=1, max_value=5)
-    st.info(f"💡 单仓分配本金：**{INIT_TOTAL_CAPITAL // MAX_SLOTS:,} 元**")
+    st.header("⚙️ 全景分析配置 (无资金限制)")
     
     st.markdown("---")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("追溯交易天数", value=250, step=30)
     
     st.markdown("---")
-    if st.button("🗑️ 清空行情缓存"):
+    if st.button("🗑️ 清空行情缓存 (除非换Token否则别点)"):
         if os.path.exists(MARKET_CACHE_FILE):
             os.remove(MARKET_CACHE_FILE)
         st.cache_data.clear()
         st.success("底层行情缓存已清理！")
             
-    if st.button("🗑️ 清除所有回测记录 (重跑前必点)"):
+    if st.button("🗑️ 清除历史分析记录 (重跑前必点)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
-        st.success("回测记录已清理！下次运行将全量重跑。")
+        st.success("分析记录已清理！下次运行将重新生成。")
             
     st.markdown("---")
     st.subheader("💰 护城河底座")
@@ -576,9 +570,9 @@ with st.sidebar:
 token_clean = clean_token_str(TS_TOKEN_INPUT)
 
 # ---------------------------
-# 主流程：启动实战回测
+# 主流程：启动全景信号扫描
 # ---------------------------
-if st.button("🚀 启动翻转打分资金轮动测算"):
+if st.button("🚀 提取全量信号与翻转打分归因"):
     is_valid, msg = verify_token_connection(token_clean)
     if not is_valid:
         st.error(f"❌ **Token 预检拦截**：{msg}")
@@ -629,9 +623,9 @@ if st.button("🚀 启动翻转打分资金轮动测算"):
                         dates_to_run.sort()
                         
                         if not dates_to_run:
-                            st.success("🎉 指定区间数据已扫描完毕！查看下方实盘报告即可。")
+                            st.success("🎉 指定区间数据已扫描完毕！查看下方分析报告即可。")
                         else:
-                            # 极致提速优化：将回测预热期缩短至 300 天
+                            # 极致提速优化：缩短预热期至 300 天
                             fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
                             fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
                             
@@ -641,7 +635,7 @@ if st.button("🚀 启动翻转打分资金轮动测算"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V13.0 实战信号扫描...")
+                                bar = st.progress(0, text="执行 V14.0 全量翻转扫描...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -690,8 +684,8 @@ if st.button("🚀 启动翻转打分资金轮动测算"):
                                         records.append(record_dict)
                                             
                                     if records:
-                                        # 截取当天打分排名前列的标的进入实盘抢仓位
-                                        fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False).head(int(MAX_SLOTS) * 2)
+                                        # 全量记录所有被选出的股票（不再截断前两只），只做排序
+                                        fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False)
                                         fdf.insert(0, 'Rank', range(1, len(fdf) + 1))
                                         fdf['Trade_Date'] = date
                                         is_first = not os.path.exists(CHECKPOINT_FILE)
@@ -700,12 +694,12 @@ if st.button("🚀 启动翻转打分资金轮动测算"):
                                     bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date} (捕获 {len(records)} 只目标)")
                                     
                                 bar.empty()
-                                st.success("🎉 实战定型数据已全部处理完毕！")
+                                st.success("🎉 全量信号数据已全部处理完毕！")
         except Exception as e:
             st.error(f"❌ **运行异常拦截**：{str(e)}")
 
 # ---------------------------
-# 实战资金曲线与三仓模拟展示区
+# 全景分析展示区
 # ---------------------------
 if os.path.exists(CHECKPOINT_FILE):
     st.markdown("---")
@@ -714,105 +708,76 @@ if os.path.exists(CHECKPOINT_FILE):
         raw_res['Trade_Date'] = raw_res['Trade_Date'].astype(str)
         
         repaired_res = repair_checkpoint_df(raw_res)
+        # 排除因为一字板没买进或者恶劣跳空的样本，只保留真实成交清单
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
-        st.header("📈 V13.0 翻转打分三仓实战模拟报告")
+        st.header("📈 V14.0 翻转打分全景分析报告")
         
-        slot_cash = [INIT_TOTAL_CAPITAL / MAX_SLOTS] * int(MAX_SLOTS)
-        slot_occupied_until = ["" for _ in range(int(MAX_SLOTS))]
-        portfolio_trades = []
-        
-        unique_dates = sorted(valid_signals['Trade_Date'].astype(str).unique())
-        
-        for date_str in unique_dates:
-            clean_d_str = str(date_str).replace("-", "")
-            day_candidates = valid_signals[valid_signals['Trade_Date'].astype(str) == date_str].sort_values('Rank', ascending=True)
+        if not valid_signals.empty:
+            comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
+            total_executed = len(comp_trades)
             
-            free_slots = []
-            for s_idx in range(int(MAX_SLOTS)):
-                occ = str(slot_occupied_until[s_idx]).replace("-", "")
-                if occ == "" or occ <= clean_d_str:
-                    free_slots.append(s_idx)
-                    
-            if not free_slots:
-                continue
+            if total_executed > 0:
+                comp_trades['Final_Return (%)'] = pd.to_numeric(comp_trades['Final_Return (%)'], errors='coerce').fillna(0)
+                win_count = (comp_trades['Final_Return (%)'] > 0).sum()
+                global_win_rate = (win_count / total_executed) * 100.0
+                global_mean_ret = comp_trades['Final_Return (%)'].mean()
                 
-            for _, row in day_candidates.iterrows():
-                if not free_slots:
-                    break
-                    
-                target_slot = free_slots.pop(0)
-                alloc_capital = slot_cash[target_slot]
+                col_m1, col_m2, col_m3 = st.columns(3)
+                col_m1.metric("全样本成交总笔数", f"{total_executed} 笔")
+                col_m2.metric("无干预绝对胜率", f"{global_win_rate:.1f}%", f"{win_count}胜")
+                col_m3.metric("全样本平均单笔收益", f"{global_mean_ret:.2f}%")
                 
-                final_pct = row.get('Final_Return (%)', np.nan)
-                if pd.isna(final_pct):
-                    final_pct = 0.0
-                    
-                profit_amount = alloc_capital * (final_pct / 100.0)
-                end_capital = alloc_capital + profit_amount
-                slot_cash[target_slot] = end_capital
+                st.subheader("🗓️ 周度胜率分布 (强制有序排列 W1 - W12)")
+                # 重新规划为 3 行 4 列的布局，确保严格按照顺序显示
+                cols_row1 = st.columns(4)
+                cols_row2 = st.columns(4)
+                cols_row3 = st.columns(4)
                 
-                if pd.notna(row.get('Exit_Date')) and str(row['Exit_Date']).strip() != "":
-                    exit_date_str = str(row['Exit_Date']).replace("-", "")
-                else:
-                    hold_days = row.get('Hold_Days', 40)
-                    if pd.isna(hold_days) or hold_days <= 0:
-                        hold_days = 40
-                    try:
-                        td_dt = datetime.strptime(clean_d_str, "%Y%m%d")
-                        exit_dt = td_dt + timedelta(days=int(hold_days * 7 / 5))
-                        exit_date_str = exit_dt.strftime("%Y%m%d")
-                    except Exception:
-                        exit_date_str = "20991231"
-                        
-                slot_occupied_until[target_slot] = exit_date_str
+                for w in range(1, 13):
+                    col_name = f'Return_W{w} (%)'
+                    if col_name in valid_signals.columns:
+                        valid = valid_signals.dropna(subset=[col_name]) 
+                        # 严格分配到对应的列
+                        if w <= 4:
+                            target_col = cols_row1[w - 1]
+                        elif w <= 8:
+                            target_col = cols_row2[w - 5]
+                        else:
+                            target_col = cols_row3[w - 9]
+                            
+                        with target_col:
+                            if not valid.empty:
+                                avg = valid[col_name].mean()
+                                win = (valid[col_name] > 0).mean() * 100
+                                st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
+                                
+                st.markdown("### 🏆 评分层级横向对比验证 (Top 10)")
+                rank_stats = comp_trades.groupby('Rank', observed=False).agg(
+                    样本数=('Final_Return (%)', 'count'),
+                    平均分=('Total_Score', 'mean'),
+                    平均K值=('SKDJ_K', 'mean'),
+                    均水下周数=('Weeks_Under', 'mean'),
+                    胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                    均益=('Final_Return (%)', 'mean'),
+                    止损率=('Exit_Reason', lambda x: x.str.contains('破-10%').mean() * 100),
+                    超级大牛=('Exit_Reason', lambda x: x.str.contains('移动止盈').mean() * 100)
+                ).reset_index().head(10)
                 
-                trade_record = row.to_dict()
-                trade_record['Slot'] = f"槽位 {target_slot + 1}"
-                trade_record['Alloc_Capital'] = round(alloc_capital, 2)
-                trade_record['End_Capital'] = round(end_capital, 2)
-                trade_record['Net_Profit'] = round(profit_amount, 2)
-                trade_record['Exit_Date_Clean'] = exit_date_str
-                portfolio_trades.append(trade_record)
+                # 格式化输出
+                rank_stats['胜率'] = rank_stats['胜率'].map('{:.1f}%'.format)
+                rank_stats['均益'] = rank_stats['均益'].map('{:.2f}%'.format)
+                rank_stats['止损率'] = rank_stats['止损率'].map('{:.1f}%'.format)
+                rank_stats['超级大牛'] = rank_stats['超级大牛'].map('{:.1f}%'.format)
+                rank_stats['均水下周数'] = rank_stats['均水下周数'].map('{:.1f}'.format)
+                st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), use_container_width=True)
 
-        if portfolio_trades:
-            port_df = pd.DataFrame(portfolio_trades)
-            total_current_value = sum(slot_cash)
-            total_net_profit = total_current_value - INIT_TOTAL_CAPITAL
-            total_return_pct = (total_net_profit / INIT_TOTAL_CAPITAL) * 100.0
-            
-            comp_trades = port_df[port_df['Exit_Reason'] != '持仓中']
-            win_count = (comp_trades['Final_Return (%)'] > 0).sum()
-            total_comp_count = len(comp_trades)
-            portfolio_win_rate = (win_count / total_comp_count * 100) if total_comp_count > 0 else 0.0
-            
-            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-            col_m1.metric("账户期末总资产", f"¥ {total_current_value:,.2f}", f"{total_return_pct:+.2f}%")
-            col_m2.metric("累计净利润", f"¥ {total_net_profit:+,.2f}")
-            col_m3.metric("三仓实盘总胜率", f"{portfolio_win_rate:.1f}%", f"{win_count}胜 / {total_comp_count}笔")
-            col_m4.metric("交易执行总笔数", f"{len(port_df)} 笔")
-            
-            st.subheader("🗓️ 周度胜率分布 (严格对齐周末信号)")
-            cols_row1 = st.columns(4)
-            cols_row2 = st.columns(4)
-            
-            for w in range(1, 13):
-                col_name = f'Return_W{w} (%)'
-                if col_name in valid_signals.columns:
-                    valid = valid_signals.dropna(subset=[col_name]) 
-                    target_col = cols_row1[(w-1)%4] if w <= 4 else (cols_row2[(w-5)%4] if w <= 8 else cols_row1[(w-9)%4])
-                    with target_col:
-                        if not valid.empty:
-                            avg = valid[col_name].mean()
-                            win = (valid[col_name] > 0).mean() * 100
-                            st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
-            
-            st.subheader("📋 三仓实操交割流水单")
-            port_disp_cols = [
-                'Slot', 'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'D_Min(10W)', 'Weeks_Under',
-                'Buy_Price', 'Alloc_Capital', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)', 'Net_Profit', 'End_Capital'
+            st.subheader("📋 全量信号交割流水单")
+            disp_cols = [
+                'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'SKDJ_K', 'D_Min(10W)', 'Weeks_Under',
+                'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
             ]
-            final_port_cols = [c for c in port_disp_cols if c in port_df.columns]
+            final_disp = [c for c in disp_cols if c in valid_signals.columns]
             
             def color_exit_reason(val):
                 if isinstance(val, str):
@@ -823,8 +788,8 @@ if os.path.exists(CHECKPOINT_FILE):
                     elif '期满' in val: return 'color: blue'
                 return ''
                 
-            styled_port = port_df[final_port_cols].sort_values('Trade_Date', ascending=False).style
-            if 'Exit_Reason' in port_df.columns:
+            styled_port = valid_signals[final_disp].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]).style
+            if 'Exit_Reason' in valid_signals.columns:
                 styled_port = styled_port.map(color_exit_reason, subset=['Exit_Reason'])
                 
             try:
@@ -832,15 +797,15 @@ if os.path.exists(CHECKPOINT_FILE):
             except Exception:
                 st.dataframe(styled_port, use_container_width=True)
                 
-            csv_data = port_df.to_csv(index=False).encode('utf-8-sig')
+            csv_data = valid_signals.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 导出终极三仓实战流水 (CSV)", 
+                label="📥 导出全量一览流水 (CSV)", 
                 data=csv_data, 
-                file_name="skdj_v13_real_trading_export.csv", 
+                file_name="skdj_v14_analysis_export.csv", 
                 mime="text/csv"
             )
         else:
-            st.info("🕒 当前暂无可执行的资金组合流水。")
+            st.info("🕒 未发现符合条件的样本。")
     except pd.errors.EmptyDataError:
         st.info("🕒 当前暂无满足条件的回测记录。")
 
