@@ -773,7 +773,7 @@ if os.path.exists(CHECKPOINT_FILE):
                 rank_stats['超级大牛'] = rank_stats['超级大牛'].map('{:.1f}%'.format)
                 rank_stats['均水下周数'] = rank_stats['均水下周数'].map('{:.1f}'.format)
                 rank_stats['均历史回撤'] = rank_stats['均历史回撤'].map('{:.1f}%'.format)
-                st.dataframe(rank_stats.style.background_gradient(subset=['平均分', '胜率'], cmap='YlOrRd'), use_container_width=True)
+                st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), use_container_width=True)
 
             st.subheader("📋 因子过滤放行清单")
             disp_cols = [
