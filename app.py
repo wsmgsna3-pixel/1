@@ -779,7 +779,6 @@ if os.path.exists(CHECKPOINT_FILE):
                 st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), use_container_width=True)
 
             st.subheader("📋 Top N 优选信号交割流水单")
-            # 🌟 关键修改：暴露 Signal_Close 和 Gap_pct (%) 字段
             disp_cols = [
                 'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'SKDJ_K', 'D_Min(10W)', 'Weeks_Under',
                 'Signal_Close', 'Gap_pct (%)', 'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
