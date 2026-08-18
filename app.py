@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 翻转打分系统 (V14.1 Top N 优选版)
+周线 SKDJ 翻转打分系统 (V14.2 跳空透视版)
 ------------------------------------------------
-1. 【优选截断控制】：在侧边栏新增“Top N”限制开关，每周仅展示得分最高的 N 只核心标的，去除普涨杂波。
-2. 【保留强控盘打分】：继承翻转打分逻辑，重奖浅坑（22-25）与短洗（1-2周）。
-3. 【周度面板重排】：强制规范 W1 ~ W12 的胜率/收益率面板顺序。
-4. 【极速下载优化】：回测预热期缩短至 300 天，大幅降低内存与接口压力。
+1. 【新增跳空追踪】：交割单全量展示 Signal_Close(周五收盘) 与 Gap_pct(周一跳空比例)。
+2. 【新增跳空归因】：UI 增加专属面板，统计高开/低开对最终胜率和收益的真实影响。
+3. 【优选截断控制】：在侧边栏新增“Top N”限制开关，每周仅展示得分最高的 N 只核心标的。
+4. 【周度面板重排】：强制规范 W1 ~ W12 的胜率/收益率面板顺序。
 ------------------------------------------------
 """
 
@@ -32,8 +32,8 @@ MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 # 页面基础配置
 # ---------------------------
 st.set_page_config(page_title="SKDJ TopN 优选打分系统", layout="wide")
-st.title("🔬 周线 SKDJ 底部脱离系统 (V14.1 Top N 优选版)")
-st.markdown("🔒 **新增每周 Top N 截断阀 · 全面展示周度最高分核心信号**")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.2 跳空透视版)")
+st.markdown("🔒 **自带每周 Top N 截断阀 · 全维度解析周一开盘跳空博弈真相**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -335,23 +335,19 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     # ========================================================
     score = 0.0
     
-    # 1. 均线趋势因子
     if curr_w['close'] >= ma20_curr: score += 20.0
     else: score -= 5.0
         
-    # 2. 空间极值因子 (重赏浅坑)
     if 22.0 <= recent_k_min <= 25.0: score += 30.0    
     elif 15.0 <= recent_k_min < 22.0: score += 15.0   
     elif 5.0 <= recent_k_min < 15.0: score -= 10.0    
     else: score -= 25.0                               
         
-    # 3. 时间清洗因子 (重赏短洗)
     if 1 <= weeks_under_25 <= 2: score += 30.0        
     elif 3 <= weeks_under_25 <= 5: score += 15.0      
     elif 6 <= weeks_under_25 <= 9: score -= 5.0       
     else: score -= 20.0                               
         
-    # 4. 起爆甜区与量能因子
     k_val = curr_w['k']
     if 25.0 < k_val <= 32.0: score += 10.0
     elif k_val > 38.0: score -= 10.0
@@ -362,7 +358,7 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
     res['Total_Score'] = round(score, 1)
     return res
 
-# === # ---------------------------
+# ---------------------------
 # 🚀 独立出局系统：全域一字板拦截 + 首周五截断 + +2%保本 + 15%移动止盈
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
@@ -388,9 +384,10 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     is_20cm = any(ts_code.startswith(prefix) for prefix in ['300', '301', '688', '689'])
     limit_rate_pct = 19.0 if is_20cm else 9.5
     gap_pct = (buy_price - signal_close) / signal_close * 100.0
+    
+    # 🌟 跳空数据强绑定
     results['Gap_pct (%)'] = round(gap_pct, 2)
 
-    # 🚀【周一全域一字板无法买入拦截】
     is_monday_yiziban = (next_row['open'] == next_row['high'] == next_row['low']) and (gap_pct >= limit_rate_pct)
     if is_monday_yiziban:
         results['Exit_Reason'] = f"一字板无法买入(剔除: {round(gap_pct, 1)}%)"
@@ -429,7 +426,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         curr_open, curr_close, curr_high, curr_low = row['open'], row['close'], row['high'], row['low']
         curr_date = hist_future.index[i]
         
-        # 1. 挂单止盈/保本执行 (T+1 开盘)
         if pending_exit_reason is not None and day_count >= 2:
             if "保本" in pending_exit_reason:
                 final_return = 2.0  
@@ -447,7 +443,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         peak_price = max(peak_price, curr_high)
         peak_profit_pct = (peak_price - buy_price) / buy_price
         
-        # 2. T+1 起底线硬止损 (-10%)
         if day_count >= 2:
             if (curr_low - buy_price) / buy_price <= hard_stop_limit:
                 final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
@@ -459,7 +454,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
                 results[f'Return_W{current_week} (%)'] = round(final_return, 2)
                 break
         
-        # 3. 动态阶梯状态机
         if tier == 0 and peak_profit_pct >= 0.10: 
             tier = 1  
             
@@ -474,7 +468,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
             if giveback >= 0.15:  
                 pending_exit_reason = "移动止盈(回撤15%)"
         
-        # 4. 首周五 14:50 截断机制：收盘浮亏 <= -3.0%，尾盘直接平仓
         if day_count == 5 and not exit_triggered and pending_exit_reason is None:
             w1_ret = (curr_close - buy_price) / buy_price * 100.0
             if w1_ret <= -3.0:
@@ -489,7 +482,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = round((curr_close - buy_price) / buy_price * 100.0, 2)
             
-    # 5. 12 周期满平仓
     if not exit_triggered and len(hist_future) >= max_days:
         last_price = hist_future.iloc[max_days - 1]['close']
         final_return = (last_price - buy_price) / buy_price * 100.0
@@ -536,20 +528,19 @@ with st.sidebar:
     st.header("⚙️ 全景分析配置 (优选展示)")
     
     st.markdown("---")
-    # 🌟 新增：Top N 截断数
-    MAX_TOP_N = st.number_input("每周最多展示股票数 (Top N)", value=5, min_value=1, max_value=50, step=1, help="如果某周符合突破条件的股票很多，只截取打分排名前 N 的标的，去除杂波。")
+    MAX_TOP_N = st.number_input("每周最多展示股票数 (Top N)", value=5, min_value=1, max_value=50, step=1)
     
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("追溯交易天数", value=250, step=30)
     
     st.markdown("---")
-    if st.button("🗑️ 清空行情缓存 (除非换Token否则别点)"):
+    if st.button("🗑️ 清空行情缓存"):
         if os.path.exists(MARKET_CACHE_FILE):
             os.remove(MARKET_CACHE_FILE)
         st.cache_data.clear()
         st.success("底层行情缓存已清理！")
             
-    if st.button("🗑️ 清除历史分析记录 (重跑前必点)"):
+    if st.button("🗑️ 清除历史分析记录"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
         st.success("分析记录已清理！下次运行将重新生成。")
@@ -566,8 +557,7 @@ with st.sidebar:
     TS_TOKEN_INPUT = st.text_input(
         "🔑 Tushare Token", 
         value=secret_token,
-        type="password",
-        help="可在 Streamlit Cloud 的 Settings -> Secrets 中预设 TUSHARE_TOKEN"
+        type="password"
     )
 
 token_clean = clean_token_str(TS_TOKEN_INPUT)
@@ -628,7 +618,6 @@ if st.button("🚀 提取 Top N 优选信号与翻转打分归因"):
                         if not dates_to_run:
                             st.success("🎉 指定区间数据已扫描完毕！查看下方分析报告即可。")
                         else:
-                            # 极致提速优化：缩短预热期至 300 天
                             fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
                             fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
                             
@@ -638,7 +627,7 @@ if st.button("🚀 提取 Top N 优选信号与翻转打分归因"):
                             if not stock_qfq_dict:
                                 st.warning("⚠️ 未能加载到行情数据，请重试。")
                             else:
-                                bar = st.progress(0, text="执行 V14.1 Top N 翻转扫描...")
+                                bar = st.progress(0, text="执行 V14.2 Top N 翻转扫描...")
                                 
                                 for i, date in enumerate(dates_to_run):
                                     records = []
@@ -687,7 +676,6 @@ if st.button("🚀 提取 Top N 优选信号与翻转打分归因"):
                                         records.append(record_dict)
                                             
                                     if records:
-                                        # 🌟 关键修改：按分数排序后，只截取前 N 名
                                         fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False).head(int(MAX_TOP_N))
                                         fdf.insert(0, 'Rank', range(1, len(fdf) + 1))
                                         fdf['Trade_Date'] = date
@@ -711,10 +699,9 @@ if os.path.exists(CHECKPOINT_FILE):
         raw_res['Trade_Date'] = raw_res['Trade_Date'].astype(str)
         
         repaired_res = repair_checkpoint_df(raw_res)
-        # 排除因为一字板没买进或者恶劣跳空的样本，只保留真实成交清单
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
-        st.header("📈 V14.1 Top N 翻转打分全景分析报告")
+        st.header("📈 V14.2 Top N 翻转打分全景分析报告")
         
         if not valid_signals.empty:
             comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
@@ -731,7 +718,28 @@ if os.path.exists(CHECKPOINT_FILE):
                 col_m2.metric("无干预绝对胜率", f"{global_win_rate:.1f}%", f"{win_count}胜")
                 col_m3.metric("全样本平均单笔收益", f"{global_mean_ret:.2f}%")
                 
-                # 🌟 关键修改：强制有序重排 W1 到 W12 面板
+                # 🌟 新增：跳空博弈专属分析看板
+                st.markdown("### 🪂 开盘跳空博弈分析 (周一买点复盘)")
+                def categorize_open(gap):
+                    if pd.isna(gap): return "未知"
+                    if gap > 2.0: return "🔴 大幅高开 (>2%)"
+                    elif 0 < gap <= 2.0: return "🟠 小幅高开 (0~2%)"
+                    elif gap < 0: return "🟢 水下低吸 (<0%)"
+                    else: return "⚪ 平开 (0%)"
+                
+                comp_trades['开盘定性'] = comp_trades['Gap_pct (%)'].apply(categorize_open)
+                gap_stats = comp_trades.groupby('开盘定性', observed=False).agg(
+                    样本数=('Final_Return (%)', 'count'),
+                    胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                    平均收益=('Final_Return (%)', 'mean')
+                ).reset_index()
+                
+                gap_stats['出现比例'] = (gap_stats['样本数'] / total_executed * 100).map('{:.1f}%'.format)
+                gap_stats['胜率'] = gap_stats['胜率'].map('{:.1f}%'.format)
+                gap_stats['平均收益'] = gap_stats['平均收益'].map('{:.2f}%'.format)
+                gap_stats = gap_stats[['开盘定性', '样本数', '出现比例', '胜率', '平均收益']]
+                st.dataframe(gap_stats, use_container_width=True)
+                
                 st.subheader("🗓️ 周度胜率分布 (强制有序排列 W1 - W12)")
                 cols_row1 = st.columns(4)
                 cols_row2 = st.columns(4)
@@ -741,14 +749,9 @@ if os.path.exists(CHECKPOINT_FILE):
                     col_name = f'Return_W{w} (%)'
                     if col_name in valid_signals.columns:
                         valid = valid_signals.dropna(subset=[col_name]) 
-                        # 严格分配到对应的列：
-                        # W1-W4 在第一排，W5-W8 在第二排，W9-W12 在第三排
-                        if w <= 4:
-                            target_col = cols_row1[w - 1]
-                        elif w <= 8:
-                            target_col = cols_row2[w - 5]
-                        else:
-                            target_col = cols_row3[w - 9]
+                        if w <= 4: target_col = cols_row1[w - 1]
+                        elif w <= 8: target_col = cols_row2[w - 5]
+                        else: target_col = cols_row3[w - 9]
                             
                         with target_col:
                             if not valid.empty:
@@ -768,7 +771,6 @@ if os.path.exists(CHECKPOINT_FILE):
                     超级大牛=('Exit_Reason', lambda x: x.str.contains('移动止盈').mean() * 100)
                 ).reset_index().head(10)
                 
-                # 格式化输出
                 rank_stats['胜率'] = rank_stats['胜率'].map('{:.1f}%'.format)
                 rank_stats['均益'] = rank_stats['均益'].map('{:.2f}%'.format)
                 rank_stats['止损率'] = rank_stats['止损率'].map('{:.1f}%'.format)
@@ -777,9 +779,10 @@ if os.path.exists(CHECKPOINT_FILE):
                 st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), use_container_width=True)
 
             st.subheader("📋 Top N 优选信号交割流水单")
+            # 🌟 关键修改：暴露 Signal_Close 和 Gap_pct (%) 字段
             disp_cols = [
                 'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'SKDJ_K', 'D_Min(10W)', 'Weeks_Under',
-                'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
+                'Signal_Close', 'Gap_pct (%)', 'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
             ]
             final_disp = [c for c in disp_cols if c in valid_signals.columns]
             
@@ -803,13 +806,12 @@ if os.path.exists(CHECKPOINT_FILE):
                 
             csv_data = valid_signals.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 导出优选一览流水 (CSV)", 
+                label="📥 导出带跳空追踪流水 (CSV)", 
                 data=csv_data, 
-                file_name="skdj_v14_1_top_n_export.csv", 
+                file_name="skdj_v14_2_top_n_export.csv", 
                 mime="text/csv"
             )
         else:
             st.info("🕒 未发现符合条件的样本。")
     except pd.errors.EmptyDataError:
         st.info("🕒 当前暂无满足条件的回测记录。")
-
