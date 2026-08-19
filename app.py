@@ -264,7 +264,7 @@ def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
         'trade_date_str': 'last', 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'
     }).sort_values('trade_date_str').reset_index(drop=True)
 
-    n, m = 5, 3
+    n, m = 4, 3
     if len(weekly_df) < n + 15: return res
 
     weekly_df['lowv'] = weekly_df['low'].rolling(window=n).min()
