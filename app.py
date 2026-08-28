@@ -12,7 +12,7 @@
 1. 行情、复权和市值数据按交易日原子分片保存；中断后只补缺失日期。
 2. 结果、扫描账本和任务状态原子保存；页面刷新或网络重连后从断点续跑。
 3. 无标的日期同样记入扫描账本；重跑某日时覆盖旧快照，不重复追加。
-4. 加入任务锁、Token预检、临时异常重试和磁盘报告恢复。
+4. 使用原子文件和任务状态防止重复结果；不再长期持有文件锁，避免页面重跑后误判占用。
 ------------------------------------------------
 """
 
@@ -32,21 +32,15 @@ import hashlib
 import json
 import re
 
-try:
-    import fcntl
-except ImportError:  # Windows 本地运行时使用后备锁
-    fcntl = None
-
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "V40.6-S1"
+APP_VERSION = "V40.6-S2"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LEGACY_CACHE_BASENAME = "market_data_cache_v40_6.pkl"
 MARKET_CACHE_ROOT = os.path.join(APP_DIR, "market_data_cache_v40_6_stable")
 CHECKPOINT_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_history.csv")
 SCAN_LEDGER_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_scanned_dates.csv")
 RUN_TASK_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_running_task.json")
-RUN_LOCK_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_running.lock")
 TUSHARE_REQUEST_TIMEOUT_SECONDS = 20
 DAYS_PER_BATCH = 5
 
@@ -62,14 +56,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 GLOBAL_STOCK_BASIC = pd.DataFrame()
 SINA_STATUS = {'success': 0, 'fail': 0} 
 API_ERRORS = []
-_RUN_LOCK_HANDLE = None
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.6-S1 稳定修复版", layout="wide")
+st.set_page_config(page_title="选股王 V40.6-S2 稳定修复版", layout="wide")
 st.title("选股王 V40.6：箱体首发 + 四大神盾")
-st.caption("V40.6-S1 仅修复缓存、断点续跑和页面崩溃问题；选股与买卖规则保持不变。")
+st.caption("V40.6-S2 仅修复缓存、断点续跑和页面崩溃问题；选股与买卖规则保持不变。")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -278,54 +271,6 @@ def atomic_write_pickle(value, path):
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-
-def acquire_run_lock(stale_seconds=600):
-    global _RUN_LOCK_HANDLE
-    if fcntl is not None:
-        try:
-            lock_handle = open(RUN_LOCK_FILE, "a+", encoding="utf-8")
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_handle.seek(0)
-            lock_handle.truncate()
-            lock_handle.write(str(time.time()))
-            lock_handle.flush()
-            _RUN_LOCK_HANDLE = lock_handle
-            return True
-        except (OSError, BlockingIOError):
-            try:
-                lock_handle.close()
-            except Exception:
-                pass
-            return False
-
-    if os.path.exists(RUN_LOCK_FILE):
-        try:
-            if time.time() - os.path.getmtime(RUN_LOCK_FILE) > stale_seconds:
-                os.remove(RUN_LOCK_FILE)
-        except OSError:
-            pass
-    try:
-        fd = os.open(RUN_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(time.time()).encode("utf-8"))
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-
-
-def release_run_lock():
-    global _RUN_LOCK_HANDLE
-    try:
-        if _RUN_LOCK_HANDLE is not None:
-            if fcntl is not None:
-                fcntl.flock(_RUN_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
-            _RUN_LOCK_HANDLE.close()
-            _RUN_LOCK_HANDLE = None
-            return
-        if fcntl is None and os.path.exists(RUN_LOCK_FILE):
-            os.remove(RUN_LOCK_FILE)
-    except OSError:
-        pass
 
 def get_trade_days(end_date_str, num_days):
     lookback_days = max(num_days * 3, 365) 
@@ -1244,7 +1189,7 @@ def clear_config_records(config_id):
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.6-S1 稳定修复版")
+    st.header("V40.6-S2 稳定修复版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", min_value=1, value=100, step=1)
     
@@ -1267,28 +1212,16 @@ with st.sidebar:
 TS_TOKEN_INPUT = st.text_input("Tushare Token", type="password")
 
 if clear_market_clicked:
-    if acquire_run_lock():
-        try:
-            removed = clear_all_market_caches()
-            if removed:
-                st.success(f"已清除 {len(removed)} 个行情缓存位置。")
-            else:
-                st.info("没有找到可清除的行情缓存。")
-        finally:
-            release_run_lock()
+    removed = clear_all_market_caches()
+    if removed:
+        st.success(f"已清除 {len(removed)} 个行情缓存位置。")
     else:
-        st.warning("回测正在使用行情缓存，请等待当前批次结束。")
+        st.info("没有找到可清除的行情缓存。")
 
 if clear_history_clicked:
-    if acquire_run_lock():
-        try:
-            for file_path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
-                remove_with_backup(file_path)
-            st.success("历史结果、扫描账本和断点任务已清理。")
-        finally:
-            release_run_lock()
-    else:
-        st.warning("回测正在写入结果，请等待当前批次结束。")
+    for file_path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
+        remove_with_backup(file_path)
+    st.success("历史结果、扫描账本和断点任务已清理。")
 
 token_clean = clean_token_str(TS_TOKEN_INPUT)
 is_realtime_mode = int(BACKTEST_DAYS) == 1
@@ -1361,8 +1294,6 @@ if run_history or run_realtime:
             active_task['Last_Error'] = 'Token为空'
             save_task(active_task)
         st.error("❌ Token为空，历史回测断点已保留。")
-    elif not acquire_run_lock():
-        st.info("另一个页面会话正在执行同一回测，本页面不会重复启动。")
     else:
         try:
             API_ERRORS.clear()
@@ -1519,8 +1450,6 @@ if run_history or run_realtime:
                 save_task(latest_task)
             else:
                 st.error(f"❌ 运行异常：{error}")
-        finally:
-            release_run_lock()
 
 if rerun_needed:
     time.sleep(0.8)
@@ -1600,6 +1529,8 @@ if not all_res.empty:
     st.download_button("📥 下载完整轨迹 (CSV)", csv, "export_v40_6_final.csv", "text/csv")
 elif not realtime_result.empty:
     pass
+elif latest_task.get('State') in {'RUNNING', 'PAUSED_ERROR', 'WAITING_DATA'}:
+    st.info("历史回测任务已建立，尚未完成首个可保存交易日；断点仍然有效。")
 elif ledger.empty:
     st.info("尚未运行历史回测。")
 else:
