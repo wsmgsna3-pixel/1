@@ -3,7 +3,7 @@
 选股王 · V40.6 实战定型版 (四大神盾)
 ------------------------------------------------
 核心改进 (基于数据复盘后的终极定型):
-1. [硬门槛 1：盘子基座] 侧边栏默认流通市值提高至 250 亿，彻底隔绝微盘股的画线诱多陷阱。
+1. [硬门槛 1：盘子基座] 侧边栏默认流通市值设为 50 亿；具体门槛仍由侧边栏参数控制。
 2. [硬门槛 2：温和爆破] 突破量比上限严格锁定在 3.0倍 (1.3 <= vol <= 3.0)，绞杀“天量见天价”的分歧坑。
 3. [硬门槛 3：开盘定生死] 在 T+1 买入引擎中加入集合竞价拦截器。若高开>5%或低开<-3%，直接放弃买入，剔除该标的！
 4. [废除主观加分] 尊重客观数据，剔除原有的“洗盘2-3次加分”逻辑，所有分数纯靠量价真实动能。
@@ -12,7 +12,8 @@
 1. 行情、复权和市值数据按交易日原子分片保存；中断后只补缺失日期。
 2. 结果、扫描账本和任务状态原子保存；页面刷新或网络重连后从断点续跑。
 3. 无标的日期同样记入扫描账本；重跑某日时覆盖旧快照，不重复追加。
-4. 使用原子文件和任务状态防止重复结果；不再长期持有文件锁，避免页面重跑后误判占用。
+4. 历史回测在一次进程中连续运行，避免每5日重载全部行情；真实中断后再从下一日恢复。
+5. 扫描前校验完整历史覆盖；数据不足只记为未完成，不再误报“无标的”。
 ------------------------------------------------
 """
 
@@ -34,7 +35,8 @@ import re
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "V40.6-S2"
+APP_VERSION = "V40.6-S3"
+RUNTIME_SCHEMA_VERSION = "stable-runtime-s3"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LEGACY_CACHE_BASENAME = "market_data_cache_v40_6.pkl"
 MARKET_CACHE_ROOT = os.path.join(APP_DIR, "market_data_cache_v40_6_stable")
@@ -42,7 +44,7 @@ CHECKPOINT_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_history.csv")
 SCAN_LEDGER_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_scanned_dates.csv")
 RUN_TASK_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_running_task.json")
 TUSHARE_REQUEST_TIMEOUT_SECONDS = 20
-DAYS_PER_BATCH = 5
+MIN_SIGNAL_HISTORY_DAYS = 140
 
 # ---------------------------
 # 全局变量与探针
@@ -60,9 +62,9 @@ API_ERRORS = []
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.6-S2 稳定修复版", layout="wide")
+st.set_page_config(page_title="选股王 V40.6-S3 稳定高效版", layout="wide")
 st.title("选股王 V40.6：箱体首发 + 四大神盾")
-st.caption("V40.6-S2 仅修复缓存、断点续跑和页面崩溃问题；选股与买卖规则保持不变。")
+st.caption("V40.6-S3 仅修复缓存、断点续跑、数据完整性和运行效率；选股与买卖规则保持不变。")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -388,6 +390,46 @@ def read_market_partition(trade_date, cache_dir, pool_hash, require_basic=False)
         return None
 
 
+def market_cache_stamp(valid_dates, cache_dir):
+    """只读取目录元数据，作为分片校验与内存索引的可靠缓存键。"""
+    file_count = 0
+    total_size = 0
+    latest_mtime_ns = 0
+    mtime_checksum = 0
+    for trade_date in valid_dates:
+        path = market_partition_path(trade_date, cache_dir)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        file_count += 1
+        total_size += int(stat.st_size)
+        latest_mtime_ns = max(latest_mtime_ns, int(stat.st_mtime_ns))
+        mtime_checksum += int(stat.st_mtime_ns)
+    return file_count, total_size, latest_mtime_ns, mtime_checksum
+
+
+@st.cache_data(ttl=3600*12, show_spinner=False)
+def scan_market_partitions(valid_dates_key, required_basic_key, cache_dir, pool_hash, cache_stamp):
+    """同一批分片内容未变化时不重复反序列化；返回完整缺失与基础行情缺失日期。"""
+    del cache_stamp
+    required_basic = set(required_basic_key)
+    missing_dates = []
+    base_missing_dates = []
+    for trade_date in valid_dates_key:
+        payload = read_market_partition(
+            trade_date, cache_dir, pool_hash, require_basic=False
+        )
+        if payload is None:
+            missing_dates.append(trade_date)
+            base_missing_dates.append(trade_date)
+        elif trade_date in required_basic and not valid_market_partition(
+            payload, trade_date, pool_hash, require_basic=True
+        ):
+            missing_dates.append(trade_date)
+    return tuple(missing_dates), tuple(base_missing_dates)
+
+
 def legacy_cache_paths():
     paths = [
         os.path.join(APP_DIR, LEGACY_CACHE_BASENAME),
@@ -452,12 +494,12 @@ def sync_market_data_incrementally(start_date, end_date, basic_required_dates, w
         required_basic.update(prior_dates)
 
     cache_dir, pool_hash = pool_cache_dir(whitelist_set)
-    missing_dates = [
-        date for date in valid_dates
-        if read_market_partition(
-            date, cache_dir, pool_hash, require_basic=date in required_basic
-        ) is None
-    ]
+    cache_stamp = market_cache_stamp(valid_dates, cache_dir)
+    missing_dates_key, base_missing_dates_key = scan_market_partitions(
+        tuple(valid_dates), tuple(sorted(required_basic)), cache_dir, pool_hash, cache_stamp
+    )
+    missing_dates = list(missing_dates_key)
+    base_missing_dates = list(base_missing_dates_key)
     complete_hits = len(valid_dates) - len(missing_dates)
     st.caption(
         f"行情缓存：完整命中 {complete_hits}/{len(valid_dates)} 个交易日；"
@@ -466,10 +508,6 @@ def sync_market_data_incrementally(start_date, end_date, basic_required_dates, w
 
     legacy_daily = pd.DataFrame()
     legacy_adj = pd.DataFrame()
-    base_missing_dates = [
-        date for date in missing_dates
-        if read_market_partition(date, cache_dir, pool_hash, require_basic=False) is None
-    ]
     legacy_marker_path = os.path.join(cache_dir, 'legacy_cache_dates.json')
     legacy_marker = read_json_safe(legacy_marker_path)
     known_legacy_dates = set(legacy_marker.get('dates', []))
@@ -482,6 +520,7 @@ def sync_market_data_incrementally(start_date, end_date, basic_required_dates, w
         atomic_write_json({'dates': sorted(known_legacy_dates)}, legacy_marker_path)
 
     failed_dates = []
+    failed_base_dates = []
     migrated_dates = 0
     if missing_dates:
         bar = st.progress(0, text=f"从断点补充 {len(missing_dates)} 个交易日行情...")
@@ -544,6 +583,8 @@ def sync_market_data_incrementally(start_date, end_date, basic_required_dates, w
             if base_complete:
                 atomic_write_pickle(payload, market_partition_path(trade_date, cache_dir))
                 migrated_dates += int(used_legacy)
+            else:
+                failed_base_dates.append(trade_date)
             if not fully_complete:
                 failed_dates.append(trade_date)
 
@@ -565,7 +606,7 @@ def sync_market_data_incrementally(start_date, end_date, basic_required_dates, w
         )
     if migrated_dates:
         st.caption(f"已从旧版整包缓存迁移 {migrated_dates} 个交易日，避免重复下载行情和复权。")
-    return valid_dates, failed_dates, cache_dir, pool_hash
+    return valid_dates, failed_dates, failed_base_dates, cache_dir, pool_hash
 
 
 @st.cache_resource(ttl=3600*12, show_spinner=False)
@@ -621,11 +662,44 @@ def build_market_index_from_partitions(valid_dates_key, cache_dir, pool_hash, ca
     return daily_index, adj_index, basic_index, base_factors, tuple(complete_dates)
 
 
+def assess_signal_data_coverage(signal_dates, expected_dates, complete_dates, failed_dates):
+    """只判断运行数据是否完整，不参与选股条件与信号计算。"""
+    expected_dates = tuple(sorted(str(date) for date in expected_dates))
+    complete_set = {str(date) for date in complete_dates}
+    failed_set = {str(date) for date in failed_dates}
+    coverage_errors = {}
+
+    for signal_date in signal_dates:
+        signal_date = str(signal_date)
+        if signal_date in failed_set or signal_date not in complete_set:
+            coverage_errors[signal_date] = "数据缺失"
+            continue
+
+        history_start = (
+            datetime.strptime(signal_date, "%Y%m%d") - timedelta(days=365)
+        ).strftime("%Y%m%d")
+        expected_history = [
+            date for date in expected_dates if history_start <= date <= signal_date
+        ]
+        missing_history = [date for date in expected_history if date not in complete_set]
+        available_count = len(expected_history) - len(missing_history)
+        if missing_history:
+            coverage_errors[signal_date] = f"历史行情缺失({len(missing_history)}日)"
+        elif available_count < MIN_SIGNAL_HISTORY_DAYS:
+            coverage_errors[signal_date] = (
+                f"历史数据不足({available_count}/{MIN_SIGNAL_HISTORY_DAYS}交易日)"
+            )
+    return coverage_errors
+
+
 def get_all_historical_data(trade_days_list, use_cache=True):
     del use_cache  # 稳定版始终使用可恢复分片；清除按钮可显式全量重建。
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_DAILY_BASIC, GLOBAL_QFQ_BASE_FACTORS
     if not trade_days_list:
-        return {'ok': False, 'failed_dates': [], 'complete_dates': []}
+        return {
+            'ok': False, 'failed_dates': [], 'failed_base_dates': [],
+            'complete_dates': [], 'coverage_errors': {},
+        }
 
     latest_trade_date = max(trade_days_list)
     earliest_trade_date = min(trade_days_list)
@@ -637,18 +711,14 @@ def get_all_historical_data(trade_days_list, use_cache=True):
 
     whitelist_set = set(GLOBAL_STOCK_INDUSTRY)
     if not whitelist_set:
-        return {'ok': False, 'failed_dates': [], 'complete_dates': []}
-    valid_dates, failed_dates, cache_dir, pool_hash = sync_market_data_incrementally(
+        return {
+            'ok': False, 'failed_dates': [], 'failed_base_dates': [],
+            'complete_dates': [], 'coverage_errors': {},
+        }
+    valid_dates, failed_dates, failed_base_dates, cache_dir, pool_hash = sync_market_data_incrementally(
         start_date, end_date, set(trade_days_list), whitelist_set
     )
-    shard_paths = [
-        market_partition_path(date, cache_dir) for date in valid_dates
-        if os.path.exists(market_partition_path(date, cache_dir))
-    ]
-    cache_stamp = (
-        len(shard_paths),
-        max((os.path.getmtime(path) for path in shard_paths), default=0.0),
-    )
+    cache_stamp = market_cache_stamp(valid_dates, cache_dir)
     (
         GLOBAL_DAILY_RAW,
         GLOBAL_ADJ_FACTOR,
@@ -659,7 +729,16 @@ def get_all_historical_data(trade_days_list, use_cache=True):
         tuple(valid_dates), cache_dir, pool_hash, cache_stamp
     )
     ok = not GLOBAL_DAILY_RAW.empty and not GLOBAL_ADJ_FACTOR.empty
-    return {'ok': ok, 'failed_dates': failed_dates, 'complete_dates': list(complete_dates)}
+    coverage_errors = assess_signal_data_coverage(
+        trade_days_list, valid_dates, complete_dates, failed_dates
+    )
+    return {
+        'ok': ok,
+        'failed_dates': failed_dates,
+        'failed_base_dates': failed_base_dates,
+        'complete_dates': list(complete_dates),
+        'coverage_errors': coverage_errors,
+    }
 
 
 def get_market_slice(frame, trade_date):
@@ -1069,6 +1148,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 def make_config_id(top_k, min_mv, max_mv, min_price):
     payload = {
         'strategy': 'V40.6-original',
+        'runtime_schema': RUNTIME_SCHEMA_VERSION,
         'top_k': int(top_k),
         'min_mv': float(min_mv),
         'max_mv': float(max_mv),
@@ -1096,8 +1176,28 @@ def canonicalize_history(df):
     return clean.reset_index(drop=True)
 
 
-def replace_checkpoint_date(new_rows, trade_date, config_id):
-    existing = canonicalize_history(read_csv_safe(CHECKPOINT_FILE))
+def canonicalize_ledger(df):
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    ledger = df.copy()
+    ledger = ledger.drop(
+        columns=[c for c in ledger.columns if str(c).startswith('Unnamed:')],
+        errors='ignore',
+    )
+    if 'Trade_Date' in ledger.columns:
+        ledger['Trade_Date'] = ledger['Trade_Date'].map(parse_yyyymmdd)
+        ledger = ledger.dropna(subset=['Trade_Date'])
+    if 'Config_ID' in ledger.columns:
+        ledger['Config_ID'] = ledger['Config_ID'].astype(str)
+    if {'Trade_Date', 'Config_ID'}.issubset(ledger.columns):
+        ledger = ledger.drop_duplicates(['Trade_Date', 'Config_ID'], keep='last')
+    return ledger.reset_index(drop=True)
+
+
+def replace_checkpoint_date(new_rows, trade_date, config_id, existing=None):
+    if existing is None:
+        existing = read_csv_safe(CHECKPOINT_FILE)
+    existing = canonicalize_history(existing)
     if not existing.empty and {'Trade_Date', 'Config_ID'}.issubset(existing.columns):
         keep = ~(
             existing['Trade_Date'].astype(str).eq(str(trade_date))
@@ -1115,11 +1215,15 @@ def replace_checkpoint_date(new_rows, trade_date, config_id):
     sort_cols = [column for column in ('Trade_Date', 'Rank') if column in combined.columns]
     if sort_cols:
         combined = combined.sort_values(sort_cols, kind='mergesort')
-    atomic_write_csv(combined.reset_index(drop=True), CHECKPOINT_FILE)
+    combined = combined.reset_index(drop=True)
+    atomic_write_csv(combined, CHECKPOINT_FILE)
+    return combined
 
 
-def mark_scan_status(trade_date, raw_count, selected_count, config_id, status, error=''):
-    ledger = read_csv_safe(SCAN_LEDGER_FILE)
+def mark_scan_status(trade_date, raw_count, selected_count, config_id, status, error='', ledger=None):
+    if ledger is None:
+        ledger = read_csv_safe(SCAN_LEDGER_FILE)
+    ledger = canonicalize_ledger(ledger)
     row = pd.DataFrame([{
         'Trade_Date': str(trade_date),
         'Raw_Signal_Count': int(raw_count),
@@ -1130,16 +1234,25 @@ def mark_scan_status(trade_date, raw_count, selected_count, config_id, status, e
         'Updated_At': datetime.now().isoformat(timespec='seconds'),
     }])
     ledger = pd.concat([ledger, row], ignore_index=True, sort=False) if not ledger.empty else row
-    ledger['Trade_Date'] = ledger['Trade_Date'].map(parse_yyyymmdd)
-    ledger = ledger.dropna(subset=['Trade_Date'])
-    ledger['Config_ID'] = ledger['Config_ID'].astype(str)
-    ledger = ledger.drop_duplicates(['Trade_Date', 'Config_ID'], keep='last')
-    atomic_write_csv(ledger.sort_values('Trade_Date').reset_index(drop=True), SCAN_LEDGER_FILE)
+    ledger = canonicalize_ledger(ledger)
+    ledger = ledger.sort_values('Trade_Date').reset_index(drop=True)
+    atomic_write_csv(ledger, SCAN_LEDGER_FILE)
+    return ledger
+
+
+def is_data_incomplete_error(error):
+    if not error:
+        return False
+    error_text = str(error)
+    return any(error_text.startswith(prefix) for prefix in (
+        '数据缺失', '市值数据缺失', '股票基础数据缺失',
+        '历史数据不足', '历史行情缺失',
+    ))
 
 
 def completed_scan_dates(config_id):
     completed = set()
-    ledger = read_csv_safe(SCAN_LEDGER_FILE)
+    ledger = canonicalize_ledger(read_csv_safe(SCAN_LEDGER_FILE))
     if not ledger.empty and {'Trade_Date', 'Config_ID', 'Scan_Status'}.issubset(ledger.columns):
         match = ledger[
             ledger['Config_ID'].astype(str).eq(str(config_id))
@@ -1171,6 +1284,7 @@ def clear_all_market_caches():
         if os.path.isfile(path):
             os.remove(path)
             removed.append(path)
+    scan_market_partitions.clear()
     st.cache_resource.clear()
     return removed
 
@@ -1189,7 +1303,7 @@ def clear_config_records(config_id):
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V40.6-S2 稳定修复版")
+    st.header("V40.6-S3 稳定高效版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", min_value=1, value=100, step=1)
     
@@ -1197,7 +1311,7 @@ with st.sidebar:
     
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
-    st.caption("每完成一个交易日就安全保存；中断、刷新或网络重连后可继续。")
+    st.caption("连续分析、每完成一个交易日就安全保存；真实中断后从下一日继续。")
     clear_market_clicked = st.button("🗑️ 清除全部行情缓存")
     clear_history_clicked = st.button("🗑️ 清除断点记录 (重新回测)")
             
@@ -1205,9 +1319,9 @@ with st.sidebar:
     st.subheader("💰 核心护城河门槛")
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
     col1, col2 = st.columns(2)
-    # 【改动1：市值基准提升】默认过滤掉 250亿以下的微盘股
-    MIN_MV = col1.number_input("最小市值(亿)", value=250.0) 
-    MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
+    # 用户指定：侧边栏最小流通市值默认值为 50 亿。
+    MIN_MV = col1.number_input("最小流通市值(亿)", value=50.0) 
+    MAX_MV = col2.number_input("最大流通市值(亿)", value=1000.0)
 
 TS_TOKEN_INPUT = st.text_input("Tushare Token", type="password")
 
@@ -1227,6 +1341,9 @@ token_clean = clean_token_str(TS_TOKEN_INPUT)
 is_realtime_mode = int(BACKTEST_DAYS) == 1
 current_config_id = make_config_id(TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE)
 task_before = read_json_safe(RUN_TASK_FILE)
+if task_before and task_before.get('Runtime_Schema') != RUNTIME_SCHEMA_VERSION:
+    st.warning("检测到旧稳定版断点；其完成状态可能不可靠，本版不会自动续跑。请重新点击启动。")
+    task_before = {}
 
 if task_before.get('State') in {'RUNNING', 'PAUSED_ERROR', 'WAITING_DATA'}:
     done_count = int(task_before.get('Completed_Days', 0))
@@ -1264,6 +1381,7 @@ if start_clicked:
     if token_ok and not is_realtime_mode:
         new_task = {
             'State': 'RUNNING',
+            'Runtime_Schema': RUNTIME_SCHEMA_VERSION,
             'Config_ID': current_config_id,
             'Params': {
                 'Backtest_Days': int(BACKTEST_DAYS),
@@ -1281,6 +1399,8 @@ if start_clicked:
         save_task(new_task)
 
 active_task = read_json_safe(RUN_TASK_FILE)
+if active_task and active_task.get('Runtime_Schema') != RUNTIME_SCHEMA_VERSION:
+    active_task = {}
 run_history = active_task.get('State') == 'RUNNING' and not stop_clicked
 run_realtime = start_clicked and is_realtime_mode and not run_history
 rerun_needed = False
@@ -1351,7 +1471,12 @@ if run_history or run_realtime:
                 if not sync_info['ok']:
                     raise RuntimeError("未能加载到任何完整行情；已下载部分仍保留在分片缓存中")
 
-                batch_dates = pending_dates if run_realtime else pending_dates[:DAYS_PER_BATCH]
+                # 同一次运行连续处理全部待扫日期；每个交易日仍原子落盘。
+                # 只有真实异常才触发重跑，从而避免每5日重复加载全部行情分片。
+                batch_dates = pending_dates
+                coverage_errors = sync_info.get('coverage_errors', {})
+                checkpoint_state = canonicalize_history(read_csv_safe(CHECKPOINT_FILE))
+                ledger_state = canonicalize_ledger(read_csv_safe(SCAN_LEDGER_FILE))
                 bar = st.progress(0, text="箱体首发与四大神盾过滤中...")
                 stopped_during_batch = False
                 incomplete_dates = []
@@ -1365,12 +1490,16 @@ if run_history or run_realtime:
                         run_realtime and date == datetime.now().strftime('%Y%m%d')
                     )
                     run_timestamp = time.time() if is_realtime_radar else None
-                    result, error, raw_count = run_backtest_for_a_day(
-                        date, run_top_k, run_min_mv, run_max_mv, run_min_price,
-                        use_sina=is_realtime_radar, run_timestamp=run_timestamp,
-                    )
+                    coverage_error = coverage_errors.get(str(date))
+                    if coverage_error:
+                        result, error, raw_count = pd.DataFrame(), coverage_error, 0
+                    else:
+                        result, error, raw_count = run_backtest_for_a_day(
+                            date, run_top_k, run_min_mv, run_max_mv, run_min_price,
+                            use_sina=is_realtime_radar, run_timestamp=run_timestamp,
+                        )
 
-                    data_incomplete = error in {'数据缺失', '市值数据缺失', '股票基础数据缺失'}
+                    data_incomplete = is_data_incomplete_error(error)
                     if run_realtime:
                         realtime_result = result.copy()
                         realtime_error = error
@@ -1378,14 +1507,21 @@ if run_history or run_realtime:
                             st.warning(f"[{date}] {error}；本次不把该日记为完成。")
                     elif data_incomplete:
                         incomplete_dates.append(date)
-                        mark_scan_status(date, raw_count, 0, run_config_id, 'INCOMPLETE', error)
+                        ledger_state = mark_scan_status(
+                            date, raw_count, 0, run_config_id, 'INCOMPLETE', error,
+                            ledger=ledger_state,
+                        )
                     else:
-                        replace_checkpoint_date(result, date, run_config_id)
-                        mark_scan_status(
-                            date, raw_count, len(result), run_config_id, 'COMPLETED', error or ''
+                        checkpoint_state = replace_checkpoint_date(
+                            result, date, run_config_id, existing=checkpoint_state
+                        )
+                        ledger_state = mark_scan_status(
+                            date, raw_count, len(result), run_config_id, 'COMPLETED', error or '',
+                            ledger=ledger_state,
                         )
                         completed_in_batch += 1
-                        active_task['Completed_Days'] = len(completed_scan_dates(run_config_id))
+                        processed.add(str(date))
+                        active_task['Completed_Days'] = len(processed)
                         active_task['Error_Count'] = 0
                         active_task['Last_Date'] = date
                         save_task(active_task)
@@ -1403,17 +1539,10 @@ if run_history or run_realtime:
                     elif realtime_error == '无标的':
                         st.info(f"[{batch_dates[0]}] 暂无符合V40.6原条件的股票。")
                 elif stopped_during_batch:
-                    st.warning("断点任务已停止；本批已完成的结果已经安全保存。")
+                    st.warning("断点任务已停止；已完成的结果已经安全保存。")
                 else:
-                    completed_after = completed_scan_dates(run_config_id)
-                    remaining_dates = [date for date in trade_days_list if date not in completed_after]
-                    unattempted_remain = len(pending_dates) > len(batch_dates)
-                    if unattempted_remain:
-                        st.success(
-                            f"✅ 本批完成 {completed_in_batch} 日；其余日期将从断点自动续跑。"
-                        )
-                        rerun_needed = True
-                    elif remaining_dates:
+                    remaining_dates = [date for date in trade_days_list if date not in processed]
+                    if remaining_dates:
                         active_task['State'] = 'WAITING_DATA'
                         active_task['Completed_Days'] = len(trade_days_list) - len(remaining_dates)
                         active_task['Missing_Dates'] = remaining_dates
@@ -1424,7 +1553,7 @@ if run_history or run_realtime:
                         )
                     else:
                         remove_with_backup(RUN_TASK_FILE)
-                        st.success("🎉 回测数据更新完毕！")
+                        st.success(f"🎉 回测数据更新完毕！本次连续完成 {completed_in_batch} 日。")
 
             if run_realtime:
                 st.markdown("---")
@@ -1460,6 +1589,8 @@ if rerun_needed:
 # 报告始终从磁盘恢复，页面刷新后仍可查看和下载
 # ---------------------------
 latest_task = read_json_safe(RUN_TASK_FILE)
+if latest_task and latest_task.get('Runtime_Schema') != RUNTIME_SCHEMA_VERSION:
+    latest_task = {}
 report_config_id = str(latest_task.get('Config_ID', current_config_id))
 all_history = canonicalize_history(read_csv_safe(CHECKPOINT_FILE))
 if not all_history.empty and 'Config_ID' in all_history.columns:
@@ -1467,7 +1598,7 @@ if not all_history.empty and 'Config_ID' in all_history.columns:
 else:
     all_res = pd.DataFrame()
 
-ledger = read_csv_safe(SCAN_LEDGER_FILE)
+ledger = canonicalize_ledger(read_csv_safe(SCAN_LEDGER_FILE))
 if not ledger.empty and {'Config_ID', 'Scan_Status'}.issubset(ledger.columns):
     ledger_current = ledger[ledger['Config_ID'].astype(str).eq(report_config_id)]
     completed_count = int(ledger_current['Scan_Status'].astype(str).eq('COMPLETED').sum())
