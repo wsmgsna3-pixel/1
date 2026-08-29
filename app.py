@@ -21,7 +21,9 @@ import pickle
 import re
 import shutil
 import tempfile
+import threading
 import time
+import uuid
 import warnings
 import zipfile
 from datetime import date, datetime, timedelta
@@ -41,6 +43,7 @@ warnings.filterwarnings("ignore")
 
 APP_VERSION = "R1.0-TREND-ENTRY-AUDIT"
 APP_TITLE = "R1 趋势延续候选与入场排序验证器"
+ENGINE_PATCH = "R1.0.1-SELF-HEALING-RUN-LOCK"
 
 CHECKPOINT_FILE = "r1_trend_entry_candidates.csv"
 SCAN_LEDGER_FILE = "r1_trend_entry_scanned_dates.csv"
@@ -185,21 +188,85 @@ def remove_with_backup(path: str):
             pass
 
 
+_PROCESS_RUN_LOCK = threading.Lock()
 _RUN_LOCK_HANDLE = None
+_RUN_LOCK_OWNER = None
+_RUN_LOCK_FALLBACK_ACTIVE = False
 
 
-def acquire_run_lock(stale_seconds: int = 900):
-    global _RUN_LOCK_HANDLE
+def _read_run_lock_metadata():
+    if not os.path.exists(RUN_LOCK_FILE):
+        return {}
+    try:
+        with open(RUN_LOCK_FILE, "r", encoding="utf-8") as file_obj:
+            value = json.load(file_obj)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        # 兼容旧版只写入时间戳的锁文件。旧格式不能证明仍有进程持锁。
+        return {"Legacy_Lock": True}
+
+
+def _pid_is_alive(pid_value: Any):
+    try:
+        pid = int(pid_value)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _lock_metadata(owner_id: str, purpose: str, acquired_at: str | None = None):
+    now = datetime.now().isoformat(timespec="seconds")
+    return {
+        "Schema": 2,
+        "Owner_ID": str(owner_id),
+        "PID": os.getpid(),
+        "Purpose": str(purpose),
+        "Acquired_At": acquired_at or now,
+        "Heartbeat_At": now,
+    }
+
+
+def _write_locked_handle_metadata(lock_handle, metadata: dict[str, Any]):
+    lock_handle.seek(0)
+    lock_handle.truncate()
+    json.dump(metadata, lock_handle, ensure_ascii=False)
+    lock_handle.flush()
+    os.fsync(lock_handle.fileno())
+
+
+def acquire_run_lock(owner_id: str = "unknown", purpose: str = "R1运行"):
+    """
+    进程内线程锁 + 进程间文件锁。
+
+    旧版遗留的纯时间戳文件不再直接阻塞；只有仍被进程实际持有的文件锁，
+    或Windows下能确认仍存活的其他PID，才会判定为真正并发。
+    """
+    global _RUN_LOCK_HANDLE, _RUN_LOCK_OWNER, _RUN_LOCK_FALLBACK_ACTIVE
+    if not _PROCESS_RUN_LOCK.acquire(blocking=False):
+        return False
+
     if fcntl is not None:
         lock_handle = None
         try:
             lock_handle = open(RUN_LOCK_FILE, "a+", encoding="utf-8")
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_handle.seek(0)
-            lock_handle.truncate()
-            lock_handle.write(str(time.time()))
-            lock_handle.flush()
+            metadata = _lock_metadata(owner_id, purpose)
+            _write_locked_handle_metadata(lock_handle, metadata)
             _RUN_LOCK_HANDLE = lock_handle
+            _RUN_LOCK_OWNER = str(owner_id)
+            _RUN_LOCK_FALLBACK_ACTIVE = False
             return True
         except (OSError, BlockingIOError):
             if lock_handle is not None:
@@ -207,36 +274,147 @@ def acquire_run_lock(stale_seconds: int = 900):
                     lock_handle.close()
                 except OSError:
                     pass
+            _PROCESS_RUN_LOCK.release()
             return False
 
-    if os.path.exists(RUN_LOCK_FILE):
-        try:
-            if time.time() - os.path.getmtime(RUN_LOCK_FILE) > stale_seconds:
-                os.remove(RUN_LOCK_FILE)
-        except OSError:
-            pass
+    # Windows等无fcntl环境：进程内线程锁先排除同一进程的真实并发。
+    # 如果文件来自同一PID但线程锁空闲，说明它是被中断会话遗留的陈旧文件。
+    metadata = _read_run_lock_metadata()
+    existing_pid = metadata.get("PID")
+    if os.path.exists(RUN_LOCK_FILE) and _pid_is_alive(existing_pid) and int(existing_pid) != os.getpid():
+        _PROCESS_RUN_LOCK.release()
+        return False
     try:
-        fd = os.open(RUN_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(time.time()).encode("utf-8"))
+        if os.path.exists(RUN_LOCK_FILE):
+            os.remove(RUN_LOCK_FILE)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        fd = os.open(RUN_LOCK_FILE, flags)
+        payload = json.dumps(_lock_metadata(owner_id, purpose), ensure_ascii=False).encode("utf-8")
+        os.write(fd, payload)
+        os.fsync(fd)
         os.close(fd)
+        _RUN_LOCK_OWNER = str(owner_id)
+        _RUN_LOCK_FALLBACK_ACTIVE = True
         return True
-    except FileExistsError:
+    except (OSError, FileExistsError):
+        _RUN_LOCK_OWNER = None
+        _RUN_LOCK_FALLBACK_ACTIVE = False
+        _PROCESS_RUN_LOCK.release()
         return False
 
 
-def release_run_lock():
+def touch_run_lock(owner_id: str):
+    """在下载和逐周扫描期间更新心跳，供页面判断后台任务是否仍在推进。"""
     global _RUN_LOCK_HANDLE
+    if _RUN_LOCK_OWNER != str(owner_id):
+        return False
+    try:
+        metadata = _read_run_lock_metadata()
+        acquired_at = metadata.get("Acquired_At")
+        refreshed = _lock_metadata(
+            owner_id,
+            metadata.get("Purpose", "R1运行"),
+            acquired_at=acquired_at,
+        )
+        if _RUN_LOCK_HANDLE is not None:
+            _write_locked_handle_metadata(_RUN_LOCK_HANDLE, refreshed)
+        else:
+            atomic_write_json(refreshed, RUN_LOCK_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def run_lock_status():
+    metadata = _read_run_lock_metadata()
+    if not metadata:
+        return {"Exists": False, "Active": False, "Age_Seconds": np.nan}
+    heartbeat_text = metadata.get("Heartbeat_At")
+    age_seconds = np.nan
+    if heartbeat_text:
+        try:
+            age_seconds = max(
+                0.0,
+                (datetime.now() - datetime.fromisoformat(str(heartbeat_text))).total_seconds(),
+            )
+        except ValueError:
+            age_seconds = np.nan
+    pid_alive = _pid_is_alive(metadata.get("PID"))
+    try:
+        metadata_pid = int(metadata.get("PID"))
+    except (TypeError, ValueError):
+        metadata_pid = -1
+    active_in_process = _PROCESS_RUN_LOCK.locked()
+    return {
+        **metadata,
+        "Exists": os.path.exists(RUN_LOCK_FILE),
+        "Active": bool(active_in_process or (pid_alive and metadata_pid != os.getpid())),
+        "Age_Seconds": age_seconds,
+    }
+
+
+def clear_stale_run_lock():
+    """只清理没有实际持锁者的遗留文件；不会强拆正在运行的任务。"""
+    if _PROCESS_RUN_LOCK.locked():
+        return False, "当前进程确有一个批次仍在运行，不能强拆。"
+    if not os.path.exists(RUN_LOCK_FILE):
+        return True, "当前没有运行锁。"
+    if fcntl is not None:
+        probe = None
+        try:
+            probe = open(RUN_LOCK_FILE, "a+", encoding="utf-8")
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            probe.close()
+            probe = None
+            os.remove(RUN_LOCK_FILE)
+            return True, "失效运行锁已清理。"
+        except (OSError, BlockingIOError):
+            if probe is not None:
+                try:
+                    probe.close()
+                except OSError:
+                    pass
+            return False, "检测到仍被进程持有的真实文件锁，不能强拆。"
+    metadata = _read_run_lock_metadata()
+    try:
+        metadata_pid = int(metadata.get("PID"))
+    except (TypeError, ValueError):
+        metadata_pid = -1
+    if _pid_is_alive(metadata_pid) and metadata_pid != os.getpid():
+        return False, "记录中的后台进程仍存活，不能强拆。"
+    try:
+        os.remove(RUN_LOCK_FILE)
+        return True, "失效运行锁已清理。"
+    except OSError as exc:
+        return False, f"清理失败：{exc}"
+
+
+def release_run_lock(owner_id: str | None = None):
+    global _RUN_LOCK_HANDLE, _RUN_LOCK_OWNER, _RUN_LOCK_FALLBACK_ACTIVE
+    if owner_id is not None and _RUN_LOCK_OWNER != str(owner_id):
+        return
+    owned = _RUN_LOCK_OWNER is not None
     try:
         if _RUN_LOCK_HANDLE is not None:
             if fcntl is not None:
                 fcntl.flock(_RUN_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
             _RUN_LOCK_HANDLE.close()
             _RUN_LOCK_HANDLE = None
-            return
-        if fcntl is None and os.path.exists(RUN_LOCK_FILE):
-            os.remove(RUN_LOCK_FILE)
+        elif _RUN_LOCK_FALLBACK_ACTIVE and os.path.exists(RUN_LOCK_FILE):
+            metadata = _read_run_lock_metadata()
+            if metadata.get("Owner_ID") == _RUN_LOCK_OWNER:
+                os.remove(RUN_LOCK_FILE)
     except OSError:
         pass
+    finally:
+        _RUN_LOCK_OWNER = None
+        _RUN_LOCK_FALLBACK_ACTIVE = False
+        if owned and _PROCESS_RUN_LOCK.locked():
+            try:
+                _PROCESS_RUN_LOCK.release()
+            except RuntimeError:
+                pass
 
 
 # -----------------------------------------------------------------------------
@@ -391,7 +569,11 @@ def _read_market_partition(path: str, trade_date: str, pool_hash: str):
 
 
 def sync_market_data_incrementally(
-    start_date: str, end_date: str, token: str, whitelist_set: set[str]
+    start_date: str,
+    end_date: str,
+    token: str,
+    whitelist_set: set[str],
+    heartbeat=None,
 ):
     token_c = clean_token_str(token)
     ts.set_token(token_c)
@@ -424,6 +606,8 @@ def sync_market_data_incrementally(
     if missing_dates:
         progress = st.progress(0, text=f"从断点补充{len(missing_dates)}个交易日行情……")
         for idx, trade_date in enumerate(missing_dates):
+            if heartbeat is not None:
+                heartbeat()
             daily_all = safe_tushare_call(pro.daily, trade_date=trade_date)
             adj_all = safe_tushare_call(pro.adj_factor, trade_date=trade_date)
             basic_all = safe_tushare_call(
@@ -465,6 +649,8 @@ def sync_market_data_incrementally(
                     (idx + 1) / len(missing_dates),
                     text=f"行情同步 {idx + 1}/{len(missing_dates)}：{trade_date}",
                 )
+                if heartbeat is not None:
+                    heartbeat()
             time.sleep(0.12)
         progress.empty()
     return valid_dates, cache_dir, pool_hash, failed_dates
@@ -542,11 +728,11 @@ def _build_market_index_from_partitions(
 
 
 def load_optimized_market_data(
-    start_date: str, end_date: str, token: str, whitelist_keys
+    start_date: str, end_date: str, token: str, whitelist_keys, heartbeat=None
 ):
     whitelist_set = set(whitelist_keys)
     valid_dates, cache_dir, pool_hash, failed_dates = sync_market_data_incrementally(
-        start_date, end_date, token, whitelist_set
+        start_date, end_date, token, whitelist_set, heartbeat=heartbeat
     )
     if not valid_dates:
         return {}, pd.DataFrame(), [], [], failed_dates
@@ -1710,6 +1896,7 @@ def main():
         "本版只检验买入前排序能力：周线第一根红柱是候选标志，趋势、回调、收缩、启动、"
         "相对强度和位置风险共同排序。所有未来收益只用于事后验收。"
     )
+    st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
         "R1不是实盘交易版。只有稳健性验收通过后，才进入W1—W8持仓管理和30万元三仓组合开发。"
     )
@@ -1727,6 +1914,9 @@ def main():
 
     today = datetime.now().date()
     default_start = today - timedelta(days=820)
+    if "r1_session_owner" not in st.session_state:
+        st.session_state["r1_session_owner"] = uuid.uuid4().hex
+    session_owner = str(st.session_state["r1_session_owner"])
     with st.sidebar:
         st.header("研究配置")
         mode = st.radio(
@@ -1762,6 +1952,10 @@ def main():
         st.markdown("---")
         clear_market_clicked = st.button("清空R1行情缓存")
         clear_history_clicked = st.button("清除R1历史结果")
+        clear_stale_lock_clicked = st.button(
+            "修复失效运行锁",
+            help="只清除没有真实后台任务持有的遗留锁，不会强拆正在运行的批次。",
+        )
 
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
@@ -1771,28 +1965,35 @@ def main():
         return
 
     if clear_market_clicked:
-        if acquire_run_lock():
+        if acquire_run_lock(session_owner, "清空行情缓存"):
             try:
                 if os.path.isdir(MARKET_CACHE_ROOT):
                     shutil.rmtree(MARKET_CACHE_ROOT)
                 st.cache_resource.clear()
                 st.success("R1行情缓存已清空。")
             finally:
-                release_run_lock()
+                release_run_lock(session_owner)
         else:
             st.warning("当前有任务正在使用缓存。")
 
     if clear_history_clicked:
-        if acquire_run_lock():
+        if acquire_run_lock(session_owner, "清除历史结果"):
             try:
                 for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
                     remove_with_backup(path)
                 st.session_state.pop("r1_preview", None)
                 st.success("R1历史结果和断点任务已清除。")
             finally:
-                release_run_lock()
+                release_run_lock(session_owner)
         else:
             st.warning("当前有任务正在写入结果。")
+
+    if clear_stale_lock_clicked:
+        cleared, clear_message = clear_stale_run_lock()
+        if cleared:
+            st.success(clear_message)
+        else:
+            st.warning(clear_message)
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
@@ -1838,6 +2039,7 @@ def main():
             task_end = end_input.strftime("%Y%m%d")
             invalidate_recent_ledger_once(config_id, task_start, task_end)
             task = {
+                "Task_ID": uuid.uuid4().hex,
                 "State": "RUNNING",
                 "Config_ID": config_id,
                 "Params": {
@@ -1867,9 +2069,29 @@ def main():
                 active_task["Last_Error"] = "Token为空。"
                 save_task(active_task)
             st.error("Token为空，历史断点已经保留。")
-        elif not acquire_run_lock():
-            st.info("另一个页面正在执行R1任务，本页面不会重复运行。")
         else:
+            lock_purpose = "历史R1验证" if run_history else "最新选股预览"
+            lock_acquired = acquire_run_lock(session_owner, lock_purpose)
+            if not lock_acquired:
+                status = run_lock_status()
+                if not status.get("Active", False):
+                    clear_stale_run_lock()
+                    lock_acquired = acquire_run_lock(session_owner, lock_purpose)
+            if not lock_acquired:
+                status = run_lock_status()
+                age = _safe_float(status.get("Age_Seconds"))
+                age_text = f"，最近心跳{age:.0f}秒前" if math.isfinite(age) else ""
+                st.warning(
+                    "检测到后台确有一个R1批次仍在运行"
+                    f"（进程{status.get('PID', '未知')}{age_text}）。"
+                    "当前页面只读取已保存进度，不会启动第二份下载。"
+                )
+                lock_status_blocked = True
+            else:
+                lock_status_blocked = False
+                touch_run_lock(session_owner)
+
+        if (run_history or run_preview) and token_clean and not locals().get("lock_status_blocked", True):
             try:
                 if run_history:
                     params = active_task["Params"]
@@ -1891,8 +2113,10 @@ def main():
 
                 ts.set_token(token_clean)
                 pro = ts.pro_api(token_clean)
+                touch_run_lock(session_owner)
                 with st.spinner("构建固定科技股研究池……"):
                     whitelist_set, name_map, industry_map = load_custom_tech_whitelist(token_clean)
+                touch_run_lock(session_owner)
                 whitelist_keys = tuple(sorted(whitelist_set))
                 if not whitelist_keys:
                     raise RuntimeError("未取得科技股研究池，请检查Token权限或网络。")
@@ -1901,6 +2125,7 @@ def main():
                 requested_dates, pending_dates, latest_is_completed_week = build_run_dates(
                     pro, run_start, run_end, run_preview, run_config_id
                 )
+                touch_run_lock(session_owner)
                 if run_history:
                     active_task["Total_Weeks"] = len(requested_dates)
                     active_task["Completed_Weeks"] = len(requested_dates) - len(pending_dates)
@@ -1920,8 +2145,13 @@ def main():
                     requested_fetch_end = datetime.strptime(max(requested_dates), "%Y%m%d") + timedelta(days=110)
                     fetch_end = min(requested_fetch_end.date(), today).strftime("%Y%m%d")
                     stocks, basic_indexed, market_dates, loaded_dates, failed_dates = load_optimized_market_data(
-                        fetch_start, fetch_end, token_clean, whitelist_keys
+                        fetch_start,
+                        fetch_end,
+                        token_clean,
+                        whitelist_keys,
+                        heartbeat=lambda: touch_run_lock(session_owner),
                     )
+                    touch_run_lock(session_owner)
                     if not stocks:
                         raise RuntimeError("未加载到行情；已成功下载的分片仍然保留。")
                     if failed_dates:
@@ -1933,6 +2163,7 @@ def main():
                     progress = st.progress(0, text="开始扫描第一根红柱候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
+                        touch_run_lock(session_owner)
                         if run_history and read_json_safe(RUN_TASK_FILE).get("State") == "STOPPED":
                             stopped_during_batch = True
                             break
@@ -1987,6 +2218,7 @@ def main():
                                 f"趋势延续候选{eligible_count}只，入选{selected_count}只"
                             ),
                         )
+                        touch_run_lock(session_owner)
                     progress.empty()
 
                     if run_preview:
@@ -2018,7 +2250,7 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
             finally:
-                release_run_lock()
+                release_run_lock(session_owner)
 
     preview = st.session_state.get("r1_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
