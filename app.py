@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 底部脱离系统 (V14.6 V40确认审计版)
+周线 SKDJ 底部脱离系统 (V14.7 持仓确认审计版)
 ------------------------------------------------
-1. 【主框架不动】：V14.5 的 SKDJ 买点、原评分、T+1买入与退出规则保持不变。
-2. 【市值分层】：候选池仍从50亿起步；主结果优先100亿以上，不足Top N时由50~100亿补位。
-3. 【V40确认层】：日线趋势、突破、MACD、量价和过热度只做诊断，并仅在V14.5同分时辅助排序。
-4. 【三组并测】：同时保存原版50亿、硬100亿、分层补位三组结果，避免凭感觉修改门槛。
-5. 【持仓审计】：记录买入后第3日和第5日的日线确认状态，但本版不据此改变卖出规则。
+1. 【主框架冻结】：V14.5 的50亿股票池、SKDJ买点、原评分、T+1买入与退出规则保持不变。
+2. 【排序回归原版】：市值和V40均不参与入选日排序，彻底取消100亿优先。
+3. 【双口径研究】：实盘主结果固定Top 3，同时保留原版Top 5排名研究及1/2/5组合对照。
+4. 【持仓确认】：记录买入后第3日和第5日确认分，0分单列为F级候选，1分不再误标失败。
+5. 【可执行审计】：记录D3收盘/D4开盘、D5收盘/D6开盘及退出后潜在最高收益，但不自动卖出。
 ------------------------------------------------
 """
 
@@ -36,17 +36,17 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 全局持久化缓存配置
 # ---------------------------
-CHECKPOINT_FILE = "skdj_v14_6_confirm_audit_checkpoint.csv"
-PROCESSED_DATES_FILE = "skdj_v14_6_confirm_audit_processed_dates.csv"
+CHECKPOINT_FILE = "skdj_v14_7_holding_confirm_checkpoint.csv"
+PROCESSED_DATES_FILE = "skdj_v14_7_holding_confirm_processed_dates.csv"
 MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 MARKET_CACHE_DIR = "skdj_market_data_daily_cache"
 
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ V14.6 V40确认审计版", layout="wide")
-st.title("🔬 周线 SKDJ 底部脱离系统 (V14.6 V40确认审计版)")
-st.markdown("🔒 **V14.5主信号不变 · 100亿优先/50亿补位 · V40只做确认与同分排序**")
+st.set_page_config(page_title="SKDJ V14.7 持仓确认审计版", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.7 持仓确认审计版)")
+st.markdown("🔒 **V14.5原版排序 · Top3实盘/Top5研究 · V40只用于买入后D3/D5确认**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -624,14 +624,16 @@ def compute_v40_daily_diagnostics(ts_code, end_date, stock_qfq_dict):
 
     # 五项均为等权诊断；过热单独标记，不用主观权重覆盖V14.5评分。
     confirm_score = int(sum((breakout10, trend_ok, macd_ok, volume_ok, candle_ok)))
-    if confirm_score >= 4 and not overheat:
-        state = '已确认'
-    elif confirm_score <= 1:
-        state = '确认偏弱'
+    if confirm_score == 0:
+        state = '0分-F级候选'
+    elif confirm_score == 1:
+        state = '1分-弱观察'
+    elif confirm_score == 2:
+        state = '2分-中性'
+    elif overheat:
+        state = '3~5分-确认但过热'
     else:
-        state = '中性等待'
-    if overheat and state == '已确认':
-        state = '确认但过热'
+        state = '3~5分-已确认'
 
     default_res.update({
         'V40_Confirm_Score': confirm_score,
@@ -656,54 +658,33 @@ def compute_v40_daily_diagnostics(ts_code, end_date, stock_qfq_dict):
     return default_res
 
 
-def _sort_v14_then_v40(df_in):
-    """V14.5总分始终优先；V40只打破同分。"""
-    if df_in.empty:
-        return df_in.copy()
-    df = df_in.copy()
-    for col in ('Total_Score', 'V40_Confirm_Score', 'circ_mv'):
-        if col not in df.columns:
-            df[col] = np.nan
-    return df.sort_values(
-        ['Total_Score', 'V40_Confirm_Score', 'circ_mv', 'ts_code'],
-        ascending=[False, False, False, True],
-        kind='mergesort',
-        na_position='last',
-    )
-
-
-def build_selection_groups(candidate_df, top_n, priority_mv=100.0, base_mv=50.0):
-    """生成原版50亿、硬100亿、100亿优先/50亿补位及全候选审计四组。"""
+def build_research_groups(candidate_df, portfolio_slots=3, research_top_n=5):
+    """原版排序不动，同时生成Top3、1/2/5组合、Top5研究和全候选审计。"""
     if candidate_df.empty:
         return pd.DataFrame()
 
-    top_n = max(int(top_n), 1)
+    portfolio_slots = max(int(portfolio_slots), 1)
+    research_top_n = max(int(research_top_n), 5, portfolio_slots)
+    # whitelist_keys本来就是按代码排序；显式加入ts_code保证同分结果稳定且可复现。
     base_sorted = candidate_df.sort_values(
-        ['Total_Score'], ascending=[False], kind='mergesort', na_position='last'
-    )
-    hard100_sorted = candidate_df[
-        pd.to_numeric(candidate_df['circ_mv'], errors='coerce') >= float(priority_mv)
-    ].sort_values(['Total_Score'], ascending=[False], kind='mergesort', na_position='last')
+        ['Total_Score', 'ts_code'], ascending=[False, True], kind='mergesort', na_position='last'
+    ).copy()
+    base_sorted['Original_Rank'] = np.arange(1, len(base_sorted) + 1)
+    top123 = base_sorted.head(portfolio_slots)
+    research_top = base_sorted.head(research_top_n)
 
-    mv_numeric = pd.to_numeric(candidate_df['circ_mv'], errors='coerce')
-    priority_pool = _sort_v14_then_v40(candidate_df[mv_numeric >= float(priority_mv)])
-    fallback_pool = _sort_v14_then_v40(candidate_df[mv_numeric < float(priority_mv)])
-    unknown_pool = _sort_v14_then_v40(candidate_df[mv_numeric.isna()])
-    fallback_all = pd.concat([fallback_pool, unknown_pool], ignore_index=False, sort=False)
+    desired_ranks = [1, 2, 5]
+    combo = research_top[research_top['Original_Rank'].isin(desired_ranks)].copy()
+    if len(combo) < portfolio_slots:
+        fallback = research_top[~research_top.index.isin(combo.index)].sort_values('Original_Rank')
+        combo = pd.concat([combo, fallback.head(portfolio_slots - len(combo))], sort=False)
+    combo = combo.head(portfolio_slots)
 
-    layered_parts = [priority_pool.head(top_n)]
-    remaining = top_n - len(layered_parts[0])
-    if remaining > 0:
-        layered_parts.append(fallback_all.head(remaining))
-    layered = pd.concat(layered_parts, ignore_index=False, sort=False)
-
-    priority_label = f"{float(priority_mv):g}亿"
-    base_label = f"{float(base_mv):g}亿"
     group_defs = [
-        ('BASE50', f'原版{base_label}', base_sorted.head(top_n)),
-        ('HARD100', f'硬{priority_label}', hard100_sorted.head(top_n)),
-        ('LAYERED', f'{priority_label}优先/低市值补位', layered),
-        ('AUDIT_ALL', '全候选审计', _sort_v14_then_v40(candidate_df)),
+        ('TOP123', '原版Top1/2/3主结果', top123),
+        ('TOP125', 'Top1/2/5研究组合', combo),
+        ('RESEARCH5', f'原版Top{research_top_n}排名研究', research_top),
+        ('AUDIT_ALL', '全候选审计', base_sorted),
     ]
     frames = []
     for strategy_id, strategy_name, frame in group_defs:
@@ -727,6 +708,13 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         'Exit_Date': None, 'Final_Return (%)': np.nan, 'Hold_Days': 0,
         'Confirm_D3_Score': np.nan, 'Confirm_D3_State': '未到第3日',
         'Confirm_D5_Score': np.nan, 'Confirm_D5_State': '未到第5日',
+        'Return_D3_Close (%)': np.nan, 'Return_D4_Open (%)': np.nan,
+        'Return_D5_Close (%)': np.nan, 'Return_D6_Open (%)': np.nan,
+        'D4_Open_Date': None, 'D6_Open_Date': None,
+        'Max_After_D4_Open (%)': np.nan, 'Max_After_D6_Open (%)': np.nan,
+        'Final_If_D3_Zero_Exit_D4_Open (%)': np.nan,
+        'Final_If_D5_Zero_Exit_D6_Open (%)': np.nan,
+        'D3_Zero_Missed_Max (%)': np.nan, 'D5_Zero_Missed_Max (%)': np.nan,
     })
     
     if ts_code not in stock_qfq_dict: return default_res
@@ -779,6 +767,13 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         current_week = ((day_count - 1) // 5) + 1 
         curr_open, curr_close, curr_high, curr_low = row['open'], row['close'], row['high'], row['low']
         curr_date = hist_future.index[i]
+
+        if day_count == 4:
+            results['Return_D4_Open (%)'] = round((curr_open - buy_price) / buy_price * 100.0, 2)
+            results['D4_Open_Date'] = curr_date
+        elif day_count == 6:
+            results['Return_D6_Open (%)'] = round((curr_open - buy_price) / buy_price * 100.0, 2)
+            results['D6_Open_Date'] = curr_date
         
         if pending_exit_reason is not None and day_count >= 2:
             if "保本" in pending_exit_reason: final_return = 2.0  
@@ -810,6 +805,9 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
             confirm_diag = compute_v40_daily_diagnostics(ts_code, curr_date, stock_qfq_dict)
             results[f'Confirm_D{day_count}_Score'] = confirm_diag.get('V40_Confirm_Score', np.nan)
             results[f'Confirm_D{day_count}_State'] = confirm_diag.get('V40_State', '数据不足')
+            results[f'Return_D{day_count}_Close (%)'] = round(
+                (curr_close - buy_price) / buy_price * 100.0, 2
+            )
         
         if tier == 0 and peak_profit_pct >= 0.10: tier = 1  
         if tier == 1:
@@ -841,6 +839,43 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         results['Final_Return (%)'] = round(final_return, 2)
         results['Exit_Date'] = hist_future.index[max_days - 1]
         results['Hold_Days'] = max_days
+
+    # 反事实审计只观察，不改变原始退出。最高收益统一限制在原12周期持仓窗口内。
+    horizon = hist_future.iloc[:min(max_days, len(hist_future))]
+    if len(horizon) >= 4:
+        if pd.isna(results.get('Return_D4_Open (%)')):
+            d4_row = horizon.iloc[3]
+            results['Return_D4_Open (%)'] = round((d4_row['open'] - buy_price) / buy_price * 100.0, 2)
+            results['D4_Open_Date'] = horizon.index[3]
+        max_after_d4 = (horizon.iloc[3:]['high'].max() - buy_price) / buy_price * 100.0
+        results['Max_After_D4_Open (%)'] = round(max_after_d4, 2)
+    if len(horizon) >= 6:
+        if pd.isna(results.get('Return_D6_Open (%)')):
+            d6_row = horizon.iloc[5]
+            results['Return_D6_Open (%)'] = round((d6_row['open'] - buy_price) / buy_price * 100.0, 2)
+            results['D6_Open_Date'] = horizon.index[5]
+        max_after_d6 = (horizon.iloc[5:]['high'].max() - buy_price) / buy_price * 100.0
+        results['Max_After_D6_Open (%)'] = round(max_after_d6, 2)
+
+    original_final = results.get('Final_Return (%)', np.nan)
+    d3_zero = results.get('Confirm_D3_Score') == 0
+    d5_zero = results.get('Confirm_D5_Score') == 0
+    d4_open_ret = results.get('Return_D4_Open (%)', np.nan)
+    d6_open_ret = results.get('Return_D6_Open (%)', np.nan)
+    results['Final_If_D3_Zero_Exit_D4_Open (%)'] = (
+        d4_open_ret if d3_zero and pd.notna(d4_open_ret) else original_final
+    )
+    results['Final_If_D5_Zero_Exit_D6_Open (%)'] = (
+        d6_open_ret if d5_zero and pd.notna(d6_open_ret) else original_final
+    )
+    if d3_zero and pd.notna(d4_open_ret) and pd.notna(results.get('Max_After_D4_Open (%)')):
+        results['D3_Zero_Missed_Max (%)'] = round(
+            results['Max_After_D4_Open (%)'] - d4_open_ret, 2
+        )
+    if d5_zero and pd.notna(d6_open_ret) and pd.notna(results.get('Max_After_D6_Open (%)')):
+        results['D5_Zero_Missed_Max (%)'] = round(
+            results['Max_After_D6_Open (%)'] - d6_open_ret, 2
+        )
         
     return results
 
@@ -873,7 +908,8 @@ with st.sidebar:
     st.info("💡 **双模引擎说明**：\n将追溯天数设为 **1**，触发【盘中极速选股】(不保存)；设为 **>1**，触发【历史回测】。系统已锁定回测模式仅在周末生效，防止污染。")
     
     BACKTEST_DAYS = st.number_input("追溯交易天数 (设为1为极速选股)", value=1, step=30, min_value=1)
-    MAX_TOP_N = st.number_input("每周目标股票数 (Top N)", value=3, min_value=1, max_value=50, step=1)
+    PORTFOLIO_SLOTS = st.number_input("实盘仓位数", value=3, min_value=1, max_value=5, step=1)
+    RESEARCH_TOP_N = st.number_input("排名研究数量 (至少5名)", value=5, min_value=5, max_value=20, step=1)
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     
     st.markdown("---")
@@ -899,8 +935,7 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     MIN_MV = col1.number_input("扫描最低流通市值(亿)", value=50.0)
     MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
-    PRIORITY_MV = st.number_input("优先流通市值门槛(亿)", value=100.0, min_value=50.0, step=10.0)
-    st.caption("主结果优先选择达到该门槛的股票；不足Top N时由扫描池内较小市值股票补位。")
+    st.caption("流通市值只保留为审计字段，不参与排序。")
     
     st.markdown("---")
     secret_token = st.secrets.get("TUSHARE_TOKEN", "") if hasattr(st, "secrets") else ""
@@ -910,7 +945,7 @@ token_clean = clean_token_str(TS_TOKEN_INPUT)
 is_picking_mode = (int(BACKTEST_DAYS) == 1)
 CURRENT_CONFIG_ID = (
     f"price{float(MIN_PRICE):.2f}_mv{float(MIN_MV):.2f}"
-    f"_priority{float(PRIORITY_MV):.2f}_max{float(MAX_MV):.2f}_top{int(MAX_TOP_N)}"
+    f"_max{float(MAX_MV):.2f}_slots{int(PORTFOLIO_SLOTS)}_research{int(RESEARCH_TOP_N)}"
 )
 
 # ---------------------------
@@ -1031,10 +1066,14 @@ if st.button(btn_label):
                                         v40_diag = compute_v40_daily_diagnostics(ts_code, date, stock_qfq_dict)
                                         if pd.isna(circ_mv_billion):
                                             cap_tier = "市值未知"
-                                        elif circ_mv_billion >= float(PRIORITY_MV):
-                                            cap_tier = f"≥{float(PRIORITY_MV):g}亿"
+                                        elif circ_mv_billion < 100.0:
+                                            cap_tier = "50~100亿"
+                                        elif circ_mv_billion < 200.0:
+                                            cap_tier = "100~200亿"
+                                        elif circ_mv_billion < 500.0:
+                                            cap_tier = "200~500亿"
                                         else:
-                                            cap_tier = f"{float(MIN_MV):g}~{float(PRIORITY_MV):g}亿"
+                                            cap_tier = "500亿以上"
                                             
                                         stock_name = basic_name_map.get(ts_code, ts_code)
                                         record_dict = {
@@ -1056,22 +1095,21 @@ if st.button(btn_label):
                                             
                                     if records:
                                         candidate_df = pd.DataFrame(records)
-                                        selected_groups = build_selection_groups(
+                                        selected_groups = build_research_groups(
                                             candidate_df,
-                                            top_n=int(MAX_TOP_N),
-                                            priority_mv=float(PRIORITY_MV),
-                                            base_mv=float(MIN_MV),
+                                            portfolio_slots=int(PORTFOLIO_SLOTS),
+                                            research_top_n=int(RESEARCH_TOP_N),
                                         )
                                         selected_groups['Trade_Date'] = date
                                         selected_groups['Config_ID'] = CURRENT_CONFIG_ID
                                         
                                         if is_picking_mode:
-                                            fdf = selected_groups[selected_groups['Strategy_ID'] == 'LAYERED'].copy()
+                                            fdf = selected_groups[selected_groups['Strategy_ID'] == 'TOP123'].copy()
                                             st.subheader(
-                                                f"🎯 主结果 [{date}]：{float(PRIORITY_MV):g}亿优先 / 低市值补位 - Top {MAX_TOP_N}"
+                                                f"🎯 V14.5原版主结果 [{date}] - Top {PORTFOLIO_SLOTS}"
                                             )
                                             main_cols = [
-                                                'Rank', 'name', 'ts_code', 'Total_Score', 'circ_mv', 'Cap_Tier',
+                                                'Original_Rank', 'name', 'ts_code', 'Total_Score', 'circ_mv', 'Cap_Tier',
                                                 'V40_Confirm_Score', 'V40_State', 'Daily_Breakout10',
                                                 'Daily_Trend_OK', 'Daily_MACD_OK', 'Daily_Volume_OK',
                                                 'Daily_Overheat', 'SKDJ_K', 'Weeks_Under',
@@ -1082,12 +1120,10 @@ if st.button(btn_label):
                                             except Exception:
                                                 st.dataframe(fdf[main_cols], width='stretch')
 
-                                            with st.expander(
-                                                f"查看原版{float(MIN_MV):g}亿、硬{float(PRIORITY_MV):g}亿及全部诊断候选"
-                                            ):
-                                                audit_live = selected_groups[selected_groups['Strategy_ID'] != 'LAYERED'].copy()
+                                            with st.expander("查看Top1/2/5组合、Top5排名及全部诊断候选"):
+                                                audit_live = selected_groups[selected_groups['Strategy_ID'] != 'TOP123'].copy()
                                                 audit_cols = [
-                                                    'Strategy_Name', 'Rank', 'name', 'ts_code', 'Total_Score',
+                                                    'Strategy_Name', 'Original_Rank', 'name', 'ts_code', 'Total_Score',
                                                     'circ_mv', 'V40_Confirm_Score', 'V40_State',
                                                     'Daily_Vol_Ratio', 'Daily_Bias20 (%)', 'Daily_Return5 (%)',
                                                 ]
@@ -1110,8 +1146,19 @@ if st.button(btn_label):
             st.error(f"❌ **运行异常拦截**：{str(e)}")
 
 # ---------------------------
-# 全景分析展示区 (仅在有历史记录时展示)
+# 全景分析展示区
 # ---------------------------
+if not is_picking_mode and not os.path.exists(CHECKPOINT_FILE) and os.path.exists(PROCESSED_DATES_FILE):
+    # 所有扫描周均无候选时也给出明确结果，避免误以为回测没有运行。
+    processed_only = _read_csv_safely(PROCESSED_DATES_FILE)
+    if not processed_only.empty and 'Config_ID' in processed_only.columns:
+        processed_only = processed_only[
+            processed_only['Config_ID'].astype(str) == CURRENT_CONFIG_ID
+        ].copy()
+    if not processed_only.empty:
+        completed_count = processed_only['Trade_Date'].astype(str).nunique()
+        st.info(f"当前参数已完成 {completed_count} 个扫描周，但没有出现符合V14.5条件的标的。")
+
 if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
     st.markdown("---")
     try:
@@ -1128,8 +1175,8 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
 
         repaired_res = repair_checkpoint_df(raw_res)
         if 'Strategy_ID' not in repaired_res.columns:
-            repaired_res['Strategy_ID'] = 'LAYERED'
-            repaired_res['Strategy_Name'] = f'{float(PRIORITY_MV):g}亿优先/低市值补位'
+            repaired_res['Strategy_ID'] = 'TOP123'
+            repaired_res['Strategy_Name'] = '原版Top1/2/3主结果'
 
         processed_df = _read_csv_safely(PROCESSED_DATES_FILE)
         if not processed_df.empty and 'Config_ID' in processed_df.columns:
@@ -1143,21 +1190,23 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
 
         is_rejected = repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)
         valid_all = repaired_res[~is_rejected].copy()
-        selection_ids = ['BASE50', 'HARD100', 'LAYERED']
+        selection_ids = ['TOP123', 'TOP125', 'RESEARCH5']
         selected_raw = repaired_res[repaired_res['Strategy_ID'].isin(selection_ids)].copy()
         selected_valid = valid_all[valid_all['Strategy_ID'].isin(selection_ids)].copy()
         audit_valid = valid_all[valid_all['Strategy_ID'] == 'AUDIT_ALL'].copy()
-        main_signals = selected_valid[selected_valid['Strategy_ID'] == 'LAYERED'].copy()
+        main_signals = selected_valid[selected_valid['Strategy_ID'] == 'TOP123'].copy()
+        combo_signals = selected_valid[selected_valid['Strategy_ID'] == 'TOP125'].copy()
+        research_signals = selected_valid[selected_valid['Strategy_ID'] == 'RESEARCH5'].copy()
 
-        st.header("📈 V14.6 市值分层与V40确认审计报告")
-        st.caption("三组使用完全相同的V14.5买点和退出规则；V40只参与分层组的同分排序。")
+        st.header("📈 V14.7 原版排名与持仓确认审计报告")
+        st.caption("V14.5入场和原评分完全不变；V40与市值不参与买入排序，D3/D5退出仅作反事实审计。")
 
-        st.subheader("⚖️ 原版50亿 / 硬100亿 / 分层补位对比")
+        st.subheader("⚖️ 原版Top1/2/3、Top1/2/5与Top5研究口径")
         strategy_rows = []
         strategy_names = {
-            'BASE50': f'原版{float(MIN_MV):g}亿',
-            'HARD100': f'硬{float(PRIORITY_MV):g}亿',
-            'LAYERED': f'{float(PRIORITY_MV):g}亿优先/低市值补位',
+            'TOP123': '原版Top1/2/3主结果',
+            'TOP125': 'Top1/2/5研究组合',
+            'RESEARCH5': f'原版Top{int(RESEARCH_TOP_N)}排名研究',
         }
         for strategy_id in selection_ids:
             raw_group = selected_raw[selected_raw['Strategy_ID'] == strategy_id]
@@ -1169,7 +1218,8 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
             closed_group = closed_group.dropna(subset=['Final_Return (%)'])
 
             date_counts = raw_group.groupby('Trade_Date').size() if not raw_group.empty else pd.Series(dtype=float)
-            underfilled = sum(int(date_counts.get(d, 0)) < int(MAX_TOP_N) for d in completed_dates)
+            target_count = int(RESEARCH_TOP_N) if strategy_id == 'RESEARCH5' else int(PORTFOLIO_SLOTS)
+            underfilled = sum(int(date_counts.get(d, 0)) < target_count for d in completed_dates)
             no_pick = sum(int(date_counts.get(d, 0)) == 0 for d in completed_dates)
 
             strategy_rows.append({
@@ -1177,7 +1227,7 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
                 '已完成扫描周': total_completed_weeks,
                 '有入选周': int(raw_group['Trade_Date'].nunique()) if not raw_group.empty else 0,
                 '空窗周': no_pick,
-                f'不足{int(MAX_TOP_N)}只周': underfilled,
+                '选不满目标周': underfilled,
                 '入选笔数': len(raw_group),
                 '完成交易': len(closed_group),
                 '胜率': (closed_group['Final_Return (%)'] > 0).mean() * 100 if not closed_group.empty else np.nan,
@@ -1197,12 +1247,12 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
             if not main_closed.empty:
                 win_count = int((main_closed['Final_Return (%)'] > 0).sum())
                 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                col_m1.metric("分层组完成交易", f"{len(main_closed)} 笔")
-                col_m2.metric("分层组胜率", f"{win_count / len(main_closed) * 100:.1f}%", f"{win_count}胜")
-                col_m3.metric("分层组平均收益", f"{main_closed['Final_Return (%)'].mean():.2f}%")
-                col_m4.metric("分层组中位数", f"{main_closed['Final_Return (%)'].median():.2f}%")
+                col_m1.metric("原版Top3完成交易", f"{len(main_closed)} 笔")
+                col_m2.metric("原版Top3胜率", f"{win_count / len(main_closed) * 100:.1f}%", f"{win_count}胜")
+                col_m3.metric("原版Top3平均收益", f"{main_closed['Final_Return (%)'].mean():.2f}%")
+                col_m4.metric("原版Top3中位数", f"{main_closed['Final_Return (%)'].median():.2f}%")
 
-                st.subheader("🗓️ 分层主结果周度表现（仍为存活样本口径）")
+                st.subheader("🗓️ 原版Top3周度表现（仍为存活样本口径）")
                 cols_row1 = st.columns(4)
                 cols_row2 = st.columns(4)
                 cols_row3 = st.columns(4)
@@ -1226,25 +1276,32 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
                                     f"{week_values.mean():.2f}% / {(week_values > 0).mean() * 100:.1f}%",
                                 )
 
-                st.subheader("🏆 分层主结果的名次表现")
-                rank_stats = main_closed.groupby('Rank', observed=False).agg(
-                    样本数=('Final_Return (%)', 'count'),
-                    平均分=('Total_Score', 'mean'),
-                    平均确认分=('V40_Confirm_Score', 'mean'),
-                    胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
-                    均益=('Final_Return (%)', 'mean'),
-                    中位数=('Final_Return (%)', 'median'),
-                    止损率=('Exit_Reason', lambda x: x.astype(str).str.contains('破-10%').mean() * 100),
-                ).reset_index().head(10)
-                for col in ('胜率', '均益', '中位数', '止损率'):
-                    rank_stats[col] = rank_stats[col].map('{:.2f}%'.format)
-                st.dataframe(rank_stats, width='stretch', hide_index=True)
+        research_closed = research_signals[
+            research_signals['Exit_Reason'].astype(str) != '持仓中'
+        ].copy()
+        research_closed['Final_Return (%)'] = pd.to_numeric(
+            research_closed['Final_Return (%)'], errors='coerce'
+        )
+        research_closed = research_closed.dropna(subset=['Final_Return (%)'])
+        if not research_closed.empty:
+            st.subheader(f"🏆 原版前{int(RESEARCH_TOP_N)}名逐名表现")
+            rank_stats = research_closed.groupby('Original_Rank', observed=False).agg(
+                样本数=('Final_Return (%)', 'count'),
+                平均分=('Total_Score', 'mean'),
+                胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                均益=('Final_Return (%)', 'mean'),
+                中位数=('Final_Return (%)', 'median'),
+                止损率=('Exit_Reason', lambda x: x.astype(str).str.contains('破-10%').mean() * 100),
+            ).reset_index().head(int(RESEARCH_TOP_N))
+            for col in ('胜率', '均益', '中位数', '止损率'):
+                rank_stats[col] = rank_stats[col].map('{:.2f}%'.format)
+            st.dataframe(rank_stats, width='stretch', hide_index=True)
 
         audit_closed = audit_valid[audit_valid['Exit_Reason'].astype(str) != '持仓中'].copy()
         audit_closed['Final_Return (%)'] = pd.to_numeric(audit_closed['Final_Return (%)'], errors='coerce')
         audit_closed = audit_closed.dropna(subset=['Final_Return (%)'])
         if not audit_closed.empty:
-            st.subheader("🔎 全候选诊断：市值层与入选日V40状态")
+            st.subheader("🔎 全候选旁证：市值层与入选日V40状态（均不参与排序）")
             diag_col1, diag_col2 = st.columns(2)
             cap_stats = audit_closed.groupby('Cap_Tier', observed=False).agg(
                 样本数=('Final_Return (%)', 'count'),
@@ -1268,34 +1325,71 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
                 st.markdown("**入选日V40确认状态**")
                 st.dataframe(state_stats, width='stretch', hide_index=True)
 
-            st.subheader("🧭 买入后第3日 / 第5日确认状态（本版仅观察，不触发卖出）")
+        if not main_signals.empty and not main_closed.empty:
+            st.subheader("🧭 原版Top3买入后第3日 / 第5日确认分")
             hold_cols = st.columns(2)
             for idx, day in enumerate((3, 5)):
-                state_col = f'Confirm_D{day}_State'
-                if state_col not in audit_closed.columns:
+                score_col = f'Confirm_D{day}_Score'
+                if score_col not in main_closed.columns:
                     continue
-                reached = audit_closed[
-                    ~audit_closed[state_col].astype(str).isin([f'未到第{day}日', '数据不足', 'nan'])
-                ].copy()
+                reached = main_closed[main_closed[score_col].notna()].copy()
                 if reached.empty:
                     continue
-                hold_stats = reached.groupby(state_col, observed=False).agg(
+                hold_stats = reached.groupby(score_col, observed=False).agg(
                     样本数=('Final_Return (%)', 'count'),
                     胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
                     均益=('Final_Return (%)', 'mean'),
                     中位数=('Final_Return (%)', 'median'),
-                ).reset_index().rename(columns={state_col: '确认状态'})
+                ).reset_index().rename(columns={score_col: '确认分'})
                 for col in ('胜率', '均益', '中位数'):
                     hold_stats[col] = hold_stats[col].map('{:.2f}%'.format)
                 with hold_cols[idx]:
                     st.markdown(f"**第{day}个交易日（到达样本{len(reached)}只）**")
                     st.dataframe(hold_stats, width='stretch', hide_index=True)
 
+            st.subheader("🧪 确认分0的真实次日开盘退出反事实")
+            counterfactual_rows = []
+            counterfactual_defs = [
+                ('保持原规则', 'Final_Return (%)', None, None),
+                ('D3为0→D4开盘退出', 'Final_If_D3_Zero_Exit_D4_Open (%)', 'Confirm_D3_Score', 'Max_After_D4_Open (%)'),
+                ('D5为0→D6开盘退出', 'Final_If_D5_Zero_Exit_D6_Open (%)', 'Confirm_D5_Score', 'Max_After_D6_Open (%)'),
+            ]
+            for label, return_col, score_col, max_col in counterfactual_defs:
+                values = pd.to_numeric(main_closed.get(return_col), errors='coerce')
+                valid_values = values.dropna()
+                affected = int((main_closed[score_col] == 0).sum()) if score_col else 0
+                missed_20 = 0
+                avg_missed_max = np.nan
+                if score_col and max_col in main_closed.columns:
+                    affected_rows = main_closed[main_closed[score_col] == 0].copy()
+                    max_values = pd.to_numeric(affected_rows[max_col], errors='coerce')
+                    missed_20 = int((max_values >= 20.0).sum())
+                    avg_missed_max = max_values.mean()
+                counterfactual_rows.append({
+                    '方案': label,
+                    '有效样本': len(valid_values),
+                    '触发退出': affected,
+                    '平均收益': valid_values.mean() if not valid_values.empty else np.nan,
+                    '中位数': valid_values.median() if not valid_values.empty else np.nan,
+                    '胜率': (valid_values > 0).mean() * 100 if not valid_values.empty else np.nan,
+                    '触发后仍曾达到20%': missed_20,
+                    '触发样本后续最高收益均值': avg_missed_max,
+                })
+            counterfactual_stats = pd.DataFrame(counterfactual_rows)
+            for col in ('平均收益', '中位数', '胜率', '触发样本后续最高收益均值'):
+                counterfactual_stats[col] = counterfactual_stats[col].map(
+                    lambda x: f"{x:.2f}%" if pd.notna(x) else "-"
+                )
+            st.dataframe(counterfactual_stats, width='stretch', hide_index=True)
+            st.caption("反事实采用D3收盘后D4开盘、D5收盘后D6开盘，尚未计入额外交易成本；主交易结果未被改变。")
+
         if not main_signals.empty:
-            st.subheader("📋 分层主结果交割流水单")
+            st.subheader("📋 原版Top3主结果交割流水单")
             disp_cols = [
-                'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'circ_mv', 'Cap_Tier',
+                'Trade_Date', 'name', 'ts_code', 'Original_Rank', 'Total_Score', 'circ_mv', 'Cap_Tier',
                 'V40_Confirm_Score', 'V40_State', 'Confirm_D3_State', 'Confirm_D5_State',
+                'Return_D3_Close (%)', 'Return_D4_Open (%)',
+                'Return_D5_Close (%)', 'Return_D6_Open (%)',
                 'SKDJ_K', 'D_Min(10W)', 'Weeks_Under', 'Signal_Close', 'Buy_Price',
                 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)',
             ]
@@ -1311,7 +1405,7 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
                 return ''
 
             display_main = main_signals[final_disp].sort_values(
-                ['Trade_Date', 'Rank'], ascending=[False, True], kind='mergesort'
+                ['Trade_Date', 'Original_Rank'], ascending=[False, True], kind='mergesort'
             )
             try:
                 styled_port = display_main.style
@@ -1323,12 +1417,12 @@ if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
 
         csv_data = repaired_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            label="📥 导出三方案与全部诊断流水单 (CSV)",
+            label="📥 导出Top3/Top5与D3/D5确认审计流水单 (CSV)",
             data=csv_data,
-            file_name="skdj_v14_6_v40_confirm_audit_export.csv",
+            file_name="skdj_v14_7_holding_confirmation_audit_export.csv",
             mime="text/csv",
             on_click="ignore",
-            key="download_v14_6_confirm_audit",
+            key="download_v14_7_holding_confirm_audit",
         )
     except pd.errors.EmptyDataError:
         st.info("🕒 当前暂无满足条件的回测记录。")
