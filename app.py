@@ -1,1673 +1,1336 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.6 实战定型版 (四大神盾)
+周线 SKDJ 底部脱离系统 (V14.6 V40确认审计版)
 ------------------------------------------------
-核心改进 (基于数据复盘后的终极定型):
-1. [硬门槛 1：盘子基座] 侧边栏默认流通市值设为 50 亿；具体门槛仍由侧边栏参数控制。
-2. [硬门槛 2：温和爆破] 突破量比上限严格锁定在 3.0倍 (1.3 <= vol <= 3.0)，绞杀“天量见天价”的分歧坑。
-3. [硬门槛 3：开盘定生死] 在 T+1 买入引擎中加入集合竞价拦截器。若高开>5%或低开<-3%，直接放弃买入，剔除该标的！
-4. [废除主观加分] 尊重客观数据，剔除原有的“洗盘2-3次加分”逻辑，所有分数纯靠量价真实动能。
-------------------------------------------------
-稳定性修复（不改变任何选股、排序、买入、卖出和收益计算规则）:
-1. 行情、复权和市值数据按交易日原子分片保存；中断后只补缺失日期。
-2. 结果、扫描账本和任务状态原子保存；页面刷新或网络重连后从断点续跑。
-3. 无标的日期同样记入扫描账本；重跑某日时覆盖旧快照，不重复追加。
-4. 历史回测在一次进程中连续运行，避免每5日重载全部行情；真实中断后再从下一日恢复。
-5. 扫描前校验完整历史覆盖；数据不足只记为未完成，不再误报“无标的”。
+1. 【主框架不动】：V14.5 的 SKDJ 买点、原评分、T+1买入与退出规则保持不变。
+2. 【市值分层】：候选池仍从50亿起步；主结果优先100亿以上，不足Top N时由50~100亿补位。
+3. 【V40确认层】：日线趋势、突破、MACD、量价和过热度只做诊断，并仅在V14.5同分时辅助排序。
+4. 【三组并测】：同时保存原版50亿、硬100亿、分层补位三组结果，避免凭感觉修改门槛。
+5. 【持仓审计】：记录买入后第3日和第5日的日线确认状态，但本版不据此改变卖出规则。
 ------------------------------------------------
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
 import time
 import os
-import pickle
-import shutil
-import tempfile
-import hashlib
-import json
 import re
+import pickle
+import gzip
+import tempfile
+import shutil
+import gc
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "V40.6-S3"
-RUNTIME_SCHEMA_VERSION = "stable-runtime-s3"
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-LEGACY_CACHE_BASENAME = "market_data_cache_v40_6.pkl"
-MARKET_CACHE_ROOT = os.path.join(APP_DIR, "market_data_cache_v40_6_stable")
-CHECKPOINT_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_history.csv")
-SCAN_LEDGER_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_scanned_dates.csv")
-RUN_TASK_FILE = os.path.join(APP_DIR, "backtest_v40_6_stable_running_task.json")
-TUSHARE_REQUEST_TIMEOUT_SECONDS = 20
-MIN_SIGNAL_HISTORY_DAYS = 140
+# ---------------------------
+# 全局持久化缓存配置
+# ---------------------------
+CHECKPOINT_FILE = "skdj_v14_6_confirm_audit_checkpoint.csv"
+PROCESSED_DATES_FILE = "skdj_v14_6_confirm_audit_processed_dates.csv"
+MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
+MARKET_CACHE_DIR = "skdj_market_data_daily_cache"
 
 # ---------------------------
-# 全局变量与探针
+# 页面基础配置
 # ---------------------------
-pro = None 
-GLOBAL_ADJ_FACTOR = pd.DataFrame() 
-GLOBAL_DAILY_RAW = pd.DataFrame() 
-GLOBAL_DAILY_BASIC = pd.DataFrame()
-GLOBAL_QFQ_BASE_FACTORS = {} 
-GLOBAL_STOCK_INDUSTRY = {} 
-GLOBAL_STOCK_BASIC = pd.DataFrame()
-SINA_STATUS = {'success': 0, 'fail': 0} 
-API_ERRORS = []
+st.set_page_config(page_title="SKDJ V14.6 V40确认审计版", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.6 V40确认审计版)")
+st.markdown("🔒 **V14.5主信号不变 · 100亿优先/50亿补位 · V40只做确认与同分排序**")
 
 # ---------------------------
-# 页面设置
+# Token 清洗与安全请求模块
 # ---------------------------
-st.set_page_config(page_title="选股王 V40.6-S3 稳定高效版", layout="wide")
-st.title("选股王 V40.6：箱体首发 + 四大神盾")
-st.caption("V40.6-S3 仅修复缓存、断点续跑、数据完整性和运行效率；选股与买卖规则保持不变。")
-
-# ---------------------------
-# 新浪实时行情引擎
-# ---------------------------
-def get_sina_realtime_kline(ts_code):
-    global SINA_STATUS
-    code_split = ts_code.split('.')
-    if len(code_split) != 2: return None
-    sina_code = code_split[1].lower() + code_split[0]
-    
-    url = f"http://hq.sinajs.cn/list={sina_code}"
-    headers = {'Referer': 'https://finance.sina.com.cn'}
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        response.encoding = 'gbk'
-        data_str = response.text.split('="')[1].split('";')[0]
-        if not data_str: 
-            SINA_STATUS['fail'] += 1
-            return None
-        data_list = data_str.split(',')
-        
-        SINA_STATUS['success'] += 1
-        return {
-            'trade_date_str': datetime.now().strftime('%Y%m%d'),
-            'open': float(data_list[1]),
-            'pre_close': float(data_list[2]),
-            'close': float(data_list[3]),
-            'high': float(data_list[4]),
-            'low': float(data_list[5]),
-            'vol': (float(data_list[8]) / 100) * (240 / 225) 
-        }
-    except Exception:
-        SINA_STATUS['fail'] += 1
-        return None
-
-# ---------------------------
-# 基础 API 函数
-# ---------------------------
-def clean_token_str(raw_token):
-    if not raw_token:
-        return ""
+def clean_token_str(raw_token: str) -> str:
+    if not raw_token: return ""
     return re.sub(r'[\s\u3000\ufeff\xa0\r\n]+', '', str(raw_token)).strip()
 
-
-def record_api_error(message):
-    if len(API_ERRORS) < 300:
-        API_ERRORS.append(str(message))
-
-
-def safe_get(func_name, required=False, max_retries=3, sleep_time=0.8, **kwargs):
-    """失败结果不进入Streamlit缓存，避免一次空返回把当天锁死12小时。"""
-    global pro
-    if pro is None:
-        message = f"{func_name}: Tushare尚未初始化"
-        record_api_error(message)
-        if required:
-            raise RuntimeError(message)
-        return pd.DataFrame()
+def verify_token_connection(token_str: str):
+    if not token_str:
+        return False, "Token 为空，请在侧边栏填入 Token。"
     try:
-        func = getattr(pro, func_name)
-    except Exception as exc:
-        message = f"当前Tushare SDK不支持接口 {func_name}: {exc}"
-        record_api_error(message)
-        if required:
-            raise RuntimeError(message) from exc
-        return pd.DataFrame()
+        ts.set_token(token_str)
+        pro = ts.pro_api(token_str)
+        test_df = pro.trade_cal(exchange='SSE', start_date='20260801', end_date='20260805')
+        if test_df is not None and not test_df.empty:
+            return True, "验证通过"
+        return False, "Token 校验未返回数据，请检查网络连接。"
+    except Exception as e:
+        err_msg = str(e)
+        if "token不对" in err_msg or "-40001" in err_msg:
+            return False, "您的 Token 不正确，请检查复制内容。"
+        return False, f"接口校验失败: {err_msg}"
 
-    last_error = None
+def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
     for attempt in range(max_retries):
         try:
             df = func(**kwargs)
             if df is not None and not df.empty:
                 return df
-            last_error = RuntimeError("接口返回空数据")
-        except Exception as exc:
-            last_error = exc
-        time.sleep(sleep_time * (attempt + 1))
-
-    message = f"{func_name}({kwargs})失败: {last_error}"
-    record_api_error(message)
-    if required:
-        raise RuntimeError(message) from last_error
+            time.sleep(sleep_time)
+        except Exception:
+            time.sleep(sleep_time * (attempt + 1))
     return pd.DataFrame()
 
 
-def verify_token_connection(token_str):
-    if not token_str:
-        return False, "Token为空，请填写Tushare Token。"
-    try:
-        ts.set_token(token_str)
-        test_pro = ts.pro_api(token_str)
-        setattr(test_pro, "_DataApi__timeout", TUSHARE_REQUEST_TIMEOUT_SECONDS)
-        end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
-        test_df = test_pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date)
-        if test_df is not None and not test_df.empty:
-            return True, "验证通过"
-        return False, "Token校验未返回数据，请检查网络连接。"
-    except Exception as exc:
-        message = str(exc)
-        if "token不对" in message or "-40001" in message:
-            return False, "Token不正确，请检查复制内容。"
-        return False, f"接口校验失败: {message}"
-
-
-def parse_yyyymmdd(value):
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return None
-    text = re.sub(r"\.0$", "", str(value)).replace("-", "")
-    return text if re.fullmatch(r"\d{8}", text) else None
-
-
-def atomic_write_csv(df, path):
-    """先写临时文件再原子替换，并保留上一份可恢复备份。"""
-    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+def _atomic_replace_bytes(write_callback, target_path):
+    target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
     os.makedirs(target_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=os.path.basename(target_path) + ".", suffix=".tmp", dir=target_dir
+    )
     os.close(fd)
     try:
-        df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
-        with open(tmp_path, "rb") as file_obj:
-            os.fsync(file_obj.fileno())
-        if os.path.exists(path):
-            try:
-                shutil.copy2(path, path + ".bak")
-            except OSError:
-                pass
-        elif os.path.exists(path + ".bak"):
-            os.remove(path + ".bak")
-        os.replace(tmp_path, path)
+        write_callback(temp_path)
+        os.replace(temp_path, target_path)
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
-def read_csv_safe(path):
-    for candidate in (path, path + ".bak"):
+def _atomic_write_csv(dataframe, target_path):
+    def writer(temp_path):
+        dataframe.to_csv(temp_path, index=False, encoding="utf-8-sig")
+        with open(temp_path, "rb") as file_obj:
+            os.fsync(file_obj.fileno())
+
+    if os.path.exists(target_path):
+        try:
+            shutil.copy2(target_path, target_path + ".bak")
+        except OSError:
+            pass
+    _atomic_replace_bytes(writer, target_path)
+
+
+def _read_csv_safely(target_path):
+    if not os.path.exists(target_path):
+        return pd.DataFrame()
+    for candidate in (target_path, target_path + ".bak"):
         if not os.path.exists(candidate):
             continue
         try:
             return pd.read_csv(candidate, encoding="utf-8-sig", low_memory=False)
-        except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError, OSError):
+        except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError):
             continue
     return pd.DataFrame()
 
 
-def atomic_write_json(value, path):
-    target_dir = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(target_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir)
-    os.close(fd)
+@contextmanager
+def _checkpoint_lock():
+    """只锁定数秒钟的结果提交，不锁下载、计算或页面会话。"""
+    lock_path = CHECKPOINT_FILE + ".lock"
+    handle = open(lock_path, "a+", encoding="utf-8")
     try:
-        with open(tmp_path, "w", encoding="utf-8") as file_obj:
-            json.dump(value, file_obj, ensure_ascii=False, indent=2)
-            file_obj.flush()
-            os.fsync(file_obj.fileno())
-        if os.path.exists(path):
-            try:
-                shutil.copy2(path, path + ".bak")
-            except OSError:
-                pass
-        elif os.path.exists(path + ".bak"):
-            os.remove(path + ".bak")
-        os.replace(tmp_path, path)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
-def read_json_safe(path):
-    for candidate in (path, path + ".bak"):
-        if not os.path.exists(candidate):
-            continue
-        try:
-            with open(candidate, "r", encoding="utf-8") as file_obj:
-                value = json.load(file_obj)
-            if isinstance(value, dict):
-                return value
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-    return {}
+def _commit_scan_date(new_rows, trade_date, candidate_count, config_id):
+    """先提交结果，再登记完成日；即使无信号也不会在下次重复扫描。"""
+    with _checkpoint_lock():
+        if new_rows is not None and not new_rows.empty:
+            existing = _read_csv_safely(CHECKPOINT_FILE)
+            combined = (
+                pd.concat([existing, new_rows], ignore_index=True, sort=False)
+                if not existing.empty else new_rows.copy()
+            )
+            if "Trade_Date" in combined.columns:
+                combined["Trade_Date"] = (
+                    combined["Trade_Date"].astype(str).str.replace(r"\.0$", "", regex=True)
+                )
+            dedup_cols = [c for c in ("Trade_Date", "Config_ID", "Strategy_ID", "ts_code") if c in combined.columns]
+            if {"Trade_Date", "ts_code"}.issubset(dedup_cols):
+                combined = combined.drop_duplicates(dedup_cols, keep="last")
+            sort_columns = [col for col in ("Trade_Date", "Strategy_ID", "Rank") if col in combined.columns]
+            if sort_columns:
+                combined = combined.sort_values(sort_columns, kind="mergesort")
+            _atomic_write_csv(combined.reset_index(drop=True), CHECKPOINT_FILE)
 
+        processed = _read_csv_safely(PROCESSED_DATES_FILE)
+        completed_row = pd.DataFrame([{
+            "Trade_Date": str(trade_date),
+            "Config_ID": str(config_id),
+            "Candidate_Count": int(candidate_count),
+            "Completed_At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }])
+        processed = (
+            pd.concat([processed, completed_row], ignore_index=True, sort=False)
+            if not processed.empty else completed_row
+        )
+        processed["Trade_Date"] = processed["Trade_Date"].astype(str).str.replace(r"\.0$", "", regex=True)
+        processed = processed.drop_duplicates(
+            [c for c in ("Trade_Date", "Config_ID") if c in processed.columns], keep="last"
+        ).sort_values([c for c in ("Config_ID", "Trade_Date") if c in processed.columns])
+        _atomic_write_csv(processed.reset_index(drop=True), PROCESSED_DATES_FILE)
 
-def remove_with_backup(path):
-    for candidate in (path, path + ".bak"):
-        try:
-            if os.path.exists(candidate):
-                os.remove(candidate)
-        except OSError:
-            pass
-
-
-def atomic_write_pickle(value, path):
-    target_dir = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(target_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir)
-    os.close(fd)
-    try:
-        with open(tmp_path, "wb") as file_obj:
-            pickle.dump(value, file_obj, protocol=pickle.HIGHEST_PROTOCOL)
-            file_obj.flush()
-            os.fsync(file_obj.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-def get_trade_days(end_date_str, num_days):
-    lookback_days = max(num_days * 3, 365) 
-    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
-    cal = safe_get('trade_cal', required=True, exchange='SSE', start_date=start_date, end_date=end_date_str)
-    trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
-    trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
-    return trade_days_df['cal_date'].head(num_days).tolist()
-
+# ---------------------------
+# 科技白名单池构建
+# ---------------------------
 @st.cache_data(ttl=3600*24*7, show_spinner=False)
-def load_industry_mapping(token_hash):
-    del token_hash
-    global pro
-    if pro is None:
-        raise RuntimeError("Tushare尚未初始化，无法构建科技白名单")
+def load_custom_tech_whitelist(token):
+    token_c = clean_token_str(token)
+    if not token_c: return set(), {}
+    
+    ts.set_token(token_c)
+    pro = ts.pro_api(token_c)
+    
+    stock_basic = safe_tushare_call(pro.stock_basic, list_status='L', fields='ts_code,symbol,name,industry,market,list_date')
+    if stock_basic.empty: return set(), {}
+        
+    BOARDS = ("主板", "创业板", "科创板")
+    valid_stocks = stock_basic[stock_basic['market'].isin(BOARDS)].copy()
+    valid_stocks = valid_stocks[~valid_stocks['name'].str.contains('ST|退', na=False)]
+    valid_stocks = valid_stocks[~valid_stocks['ts_code'].str.startswith('92')]
+    
+    CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
+    EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
+    TECH_INDUSTRY_KEYWORDS = {
+        "半导体", "电子元件", "元件", "光学光电子", "消费电子", "电子化学品",
+        "计算机设备", "软件开发", "IT服务", "通信设备", "军工电子", "航空装备",
+        "航天装备", "自动化设备", "机器人", "激光设备", "工控设备", "仪器仪表",
+        "电池", "光伏设备", "风电设备", "电网设备", "电机", "医疗器械",
+        "生物制品", "汽车电子", "金属新材料", "非金属材料", "膜材料", "碳纤维",
+    }
+    
+    sw_indices = safe_tushare_call(pro.index_classify, level='L1', src='SW2021')
+    tech_l1_names = CORE_TECH_L1.union(EXTENDED_TECH_L1)
+    target_sw = sw_indices[sw_indices['industry_name'].isin(tech_l1_names)] if not sw_indices.empty else pd.DataFrame()
+    
+    stock_sw_map = {}
+    if not target_sw.empty:
+        for _, s_row in target_sw.iterrows():
+            idx_code = s_row['index_code']
+            ind_name = s_row['industry_name']
+            m_df = safe_tushare_call(pro.index_member, index_code=idx_code, is_new='Y')
+            if not m_df.empty:
+                for c_code in m_df['con_code']:
+                    stock_sw_map[c_code] = ind_name
+            time.sleep(0.03)
+            
+    whitelist_set = set()
+    name_map = dict(zip(stock_basic['ts_code'], stock_basic['name']))
+    
+    for _, row in valid_stocks.iterrows():
+        code = row['ts_code']
+        ind_basic = str(row['industry']) if pd.notna(row['industry']) else ""
+        sw_l1 = stock_sw_map.get(code, "")
+        
+        if sw_l1 in CORE_TECH_L1: whitelist_set.add(code); continue
+        if sw_l1 in EXTENDED_TECH_L1:
+            if any(kw in ind_basic for kw in TECH_INDUSTRY_KEYWORDS) or ind_basic == "" or sw_l1 in {"机械设备", "电力设备", "医药生物"}:
+                whitelist_set.add(code); continue
+        if any(kw in ind_basic for kw in TECH_INDUSTRY_KEYWORDS): whitelist_set.add(code); continue
+
+    return whitelist_set, name_map
+
+# ---------------------------
+# 增量下载引擎
+# ---------------------------
+def _market_partition_path(trade_date):
+    os.makedirs(MARKET_CACHE_DIR, exist_ok=True)
+    return os.path.join(MARKET_CACHE_DIR, f"{trade_date}.pkl.gz")
+
+
+def _market_partition_exists(trade_date):
     try:
-        sw_indices = safe_get('index_classify', required=True, level='L1', src='SW2021')
-        white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
-        target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
-        index_codes = target_indices['index_code'].tolist()
-        if not index_codes:
-            raise RuntimeError("未取得V40.6原科技行业目录")
-        
-        all_members = []
-        load_bar = st.progress(0, text="正在加载硬科技白名单赛道数据...")
-        for i, idx_code in enumerate(index_codes):
-            df = safe_get('index_member', required=True, index_code=idx_code, is_new='Y')
-            if not df.empty: 
-                df['industry_code'] = idx_code
-                all_members.append(df)
-            time.sleep(0.05) 
-            load_bar.progress((i + 1) / len(index_codes))
-        load_bar.empty()
-        
-        if not all_members:
-            raise RuntimeError("未取得V40.6原科技白名单成分")
-        full_df = pd.concat(all_members).drop_duplicates(subset=['con_code'])
-        return dict(zip(full_df['con_code'], full_df['industry_code']))
-    except Exception:
-        try:
-            load_bar.empty()
-        except Exception:
-            pass
-        raise
+        return os.path.getsize(_market_partition_path(trade_date)) >= 100
+    except OSError:
+        return False
 
 
-@st.cache_data(ttl=3600*24, show_spinner=False)
-def load_stock_basic(token_hash):
-    del token_hash
-    stock_basic = safe_get('stock_basic', required=True, list_status='L', fields='ts_code,name')
-    if stock_basic.empty:
-        raise RuntimeError("stock_basic加载失败")
-    return stock_basic.drop_duplicates('ts_code', keep='last').reset_index(drop=True)
-
-# ---------------------------
-# 数据获取与复权引擎
-# ---------------------------
-def pool_cache_dir(whitelist_set):
-    pool_hash = hashlib.sha1(
-        "|".join(sorted(whitelist_set)).encode('utf-8')
-    ).hexdigest()[:12]
-    cache_dir = os.path.join(MARKET_CACHE_ROOT, pool_hash)
-    os.makedirs(cache_dir, exist_ok=True)
-    return cache_dir, pool_hash
-
-
-def market_partition_path(trade_date, cache_dir):
-    return os.path.join(cache_dir, f"market_{trade_date}.pkl")
-
-
-def valid_market_partition(payload, trade_date, pool_hash, require_basic=False):
+def _valid_market_partition(payload, trade_date):
     if not isinstance(payload, dict):
         return False
-    if payload.get("version") != 2 or str(payload.get("trade_date")) != str(trade_date):
-        return False
-    if str(payload.get('pool_hash')) != str(pool_hash):
+    if payload.get("version") != 1 or str(payload.get("trade_date")) != str(trade_date):
         return False
     daily = payload.get("daily")
     adj = payload.get("adj")
     basic = payload.get("daily_basic")
-    if not isinstance(daily, pd.DataFrame) or not isinstance(adj, pd.DataFrame):
-        return False
-    if int(payload.get("raw_daily_count", 0)) < 1000 or int(payload.get("raw_adj_count", 0)) < 1000:
+    if not all(isinstance(frame, pd.DataFrame) for frame in (daily, adj, basic)):
         return False
     required_daily = {"ts_code", "trade_date", "open", "high", "low", "close", "vol"}
+    required_adj = {"ts_code", "trade_date", "adj_factor"}
     if daily.empty or adj.empty:
         return False
-    if not required_daily.issubset(daily.columns):
+    if not required_daily.issubset(daily.columns) or not required_adj.issubset(adj.columns):
         return False
-    if not {"ts_code", "trade_date", "adj_factor"}.issubset(adj.columns):
+    # 防止Tushare网络波动只返回一小部分股票，却被永久当成完整缓存。
+    if int(payload.get("daily_count", 0)) < 1000:
         return False
-    if not daily["trade_date"].astype(str).eq(str(trade_date)).any():
+    if int(payload.get("adj_count", 0)) < 1000:
         return False
-    if not adj["trade_date"].astype(str).eq(str(trade_date)).any():
-        return False
-    if require_basic:
-        if not isinstance(basic, pd.DataFrame) or basic.empty:
-            return False
-        if int(payload.get("raw_basic_count", 0)) < 1000:
-            return False
-        if not {"ts_code", "trade_date", "circ_mv"}.issubset(basic.columns):
-            return False
     return True
 
 
-def read_market_partition(trade_date, cache_dir, pool_hash, require_basic=False):
-    path = market_partition_path(trade_date, cache_dir)
-    if not os.path.exists(path):
+def _read_market_partition(trade_date):
+    partition_path = _market_partition_path(trade_date)
+    if not os.path.exists(partition_path):
         return None
     try:
-        with open(path, "rb") as file_obj:
+        with gzip.open(partition_path, "rb") as file_obj:
             payload = pickle.load(file_obj)
-        return payload if valid_market_partition(payload, trade_date, pool_hash, require_basic) else None
+        if _valid_market_partition(payload, trade_date):
+            return payload
+        try:
+            os.remove(partition_path)
+        except OSError:
+            pass
+        return None
     except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ValueError):
+        try:
+            os.remove(partition_path)
+        except OSError:
+            pass
         return None
 
 
-def market_cache_stamp(valid_dates, cache_dir):
-    """只读取目录元数据，作为分片校验与内存索引的可靠缓存键。"""
-    file_count = 0
-    total_size = 0
-    latest_mtime_ns = 0
-    mtime_checksum = 0
-    for trade_date in valid_dates:
-        path = market_partition_path(trade_date, cache_dir)
-        try:
-            stat = os.stat(path)
-        except OSError:
-            continue
-        file_count += 1
-        total_size += int(stat.st_size)
-        latest_mtime_ns = max(latest_mtime_ns, int(stat.st_mtime_ns))
-        mtime_checksum += int(stat.st_mtime_ns)
-    return file_count, total_size, latest_mtime_ns, mtime_checksum
+def _write_market_partition(payload, trade_date):
+    partition_path = _market_partition_path(trade_date)
+
+    def writer(temp_path):
+        with gzip.open(temp_path, "wb", compresslevel=3) as file_obj:
+            pickle.dump(payload, file_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(temp_path, "rb") as file_obj:
+            os.fsync(file_obj.fileno())
+
+    _atomic_replace_bytes(writer, partition_path)
 
 
-@st.cache_data(ttl=3600*12, show_spinner=False)
-def scan_market_partitions(valid_dates_key, required_basic_key, cache_dir, pool_hash, cache_stamp):
-    """同一批分片内容未变化时不重复反序列化；返回完整缺失与基础行情缺失日期。"""
-    del cache_stamp
-    required_basic = set(required_basic_key)
-    missing_dates = []
-    base_missing_dates = []
-    for trade_date in valid_dates_key:
-        payload = read_market_partition(
-            trade_date, cache_dir, pool_hash, require_basic=False
-        )
-        if payload is None:
-            missing_dates.append(trade_date)
-            base_missing_dates.append(trade_date)
-        elif trade_date in required_basic and not valid_market_partition(
-            payload, trade_date, pool_hash, require_basic=True
-        ):
-            missing_dates.append(trade_date)
-    return tuple(missing_dates), tuple(base_missing_dates)
-
-
-def legacy_cache_paths():
-    paths = [
-        os.path.join(APP_DIR, LEGACY_CACHE_BASENAME),
-        os.path.join(os.getcwd(), LEGACY_CACHE_BASENAME),
-    ]
-    return list(dict.fromkeys(os.path.abspath(path) for path in paths))
-
-
-def load_legacy_cache_index():
-    """复用V40.6旧整包缓存；只补市值数据后迁移为可靠分片。"""
-    for path in legacy_cache_paths():
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "rb") as file_obj:
-                cached = pickle.load(file_obj)
-            daily = cached.get("daily", pd.DataFrame())
-            adj = cached.get("adj", pd.DataFrame())
-            if daily.empty or adj.empty:
-                continue
-            if not isinstance(daily.index, pd.MultiIndex):
-                daily = daily.drop_duplicates(['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date'])
-            if not isinstance(adj.index, pd.MultiIndex):
-                adj = adj.drop_duplicates(['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date'])
-            daily = daily.reorder_levels(['trade_date', 'ts_code']).sort_index()
-            adj = adj.reorder_levels(['trade_date', 'ts_code']).sort_index()
-            legacy_dates = sorted(
-                set(daily.index.get_level_values('trade_date').astype(str))
-                & set(adj.index.get_level_values('trade_date').astype(str))
-            )
-            return daily, adj, legacy_dates
-        except Exception as exc:
-            record_api_error(f"旧行情缓存读取失败，改用分片下载: {exc}")
-    return pd.DataFrame(), pd.DataFrame(), []
-
-
-def extract_legacy_day(frame, trade_date):
-    if frame is None or frame.empty:
-        return pd.DataFrame()
-    try:
-        part = frame.loc[str(trade_date)].reset_index()
-        part['trade_date'] = str(trade_date)
-        return part
-    except (KeyError, TypeError, ValueError):
-        return pd.DataFrame()
-
-
-def sync_market_data_incrementally(start_date, end_date, basic_required_dates, whitelist_set):
-    """每成功一个交易日立即原子保存；失败日期不写完成分片。"""
-    calendar = safe_get(
-        'trade_cal', required=True, exchange='SSE', start_date=start_date, end_date=end_date
-    )
+def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
+    token_c = clean_token_str(token)
+    ts.set_token(token_c)
+    pro = ts.pro_api(token_c)
+    
+    cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_date, end_date=end_date)
+    if cal_raw.empty: return []
+        
+    cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
+    all_dates = cal_open['cal_date'].tolist()
+    
     today_str = datetime.now().strftime("%Y%m%d")
-    valid_dates = (
-        calendar[(calendar['is_open'] == 1) & (calendar['cal_date'].astype(str) <= today_str)]
-        .sort_values('cal_date')['cal_date'].astype(str).tolist()
-    )
-    required_basic = {str(date) for date in basic_required_dates}
-    if len(required_basic) == 1:
-        anchor = next(iter(required_basic))
-        prior_dates = [date for date in valid_dates if date <= anchor][-10:]
-        required_basic.update(prior_dates)
-
-    cache_dir, pool_hash = pool_cache_dir(whitelist_set)
-    cache_stamp = market_cache_stamp(valid_dates, cache_dir)
-    missing_dates_key, base_missing_dates_key = scan_market_partitions(
-        tuple(valid_dates), tuple(sorted(required_basic)), cache_dir, pool_hash, cache_stamp
-    )
-    missing_dates = list(missing_dates_key)
-    base_missing_dates = list(base_missing_dates_key)
-    complete_hits = len(valid_dates) - len(missing_dates)
-    st.caption(
-        f"行情缓存：完整命中 {complete_hits}/{len(valid_dates)} 个交易日；"
-        f"待补 {len(missing_dates)} 个。"
-    )
-
-    legacy_daily = pd.DataFrame()
-    legacy_adj = pd.DataFrame()
-    legacy_marker_path = os.path.join(cache_dir, 'legacy_cache_dates.json')
-    legacy_marker = read_json_safe(legacy_marker_path)
-    known_legacy_dates = set(legacy_marker.get('dates', []))
-    should_open_legacy = bool(base_missing_dates) and (
-        not legacy_marker or bool(set(base_missing_dates) & known_legacy_dates)
-    )
-    if should_open_legacy:
-        legacy_daily, legacy_adj, legacy_dates = load_legacy_cache_index()
-        known_legacy_dates = set(legacy_dates)
-        atomic_write_json({'dates': sorted(known_legacy_dates)}, legacy_marker_path)
-
-    failed_dates = []
-    failed_base_dates = []
-    migrated_dates = 0
+    valid_dates = [d for d in all_dates if d <= today_str]
+    
+    missing_dates = [
+        d for d in valid_dates
+        if not _market_partition_exists(d)
+    ]
+    
     if missing_dates:
-        bar = st.progress(0, text=f"从断点补充 {len(missing_dates)} 个交易日行情...")
-        for idx, trade_date in enumerate(missing_dates):
-            existing = read_market_partition(
-                trade_date, cache_dir, pool_hash, require_basic=False
-            )
-            daily = existing.get('daily', pd.DataFrame()) if existing else pd.DataFrame()
-            adj = existing.get('adj', pd.DataFrame()) if existing else pd.DataFrame()
-            basic = existing.get('daily_basic', pd.DataFrame()) if existing else pd.DataFrame()
-            raw_daily_count = int(existing.get('raw_daily_count', 0)) if existing else 0
-            raw_adj_count = int(existing.get('raw_adj_count', 0)) if existing else 0
-            raw_basic_count = int(existing.get('raw_basic_count', 0)) if existing else 0
+        my_bar = st.progress(0, text=f"📥 检测到 {len(missing_dates)} 天增量行情需要同步...")
+        for i, d in enumerate(missing_dates):
+            df_d = safe_tushare_call(pro.daily, max_retries=3, sleep_time=0.8, trade_date=d)
+            df_a = safe_tushare_call(pro.adj_factor, max_retries=3, sleep_time=0.8, trade_date=d)
+            df_b = safe_tushare_call(pro.daily_basic, max_retries=3, sleep_time=0.8, trade_date=d, fields='ts_code,trade_date,circ_mv')
 
-            used_legacy = False
-            if daily.empty:
-                daily_all = extract_legacy_day(legacy_daily, trade_date)
-                raw_daily_count = len(daily_all)
-                daily = daily_all[daily_all['ts_code'].isin(whitelist_set)].copy() if not daily_all.empty else pd.DataFrame()
-                used_legacy = not daily.empty
-            if adj.empty:
-                adj_all = extract_legacy_day(legacy_adj, trade_date)
-                raw_adj_count = len(adj_all)
-                adj = adj_all[adj_all['ts_code'].isin(whitelist_set)].copy() if not adj_all.empty else pd.DataFrame()
-                used_legacy = used_legacy or not adj.empty
-            if daily.empty:
-                daily_all = safe_get('daily', trade_date=trade_date)
-                raw_daily_count = len(daily_all)
-                daily = daily_all[daily_all['ts_code'].isin(whitelist_set)].copy() if not daily_all.empty else pd.DataFrame()
-            if adj.empty:
-                adj_all = safe_get('adj_factor', trade_date=trade_date)
-                raw_adj_count = len(adj_all)
-                adj = adj_all[adj_all['ts_code'].isin(whitelist_set)].copy() if not adj_all.empty else pd.DataFrame()
-            if trade_date in required_basic and basic.empty:
-                basic_all = safe_get(
-                    'daily_basic', trade_date=trade_date,
-                    fields='ts_code,trade_date,circ_mv'
-                )
-                raw_basic_count = len(basic_all)
-                basic = basic_all[basic_all['ts_code'].isin(whitelist_set)].copy() if not basic_all.empty else pd.DataFrame()
+            if not df_d.empty and not df_a.empty:
+                payload = {
+                    "version": 1,
+                    "trade_date": d,
+                    "daily_count": len(df_d),
+                    "adj_count": len(df_a),
+                    "daily": df_d,
+                    "adj": df_a,
+                    "daily_basic": df_b if not df_b.empty else pd.DataFrame(),
+                }
+                if _valid_market_partition(payload, d):
+                    _write_market_partition(payload, d)
 
-            payload = {
-                'version': 2,
-                'trade_date': trade_date,
-                'pool_hash': pool_hash,
-                'saved_at': datetime.now().isoformat(timespec='seconds'),
-                'raw_daily_count': int(raw_daily_count),
-                'raw_adj_count': int(raw_adj_count),
-                'raw_basic_count': int(raw_basic_count),
-                'daily': daily,
-                'adj': adj,
-                'daily_basic': basic,
-            }
-            base_complete = valid_market_partition(
-                payload, trade_date, pool_hash, require_basic=False
-            )
-            fully_complete = valid_market_partition(
-                payload, trade_date, pool_hash, require_basic=trade_date in required_basic
-            )
-            if base_complete:
-                atomic_write_pickle(payload, market_partition_path(trade_date, cache_dir))
-                migrated_dates += int(used_legacy)
-            else:
-                failed_base_dates.append(trade_date)
-            if not fully_complete:
-                failed_dates.append(trade_date)
+            if (i + 1) % 5 == 0 or i == len(missing_dates) - 1:
+                my_bar.progress((i+1)/len(missing_dates), text=f"📥 行情同步中: {i+1}/{len(missing_dates)}")
+            time.sleep(0.25)
+        my_bar.empty()
+    return valid_dates
 
-            if (idx + 1) % 5 == 0 or idx == len(missing_dates) - 1:
-                bar.progress(
-                    (idx + 1) / len(missing_dates),
-                    text=(
-                        f"行情同步 {idx+1}/{len(missing_dates)}；"
-                        f"成功 {idx+1-len(failed_dates)}，失败 {len(failed_dates)}"
-                    ),
-                )
-            time.sleep(0.12)
-        bar.empty()
-
-    if failed_dates:
-        st.warning(
-            f"有 {len(failed_dates)} 个交易日行情暂未完整返回；示例: {failed_dates[:8]}。"
-            "成功日期已保存，本次继续回测完整日期，下次只补失败日期。"
-        )
-    if migrated_dates:
-        st.caption(f"已从旧版整包缓存迁移 {migrated_dates} 个交易日，避免重复下载行情和复权。")
-    return valid_dates, failed_dates, failed_base_dates, cache_dir, pool_hash
-
-
+# ---------------------------
+# 极速轻量化内存索引引擎
+# ---------------------------
 @st.cache_resource(ttl=3600*12, show_spinner=False)
-def build_market_index_from_partitions(valid_dates_key, cache_dir, pool_hash, cache_stamp):
+def _build_market_index(valid_dates, whitelist_keys, cache_stamp):
     del cache_stamp
-    daily_parts, adj_parts, basic_parts = [], [], []
-    complete_dates = []
-    for trade_date in valid_dates_key:
-        payload = read_market_partition(
-            trade_date, cache_dir, pool_hash, require_basic=False
-        )
-        if payload is None:
-            continue
-        daily_parts.append(payload['daily'])
-        adj_parts.append(payload['adj'])
-        if isinstance(payload.get('daily_basic'), pd.DataFrame) and not payload['daily_basic'].empty:
-            basic_parts.append(payload['daily_basic'])
-        complete_dates.append(trade_date)
+    whitelist_set = set(whitelist_keys)
+    with st.spinner("正在构建全样本前复权索引..."):
+        daily_list, adj_list, basic_list = [], [], []
+        for trade_date in valid_dates:
+            payload = _read_market_partition(trade_date)
+            if payload is None:
+                continue
+            df_d = payload['daily']
+            df_a = payload['adj']
+            df_b = payload['daily_basic']
+            if whitelist_set:
+                df_d = df_d[df_d['ts_code'].isin(whitelist_set)]
+                df_a = df_a[df_a['ts_code'].isin(whitelist_set)]
+                if not df_b.empty:
+                    df_b = df_b[df_b['ts_code'].isin(whitelist_set)]
+            if not df_d.empty and not df_a.empty:
+                daily_list.append(df_d)
+                adj_list.append(df_a)
+                if not df_b.empty:
+                    basic_list.append(df_b)
 
-    if not daily_parts or not adj_parts:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}, tuple()
+        daily_raw = pd.concat(daily_list, ignore_index=True) if daily_list else pd.DataFrame()
+        adj_raw = pd.concat(adj_list, ignore_index=True) if adj_list else pd.DataFrame()
+        basic_raw = pd.concat(basic_list, ignore_index=True) if basic_list else pd.DataFrame()
 
-    daily_raw = pd.concat(daily_parts, ignore_index=True)
-    adj_raw = pd.concat(adj_parts, ignore_index=True)
-    basic_raw = pd.concat(basic_parts, ignore_index=True) if basic_parts else pd.DataFrame()
+        if daily_raw.empty or adj_raw.empty: return {}, pd.DataFrame()
 
-    daily_raw['trade_date'] = daily_raw['trade_date'].astype(str)
-    adj_raw['trade_date'] = adj_raw['trade_date'].astype(str)
-    adj_raw['adj_factor'] = pd.to_numeric(adj_raw['adj_factor'], errors='coerce')
-    adj_raw = adj_raw.dropna(subset=['adj_factor'])
-    daily_index = (
-        daily_raw.drop_duplicates(['ts_code', 'trade_date'], keep='last')
-        .set_index(['ts_code', 'trade_date']).sort_index()
-    )
-    adj_index = (
-        adj_raw.drop_duplicates(['ts_code', 'trade_date'], keep='last')
-        .set_index(['ts_code', 'trade_date']).sort_index()
-    )
-    if not basic_raw.empty:
-        basic_raw['trade_date'] = basic_raw['trade_date'].astype(str)
-        basic_index = (
-            basic_raw.drop_duplicates(['ts_code', 'trade_date'], keep='last')
-            .set_index(['ts_code', 'trade_date']).sort_index()
-        )
-    else:
-        basic_index = pd.DataFrame()
+        merged_all = daily_raw.merge(adj_raw[['ts_code', 'trade_date', 'adj_factor']], on=['ts_code', 'trade_date'], how='inner')
+        merged_all['trade_date_str'] = merged_all['trade_date'].astype(str)
+        merged_all = merged_all.drop_duplicates(['ts_code', 'trade_date_str'], keep='last')
+        merged_all = merged_all.sort_values(['ts_code', 'trade_date_str'])
+        del daily_raw, adj_raw, daily_list, adj_list
+        gc.collect()
 
-    adj_latest = adj_index.reset_index().sort_values(['ts_code', 'trade_date'])
-    base_factors = (
-        adj_latest.groupby('ts_code', sort=False).tail(1)
-        .set_index('ts_code')['adj_factor'].to_dict()
-    )
-    return daily_index, adj_index, basic_index, base_factors, tuple(complete_dates)
-
-
-def assess_signal_data_coverage(signal_dates, expected_dates, complete_dates, failed_dates):
-    """只判断运行数据是否完整，不参与选股条件与信号计算。"""
-    expected_dates = tuple(sorted(str(date) for date in expected_dates))
-    complete_set = {str(date) for date in complete_dates}
-    failed_set = {str(date) for date in failed_dates}
-    coverage_errors = {}
-
-    for signal_date in signal_dates:
-        signal_date = str(signal_date)
-        if signal_date in failed_set or signal_date not in complete_set:
-            coverage_errors[signal_date] = "数据缺失"
-            continue
-
-        history_start = (
-            datetime.strptime(signal_date, "%Y%m%d") - timedelta(days=365)
-        ).strftime("%Y%m%d")
-        expected_history = [
-            date for date in expected_dates if history_start <= date <= signal_date
-        ]
-        missing_history = [date for date in expected_history if date not in complete_set]
-        available_count = len(expected_history) - len(missing_history)
-        if missing_history:
-            coverage_errors[signal_date] = f"历史行情缺失({len(missing_history)}日)"
-        elif available_count < MIN_SIGNAL_HISTORY_DAYS:
-            coverage_errors[signal_date] = (
-                f"历史数据不足({available_count}/{MIN_SIGNAL_HISTORY_DAYS}交易日)"
-            )
-    return coverage_errors
-
-
-def get_all_historical_data(trade_days_list, use_cache=True):
-    del use_cache  # 稳定版始终使用可恢复分片；清除按钮可显式全量重建。
-    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_DAILY_BASIC, GLOBAL_QFQ_BASE_FACTORS
-    if not trade_days_list:
-        return {
-            'ok': False, 'failed_dates': [], 'failed_base_dates': [],
-            'complete_dates': [], 'coverage_errors': {},
-        }
-
-    latest_trade_date = max(trade_days_list)
-    earliest_trade_date = min(trade_days_list)
-    start_date = (
-        datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=365)
-    ).strftime("%Y%m%d")
-    theoretical_end = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=150)
-    end_date = min(theoretical_end, datetime.now()).strftime("%Y%m%d")
-
-    whitelist_set = set(GLOBAL_STOCK_INDUSTRY)
-    if not whitelist_set:
-        return {
-            'ok': False, 'failed_dates': [], 'failed_base_dates': [],
-            'complete_dates': [], 'coverage_errors': {},
-        }
-    valid_dates, failed_dates, failed_base_dates, cache_dir, pool_hash = sync_market_data_incrementally(
-        start_date, end_date, set(trade_days_list), whitelist_set
-    )
-    cache_stamp = market_cache_stamp(valid_dates, cache_dir)
-    (
-        GLOBAL_DAILY_RAW,
-        GLOBAL_ADJ_FACTOR,
-        GLOBAL_DAILY_BASIC,
-        GLOBAL_QFQ_BASE_FACTORS,
-        complete_dates,
-    ) = build_market_index_from_partitions(
-        tuple(valid_dates), cache_dir, pool_hash, cache_stamp
-    )
-    ok = not GLOBAL_DAILY_RAW.empty and not GLOBAL_ADJ_FACTOR.empty
-    coverage_errors = assess_signal_data_coverage(
-        trade_days_list, valid_dates, complete_dates, failed_dates
-    )
-    return {
-        'ok': ok,
-        'failed_dates': failed_dates,
-        'failed_base_dates': failed_base_dates,
-        'complete_dates': list(complete_dates),
-        'coverage_errors': coverage_errors,
-    }
-
-
-def get_market_slice(frame, trade_date):
-    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
-        return pd.DataFrame()
-    try:
-        return frame.xs(str(trade_date), level='trade_date').reset_index()
-    except (KeyError, TypeError, ValueError):
-        return pd.DataFrame()
-
-def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=False):
-    global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
-    if GLOBAL_DAILY_RAW.empty: return pd.DataFrame()
-    
-    latest_adj_factor = GLOBAL_QFQ_BASE_FACTORS.get(ts_code, np.nan)
-    if pd.isna(latest_adj_factor): return pd.DataFrame() 
-
-    try:
-        daily_df = GLOBAL_DAILY_RAW.loc[ts_code]
-        daily_df = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)].copy()
-        adj_series = GLOBAL_ADJ_FACTOR.loc[ts_code]['adj_factor']
-        adj_series = adj_series.loc[(adj_series.index >= start_date) & (adj_series.index <= end_date)]
-    except KeyError: return pd.DataFrame()
-    
-    if daily_df.empty or adj_series.empty: return pd.DataFrame()
-    
-    df = daily_df.merge(adj_series.rename('adj_factor'), left_index=True, right_index=True, how='left')
-    df = df.dropna(subset=['adj_factor'])
-    
-    for col in ['open', 'high', 'low', 'close', 'pre_close']:
-        if col in df.columns:
-            df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
-    
-    df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
-    df = df.sort_values('trade_date_str').set_index('trade_date_str')
-    
-    for col in ['open', 'high', 'low', 'close']:
-        df[col] = df[col + '_qfq']
-        
-    final_df = df[['open', 'high', 'low', 'close', 'pre_close', 'vol']].copy() 
-
-    if use_sina:
-        today_str = datetime.now().strftime('%Y%m%d')
-        if end_date == today_str:
-            sina_data = get_sina_realtime_kline(ts_code)
-            if sina_data and sina_data['close'] > 0:
-                sina_row = pd.DataFrame([sina_data]).set_index('trade_date_str')
-                if today_str in final_df.index:
-                    final_df.loc[today_str] = sina_row.iloc[0]
-                else:
-                    final_df = pd.concat([final_df, sina_row])
-                    
-    return final_df
-
-# ---------------------------
-# 周线 MACD 波浪洗盘次数统计函数
-# ---------------------------
-def count_macd_wave_pullbacks(df_calc):
-    if len(df_calc) < 60: return -1 
-    
-    df = df_calc.copy()
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['dif'] = df['ema12'] - df['ema26']
-    df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
-    df['macd'] = (df['dif'] - df['dea']) * 2
-    
-    df['dt'] = pd.to_datetime(df['trade_date_str'])
-    iso_cal = df['dt'].dt.isocalendar()
-    df['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
-    
-    weekly_df = df.groupby('year_week', as_index=False).agg({
-        'trade_date_str': 'last',
-        'low': 'min',
-        'high': 'max',
-        'macd': 'last'
-    }).sort_values('trade_date_str').reset_index(drop=True)
-    
-    if len(weekly_df) < 10: return -1
-    
-    min_idx = weekly_df['low'].idxmin()
-    sub_df = weekly_df.loc[min_idx:].reset_index(drop=True)
-    if len(sub_df) < 5: return -1
-    
-    running_max = sub_df['high'].iloc[0]
-    in_pullback = False
-    pullback_count = 0
-    
-    for i in range(1, len(sub_df)):
-        curr_high = sub_df.loc[i, 'high']
-        curr_low = sub_df.loc[i, 'low']
-        curr_macd = sub_df.loc[i, 'macd']
-        
-        if curr_high > running_max:
-            running_max = curr_high
-            if in_pullback:
-                in_pullback = False
-        else:
-            drawdown = (running_max - curr_low) / running_max
-            if curr_macd < 0 and drawdown >= 0.05:
-                if not in_pullback:
-                    in_pullback = True
-                    pullback_count += 1
-                    
-    return pullback_count
-
-# ---------------------------
-# 核心指标计算 (加入四大神盾)
-# ---------------------------
-def compute_trend_indicators(ts_code, end_date, use_sina=False, _run_id=None):
-    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=365)).strftime("%Y%m%d")
-    df = get_qfq_data_v4_optimized_final(ts_code, start_date, end_date, use_sina=use_sina)
-    res = {}
-    if df.empty or len(df) < 120: return res 
-    
-    # 1. 日线基础指标
-    df['ma10'] = df['close'].rolling(10).mean()
-    df['ma20'] = df['close'].rolling(20).mean()
-    df['ma60'] = df['close'].rolling(60).mean()
-    df['ma120'] = df['close'].rolling(120).mean()
-    df['ma5_vol'] = df['vol'].shift(1).rolling(5).mean()  
-    
-    # 10 日箱体
-    df['box_high_10'] = df['high'].rolling(window=10).max().shift(1)
-    
-    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-    df['dif'] = df['ema12'] - df['ema26']
-    df['dea'] = df['dif'].ewm(span=9, adjust=False).mean()
-    df['macd'] = (df['dif'] - df['dea']) * 2
-    
-    df_calc = df.dropna().copy().reset_index()
-    if len(df_calc) < 20: return res
-
-    # 2. 周线波浪过滤
-    wave_count = count_macd_wave_pullbacks(df_calc)
-    if wave_count < 2 or wave_count > 5:
-        return res  
-
-    # 3. 周线风控
-    df_calc['dt'] = pd.to_datetime(df_calc['trade_date_str'])
-    iso_cal = df_calc['dt'].dt.isocalendar()
-    df_calc['year_week'] = iso_cal.year.astype(str) + "_" + iso_cal.week.astype(str).str.zfill(2)
-    
-    weekly_df = df_calc.groupby('year_week', as_index=False).agg({
-        'trade_date_str': 'last',
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-    }).sort_values('trade_date_str').reset_index(drop=True)
-    
-    if len(weekly_df) < 10: return res
-    weekly_df['w_ma20'] = weekly_df['close'].rolling(20).mean()
-    
-    w_curr = weekly_df.iloc[-1]
-    w_prev = weekly_df.iloc[-2] if len(weekly_df) >= 2 else w_curr
-    
-    w_bias_safe = True
-    if not pd.isna(w_curr['w_ma20']) and w_curr['w_ma20'] > 0:
-        w_bias = (w_curr['close'] - w_curr['w_ma20']) / w_curr['w_ma20']
-        if w_bias > 0.45: w_bias_safe = False
+        stock_qfq_dict = {}
+        for ts_code, group in merged_all.groupby('ts_code'):
+            df_g = group.copy()
+            latest_adj = df_g['adj_factor'].iloc[-1]
+            if latest_adj > 0:
+                for col in ['open', 'high', 'low', 'close', 'pre_close']:
+                    if col in df_g.columns:
+                        df_g[col] = df_g[col] * df_g['adj_factor'] / latest_adj
+            df_g = df_g.set_index('trade_date_str')
+            stock_qfq_dict[ts_code] = df_g
+        del merged_all
+        gc.collect()
             
-    w_shadow_safe = True
-    w_prev_range = w_prev['high'] - w_prev['low']
-    w_prev_upper_shadow = w_prev['high'] - max(w_prev['open'], w_prev['close'])
-    if w_prev_range > 0 and (w_prev_upper_shadow / w_prev_range) >= 0.60:
-        w_shadow_safe = False
+        if not basic_raw.empty:
+            basic_raw['trade_date'] = basic_raw['trade_date'].astype(str)
+            basic_indexed = basic_raw.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['trade_date', 'ts_code'])
+        else:
+            basic_indexed = pd.DataFrame()
 
-    is_weekly_safe = w_bias_safe and w_shadow_safe
+    return stock_qfq_dict, basic_indexed
 
-    # 4. 日线突破点火信号 
-    row = df_calc.iloc[-1]
-    prev_row = df_calc.iloc[-2]
+
+def load_optimized_market_data(start_date, end_date, token, _whitelist_keys):
+    token_c = clean_token_str(token)
+    whitelist_set = set(_whitelist_keys)
+    valid_dates = sync_market_data_incrementally(start_date, end_date, token_c, whitelist_set)
+    if not valid_dates:
+        return {}, pd.DataFrame()
+    valid_paths = [_market_partition_path(date) for date in valid_dates]
+    cache_stamp = (
+        sum(os.path.exists(path) for path in valid_paths),
+        max((os.path.getmtime(path) for path in valid_paths if os.path.exists(path)), default=0),
+    )
+    return _build_market_index(tuple(valid_dates), tuple(sorted(whitelist_set)), cache_stamp)
+
+# ---------------------------
+# 🚀 核心引擎：翻转打分模型（通用于选股与回测）
+# ---------------------------
+def compute_breakout_signal(ts_code, end_date, stock_qfq_dict):
+    if ts_code not in stock_qfq_dict: return {}
+    df_full = stock_qfq_dict[ts_code]
     
-    is_daily_trend_up = row['ma60'] > row['ma120']
+    df_daily = df_full[df_full.index <= end_date]
+    res = {}
+    if df_daily.empty or len(df_daily) < 100: return res
+
+    row_friday = df_daily.iloc[-1]
+    is_20cm = any(ts_code.startswith(prefix) for prefix in ['300', '301', '688', '689'])
+    limit_rate = 0.195 if is_20cm else 0.095
+    pre_close_val = row_friday.get('pre_close', np.nan)
+    if pd.isna(pre_close_val) or pre_close_val <= 0:
+        pre_close_val = df_daily.iloc[-2]['close'] if len(df_daily) >= 2 else row_friday['open']
+            
+    is_friday_yiziban = (row_friday['high'] == row_friday['low']) and ((row_friday['close'] - pre_close_val) / pre_close_val >= limit_rate)
+    if is_friday_yiziban: return res
+
+    df = df_daily.copy().reset_index()
+    df['dt'] = pd.to_datetime(df['trade_date_str'])
+    df['year_week'] = df['dt'].dt.strftime('%G_%V') 
+
+    weekly_df = df.groupby('year_week', as_index=False).agg({
+        'trade_date_str': 'last', 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'vol': 'sum'
+    }).sort_values('trade_date_str').reset_index(drop=True)
+
+    n, m = 6, 3
+    if len(weekly_df) < n + 15: return res
+
+    weekly_df['lowv'] = weekly_df['low'].rolling(window=n).min()
+    weekly_df['highv'] = weekly_df['high'].rolling(window=n).max()
+    diff = (weekly_df['highv'] - weekly_df['lowv']).replace(0, 0.001)
+
+    raw_rsv = (weekly_df['close'] - weekly_df['lowv']) / diff * 100
+    weekly_df['rsv'] = raw_rsv.ewm(span=m, adjust=False).mean()
+    weekly_df['k'] = weekly_df['rsv'].ewm(span=m, adjust=False).mean()
+    weekly_df['d'] = weekly_df['k'].rolling(window=m).mean()
+    weekly_df['ma5_vol'] = weekly_df['vol'].shift(1).rolling(window=5).mean()
+    weekly_df['ma20'] = weekly_df['close'].rolling(window=20).mean()
+
+    curr_w = weekly_df.iloc[-1]
+    prev_w = weekly_df.iloc[-2]
     
-    is_box_breakout = (row['close'] > row['box_high_10']) and (prev_row['close'] <= prev_row['box_high_10'])
-    is_daily_breakout = row['close'] > row['ma20'] * 1.02
-    is_daily_ma20_healthy = row['ma20'] >= prev_row['ma20']
+    if pd.isna(curr_w['k']) or pd.isna(prev_w['k']) or pd.isna(curr_w['d']): return res
+
+    is_breakout_25 = (curr_w['k'] > 25.0) and (prev_w['k'] <= 25.0)
+    is_bullish = curr_w['k'] > curr_w['d']
+    if not (is_breakout_25 and is_bullish): return res
+
+    recent_15_weeks = weekly_df.tail(15)
+    k_history_before_breakout = recent_15_weeks['k'].iloc[:-1] 
+    recent_k_min = k_history_before_breakout.min()
+    weeks_under_25 = (k_history_before_breakout < 25.0).sum()
     
-    # 【改动2：突破量比 ≤ 3.0倍】
-    vol_ratio = row['vol'] / row['ma5_vol'] if row['ma5_vol'] > 0 else 0
-    is_daily_vol_strong = (1.3 <= vol_ratio <= 3.0)
+    ma20_curr = curr_w['ma20'] if pd.notna(curr_w['ma20']) else curr_w['close']
+    trend_type = "均线上方" if curr_w['close'] >= ma20_curr else "均线下方(超跌)"
+    vol_ratio = curr_w['vol'] / curr_w['ma5_vol'] if (pd.notna(curr_w['ma5_vol']) and curr_w['ma5_vol'] > 0) else 1.0
+
+    res['is_buy_signal'] = True
+    res['k'] = round(curr_w['k'], 2)
+    res['d'] = round(curr_w['d'], 2)
+    res['recent_k_min'] = round(recent_k_min, 2)
+    res['weeks_under_25'] = int(weeks_under_25)
+    res['signal_close'] = curr_w['close'] 
+    res['trend_type'] = trend_type
+    res['vol_ratio'] = round(vol_ratio, 2)
     
-    candle_range = row['high'] - row['low']
-    candle_body = row['close'] - row['open']
-    is_solid_yang = (row['close'] > row['open']) and (candle_body >= candle_range * 0.6 if candle_range > 0 else True)
-    is_macd_healthy = (row['dif'] > 0) and (row['macd'] > prev_row['macd'])
-    
-    res['is_v38_buy_signal'] = (is_weekly_safe and 
-                                is_daily_trend_up and 
-                                is_box_breakout and 
-                                is_daily_breakout and 
-                                is_daily_ma20_healthy and 
-                                is_daily_vol_strong and 
-                                is_solid_yang and 
-                                is_macd_healthy)
-    
-    if res['is_v38_buy_signal']:
-        res['vol_ratio'] = vol_ratio
-        res['pre_close'] = prev_row['close']            
-        res['wave_count'] = wave_count  
+    score = 0.0
+    if curr_w['close'] >= ma20_curr: score += 20.0
+    else: score -= 5.0
         
-    res['last_close'] = row['close']
-    res['bottom_line'] = row['low'] 
-    res['ma20'] = row['ma20']
-    
+    if 22.0 <= recent_k_min <= 25.0: score += 30.0    
+    elif 15.0 <= recent_k_min < 22.0: score += 15.0   
+    elif 5.0 <= recent_k_min < 15.0: score -= 10.0    
+    else: score -= 25.0                               
+        
+    if 1 <= weeks_under_25 <= 2: score += 30.0        
+    elif 3 <= weeks_under_25 <= 5: score += 15.0      
+    elif 6 <= weeks_under_25 <= 9: score -= 5.0       
+    else: score -= 20.0                               
+        
+    k_val = curr_w['k']
+    if 25.0 < k_val <= 32.0: score += 10.0
+    elif k_val > 38.0: score -= 10.0
+        
+    if 1.0 <= vol_ratio <= 2.5: score += 10.0
+    elif vol_ratio > 4.0: score -= 15.0
+
+    res['Total_Score'] = round(score, 1)
     return res
 
 # ---------------------------
-# 三层简化止盈止损系统 (加入集合竞价拦截器)
+# V40.6 日线发动确认层（只诊断，不改变V14.5买点）
 # ---------------------------
-def get_medium_term_future(ts_code, selection_date, signal_close, bottom_line, hold_weeks=8, use_sina=False):
-    d0 = datetime.strptime(selection_date, "%Y%m%d")
-    start_fetch = (d0 - timedelta(days=60)).strftime("%Y%m%d")
-    end_future = (d0 + timedelta(days=150)).strftime("%Y%m%d") 
+def compute_v40_daily_diagnostics(ts_code, end_date, stock_qfq_dict):
+    default_res = {
+        'V40_Confirm_Score': np.nan,
+        'V40_State': '数据不足',
+        'Daily_Breakout10': False,
+        'Daily_Trend_OK': False,
+        'Daily_MACD_OK': False,
+        'Daily_Volume_OK': False,
+        'Daily_Candle_OK': False,
+        'Daily_Overheat': False,
+        'Daily_Vol_Ratio': np.nan,
+        'Daily_MA20_Slope5 (%)': np.nan,
+        'Daily_Bias20 (%)': np.nan,
+        'Daily_Return5 (%)': np.nan,
+        'Daily_ATR14 (%)': np.nan,
+        'Daily_Breakout_Distance (%)': np.nan,
+        'Daily_Body_Ratio (%)': np.nan,
+        'Daily_Close_Position (%)': np.nan,
+        'Daily_DIF': np.nan,
+        'Daily_MACD_Bar': np.nan,
+    }
+    if ts_code not in stock_qfq_dict:
+        return default_res
+
+    df = stock_qfq_dict[ts_code]
+    df = df[df.index <= str(end_date)].copy()
+    if len(df) < 120:
+        return default_res
+
+    for col in ('open', 'high', 'low', 'close', 'vol'):
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=['open', 'high', 'low', 'close', 'vol'])
+    if len(df) < 120:
+        return default_res
+
+    close = df['close']
+    high = df['high']
+    low = df['low']
+    open_ = df['open']
+    vol = df['vol']
+
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+    ma120 = close.rolling(120).mean()
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    macd_bar = (dif - dea) * 2.0
+
+    prev10_high = high.shift(1).rolling(10).max()
+    prior5_vol = vol.shift(1).rolling(5).mean()
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr14 = true_range.rolling(14).mean()
+
+    curr_close = float(close.iloc[-1])
+    curr_open = float(open_.iloc[-1])
+    curr_high = float(high.iloc[-1])
+    curr_low = float(low.iloc[-1])
+    curr_range = max(curr_high - curr_low, 1e-9)
+
+    vol_ratio = float(vol.iloc[-1] / prior5_vol.iloc[-1]) if pd.notna(prior5_vol.iloc[-1]) and prior5_vol.iloc[-1] > 0 else np.nan
+    ma20_slope5 = float((ma20.iloc[-1] / ma20.iloc[-6] - 1.0) * 100.0) if pd.notna(ma20.iloc[-6]) and ma20.iloc[-6] > 0 else np.nan
+    bias20 = float((curr_close / ma20.iloc[-1] - 1.0) * 100.0) if pd.notna(ma20.iloc[-1]) and ma20.iloc[-1] > 0 else np.nan
+    return5 = float((curr_close / close.iloc[-6] - 1.0) * 100.0) if close.iloc[-6] > 0 else np.nan
+    atr14_pct = float(atr14.iloc[-1] / curr_close * 100.0) if pd.notna(atr14.iloc[-1]) and curr_close > 0 else np.nan
+    breakout_distance = float((curr_close / prev10_high.iloc[-1] - 1.0) * 100.0) if pd.notna(prev10_high.iloc[-1]) and prev10_high.iloc[-1] > 0 else np.nan
+    body_ratio = float(max(curr_close - curr_open, 0.0) / curr_range * 100.0)
+    close_position = float((curr_close - curr_low) / curr_range * 100.0)
+
+    breakout10 = bool(pd.notna(prev10_high.iloc[-1]) and curr_close > prev10_high.iloc[-1])
+    trend_ok = bool(
+        pd.notna(ma20.iloc[-1]) and pd.notna(ma60.iloc[-1]) and pd.notna(ma120.iloc[-1])
+        and curr_close > ma20.iloc[-1]
+        and ma20.iloc[-1] > ma20.iloc[-2]
+        and ma60.iloc[-1] > ma120.iloc[-1]
+    )
+    macd_ok = bool(
+        pd.notna(dif.iloc[-1]) and pd.notna(macd_bar.iloc[-1]) and pd.notna(macd_bar.iloc[-2])
+        and dif.iloc[-1] > 0 and macd_bar.iloc[-1] > macd_bar.iloc[-2]
+    )
+    volume_ok = bool(pd.notna(vol_ratio) and 1.3 <= vol_ratio <= 3.0)
+    candle_ok = bool(curr_close > curr_open and body_ratio >= 60.0 and close_position >= 70.0)
+    overheat = bool(
+        (pd.notna(vol_ratio) and vol_ratio > 4.0)
+        or (pd.notna(return5) and return5 > 15.0)
+        or (pd.notna(bias20) and bias20 > 12.0)
+    )
+
+    # 五项均为等权诊断；过热单独标记，不用主观权重覆盖V14.5评分。
+    confirm_score = int(sum((breakout10, trend_ok, macd_ok, volume_ok, candle_ok)))
+    if confirm_score >= 4 and not overheat:
+        state = '已确认'
+    elif confirm_score <= 1:
+        state = '确认偏弱'
+    else:
+        state = '中性等待'
+    if overheat and state == '已确认':
+        state = '确认但过热'
+
+    default_res.update({
+        'V40_Confirm_Score': confirm_score,
+        'V40_State': state,
+        'Daily_Breakout10': breakout10,
+        'Daily_Trend_OK': trend_ok,
+        'Daily_MACD_OK': macd_ok,
+        'Daily_Volume_OK': volume_ok,
+        'Daily_Candle_OK': candle_ok,
+        'Daily_Overheat': overheat,
+        'Daily_Vol_Ratio': round(vol_ratio, 3) if pd.notna(vol_ratio) else np.nan,
+        'Daily_MA20_Slope5 (%)': round(ma20_slope5, 3) if pd.notna(ma20_slope5) else np.nan,
+        'Daily_Bias20 (%)': round(bias20, 3) if pd.notna(bias20) else np.nan,
+        'Daily_Return5 (%)': round(return5, 3) if pd.notna(return5) else np.nan,
+        'Daily_ATR14 (%)': round(atr14_pct, 3) if pd.notna(atr14_pct) else np.nan,
+        'Daily_Breakout_Distance (%)': round(breakout_distance, 3) if pd.notna(breakout_distance) else np.nan,
+        'Daily_Body_Ratio (%)': round(body_ratio, 2),
+        'Daily_Close_Position (%)': round(close_position, 2),
+        'Daily_DIF': round(float(dif.iloc[-1]), 4),
+        'Daily_MACD_Bar': round(float(macd_bar.iloc[-1]), 4),
+    })
+    return default_res
+
+
+def _sort_v14_then_v40(df_in):
+    """V14.5总分始终优先；V40只打破同分。"""
+    if df_in.empty:
+        return df_in.copy()
+    df = df_in.copy()
+    for col in ('Total_Score', 'V40_Confirm_Score', 'circ_mv'):
+        if col not in df.columns:
+            df[col] = np.nan
+    return df.sort_values(
+        ['Total_Score', 'V40_Confirm_Score', 'circ_mv', 'ts_code'],
+        ascending=[False, False, False, True],
+        kind='mergesort',
+        na_position='last',
+    )
+
+
+def build_selection_groups(candidate_df, top_n, priority_mv=100.0, base_mv=50.0):
+    """生成原版50亿、硬100亿、100亿优先/50亿补位及全候选审计四组。"""
+    if candidate_df.empty:
+        return pd.DataFrame()
+
+    top_n = max(int(top_n), 1)
+    base_sorted = candidate_df.sort_values(
+        ['Total_Score'], ascending=[False], kind='mergesort', na_position='last'
+    )
+    hard100_sorted = candidate_df[
+        pd.to_numeric(candidate_df['circ_mv'], errors='coerce') >= float(priority_mv)
+    ].sort_values(['Total_Score'], ascending=[False], kind='mergesort', na_position='last')
+
+    mv_numeric = pd.to_numeric(candidate_df['circ_mv'], errors='coerce')
+    priority_pool = _sort_v14_then_v40(candidate_df[mv_numeric >= float(priority_mv)])
+    fallback_pool = _sort_v14_then_v40(candidate_df[mv_numeric < float(priority_mv)])
+    unknown_pool = _sort_v14_then_v40(candidate_df[mv_numeric.isna()])
+    fallback_all = pd.concat([fallback_pool, unknown_pool], ignore_index=False, sort=False)
+
+    layered_parts = [priority_pool.head(top_n)]
+    remaining = top_n - len(layered_parts[0])
+    if remaining > 0:
+        layered_parts.append(fallback_all.head(remaining))
+    layered = pd.concat(layered_parts, ignore_index=False, sort=False)
+
+    priority_label = f"{float(priority_mv):g}亿"
+    base_label = f"{float(base_mv):g}亿"
+    group_defs = [
+        ('BASE50', f'原版{base_label}', base_sorted.head(top_n)),
+        ('HARD100', f'硬{priority_label}', hard100_sorted.head(top_n)),
+        ('LAYERED', f'{priority_label}优先/低市值补位', layered),
+        ('AUDIT_ALL', '全候选审计', _sort_v14_then_v40(candidate_df)),
+    ]
+    frames = []
+    for strategy_id, strategy_name, frame in group_defs:
+        if frame.empty:
+            continue
+        out = frame.copy().reset_index(drop=True)
+        out['Rank'] = np.arange(1, len(out) + 1)
+        out['Strategy_ID'] = strategy_id
+        out['Strategy_Name'] = strategy_name
+        frames.append(out)
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+
+# ---------------------------
+# 🚀 独立出局系统 (仅限回测模式使用)
+# ---------------------------
+def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=12):
+    default_res = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
+    default_res.update({
+        'Exit_Reason': '持仓中', 'Buy_Price': np.nan, 'Gap_pct (%)': np.nan, 
+        'Exit_Date': None, 'Final_Return (%)': np.nan, 'Hold_Days': 0,
+        'Confirm_D3_Score': np.nan, 'Confirm_D3_State': '未到第3日',
+        'Confirm_D5_Score': np.nan, 'Confirm_D5_State': '未到第5日',
+    })
     
-    hist_full = get_qfq_data_v4_optimized_final(ts_code, start_date=start_fetch, end_date=end_future, use_sina=use_sina)
-    results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
-    results['Exit_Reason'] = "持仓中"
-    results['Buy_Price'] = np.nan
-    results['Gap_pct (%)'] = np.nan
+    if ts_code not in stock_qfq_dict: return default_res
+    df_full = stock_qfq_dict[ts_code]
+    hist_future = df_full[df_full.index > selection_date]
+    results = default_res.copy()
     
-    if hist_full.empty or len(hist_full) < 30: return results
-    
-    hist_full['open'] = pd.to_numeric(hist_full['open'], errors='coerce')
-    hist_full['high'] = pd.to_numeric(hist_full['high'], errors='coerce')
-    hist_full['low'] = pd.to_numeric(hist_full['low'], errors='coerce')
-    hist_full['close'] = pd.to_numeric(hist_full['close'], errors='coerce')
-    
-    hist_future = hist_full[hist_full.index > selection_date]
     if hist_future.empty: return results
 
     next_row = hist_future.iloc[0]
-
-    is_main_board = not (ts_code.startswith('300') or ts_code.startswith('301') 
-                          or ts_code.startswith('688') or ts_code.startswith('689'))
-    is_one_word_limit = (is_main_board and pd.notna(next_row['open']) and pd.notna(next_row['high']) 
-                          and pd.notna(next_row['low']) and next_row['open'] == next_row['high'] == next_row['low'])
-    if is_one_word_limit:
-        results['Exit_Reason'] = "一字板无法买入(剔除)"
-        results['Buy_Price'] = round(next_row['open'], 2)  
-        return results
-
     buy_price = next_row['open']
-    if pd.isna(buy_price) or buy_price <= 0:
+    if pd.isna(buy_price) or buy_price <= 0: return results
+
+    is_20cm = any(ts_code.startswith(prefix) for prefix in ['300', '301', '688', '689'])
+    limit_rate_pct = 19.0 if is_20cm else 9.5
+    gap_pct = (buy_price - signal_close) / signal_close * 100.0
+    
+    is_monday_yiziban = (next_row['open'] == next_row['high'] == next_row['low']) and (gap_pct >= limit_rate_pct)
+    if is_monday_yiziban:
+        results['Exit_Reason'] = f"一字板无法买入(剔除: {round(gap_pct, 1)}%)"
+        results['Buy_Price'] = round(buy_price, 2)  
         return results
 
-    # 【改动3：T+1 集合竞价拦截器】防核按钮与高开诱多
-    if signal_close and signal_close > 0:
-        gap_pct = (buy_price - signal_close) / signal_close * 100
-        results['Gap_pct (%)'] = round(gap_pct, 2)
-        if gap_pct < -3.0 or gap_pct > 5.0:
-            results['Exit_Reason'] = f"开盘幅度不符(剔除: {round(gap_pct, 2)}%)"
-            results['Buy_Price'] = round(buy_price, 2)
-            # 直接返回，不再执行后续持仓运算
-            return results
+    if is_20cm and gap_pct > 8.0:
+        results['Exit_Reason'] = f"双创高开过大(剔除: {round(gap_pct, 2)}%)"
+        results['Buy_Price'] = round(buy_price, 2)
+        return results
+    elif not is_20cm and gap_pct > 5.0:
+        results['Exit_Reason'] = f"主板高开过大(剔除: {round(gap_pct, 2)}%)"
+        results['Buy_Price'] = round(buy_price, 2)
+        return results
+    if gap_pct < -4.0:
+        results['Exit_Reason'] = f"恶劣低开(剔除: {round(gap_pct, 2)}%)"
+        results['Buy_Price'] = round(buy_price, 2)
+        return results
 
     results['Buy_Price'] = round(buy_price, 2)
-
     exit_triggered = False
     tier = 0  
-    peak_close = buy_price
+    peak_price = buy_price
     pending_exit_reason = None  
+    hard_stop_limit = -0.10 
     
-    is_20cm = ts_code.startswith('300') or ts_code.startswith('301') or ts_code.startswith('688')
-    hard_stop_limit = -0.12 if is_20cm else -0.08
-    
+    max_days = hold_weeks * 5
     for i in range(len(hist_future)):
-        if i >= hold_weeks * 5: break 
+        if i >= max_days: break 
             
         row = hist_future.iloc[i]
         day_count = i + 1
         current_week = ((day_count - 1) // 5) + 1 
+        curr_open, curr_close, curr_high, curr_low = row['open'], row['close'], row['high'], row['low']
+        curr_date = hist_future.index[i]
         
-        curr_open = row['open']
-        curr_close = row['close']
-        curr_high = row['high']
-        curr_low = row['low']
-        
-        if pending_exit_reason is not None:
-            final_return = (curr_open - buy_price) / buy_price * 100.0
+        if pending_exit_reason is not None and day_count >= 2:
+            if "保本" in pending_exit_reason: final_return = 2.0  
+            else: final_return = (curr_open - buy_price) / buy_price * 100.0
             exit_triggered = True
             results['Exit_Reason'] = pending_exit_reason
-            results[f'Return_W{current_week} (%)'] = final_return
+            results['Final_Return (%)'] = round(final_return, 2)
+            results['Exit_Date'] = curr_date
+            results['Hold_Days'] = day_count
+            results[f'Return_W{current_week} (%)'] = round(final_return, 2)
             break
         
-        peak_close = max(peak_close, curr_high)
-        peak_profit_pct = (peak_close - buy_price) / buy_price
+        peak_price = max(peak_price, curr_high)
+        peak_profit_pct = (peak_price - buy_price) / buy_price
         
-        if (curr_low - buy_price) / buy_price <= hard_stop_limit:
-            final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
-            exit_triggered = True
-            results['Exit_Reason'] = f"固定止损(破{int(hard_stop_limit*100)}%)"
-            results[f'Return_W{current_week} (%)'] = final_return
-            break
+        if day_count >= 2:
+            if (curr_low - buy_price) / buy_price <= hard_stop_limit:
+                final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
+                exit_triggered = True
+                results['Exit_Reason'] = "认栽出局(破-10%)"
+                results['Final_Return (%)'] = round(final_return, 2)
+                results['Exit_Date'] = curr_date
+                results['Hold_Days'] = day_count
+                results[f'Return_W{current_week} (%)'] = round(final_return, 2)
+                break
+
+        # 只记录确认状态，不据此改变原V14.5退出规则。
+        if day_count in (3, 5):
+            confirm_diag = compute_v40_daily_diagnostics(ts_code, curr_date, stock_qfq_dict)
+            results[f'Confirm_D{day_count}_Score'] = confirm_diag.get('V40_Confirm_Score', np.nan)
+            results[f'Confirm_D{day_count}_State'] = confirm_diag.get('V40_State', '数据不足')
         
-        if tier == 0 and peak_profit_pct >= 0.10:
-            tier = 1
-                
+        if tier == 0 and peak_profit_pct >= 0.10: tier = 1  
         if tier == 1:
-            if curr_close < buy_price * 0.995:
-                pending_exit_reason = "保本止盈"
-            elif peak_profit_pct >= 0.20:
-                tier = 2
-                
+            if curr_close <= buy_price * 1.02: pending_exit_reason = "保本离场(+2%)"
+            elif peak_profit_pct >= 0.20: tier = 2  
         if tier == 2:
-            giveback = (peak_close - curr_close) / peak_close
-            if giveback >= 0.15:
-                pending_exit_reason = "移动止盈(回撤15%)"
+            giveback = (peak_price - curr_close) / peak_price
+            if giveback >= 0.15: pending_exit_reason = "移动止盈(回撤15%)"
+        
+        if day_count == 5 and not exit_triggered and pending_exit_reason is None:
+            w1_ret = (curr_close - buy_price) / buy_price * 100.0
+            if w1_ret <= -3.0:
+                exit_triggered = True
+                results['Exit_Reason'] = f"首周不及预期截断({round(w1_ret, 1)}%)"
+                results['Final_Return (%)'] = round(w1_ret, 2)
+                results['Exit_Date'] = curr_date
+                results['Hold_Days'] = 5
+                results['Return_W1 (%)'] = round(w1_ret, 2)
+                break
             
         if day_count % 5 == 0:
-            results[f'Return_W{current_week} (%)'] = (curr_close - buy_price) / buy_price * 100.0
+            results[f'Return_W{current_week} (%)'] = round((curr_close - buy_price) / buy_price * 100.0, 2)
             
-    if not exit_triggered and len(hist_future) >= hold_weeks * 5:
-        last_price = hist_future.iloc[hold_weeks * 5 - 1]['close']
-        results[f'Return_W{hold_weeks} (%)'] = (last_price - buy_price) / buy_price * 100.0
-        results['Exit_Reason'] = "周期结束平仓"
+    if not exit_triggered and len(hist_future) >= max_days:
+        last_price = hist_future.iloc[max_days - 1]['close']
+        final_return = (last_price - buy_price) / buy_price * 100.0
+        results[f'Return_W{hold_weeks} (%)'] = round(final_return, 2)
+        results['Exit_Reason'] = "12周期满平仓"
+        results['Final_Return (%)'] = round(final_return, 2)
+        results['Exit_Date'] = hist_future.index[max_days - 1]
+        results['Hold_Days'] = max_days
         
     return results
 
-# ---------------------------
-# 核心回测循环
-# ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, use_sina=False, run_timestamp=None):
-    global GLOBAL_STOCK_INDUSTRY, GLOBAL_STOCK_BASIC
-
-    query_date = last_trade
-    daily_all = get_market_slice(GLOBAL_DAILY_RAW, query_date)
+def repair_checkpoint_df(df_in):
+    df_out = df_in.copy()
+    w_cols = [c for c in df_out.columns if c.startswith('Return_W') and c.endswith('(%)')]
+    if w_cols: w_cols = sorted(w_cols, key=lambda x: int(x.replace('Return_W', '').replace(' (%)', '')))
     
-    if use_sina and daily_all.empty:
-        for i in range(1, 10):
-            temp_date = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=i)).strftime("%Y%m%d")
-            daily_all = get_market_slice(GLOBAL_DAILY_RAW, temp_date)
-            daily_basic_test = get_market_slice(GLOBAL_DAILY_BASIC, temp_date)
-            if not daily_all.empty and not daily_basic_test.empty:
-                query_date = temp_date
-                break
-                
-    if daily_all.empty:
-        return pd.DataFrame(), "数据缺失", 0
-
-    if GLOBAL_STOCK_BASIC.empty:
-        return pd.DataFrame(), "股票基础数据缺失", 0
-    df = daily_all.merge(GLOBAL_STOCK_BASIC, on='ts_code', how='left')
-    
-    daily_basic = get_market_slice(GLOBAL_DAILY_BASIC, query_date)
-    if not daily_basic.empty:
-        df = df.merge(daily_basic[['ts_code','circ_mv']], on='ts_code', how='left')
-    else: 
-        return pd.DataFrame(), "市值数据缺失", 0
-    
-    df['circ_mv_billion'] = df['circ_mv'] / 10000 
-    
-    df = df[~df['name'].str.contains('ST|退', na=False)]
-    df = df[~df['ts_code'].str.startswith('92')] 
-    
-    df = df[(df['close'] >= MIN_PRICE)]
-    df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
-    
-    records = []
-    for row in df.itertuples():
-        if GLOBAL_STOCK_INDUSTRY and row.ts_code not in GLOBAL_STOCK_INDUSTRY: 
-            continue
-            
-        ind = compute_trend_indicators(row.ts_code, last_trade, use_sina=use_sina, _run_id=run_timestamp)
-        if not ind or not ind.get('is_v38_buy_signal'): 
-            continue
-            
-        if use_sina and ind['last_close'] < MIN_PRICE:
-            continue
-            
-        pct_chg = (ind['last_close'] - ind['pre_close']) / ind['pre_close'] * 100
-        score_breakout = pct_chg * 10 
-        score_vol = ind['vol_ratio'] * 10
-        total_score = score_breakout + score_vol
-        
-        # 【改动4：废除主观加分】去掉了 wave_cnt 的 30 分加成，让排序回归真实的量价爆发力度。
-        wave_cnt = ind.get('wave_count', 3)
-            
-        future_returns = get_medium_term_future(row.ts_code, last_trade, ind['last_close'], ind['bottom_line'], hold_weeks=8, use_sina=use_sina)
-        
-        record_dict = {
-            'ts_code': row.ts_code, 'name': row.name, 'Signal_Close': ind['last_close'], 
-            'Wave_Count': wave_cnt,
-            'circ_mv': row.circ_mv_billion,
-            'Total_Score': round(total_score, 1),
-            'Breakout_S': round(score_breakout, 1),
-            'Volume_S': round(score_vol, 1)
-        }
-        record_dict.update(future_returns)
-        records.append(record_dict)
-            
-    if not records:
-        return pd.DataFrame(), "无标的", 0
-    
-    fdf = pd.DataFrame(records)
-    final_df = fdf.sort_values('Total_Score', ascending=False).head(TOP_BACKTEST).copy()
-    final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
-    return final_df, None, len(records)
-
+    if 'Final_Return (%)' not in df_out.columns:
+        def get_final_ret(r):
+            if not w_cols: return 0.0
+            rets = r[w_cols].dropna()
+            return rets.iloc[-1] if not rets.empty else 0.0
+        df_out['Final_Return (%)'] = df_out.apply(get_final_ret, axis=1)
+    if 'Exit_Date' not in df_out.columns: df_out['Exit_Date'] = None
+    if 'Hold_Days' not in df_out.columns:
+        def get_hold_days(r):
+            if not w_cols: return 0
+            rets = r[w_cols].dropna()
+            return len(rets) * 5 if not rets.empty else 0
+        df_out['Hold_Days'] = df_out.apply(get_hold_days, axis=1)
+    return df_out
 
 # ---------------------------
-# 稳定断点与任务状态（不参与策略计算）
-# ---------------------------
-def make_config_id(top_k, min_mv, max_mv, min_price):
-    payload = {
-        'strategy': 'V40.6-original',
-        'runtime_schema': RUNTIME_SCHEMA_VERSION,
-        'top_k': int(top_k),
-        'min_mv': float(min_mv),
-        'max_mv': float(max_mv),
-        'min_price': float(min_price),
-    }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:12]
-
-
-def canonicalize_history(df):
-    if df is None or df.empty:
-        return pd.DataFrame() if df is None else df.copy()
-    clean = df.copy()
-    clean = clean.drop(columns=[c for c in clean.columns if str(c).startswith('Unnamed:')], errors='ignore')
-    if 'Trade_Date' in clean.columns:
-        clean['Trade_Date'] = clean['Trade_Date'].map(parse_yyyymmdd)
-        clean = clean.dropna(subset=['Trade_Date'])
-    if 'Config_ID' in clean.columns:
-        clean['Config_ID'] = clean['Config_ID'].astype(str)
-    if 'ts_code' in clean.columns:
-        clean['ts_code'] = clean['ts_code'].astype(str).str.strip()
-    keys = [key for key in ('Config_ID', 'Trade_Date', 'ts_code') if key in clean.columns]
-    if keys:
-        clean = clean.drop_duplicates(keys, keep='last')
-    return clean.reset_index(drop=True)
-
-
-def canonicalize_ledger(df):
-    if df is None or df.empty:
-        return pd.DataFrame() if df is None else df.copy()
-    ledger = df.copy()
-    ledger = ledger.drop(
-        columns=[c for c in ledger.columns if str(c).startswith('Unnamed:')],
-        errors='ignore',
-    )
-    if 'Trade_Date' in ledger.columns:
-        ledger['Trade_Date'] = ledger['Trade_Date'].map(parse_yyyymmdd)
-        ledger = ledger.dropna(subset=['Trade_Date'])
-    if 'Config_ID' in ledger.columns:
-        ledger['Config_ID'] = ledger['Config_ID'].astype(str)
-    if {'Trade_Date', 'Config_ID'}.issubset(ledger.columns):
-        ledger = ledger.drop_duplicates(['Trade_Date', 'Config_ID'], keep='last')
-    return ledger.reset_index(drop=True)
-
-
-def replace_checkpoint_date(new_rows, trade_date, config_id, existing=None):
-    if existing is None:
-        existing = read_csv_safe(CHECKPOINT_FILE)
-    existing = canonicalize_history(existing)
-    if not existing.empty and {'Trade_Date', 'Config_ID'}.issubset(existing.columns):
-        keep = ~(
-            existing['Trade_Date'].astype(str).eq(str(trade_date))
-            & existing['Config_ID'].astype(str).eq(str(config_id))
-        )
-        existing = existing.loc[keep].copy()
-    if new_rows is not None and not new_rows.empty:
-        rows = new_rows.copy()
-        rows['Trade_Date'] = str(trade_date)
-        rows['Config_ID'] = str(config_id)
-        combined = pd.concat([existing, rows], ignore_index=True, sort=False) if not existing.empty else rows
-    else:
-        combined = existing
-    combined = canonicalize_history(combined)
-    sort_cols = [column for column in ('Trade_Date', 'Rank') if column in combined.columns]
-    if sort_cols:
-        combined = combined.sort_values(sort_cols, kind='mergesort')
-    combined = combined.reset_index(drop=True)
-    atomic_write_csv(combined, CHECKPOINT_FILE)
-    return combined
-
-
-def mark_scan_status(trade_date, raw_count, selected_count, config_id, status, error='', ledger=None):
-    if ledger is None:
-        ledger = read_csv_safe(SCAN_LEDGER_FILE)
-    ledger = canonicalize_ledger(ledger)
-    row = pd.DataFrame([{
-        'Trade_Date': str(trade_date),
-        'Raw_Signal_Count': int(raw_count),
-        'Selected_Count': int(selected_count),
-        'Scan_Status': str(status),
-        'Error': str(error),
-        'Config_ID': str(config_id),
-        'Updated_At': datetime.now().isoformat(timespec='seconds'),
-    }])
-    ledger = pd.concat([ledger, row], ignore_index=True, sort=False) if not ledger.empty else row
-    ledger = canonicalize_ledger(ledger)
-    ledger = ledger.sort_values('Trade_Date').reset_index(drop=True)
-    atomic_write_csv(ledger, SCAN_LEDGER_FILE)
-    return ledger
-
-
-def is_data_incomplete_error(error):
-    if not error:
-        return False
-    error_text = str(error)
-    return any(error_text.startswith(prefix) for prefix in (
-        '数据缺失', '市值数据缺失', '股票基础数据缺失',
-        '历史数据不足', '历史行情缺失',
-    ))
-
-
-def completed_scan_dates(config_id):
-    completed = set()
-    ledger = canonicalize_ledger(read_csv_safe(SCAN_LEDGER_FILE))
-    if not ledger.empty and {'Trade_Date', 'Config_ID', 'Scan_Status'}.issubset(ledger.columns):
-        match = ledger[
-            ledger['Config_ID'].astype(str).eq(str(config_id))
-            & ledger['Scan_Status'].astype(str).eq('COMPLETED')
-        ]
-        completed.update(filter(None, (parse_yyyymmdd(value) for value in match['Trade_Date'])))
-
-    # 若恰好在结果写入与账本写入之间退出，有结果的日期仍可恢复为完成状态。
-    history = canonicalize_history(read_csv_safe(CHECKPOINT_FILE))
-    if not history.empty and 'Trade_Date' in history.columns:
-        if 'Config_ID' in history.columns:
-            history = history[history['Config_ID'].astype(str).eq(str(config_id))]
-        completed.update(filter(None, (parse_yyyymmdd(value) for value in history['Trade_Date'])))
-    return completed
-
-
-def save_task(task):
-    value = dict(task)
-    value['Updated_At'] = datetime.now().isoformat(timespec='seconds')
-    atomic_write_json(value, RUN_TASK_FILE)
-
-
-def clear_all_market_caches():
-    removed = []
-    if os.path.isdir(MARKET_CACHE_ROOT):
-        shutil.rmtree(MARKET_CACHE_ROOT)
-        removed.append(MARKET_CACHE_ROOT)
-    for path in legacy_cache_paths():
-        if os.path.isfile(path):
-            os.remove(path)
-            removed.append(path)
-    scan_market_partitions.clear()
-    st.cache_resource.clear()
-    return removed
-
-
-def clear_config_records(config_id):
-    history = canonicalize_history(read_csv_safe(CHECKPOINT_FILE))
-    if not history.empty and 'Config_ID' in history.columns:
-        history = history[~history['Config_ID'].astype(str).eq(str(config_id))]
-        atomic_write_csv(history.reset_index(drop=True), CHECKPOINT_FILE)
-    ledger = read_csv_safe(SCAN_LEDGER_FILE)
-    if not ledger.empty and 'Config_ID' in ledger.columns:
-        ledger = ledger[~ledger['Config_ID'].astype(str).eq(str(config_id))]
-        atomic_write_csv(ledger.reset_index(drop=True), SCAN_LEDGER_FILE)
-
-# ---------------------------
-# UI 及 主程序
+# UI 控制流与输入侧边栏
 # ---------------------------
 with st.sidebar:
-    st.header("V40.6-S3 稳定高效版")
-    backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", min_value=1, value=100, step=1)
+    st.header("⚙️ 模式与分析配置")
     
-    TOP_BACKTEST = st.number_input("每日优选 TopK", min_value=1, value=3)
+    st.info("💡 **双模引擎说明**：\n将追溯天数设为 **1**，触发【盘中极速选股】(不保存)；设为 **>1**，触发【历史回测】。系统已锁定回测模式仅在周末生效，防止污染。")
+    
+    BACKTEST_DAYS = st.number_input("追溯交易天数 (设为1为极速选股)", value=1, step=30, min_value=1)
+    MAX_TOP_N = st.number_input("每周目标股票数 (Top N)", value=3, min_value=1, max_value=50, step=1)
+    backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     
     st.markdown("---")
-    RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
-    st.caption("连续分析、每完成一个交易日就安全保存；真实中断后从下一日继续。")
-    clear_market_clicked = st.button("🗑️ 清除全部行情缓存")
-    clear_history_clicked = st.button("🗑️ 清除断点记录 (重新回测)")
+    if st.button("🗑️ 清空行情缓存"):
+        if os.path.isdir(MARKET_CACHE_DIR): shutil.rmtree(MARKET_CACHE_DIR)
+        for cache_path in (MARKET_CACHE_FILE, MARKET_CACHE_FILE + ".tmp"):
+            if os.path.exists(cache_path): os.remove(cache_path)
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.success("底层行情缓存已清理！")
+            
+    if st.button("🗑️ 清除历史回测记录"):
+        for result_path in (
+            CHECKPOINT_FILE, CHECKPOINT_FILE + ".bak",
+            PROCESSED_DATES_FILE, PROCESSED_DATES_FILE + ".bak",
+        ):
+            if os.path.exists(result_path): os.remove(result_path)
+        st.success("历史记录已清理！")
             
     st.markdown("---")
-    st.subheader("💰 核心护城河门槛")
+    st.subheader("💰 护城河底座")
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
     col1, col2 = st.columns(2)
-    # 用户指定：侧边栏最小流通市值默认值为 50 亿。
-    MIN_MV = col1.number_input("最小流通市值(亿)", value=50.0) 
-    MAX_MV = col2.number_input("最大流通市值(亿)", value=1000.0)
-
-TS_TOKEN_INPUT = st.text_input("Tushare Token", type="password")
-
-if clear_market_clicked:
-    removed = clear_all_market_caches()
-    if removed:
-        st.success(f"已清除 {len(removed)} 个行情缓存位置。")
-    else:
-        st.info("没有找到可清除的行情缓存。")
-
-if clear_history_clicked:
-    for file_path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
-        remove_with_backup(file_path)
-    st.success("历史结果、扫描账本和断点任务已清理。")
+    MIN_MV = col1.number_input("扫描最低流通市值(亿)", value=50.0)
+    MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
+    PRIORITY_MV = st.number_input("优先流通市值门槛(亿)", value=100.0, min_value=50.0, step=10.0)
+    st.caption("主结果优先选择达到该门槛的股票；不足Top N时由扫描池内较小市值股票补位。")
+    
+    st.markdown("---")
+    secret_token = st.secrets.get("TUSHARE_TOKEN", "") if hasattr(st, "secrets") else ""
+    TS_TOKEN_INPUT = st.text_input("🔑 Tushare Token", value=secret_token, type="password")
 
 token_clean = clean_token_str(TS_TOKEN_INPUT)
-is_realtime_mode = int(BACKTEST_DAYS) == 1
-current_config_id = make_config_id(TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE)
-task_before = read_json_safe(RUN_TASK_FILE)
-if task_before and task_before.get('Runtime_Schema') != RUNTIME_SCHEMA_VERSION:
-    st.warning("检测到旧稳定版断点；其完成状态可能不可靠，本版不会自动续跑。请重新点击启动。")
-    task_before = {}
+is_picking_mode = (int(BACKTEST_DAYS) == 1)
+CURRENT_CONFIG_ID = (
+    f"price{float(MIN_PRICE):.2f}_mv{float(MIN_MV):.2f}"
+    f"_priority{float(PRIORITY_MV):.2f}_max{float(MAX_MV):.2f}_top{int(MAX_TOP_N)}"
+)
 
-if task_before.get('State') in {'RUNNING', 'PAUSED_ERROR', 'WAITING_DATA'}:
-    done_count = int(task_before.get('Completed_Days', 0))
-    total_count = int(task_before.get('Total_Days', 0))
-    state_map = {'RUNNING': '运行中', 'PAUSED_ERROR': '异常暂停', 'WAITING_DATA': '等待缺失数据'}
-    st.info(f"🔄 检测到断点回测：{state_map.get(task_before.get('State'))}，已完成 {done_count}/{total_count} 日。")
+# ---------------------------
+# 主流程：启动引擎
+# ---------------------------
+btn_label = "🚀 启动盘中极速选股 (天数=1)" if is_picking_mode else "🚀 启动历史回测分析 (天数>1)"
 
-resume_clicked = False
-stop_clicked = False
-if task_before.get('State') in {'PAUSED_ERROR', 'WAITING_DATA'}:
-    resume_clicked = st.button("▶️ 从断点继续")
-if task_before.get('State') in {'RUNNING', 'PAUSED_ERROR', 'WAITING_DATA'}:
-    stop_clicked = st.button("⏹️ 停止断点回测")
-
-if stop_clicked:
-    stopped_task = read_json_safe(RUN_TASK_FILE)
-    stopped_task['State'] = 'STOPPED'
-    save_task(stopped_task)
-    st.warning("断点任务已停止；已完成的行情和结果仍保留。")
-
-if resume_clicked:
-    task_before['State'] = 'RUNNING'
-    task_before['Error_Count'] = 0
-    task_before.pop('Last_Error', None)
-    save_task(task_before)
-
-start_clicked = st.button("🚀 启动 V40.6 四大神盾追踪")
-if start_clicked:
-    token_ok, token_message = verify_token_connection(token_clean)
-    if not token_ok:
-        st.error(f"❌ Token预检拦截：{token_message}")
-    else:
-        # 新任务只保留一个大型行情索引，避免不同区间叠加耗尽内存。
-        st.cache_resource.clear()
-    if token_ok and not is_realtime_mode:
-        new_task = {
-            'State': 'RUNNING',
-            'Runtime_Schema': RUNTIME_SCHEMA_VERSION,
-            'Config_ID': current_config_id,
-            'Params': {
-                'Backtest_Days': int(BACKTEST_DAYS),
-                'Top_K': int(TOP_BACKTEST),
-                'End_Date': backtest_date_end.strftime('%Y%m%d'),
-                'Min_Price': float(MIN_PRICE),
-                'Min_MV': float(MIN_MV),
-                'Max_MV': float(MAX_MV),
-            },
-            'Reset_Config': not bool(RESUME_CHECKPOINT),
-            'Completed_Days': 0,
-            'Total_Days': 0,
-            'Error_Count': 0,
-        }
-        save_task(new_task)
-
-active_task = read_json_safe(RUN_TASK_FILE)
-if active_task and active_task.get('Runtime_Schema') != RUNTIME_SCHEMA_VERSION:
-    active_task = {}
-run_history = active_task.get('State') == 'RUNNING' and not stop_clicked
-run_realtime = start_clicked and is_realtime_mode and not run_history
-rerun_needed = False
-realtime_result = pd.DataFrame()
-realtime_error = None
-
-if run_history or run_realtime:
-    if not token_clean:
-        if run_history:
-            active_task['State'] = 'PAUSED_ERROR'
-            active_task['Last_Error'] = 'Token为空'
-            save_task(active_task)
-        st.error("❌ Token为空，历史回测断点已保留。")
+if st.button(btn_label):
+    is_valid, msg = verify_token_connection(token_clean)
+    if not is_valid:
+        st.error(f"❌ **Token 预检拦截**：{msg}")
     else:
         try:
-            API_ERRORS.clear()
-            SINA_STATUS = {'success': 0, 'fail': 0}
-            if run_history:
-                params = active_task['Params']
-                run_days = int(params['Backtest_Days'])
-                run_top_k = int(params['Top_K'])
-                run_end_date = str(params['End_Date'])
-                run_min_price = float(params['Min_Price'])
-                run_min_mv = float(params['Min_MV'])
-                run_max_mv = float(params['Max_MV'])
-                run_config_id = str(active_task['Config_ID'])
-                if active_task.pop('Reset_Config', False):
-                    clear_config_records(run_config_id)
-                    save_task(active_task)
-            else:
-                run_days = 1
-                run_top_k = int(TOP_BACKTEST)
-                run_end_date = backtest_date_end.strftime('%Y%m%d')
-                run_min_price = float(MIN_PRICE)
-                run_min_mv = float(MIN_MV)
-                run_max_mv = float(MAX_MV)
-                run_config_id = current_config_id
-
+            # 每次新任务先释放上一轮大型内存索引，避免连续回测叠加占用内存。
+            st.cache_resource.clear()
             ts.set_token(token_clean)
             pro = ts.pro_api(token_clean)
+            
+            with st.spinner("正在精准筛选科技池白名单标的..."):
+                whitelist_set, basic_name_map = load_custom_tech_whitelist(token_clean)
+                whitelist_keys = tuple(sorted(whitelist_set))
+                
+            if not whitelist_keys:
+                st.error("❌ 未能获取到科技白名单股票，请检查 Token 积分或网络。")
+            else:
+                st.info(f"💡 成功锁定科技白名单股票池：共 **{len(whitelist_keys)}** 只标的。")
+                
+                # 🌟 修复关键点：强制系统多看 15 天的日历，确保准确识别未来的周末
+                lookback_days = max(int(BACKTEST_DAYS) * 3, 900) 
+                start_cal = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+                end_cal_extended = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") + timedelta(days=15)).strftime("%Y%m%d")
+                
+                cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_cal, end_date=end_cal_extended)
+                if cal_raw.empty:
+                    st.error("❌ 无法获取交易日历。")
+                else:
+                    cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
+                    all_trade_days = cal_open['cal_date'].tolist()
+                    
+                    # 过滤出小于等于我们所选截止日期的真实可交易日列表
+                    end_str = backtest_date_end.strftime("%Y%m%d")
+                    trade_days_list = [d for d in all_trade_days if d <= end_str]
+                    
+                    if not trade_days_list:
+                        st.error("❌ 未获取到有效交易日。")
+                    else:
+                        td_df = pd.DataFrame({'cal_date': all_trade_days})
+                        td_df['dt'] = pd.to_datetime(td_df['cal_date'])
+                        td_df['year_week'] = td_df['dt'].dt.strftime('%G_%V')
+                        
+                        # 🌟 核心模式分流与周末防线
+                        if is_picking_mode:
+                            dates_to_run = [trade_days_list[-1]] 
+                        else:
+                            # 找出所有包含在完整日历里的“真正的一周最后一天”
+                            valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
+                            
+                            processed_dates = set()
+                            if os.path.exists(PROCESSED_DATES_FILE):
+                                try:
+                                    existing_df = _read_csv_safely(PROCESSED_DATES_FILE)
+                                    if 'Config_ID' in existing_df.columns:
+                                        existing_df = existing_df[existing_df['Config_ID'].astype(str) == CURRENT_CONFIG_ID]
+                                    existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
+                                    processed_dates = set(existing_df['Trade_Date'].unique())
+                                except Exception: pass
+                            elif os.path.exists(CHECKPOINT_FILE):
+                                # 兼容首次升级时已有的结果文件。
+                                try:
+                                    existing_df = _read_csv_safely(CHECKPOINT_FILE)
+                                    if 'Config_ID' in existing_df.columns:
+                                        existing_df = existing_df[existing_df['Config_ID'].astype(str) == CURRENT_CONFIG_ID]
+                                    existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
+                                    processed_dates = set(existing_df['Trade_Date'].unique())
+                                except Exception: pass
+                            recent_trade_days = trade_days_list[-int(BACKTEST_DAYS):]
+                            
+                            # 只有这一天既在最近回测范围内，又是真正的周末，且没被处理过，才允许进入回测
+                            dates_to_run = [d for d in recent_trade_days if d not in processed_dates and d in valid_scan_dates]
+                            dates_to_run.sort()
+                        
+                        if not dates_to_run and not is_picking_mode:
+                            st.success("🎉 指定区间回测数据已全部跑完！(如果您选择了周中日期，系统已自动跳过以保护数据纯洁性)")
+                        elif dates_to_run:
+                            fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
+                            fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
+                            
+                            stock_qfq_dict, basic_indexed = load_optimized_market_data(fetch_start, fetch_end, token_clean, whitelist_keys)
+                            
+                            if not stock_qfq_dict:
+                                st.warning("⚠️ 未能加载到行情数据，请重试。")
+                            else:
+                                bar = st.progress(0, text="执行 V14.5 数据扫描...")
+                                
+                                for i, date in enumerate(dates_to_run):
+                                    records = []
+                                    for ts_code in whitelist_keys:
+                                        if ts_code not in stock_qfq_dict: continue
+                                        df_stock = stock_qfq_dict[ts_code]
+                                        if date not in df_stock.index: continue
+                                            
+                                        row_latest = df_stock.loc[date]
+                                        if isinstance(row_latest, pd.DataFrame): row_latest = row_latest.iloc[-1]
+                                            
+                                        curr_close = row_latest['close']
+                                        if curr_close < MIN_PRICE: continue
+                                            
+                                        circ_mv_billion = np.nan
+                                        if not basic_indexed.empty and (date, ts_code) in basic_indexed.index:
+                                            circ_mv_billion = basic_indexed.loc[(date, ts_code)]['circ_mv'] / 10000.0
+                                        
+                                        if pd.notna(circ_mv_billion):
+                                            if circ_mv_billion < MIN_MV or circ_mv_billion > MAX_MV: continue
+                                        
+                                        ind = compute_breakout_signal(ts_code, date, stock_qfq_dict)
+                                        if not ind or not ind.get('is_buy_signal'): continue
+
+                                        v40_diag = compute_v40_daily_diagnostics(ts_code, date, stock_qfq_dict)
+                                        if pd.isna(circ_mv_billion):
+                                            cap_tier = "市值未知"
+                                        elif circ_mv_billion >= float(PRIORITY_MV):
+                                            cap_tier = f"≥{float(PRIORITY_MV):g}亿"
+                                        else:
+                                            cap_tier = f"{float(MIN_MV):g}~{float(PRIORITY_MV):g}亿"
+                                            
+                                        stock_name = basic_name_map.get(ts_code, ts_code)
+                                        record_dict = {
+                                            'ts_code': ts_code, 'name': stock_name, 'Signal_Close': ind['signal_close'], 
+                                            'SKDJ_K': ind['k'], 'SKDJ_D': ind['d'], 
+                                            'D_Min(10W)': ind['recent_k_min'], 'Weeks_Under': ind['weeks_under_25'],
+                                            'Trend_Type': ind['trend_type'], 'vol_ratio': ind['vol_ratio'],
+                                            'circ_mv': round(circ_mv_billion, 2) if pd.notna(circ_mv_billion) else np.nan, 
+                                            'Cap_Tier': cap_tier,
+                                            'Total_Score': ind['Total_Score'],
+                                        }
+                                        record_dict.update(v40_diag)
+                                        
+                                        if not is_picking_mode:
+                                            future_returns = track_future_performance(ts_code, date, ind['signal_close'], stock_qfq_dict, hold_weeks=12)
+                                            record_dict.update(future_returns)
+                                            
+                                        records.append(record_dict)
+                                            
+                                    if records:
+                                        candidate_df = pd.DataFrame(records)
+                                        selected_groups = build_selection_groups(
+                                            candidate_df,
+                                            top_n=int(MAX_TOP_N),
+                                            priority_mv=float(PRIORITY_MV),
+                                            base_mv=float(MIN_MV),
+                                        )
+                                        selected_groups['Trade_Date'] = date
+                                        selected_groups['Config_ID'] = CURRENT_CONFIG_ID
+                                        
+                                        if is_picking_mode:
+                                            fdf = selected_groups[selected_groups['Strategy_ID'] == 'LAYERED'].copy()
+                                            st.subheader(
+                                                f"🎯 主结果 [{date}]：{float(PRIORITY_MV):g}亿优先 / 低市值补位 - Top {MAX_TOP_N}"
+                                            )
+                                            main_cols = [
+                                                'Rank', 'name', 'ts_code', 'Total_Score', 'circ_mv', 'Cap_Tier',
+                                                'V40_Confirm_Score', 'V40_State', 'Daily_Breakout10',
+                                                'Daily_Trend_OK', 'Daily_MACD_OK', 'Daily_Volume_OK',
+                                                'Daily_Overheat', 'SKDJ_K', 'Weeks_Under',
+                                            ]
+                                            main_cols = [c for c in main_cols if c in fdf.columns]
+                                            try:
+                                                st.dataframe(fdf[main_cols].style.background_gradient(subset=['Total_Score'], cmap='YlOrRd'), width='stretch')
+                                            except Exception:
+                                                st.dataframe(fdf[main_cols], width='stretch')
+
+                                            with st.expander(
+                                                f"查看原版{float(MIN_MV):g}亿、硬{float(PRIORITY_MV):g}亿及全部诊断候选"
+                                            ):
+                                                audit_live = selected_groups[selected_groups['Strategy_ID'] != 'LAYERED'].copy()
+                                                audit_cols = [
+                                                    'Strategy_Name', 'Rank', 'name', 'ts_code', 'Total_Score',
+                                                    'circ_mv', 'V40_Confirm_Score', 'V40_State',
+                                                    'Daily_Vol_Ratio', 'Daily_Bias20 (%)', 'Daily_Return5 (%)',
+                                                ]
+                                                audit_cols = [c for c in audit_cols if c in audit_live.columns]
+                                                st.dataframe(audit_live[audit_cols], width='stretch')
+                                        else:
+                                            _commit_scan_date(selected_groups, date, len(candidate_df), CURRENT_CONFIG_ID)
+                                    elif not is_picking_mode:
+                                        _commit_scan_date(pd.DataFrame(), date, 0, CURRENT_CONFIG_ID)
+                                        
+                                    bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date} (捕获 {len(records)} 只目标)")
+                                    
+                                bar.empty()
+                                if is_picking_mode:
+                                    st.success("🎉 今日极速选股完成！(当前为选股模式，数据未写入历史回测库)")
+                                else:
+                                    st.success("🎉 回测数据更新完毕！请查看下方报告。")
+                                    
+        except Exception as e:
+            st.error(f"❌ **运行异常拦截**：{str(e)}")
+
+# ---------------------------
+# 全景分析展示区 (仅在有历史记录时展示)
+# ---------------------------
+if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
+    st.markdown("---")
+    try:
+        raw_res = _read_csv_safely(CHECKPOINT_FILE)
+        if raw_res.empty:
+            raise pd.errors.EmptyDataError
+        if 'Config_ID' in raw_res.columns:
+            raw_res = raw_res[raw_res['Config_ID'].astype(str) == CURRENT_CONFIG_ID].copy()
+        else:
+            raw_res['Config_ID'] = CURRENT_CONFIG_ID
+        if raw_res.empty:
+            raise pd.errors.EmptyDataError
+        raw_res['Trade_Date'] = raw_res['Trade_Date'].astype(str)
+
+        repaired_res = repair_checkpoint_df(raw_res)
+        if 'Strategy_ID' not in repaired_res.columns:
+            repaired_res['Strategy_ID'] = 'LAYERED'
+            repaired_res['Strategy_Name'] = f'{float(PRIORITY_MV):g}亿优先/低市值补位'
+
+        processed_df = _read_csv_safely(PROCESSED_DATES_FILE)
+        if not processed_df.empty and 'Config_ID' in processed_df.columns:
+            processed_df = processed_df[processed_df['Config_ID'].astype(str) == CURRENT_CONFIG_ID].copy()
+        completed_dates = (
+            sorted(processed_df['Trade_Date'].astype(str).unique().tolist())
+            if not processed_df.empty and 'Trade_Date' in processed_df.columns
+            else sorted(repaired_res['Trade_Date'].astype(str).unique().tolist())
+        )
+        total_completed_weeks = len(completed_dates)
+
+        is_rejected = repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)
+        valid_all = repaired_res[~is_rejected].copy()
+        selection_ids = ['BASE50', 'HARD100', 'LAYERED']
+        selected_raw = repaired_res[repaired_res['Strategy_ID'].isin(selection_ids)].copy()
+        selected_valid = valid_all[valid_all['Strategy_ID'].isin(selection_ids)].copy()
+        audit_valid = valid_all[valid_all['Strategy_ID'] == 'AUDIT_ALL'].copy()
+        main_signals = selected_valid[selected_valid['Strategy_ID'] == 'LAYERED'].copy()
+
+        st.header("📈 V14.6 市值分层与V40确认审计报告")
+        st.caption("三组使用完全相同的V14.5买点和退出规则；V40只参与分层组的同分排序。")
+
+        st.subheader("⚖️ 原版50亿 / 硬100亿 / 分层补位对比")
+        strategy_rows = []
+        strategy_names = {
+            'BASE50': f'原版{float(MIN_MV):g}亿',
+            'HARD100': f'硬{float(PRIORITY_MV):g}亿',
+            'LAYERED': f'{float(PRIORITY_MV):g}亿优先/低市值补位',
+        }
+        for strategy_id in selection_ids:
+            raw_group = selected_raw[selected_raw['Strategy_ID'] == strategy_id]
+            valid_group = selected_valid[selected_valid['Strategy_ID'] == strategy_id]
+            closed_group = valid_group[valid_group['Exit_Reason'].astype(str) != '持仓中'].copy()
+            closed_group['Final_Return (%)'] = pd.to_numeric(
+                closed_group['Final_Return (%)'], errors='coerce'
+            )
+            closed_group = closed_group.dropna(subset=['Final_Return (%)'])
+
+            date_counts = raw_group.groupby('Trade_Date').size() if not raw_group.empty else pd.Series(dtype=float)
+            underfilled = sum(int(date_counts.get(d, 0)) < int(MAX_TOP_N) for d in completed_dates)
+            no_pick = sum(int(date_counts.get(d, 0)) == 0 for d in completed_dates)
+
+            strategy_rows.append({
+                '方案': strategy_names[strategy_id],
+                '已完成扫描周': total_completed_weeks,
+                '有入选周': int(raw_group['Trade_Date'].nunique()) if not raw_group.empty else 0,
+                '空窗周': no_pick,
+                f'不足{int(MAX_TOP_N)}只周': underfilled,
+                '入选笔数': len(raw_group),
+                '完成交易': len(closed_group),
+                '胜率': (closed_group['Final_Return (%)'] > 0).mean() * 100 if not closed_group.empty else np.nan,
+                '平均收益': closed_group['Final_Return (%)'].mean() if not closed_group.empty else np.nan,
+                '中位数收益': closed_group['Final_Return (%)'].median() if not closed_group.empty else np.nan,
+                '破-10%率': closed_group['Exit_Reason'].astype(str).str.contains('破-10%').mean() * 100 if not closed_group.empty else np.nan,
+            })
+        strategy_stats = pd.DataFrame(strategy_rows)
+        for col in ('胜率', '平均收益', '中位数收益', '破-10%率'):
+            strategy_stats[col] = strategy_stats[col].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "-")
+        st.dataframe(strategy_stats, width='stretch', hide_index=True)
+
+        if not main_signals.empty:
+            main_closed = main_signals[main_signals['Exit_Reason'].astype(str) != '持仓中'].copy()
+            main_closed['Final_Return (%)'] = pd.to_numeric(main_closed['Final_Return (%)'], errors='coerce')
+            main_closed = main_closed.dropna(subset=['Final_Return (%)'])
+            if not main_closed.empty:
+                win_count = int((main_closed['Final_Return (%)'] > 0).sum())
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                col_m1.metric("分层组完成交易", f"{len(main_closed)} 笔")
+                col_m2.metric("分层组胜率", f"{win_count / len(main_closed) * 100:.1f}%", f"{win_count}胜")
+                col_m3.metric("分层组平均收益", f"{main_closed['Final_Return (%)'].mean():.2f}%")
+                col_m4.metric("分层组中位数", f"{main_closed['Final_Return (%)'].median():.2f}%")
+
+                st.subheader("🗓️ 分层主结果周度表现（仍为存活样本口径）")
+                cols_row1 = st.columns(4)
+                cols_row2 = st.columns(4)
+                cols_row3 = st.columns(4)
+                for w in range(1, 13):
+                    col_name = f'Return_W{w} (%)'
+                    if col_name not in main_signals.columns:
+                        continue
+                    valid_week = main_signals.dropna(subset=[col_name]).copy()
+                    if w <= 4:
+                        target_col = cols_row1[w - 1]
+                    elif w <= 8:
+                        target_col = cols_row2[w - 5]
+                    else:
+                        target_col = cols_row3[w - 9]
+                    with target_col:
+                        if not valid_week.empty:
+                            week_values = pd.to_numeric(valid_week[col_name], errors='coerce').dropna()
+                            if not week_values.empty:
+                                st.metric(
+                                    f"W{w} 均益/胜率 (存活{len(week_values)}只)",
+                                    f"{week_values.mean():.2f}% / {(week_values > 0).mean() * 100:.1f}%",
+                                )
+
+                st.subheader("🏆 分层主结果的名次表现")
+                rank_stats = main_closed.groupby('Rank', observed=False).agg(
+                    样本数=('Final_Return (%)', 'count'),
+                    平均分=('Total_Score', 'mean'),
+                    平均确认分=('V40_Confirm_Score', 'mean'),
+                    胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                    均益=('Final_Return (%)', 'mean'),
+                    中位数=('Final_Return (%)', 'median'),
+                    止损率=('Exit_Reason', lambda x: x.astype(str).str.contains('破-10%').mean() * 100),
+                ).reset_index().head(10)
+                for col in ('胜率', '均益', '中位数', '止损率'):
+                    rank_stats[col] = rank_stats[col].map('{:.2f}%'.format)
+                st.dataframe(rank_stats, width='stretch', hide_index=True)
+
+        audit_closed = audit_valid[audit_valid['Exit_Reason'].astype(str) != '持仓中'].copy()
+        audit_closed['Final_Return (%)'] = pd.to_numeric(audit_closed['Final_Return (%)'], errors='coerce')
+        audit_closed = audit_closed.dropna(subset=['Final_Return (%)'])
+        if not audit_closed.empty:
+            st.subheader("🔎 全候选诊断：市值层与入选日V40状态")
+            diag_col1, diag_col2 = st.columns(2)
+            cap_stats = audit_closed.groupby('Cap_Tier', observed=False).agg(
+                样本数=('Final_Return (%)', 'count'),
+                胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                均益=('Final_Return (%)', 'mean'),
+                中位数=('Final_Return (%)', 'median'),
+            ).reset_index()
+            state_stats = audit_closed.groupby('V40_State', observed=False).agg(
+                样本数=('Final_Return (%)', 'count'),
+                胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                均益=('Final_Return (%)', 'mean'),
+                中位数=('Final_Return (%)', 'median'),
+            ).reset_index()
+            for frame in (cap_stats, state_stats):
+                for col in ('胜率', '均益', '中位数'):
+                    frame[col] = frame[col].map('{:.2f}%'.format)
+            with diag_col1:
+                st.markdown("**流通市值层**")
+                st.dataframe(cap_stats, width='stretch', hide_index=True)
+            with diag_col2:
+                st.markdown("**入选日V40确认状态**")
+                st.dataframe(state_stats, width='stretch', hide_index=True)
+
+            st.subheader("🧭 买入后第3日 / 第5日确认状态（本版仅观察，不触发卖出）")
+            hold_cols = st.columns(2)
+            for idx, day in enumerate((3, 5)):
+                state_col = f'Confirm_D{day}_State'
+                if state_col not in audit_closed.columns:
+                    continue
+                reached = audit_closed[
+                    ~audit_closed[state_col].astype(str).isin([f'未到第{day}日', '数据不足', 'nan'])
+                ].copy()
+                if reached.empty:
+                    continue
+                hold_stats = reached.groupby(state_col, observed=False).agg(
+                    样本数=('Final_Return (%)', 'count'),
+                    胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                    均益=('Final_Return (%)', 'mean'),
+                    中位数=('Final_Return (%)', 'median'),
+                ).reset_index().rename(columns={state_col: '确认状态'})
+                for col in ('胜率', '均益', '中位数'):
+                    hold_stats[col] = hold_stats[col].map('{:.2f}%'.format)
+                with hold_cols[idx]:
+                    st.markdown(f"**第{day}个交易日（到达样本{len(reached)}只）**")
+                    st.dataframe(hold_stats, width='stretch', hide_index=True)
+
+        if not main_signals.empty:
+            st.subheader("📋 分层主结果交割流水单")
+            disp_cols = [
+                'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'circ_mv', 'Cap_Tier',
+                'V40_Confirm_Score', 'V40_State', 'Confirm_D3_State', 'Confirm_D5_State',
+                'SKDJ_K', 'D_Min(10W)', 'Weeks_Under', 'Signal_Close', 'Buy_Price',
+                'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)',
+            ]
+            final_disp = [c for c in disp_cols if c in main_signals.columns]
+
+            def color_exit_reason(val):
+                if isinstance(val, str):
+                    if '截断' in val: return 'color: white; background-color: #8B4513'
+                    elif '认栽' in val: return 'color: white; background-color: darkred'
+                    elif '保本' in val: return 'color: white; background-color: darkgoldenrod'
+                    elif '移动止盈' in val: return 'color: white; background-color: darkgreen'
+                    elif '期满' in val: return 'color: blue'
+                return ''
+
+            display_main = main_signals[final_disp].sort_values(
+                ['Trade_Date', 'Rank'], ascending=[False, True], kind='mergesort'
+            )
             try:
-                setattr(pro, "_DataApi__timeout", TUSHARE_REQUEST_TIMEOUT_SECONDS)
-            except Exception as exc:
-                record_api_error(f"无法设置Tushare请求超时，将使用SDK默认值: {exc}")
-            token_hash = hashlib.sha1(token_clean.encode('utf-8')).hexdigest()[:12]
-            with st.spinner("正在加载V40.6原科技白名单和股票名称..."):
-                GLOBAL_STOCK_INDUSTRY = load_industry_mapping(token_hash)
-                GLOBAL_STOCK_BASIC = load_stock_basic(token_hash)
+                styled_port = display_main.style
+                if 'Exit_Reason' in display_main.columns:
+                    styled_port = styled_port.map(color_exit_reason, subset=['Exit_Reason'])
+                st.dataframe(styled_port, width='stretch')
+            except Exception:
+                st.dataframe(display_main, width='stretch')
 
-            trade_days_list = get_trade_days(run_end_date, run_days)
-            if not trade_days_list:
-                raise RuntimeError("未取得回测交易日")
-            processed = completed_scan_dates(run_config_id) if run_history else set()
-            pending_dates = [date for date in trade_days_list if date not in processed]
-            if run_history:
-                active_task['Total_Days'] = len(trade_days_list)
-                active_task['Completed_Days'] = len(trade_days_list) - len(pending_dates)
-                save_task(active_task)
-
-            if not pending_dates:
-                if run_history:
-                    remove_with_backup(RUN_TASK_FILE)
-                    st.success("🎉 指定区间回测已全部完成！")
-                else:
-                    st.warning("未取得可扫描日期。")
-            else:
-                sync_info = get_all_historical_data(trade_days_list, use_cache=True)
-                if not sync_info['ok']:
-                    raise RuntimeError("未能加载到任何完整行情；已下载部分仍保留在分片缓存中")
-
-                # 同一次运行连续处理全部待扫日期；每个交易日仍原子落盘。
-                # 只有真实异常才触发重跑，从而避免每5日重复加载全部行情分片。
-                batch_dates = pending_dates
-                coverage_errors = sync_info.get('coverage_errors', {})
-                checkpoint_state = canonicalize_history(read_csv_safe(CHECKPOINT_FILE))
-                ledger_state = canonicalize_ledger(read_csv_safe(SCAN_LEDGER_FILE))
-                bar = st.progress(0, text="箱体首发与四大神盾过滤中...")
-                stopped_during_batch = False
-                incomplete_dates = []
-                completed_in_batch = 0
-                for index, date in enumerate(batch_dates):
-                    if run_history and read_json_safe(RUN_TASK_FILE).get('State') == 'STOPPED':
-                        stopped_during_batch = True
-                        break
-
-                    is_realtime_radar = (
-                        run_realtime and date == datetime.now().strftime('%Y%m%d')
-                    )
-                    run_timestamp = time.time() if is_realtime_radar else None
-                    coverage_error = coverage_errors.get(str(date))
-                    if coverage_error:
-                        result, error, raw_count = pd.DataFrame(), coverage_error, 0
-                    else:
-                        result, error, raw_count = run_backtest_for_a_day(
-                            date, run_top_k, run_min_mv, run_max_mv, run_min_price,
-                            use_sina=is_realtime_radar, run_timestamp=run_timestamp,
-                        )
-
-                    data_incomplete = is_data_incomplete_error(error)
-                    if run_realtime:
-                        realtime_result = result.copy()
-                        realtime_error = error
-                        if error and error != '无标的':
-                            st.warning(f"[{date}] {error}；本次不把该日记为完成。")
-                    elif data_incomplete:
-                        incomplete_dates.append(date)
-                        ledger_state = mark_scan_status(
-                            date, raw_count, 0, run_config_id, 'INCOMPLETE', error,
-                            ledger=ledger_state,
-                        )
-                    else:
-                        checkpoint_state = replace_checkpoint_date(
-                            result, date, run_config_id, existing=checkpoint_state
-                        )
-                        ledger_state = mark_scan_status(
-                            date, raw_count, len(result), run_config_id, 'COMPLETED', error or '',
-                            ledger=ledger_state,
-                        )
-                        completed_in_batch += 1
-                        processed.add(str(date))
-                        active_task['Completed_Days'] = len(processed)
-                        active_task['Error_Count'] = 0
-                        active_task['Last_Date'] = date
-                        save_task(active_task)
-
-                    bar.progress(
-                        (index + 1) / max(len(batch_dates), 1),
-                        text=f"分析中: {date} (候选 {raw_count} 只)",
-                    )
-                bar.empty()
-
-                if run_realtime:
-                    if not realtime_result.empty:
-                        st.subheader(f"🎯 实盘雷达结果 [{batch_dates[0]}]")
-                        st.dataframe(realtime_result, use_container_width=True)
-                    elif realtime_error == '无标的':
-                        st.info(f"[{batch_dates[0]}] 暂无符合V40.6原条件的股票。")
-                elif stopped_during_batch:
-                    st.warning("断点任务已停止；已完成的结果已经安全保存。")
-                else:
-                    remaining_dates = [date for date in trade_days_list if date not in processed]
-                    if remaining_dates:
-                        active_task['State'] = 'WAITING_DATA'
-                        active_task['Completed_Days'] = len(trade_days_list) - len(remaining_dates)
-                        active_task['Missing_Dates'] = remaining_dates
-                        save_task(active_task)
-                        st.warning(
-                            f"完整日期已全部处理；仍有 {len(remaining_dates)} 日数据不完整，"
-                            "断点已保留。数据发布或网络恢复后点击“从断点继续”即可只补这些日期。"
-                        )
-                    else:
-                        remove_with_backup(RUN_TASK_FILE)
-                        st.success(f"🎉 回测数据更新完毕！本次连续完成 {completed_in_batch} 日。")
-
-            if run_realtime:
-                st.markdown("---")
-                if SINA_STATUS['success'] > 0:
-                    st.success(f"✅ 盘中实时探针响应正常：成功接入新浪数据 {SINA_STATUS['success']} 次。")
-                elif SINA_STATUS['fail'] > 0:
-                    st.error(f"❌ 新浪实时数据抓取失败 {SINA_STATUS['fail']} 次，请确认当前是否在交易时间。")
-                else:
-                    st.info("ℹ️ 实时探针未触发（可能由于基础选股条件未通过）。")
-        except Exception as error:
-            if run_history:
-                latest_task = read_json_safe(RUN_TASK_FILE) or active_task
-                error_count = int(latest_task.get('Error_Count', 0)) + 1
-                latest_task['Error_Count'] = error_count
-                latest_task['Last_Error'] = str(error)
-                if error_count < 3:
-                    latest_task['State'] = 'RUNNING'
-                    rerun_needed = True
-                    st.warning(f"⚠️ 临时异常，断点已保留，将自动重试 ({error_count}/3)：{error}")
-                else:
-                    latest_task['State'] = 'PAUSED_ERROR'
-                    st.error(f"❌ 连续3次失败，任务已安全暂停：{error}")
-                save_task(latest_task)
-            else:
-                st.error(f"❌ 运行异常：{error}")
-
-if rerun_needed:
-    time.sleep(0.8)
-    st.rerun()
-
-
-# ---------------------------
-# 报告始终从磁盘恢复，页面刷新后仍可查看和下载
-# ---------------------------
-latest_task = read_json_safe(RUN_TASK_FILE)
-if latest_task and latest_task.get('Runtime_Schema') != RUNTIME_SCHEMA_VERSION:
-    latest_task = {}
-report_config_id = str(latest_task.get('Config_ID', current_config_id))
-all_history = canonicalize_history(read_csv_safe(CHECKPOINT_FILE))
-if not all_history.empty and 'Config_ID' in all_history.columns:
-    all_res = all_history[all_history['Config_ID'].astype(str).eq(report_config_id)].copy()
-else:
-    all_res = pd.DataFrame()
-
-ledger = canonicalize_ledger(read_csv_safe(SCAN_LEDGER_FILE))
-if not ledger.empty and {'Config_ID', 'Scan_Status'}.issubset(ledger.columns):
-    ledger_current = ledger[ledger['Config_ID'].astype(str).eq(report_config_id)]
-    completed_count = int(ledger_current['Scan_Status'].astype(str).eq('COMPLETED').sum())
-    incomplete_count = int(ledger_current['Scan_Status'].astype(str).eq('INCOMPLETE').sum())
-    if completed_count or incomplete_count:
-        st.caption(f"断点账本：已完成 {completed_count} 日；待补数据 {incomplete_count} 日。")
-
-if not all_res.empty:
-    all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
-    st.header("📊 V40.6 实战定型版")
-    st.subheader("🗓️ 周度生存与收益切片 (剔除不符合开盘要求的无效标的)")
-    cols_row1 = st.columns(4)
-    cols_row2 = st.columns(4)
-
-    # 以下统计、展示和下载字段保持V40.6原样。
-    valid_trades_only = all_res[~all_res['Exit_Reason'].str.contains('剔除', na=False)]
-    for w in range(1, 9):
-        col_name = f'Return_W{w} (%)'
-        if col_name in valid_trades_only.columns:
-            valid = valid_trades_only.dropna(subset=[col_name])
-            target_col = cols_row1[w-1] if w <= 4 else cols_row2[w-5]
-            with target_col:
-                if not valid.empty:
-                    avg = valid[col_name].mean()
-                    win = (valid[col_name] > 0).mean() * 100
-                    st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
-                else:
-                    st.metric(f"W{w} 无持仓", "N/A")
-
-    st.subheader("📋 实战定型榜单")
-    display_cols = [
-        'Rank', 'Trade_Date', 'name', 'ts_code', 'Wave_Count', 'Signal_Close',
-        'Buy_Price', 'Gap_pct (%)', 'Total_Score', 'Breakout_S', 'Volume_S',
-        'circ_mv', 'Exit_Reason'
-    ] + [f'Return_W{w} (%)' for w in range(1, 9)]
-    final_cols = [column for column in display_cols if column in all_res.columns]
-    display_df = all_res[final_cols].sort_values(
-        ['Trade_Date', 'Rank'], ascending=[False, True]
-    ).reset_index(drop=True)
-
-    def color_exit(value):
-        if isinstance(value, str):
-            if '剔除' in value: return 'color: white; background-color: darkgray'
-            if '固定止损' in value: return 'color: white; background-color: darkred'
-            if '保本止盈' in value: return 'color: orange'
-            if '移动止盈' in value: return 'color: green'
-            if '周期结束平仓' in value: return 'color: blue'
-        return ''
-
-    if 'Exit_Reason' in display_df.columns:
-        try:
-            st.dataframe(display_df.style.map(color_exit, subset=['Exit_Reason']), use_container_width=True)
-        except AttributeError:
-            st.dataframe(display_df.style.applymap(color_exit, subset=['Exit_Reason']), use_container_width=True)
-    else:
-        st.dataframe(display_df, use_container_width=True)
-
-    csv = all_res.to_csv(index=False).encode('utf-8-sig')
-    st.download_button("📥 下载完整轨迹 (CSV)", csv, "export_v40_6_final.csv", "text/csv")
-elif not realtime_result.empty:
-    pass
-elif latest_task.get('State') in {'RUNNING', 'PAUSED_ERROR', 'WAITING_DATA'}:
-    st.info("历史回测任务已建立，尚未完成首个可保存交易日；断点仍然有效。")
-elif ledger.empty:
-    st.info("尚未运行历史回测。")
-else:
-    st.warning("当前参数已有已完成扫描日，但暂无符合条件的标的。")
-
-if API_ERRORS:
-    with st.expander("运行诊断（最近接口异常）"):
-        for message in API_ERRORS[-20:]:
-            st.text(message)
+        csv_data = repaired_res.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 导出三方案与全部诊断流水单 (CSV)",
+            data=csv_data,
+            file_name="skdj_v14_6_v40_confirm_audit_export.csv",
+            mime="text/csv",
+            on_click="ignore",
+            key="download_v14_6_confirm_audit",
+        )
+    except pd.errors.EmptyDataError:
+        st.info("🕒 当前暂无满足条件的回测记录。")
+    except Exception as report_error:
+        st.warning(f"回测数据已保留，但报告暂时无法显示：{report_error}")
