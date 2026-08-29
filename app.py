@@ -21,11 +21,11 @@ import pickle
 import re
 import shutil
 import tempfile
-import threading
 import time
 import uuid
 import warnings
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -34,21 +34,15 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
-
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R1.0-TREND-ENTRY-AUDIT"
+APP_VERSION = "R1.1-TREND-ENTRY-AUDIT"
 APP_TITLE = "R1 趋势延续候选与入场排序验证器"
-ENGINE_PATCH = "R1.0.1-SELF-HEALING-RUN-LOCK"
+ENGINE_PATCH = "R1.1-BOUNDED-MEMORY-PARALLEL-DOWNLOAD"
 
 CHECKPOINT_FILE = "r1_trend_entry_candidates.csv"
 SCAN_LEDGER_FILE = "r1_trend_entry_scanned_dates.csv"
 RUN_TASK_FILE = "r1_trend_entry_running_task.json"
-RUN_LOCK_FILE = "r1_trend_entry_running.lock"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 3
@@ -56,7 +50,8 @@ MIN_VALID_SELECTION_SIZE = 2
 HOLD_WEEKS = 8
 MARKET_DAYS_PER_WEEK = 5
 WEEKS_PER_BATCH = 3
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
+DOWNLOAD_WORKERS = 4
 
 
 # -----------------------------------------------------------------------------
@@ -188,235 +183,6 @@ def remove_with_backup(path: str):
             pass
 
 
-_PROCESS_RUN_LOCK = threading.Lock()
-_RUN_LOCK_HANDLE = None
-_RUN_LOCK_OWNER = None
-_RUN_LOCK_FALLBACK_ACTIVE = False
-
-
-def _read_run_lock_metadata():
-    if not os.path.exists(RUN_LOCK_FILE):
-        return {}
-    try:
-        with open(RUN_LOCK_FILE, "r", encoding="utf-8") as file_obj:
-            value = json.load(file_obj)
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, json.JSONDecodeError):
-        # 兼容旧版只写入时间戳的锁文件。旧格式不能证明仍有进程持锁。
-        return {"Legacy_Lock": True}
-
-
-def _pid_is_alive(pid_value: Any):
-    try:
-        pid = int(pid_value)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
-def _lock_metadata(owner_id: str, purpose: str, acquired_at: str | None = None):
-    now = datetime.now().isoformat(timespec="seconds")
-    return {
-        "Schema": 2,
-        "Owner_ID": str(owner_id),
-        "PID": os.getpid(),
-        "Purpose": str(purpose),
-        "Acquired_At": acquired_at or now,
-        "Heartbeat_At": now,
-    }
-
-
-def _write_locked_handle_metadata(lock_handle, metadata: dict[str, Any]):
-    lock_handle.seek(0)
-    lock_handle.truncate()
-    json.dump(metadata, lock_handle, ensure_ascii=False)
-    lock_handle.flush()
-    os.fsync(lock_handle.fileno())
-
-
-def acquire_run_lock(owner_id: str = "unknown", purpose: str = "R1运行"):
-    """
-    进程内线程锁 + 进程间文件锁。
-
-    旧版遗留的纯时间戳文件不再直接阻塞；只有仍被进程实际持有的文件锁，
-    或Windows下能确认仍存活的其他PID，才会判定为真正并发。
-    """
-    global _RUN_LOCK_HANDLE, _RUN_LOCK_OWNER, _RUN_LOCK_FALLBACK_ACTIVE
-    if not _PROCESS_RUN_LOCK.acquire(blocking=False):
-        return False
-
-    if fcntl is not None:
-        lock_handle = None
-        try:
-            lock_handle = open(RUN_LOCK_FILE, "a+", encoding="utf-8")
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            metadata = _lock_metadata(owner_id, purpose)
-            _write_locked_handle_metadata(lock_handle, metadata)
-            _RUN_LOCK_HANDLE = lock_handle
-            _RUN_LOCK_OWNER = str(owner_id)
-            _RUN_LOCK_FALLBACK_ACTIVE = False
-            return True
-        except (OSError, BlockingIOError):
-            if lock_handle is not None:
-                try:
-                    lock_handle.close()
-                except OSError:
-                    pass
-            _PROCESS_RUN_LOCK.release()
-            return False
-
-    # Windows等无fcntl环境：进程内线程锁先排除同一进程的真实并发。
-    # 如果文件来自同一PID但线程锁空闲，说明它是被中断会话遗留的陈旧文件。
-    metadata = _read_run_lock_metadata()
-    existing_pid = metadata.get("PID")
-    if os.path.exists(RUN_LOCK_FILE) and _pid_is_alive(existing_pid) and int(existing_pid) != os.getpid():
-        _PROCESS_RUN_LOCK.release()
-        return False
-    try:
-        if os.path.exists(RUN_LOCK_FILE):
-            os.remove(RUN_LOCK_FILE)
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        fd = os.open(RUN_LOCK_FILE, flags)
-        payload = json.dumps(_lock_metadata(owner_id, purpose), ensure_ascii=False).encode("utf-8")
-        os.write(fd, payload)
-        os.fsync(fd)
-        os.close(fd)
-        _RUN_LOCK_OWNER = str(owner_id)
-        _RUN_LOCK_FALLBACK_ACTIVE = True
-        return True
-    except (OSError, FileExistsError):
-        _RUN_LOCK_OWNER = None
-        _RUN_LOCK_FALLBACK_ACTIVE = False
-        _PROCESS_RUN_LOCK.release()
-        return False
-
-
-def touch_run_lock(owner_id: str):
-    """在下载和逐周扫描期间更新心跳，供页面判断后台任务是否仍在推进。"""
-    global _RUN_LOCK_HANDLE
-    if _RUN_LOCK_OWNER != str(owner_id):
-        return False
-    try:
-        metadata = _read_run_lock_metadata()
-        acquired_at = metadata.get("Acquired_At")
-        refreshed = _lock_metadata(
-            owner_id,
-            metadata.get("Purpose", "R1运行"),
-            acquired_at=acquired_at,
-        )
-        if _RUN_LOCK_HANDLE is not None:
-            _write_locked_handle_metadata(_RUN_LOCK_HANDLE, refreshed)
-        else:
-            atomic_write_json(refreshed, RUN_LOCK_FILE)
-        return True
-    except OSError:
-        return False
-
-
-def run_lock_status():
-    metadata = _read_run_lock_metadata()
-    if not metadata:
-        return {"Exists": False, "Active": False, "Age_Seconds": np.nan}
-    heartbeat_text = metadata.get("Heartbeat_At")
-    age_seconds = np.nan
-    if heartbeat_text:
-        try:
-            age_seconds = max(
-                0.0,
-                (datetime.now() - datetime.fromisoformat(str(heartbeat_text))).total_seconds(),
-            )
-        except ValueError:
-            age_seconds = np.nan
-    pid_alive = _pid_is_alive(metadata.get("PID"))
-    try:
-        metadata_pid = int(metadata.get("PID"))
-    except (TypeError, ValueError):
-        metadata_pid = -1
-    active_in_process = _PROCESS_RUN_LOCK.locked()
-    return {
-        **metadata,
-        "Exists": os.path.exists(RUN_LOCK_FILE),
-        "Active": bool(active_in_process or (pid_alive and metadata_pid != os.getpid())),
-        "Age_Seconds": age_seconds,
-    }
-
-
-def clear_stale_run_lock():
-    """只清理没有实际持锁者的遗留文件；不会强拆正在运行的任务。"""
-    if _PROCESS_RUN_LOCK.locked():
-        return False, "当前进程确有一个批次仍在运行，不能强拆。"
-    if not os.path.exists(RUN_LOCK_FILE):
-        return True, "当前没有运行锁。"
-    if fcntl is not None:
-        probe = None
-        try:
-            probe = open(RUN_LOCK_FILE, "a+", encoding="utf-8")
-            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
-            probe.close()
-            probe = None
-            os.remove(RUN_LOCK_FILE)
-            return True, "失效运行锁已清理。"
-        except (OSError, BlockingIOError):
-            if probe is not None:
-                try:
-                    probe.close()
-                except OSError:
-                    pass
-            return False, "检测到仍被进程持有的真实文件锁，不能强拆。"
-    metadata = _read_run_lock_metadata()
-    try:
-        metadata_pid = int(metadata.get("PID"))
-    except (TypeError, ValueError):
-        metadata_pid = -1
-    if _pid_is_alive(metadata_pid) and metadata_pid != os.getpid():
-        return False, "记录中的后台进程仍存活，不能强拆。"
-    try:
-        os.remove(RUN_LOCK_FILE)
-        return True, "失效运行锁已清理。"
-    except OSError as exc:
-        return False, f"清理失败：{exc}"
-
-
-def release_run_lock(owner_id: str | None = None):
-    global _RUN_LOCK_HANDLE, _RUN_LOCK_OWNER, _RUN_LOCK_FALLBACK_ACTIVE
-    if owner_id is not None and _RUN_LOCK_OWNER != str(owner_id):
-        return
-    owned = _RUN_LOCK_OWNER is not None
-    try:
-        if _RUN_LOCK_HANDLE is not None:
-            if fcntl is not None:
-                fcntl.flock(_RUN_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
-            _RUN_LOCK_HANDLE.close()
-            _RUN_LOCK_HANDLE = None
-        elif _RUN_LOCK_FALLBACK_ACTIVE and os.path.exists(RUN_LOCK_FILE):
-            metadata = _read_run_lock_metadata()
-            if metadata.get("Owner_ID") == _RUN_LOCK_OWNER:
-                os.remove(RUN_LOCK_FILE)
-    except OSError:
-        pass
-    finally:
-        _RUN_LOCK_OWNER = None
-        _RUN_LOCK_FALLBACK_ACTIVE = False
-        if owned and _PROCESS_RUN_LOCK.locked():
-            try:
-                _PROCESS_RUN_LOCK.release()
-            except RuntimeError:
-                pass
-
-
 # -----------------------------------------------------------------------------
 # 科技股固定研究池
 # -----------------------------------------------------------------------------
@@ -517,26 +283,34 @@ def _pool_cache_dir(whitelist_set: set[str]):
 def _valid_market_partition(payload: Any, trade_date: str, pool_hash: str):
     if not isinstance(payload, dict):
         return False
-    if payload.get("version") != CACHE_SCHEMA_VERSION:
+    version = int(payload.get("version", 0))
+    if version not in {2, CACHE_SCHEMA_VERSION}:
         return False
     if payload.get("trade_date") != str(trade_date) or payload.get("pool_hash") != pool_hash:
         return False
-    daily, adj, basic = payload.get("daily"), payload.get("adj"), payload.get("daily_basic")
-    if not all(isinstance(item, pd.DataFrame) for item in (daily, adj, basic)):
+    daily, basic = payload.get("daily"), payload.get("daily_basic")
+    if not isinstance(daily, pd.DataFrame) or not isinstance(basic, pd.DataFrame):
         return False
     if int(payload.get("raw_daily_count", 0)) < 1000:
         return False
-    if int(payload.get("raw_adj_count", 0)) < 1000:
-        return False
     required_daily = {"ts_code", "trade_date", "open", "high", "low", "close", "vol"}
     required_basic = {"ts_code", "trade_date", "circ_mv", "turnover_rate"}
-    return (
-        not daily.empty
-        and not adj.empty
-        and required_daily.issubset(daily.columns)
-        and {"ts_code", "trade_date", "adj_factor"}.issubset(adj.columns)
-        and required_basic.issubset(basic.columns)
-    )
+    if daily.empty or not required_daily.issubset(daily.columns):
+        return False
+    if not ({"pct_chg", "pre_close"} & set(daily.columns)):
+        return False
+    if version == 2:
+        adj = payload.get("adj")
+        return (
+            isinstance(adj, pd.DataFrame)
+            and not adj.empty
+            and int(payload.get("raw_adj_count", 0)) >= 1000
+            and {"ts_code", "trade_date", "adj_factor"}.issubset(adj.columns)
+            and required_basic.issubset(basic.columns)
+        )
+    if bool(payload.get("need_basic", False)):
+        return not basic.empty and required_basic.issubset(basic.columns)
+    return required_basic.issubset(basic.columns)
 
 
 def _atomic_write_pickle(payload: Any, path: str):
@@ -568,12 +342,67 @@ def _read_market_partition(path: str, trade_date: str, pool_hash: str):
         return None
 
 
+def _download_one_market_partition(
+    token: str,
+    trade_date: str,
+    whitelist_set: set[str],
+    pool_hash: str,
+    cache_dir: str,
+    need_basic: bool,
+):
+    """下载单日后立即原子落盘；线程之间不共享大表。"""
+    pro = ts.pro_api(token)
+    daily_all = safe_tushare_call(pro.daily, trade_date=trade_date)
+    basic_columns = [
+        "ts_code",
+        "trade_date",
+        "turnover_rate",
+        "volume_ratio",
+        "circ_mv",
+        "total_mv",
+    ]
+    if need_basic:
+        basic_all = safe_tushare_call(
+            pro.daily_basic,
+            trade_date=trade_date,
+            fields=",".join(basic_columns),
+        )
+    else:
+        basic_all = pd.DataFrame(columns=basic_columns)
+
+    daily = (
+        daily_all[daily_all["ts_code"].isin(whitelist_set)].copy()
+        if not daily_all.empty and "ts_code" in daily_all.columns
+        else pd.DataFrame()
+    )
+    basic = (
+        basic_all[basic_all["ts_code"].isin(whitelist_set)].copy()
+        if not basic_all.empty and "ts_code" in basic_all.columns
+        else pd.DataFrame(columns=basic_columns)
+    )
+    for column in basic_columns:
+        if column not in basic.columns:
+            basic[column] = pd.Series(dtype="object")
+    payload = {
+        "version": CACHE_SCHEMA_VERSION,
+        "trade_date": trade_date,
+        "pool_hash": pool_hash,
+        "raw_daily_count": int(len(daily_all)),
+        "need_basic": bool(need_basic),
+        "daily": daily,
+        "daily_basic": basic[basic_columns],
+    }
+    if not _valid_market_partition(payload, trade_date, pool_hash):
+        return trade_date, False
+    _atomic_write_pickle(payload, os.path.join(cache_dir, f"{trade_date}.pkl"))
+    return trade_date, True
+
+
 def sync_market_data_incrementally(
     start_date: str,
     end_date: str,
     token: str,
     whitelist_set: set[str],
-    heartbeat=None,
 ):
     token_c = clean_token_str(token)
     ts.set_token(token_c)
@@ -582,170 +411,242 @@ def sync_market_data_incrementally(
         pro.trade_cal, exchange="SSE", start_date=start_date, end_date=end_date
     )
     if calendar.empty:
-        return [], "", "", []
+        return [], "", "", [], {}
     today_str = datetime.now().strftime("%Y%m%d")
-    valid_dates = (
-        calendar[
-            (calendar["is_open"] == 1)
-            & (calendar["cal_date"].astype(str) <= today_str)
-        ]
-        .sort_values("cal_date")["cal_date"]
+    open_calendar = calendar[
+        pd.to_numeric(calendar["is_open"], errors="coerce").eq(1)
+        & (calendar["cal_date"].astype(str) <= today_str)
+    ].copy()
+    open_calendar["cal_date"] = open_calendar["cal_date"].astype(str)
+    open_calendar = open_calendar.sort_values("cal_date")
+    valid_dates = open_calendar["cal_date"].tolist()
+    open_calendar["week_key"] = pd.to_datetime(
+        open_calendar["cal_date"], format="%Y%m%d", errors="coerce"
+    ).dt.strftime("%G_%V")
+    week_end_dates = set(
+        open_calendar.dropna(subset=["week_key"])
+        .groupby("week_key")["cal_date"]
+        .max()
         .astype(str)
         .tolist()
     )
     cache_dir, pool_hash = _pool_cache_dir(whitelist_set)
-    missing_dates = [
-        trade_date
-        for trade_date in valid_dates
-        if _read_market_partition(
+    missing_dates = []
+    for trade_date in valid_dates:
+        payload = _read_market_partition(
             os.path.join(cache_dir, f"{trade_date}.pkl"), trade_date, pool_hash
         )
-        is None
-    ]
+        basic_missing = (
+            trade_date in week_end_dates
+            and payload is not None
+            and payload.get("daily_basic", pd.DataFrame()).empty
+        )
+        if payload is None or basic_missing:
+            missing_dates.append(trade_date)
+
     failed_dates: list[str] = []
+    downloaded_dates: list[str] = []
     if missing_dates:
-        progress = st.progress(0, text=f"从断点补充{len(missing_dates)}个交易日行情……")
-        for idx, trade_date in enumerate(missing_dates):
-            if heartbeat is not None:
-                heartbeat()
-            daily_all = safe_tushare_call(pro.daily, trade_date=trade_date)
-            adj_all = safe_tushare_call(pro.adj_factor, trade_date=trade_date)
-            basic_all = safe_tushare_call(
-                pro.daily_basic,
-                trade_date=trade_date,
-                fields="ts_code,trade_date,turnover_rate,volume_ratio,circ_mv,total_mv",
-            )
-            daily = (
-                daily_all[daily_all["ts_code"].isin(whitelist_set)].copy()
-                if not daily_all.empty
-                else pd.DataFrame()
-            )
-            adj = (
-                adj_all[adj_all["ts_code"].isin(whitelist_set)].copy()
-                if not adj_all.empty
-                else pd.DataFrame()
-            )
-            basic = (
-                basic_all[basic_all["ts_code"].isin(whitelist_set)].copy()
-                if not basic_all.empty
-                else pd.DataFrame()
-            )
-            payload = {
-                "version": CACHE_SCHEMA_VERSION,
-                "trade_date": trade_date,
-                "pool_hash": pool_hash,
-                "raw_daily_count": int(len(daily_all)),
-                "raw_adj_count": int(len(adj_all)),
-                "daily": daily,
-                "adj": adj,
-                "daily_basic": basic,
-            }
-            if _valid_market_partition(payload, trade_date, pool_hash):
-                _atomic_write_pickle(payload, os.path.join(cache_dir, f"{trade_date}.pkl"))
-            else:
-                failed_dates.append(trade_date)
-            if (idx + 1) % 5 == 0 or idx == len(missing_dates) - 1:
-                progress.progress(
-                    (idx + 1) / len(missing_dates),
-                    text=f"行情同步 {idx + 1}/{len(missing_dates)}：{trade_date}",
+        progress = st.progress(
+            0,
+            text=(
+                f"4路并发补充{len(missing_dates)}个交易日；每完成一天立即保存，"
+                "中断后只补未完成日期……"
+            ),
+        )
+        futures = {}
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+            for trade_date in missing_dates:
+                future = executor.submit(
+                    _download_one_market_partition,
+                    token_c,
+                    trade_date,
+                    whitelist_set,
+                    pool_hash,
+                    cache_dir,
+                    trade_date in week_end_dates,
                 )
-                if heartbeat is not None:
-                    heartbeat()
-            time.sleep(0.12)
+                futures[future] = trade_date
+            for idx, future in enumerate(as_completed(futures), start=1):
+                trade_date = futures[future]
+                try:
+                    _, succeeded = future.result()
+                except Exception:
+                    succeeded = False
+                if succeeded:
+                    downloaded_dates.append(trade_date)
+                else:
+                    failed_dates.append(trade_date)
+                if idx % 4 == 0 or idx == len(missing_dates):
+                    progress.progress(
+                        idx / len(missing_dates),
+                        text=(
+                            f"行情同步 {idx}/{len(missing_dates)}：已保存{len(downloaded_dates)}天，"
+                            f"待重试{len(failed_dates)}天"
+                        ),
+                    )
         progress.empty()
-    return valid_dates, cache_dir, pool_hash, failed_dates
+    stats = {
+        "calendar_days": len(valid_dates),
+        "cached_days": len(valid_dates) - len(missing_dates),
+        "downloaded_days": len(downloaded_dates),
+        "failed_days": len(failed_dates),
+        "weekly_basic_days": sum(item in week_end_dates for item in missing_dates),
+    }
+    return valid_dates, cache_dir, pool_hash, failed_dates, stats
 
 
-@st.cache_resource(ttl=3600 * 12, show_spinner=False)
 def _build_market_index_from_partitions(
-    valid_dates_key, cache_dir, pool_hash, whitelist_key, cache_stamp
+    valid_dates_key, cache_dir, pool_hash
 ):
-    del cache_stamp
-    daily_parts, adj_parts, basic_parts = [], [], []
+    merged_parts = []
     for trade_date in valid_dates_key:
         payload = _read_market_partition(
             os.path.join(cache_dir, f"{trade_date}.pkl"), trade_date, pool_hash
         )
         if payload is None:
             continue
-        daily_parts.append(payload["daily"])
-        adj_parts.append(payload["adj"])
-        basic_parts.append(payload["daily_basic"])
-    daily_raw = pd.concat(daily_parts, ignore_index=True) if daily_parts else pd.DataFrame()
-    adj_raw = pd.concat(adj_parts, ignore_index=True) if adj_parts else pd.DataFrame()
-    basic_raw = pd.concat(basic_parts, ignore_index=True) if basic_parts else pd.DataFrame()
-    if daily_raw.empty or adj_raw.empty:
+        day = payload["daily"].copy()
+        basic = payload.get("daily_basic", pd.DataFrame())
+        if isinstance(basic, pd.DataFrame) and not basic.empty:
+            basic_cols = [
+                column
+                for column in (
+                    "ts_code",
+                    "trade_date",
+                    "turnover_rate",
+                    "volume_ratio",
+                    "circ_mv",
+                    "total_mv",
+                )
+                if column in basic.columns
+            ]
+            if {"ts_code", "trade_date"}.issubset(basic_cols):
+                day = day.merge(
+                    basic[basic_cols].drop_duplicates(["ts_code", "trade_date"]),
+                    on=["ts_code", "trade_date"],
+                    how="left",
+                )
+        merged_parts.append(day)
+    if not merged_parts:
         return {}, pd.DataFrame(), []
-
-    merged = daily_raw.merge(
-        adj_raw[["ts_code", "trade_date", "adj_factor"]],
-        on=["ts_code", "trade_date"],
-        how="inner",
-    )
-    if not basic_raw.empty:
-        basic_cols = [
-            column
-            for column in ("ts_code", "trade_date", "turnover_rate", "volume_ratio", "circ_mv", "total_mv")
-            if column in basic_raw.columns
-        ]
-        merged = merged.merge(
-            basic_raw[basic_cols].drop_duplicates(["ts_code", "trade_date"]),
-            on=["ts_code", "trade_date"],
-            how="left",
-        )
+    merged = pd.concat(merged_parts, ignore_index=True)
+    del merged_parts
     merged["trade_date_str"] = merged["trade_date"].astype(str)
     merged = merged.drop_duplicates(["ts_code", "trade_date_str"], keep="last")
     merged = merged.sort_values(["ts_code", "trade_date_str"])
     available_dates = sorted(merged["trade_date_str"].unique().tolist())
 
+    basic_columns = [
+        column
+        for column in ("turnover_rate", "volume_ratio", "circ_mv", "total_mv")
+        if column in merged.columns
+    ]
+    if basic_columns:
+        basic_raw = merged.loc[
+            merged[basic_columns].notna().any(axis=1),
+            ["trade_date_str", "ts_code", *basic_columns],
+        ].copy()
+        basic_indexed = basic_raw.drop_duplicates(
+            ["trade_date_str", "ts_code"]
+        ).set_index(["trade_date_str", "ts_code"])
+    else:
+        basic_indexed = pd.DataFrame()
+
     stock_qfq_dict: dict[str, pd.DataFrame] = {}
     for ts_code, group in merged.groupby("ts_code", sort=False):
-        stock = group.copy()
+        stock = group.copy().sort_values("trade_date_str")
         for column in ("open", "high", "low", "close", "pre_close"):
             if column in stock.columns:
                 stock[f"raw_{column}"] = pd.to_numeric(stock[column], errors="coerce")
-        latest_adj = pd.to_numeric(stock["adj_factor"], errors="coerce").iloc[-1]
-        if pd.notna(latest_adj) and latest_adj > 0:
-            for column in ("open", "high", "low", "close", "pre_close"):
-                if column in stock.columns:
-                    stock[column] = (
-                        pd.to_numeric(stock[column], errors="coerce")
-                        * pd.to_numeric(stock["adj_factor"], errors="coerce")
-                        / latest_adj
-                    )
-        stock_qfq_dict[str(ts_code)] = stock.set_index("trade_date_str")
-
-    if not basic_raw.empty:
-        basic_raw["trade_date"] = basic_raw["trade_date"].astype(str)
-        basic_indexed = basic_raw.drop_duplicates(["trade_date", "ts_code"]).set_index(
-            ["trade_date", "ts_code"]
+        raw_close = pd.to_numeric(stock["raw_close"], errors="coerce")
+        raw_pre_close = (
+            pd.to_numeric(stock["raw_pre_close"], errors="coerce")
+            if "raw_pre_close" in stock.columns
+            else raw_close.shift(1)
         )
-    else:
-        basic_indexed = pd.DataFrame()
-    del daily_raw, adj_raw, basic_raw, daily_parts, adj_parts, basic_parts, merged
+        pct_chg = (
+            pd.to_numeric(stock["pct_chg"], errors="coerce")
+            if "pct_chg" in stock.columns
+            else pd.Series(np.nan, index=stock.index, dtype="float64")
+        )
+        fallback_pct = (raw_close / raw_pre_close.replace(0, np.nan) - 1.0) * 100.0
+        pct_chg = pct_chg.fillna(fallback_pct)
+        growth = (1.0 + pct_chg / 100.0).where(lambda values: values > 0)
+        continuous_close = pd.Series(np.nan, index=stock.index, dtype="float64")
+        if not raw_close.empty and pd.notna(raw_close.iloc[0]) and raw_close.iloc[0] > 0:
+            continuous_close.iloc[0] = raw_close.iloc[0]
+            if len(stock) > 1:
+                continuous_close.iloc[1:] = (
+                    raw_close.iloc[0] * growth.iloc[1:].fillna(1.0).cumprod()
+                )
+        price_scale = continuous_close / raw_close.replace(0, np.nan)
+        for column in ("open", "high", "low", "close"):
+            raw_column = f"raw_{column}"
+            if raw_column in stock.columns:
+                stock[column] = pd.to_numeric(stock[raw_column], errors="coerce") * price_scale
+        stock["pre_close"] = continuous_close.shift(1)
+        if len(stock) and "raw_pre_close" in stock.columns:
+            stock.iloc[0, stock.columns.get_loc("pre_close")] = (
+                _safe_float(stock.iloc[0].get("raw_pre_close"))
+                * _safe_float(price_scale.iloc[0], 1.0)
+            )
+        # 周末daily_basic给出流通市值，由此反推流通股数并补算每天换手率；
+        # 因而仍可保持原版“周换手率=日换手率之和”的评分口径。
+        if "circ_mv" in stock.columns:
+            circ_mv = pd.to_numeric(stock["circ_mv"], errors="coerce")
+            implied_float_shares = (
+                circ_mv * 10000.0 / raw_close.replace(0, np.nan)
+            ).ffill().bfill()
+            daily_turnover = (
+                pd.to_numeric(stock.get("vol"), errors="coerce")
+                * 10000.0
+                / implied_float_shares.replace(0, np.nan)
+            )
+            if "turnover_rate" in stock.columns:
+                existing_turnover = pd.to_numeric(stock["turnover_rate"], errors="coerce")
+                stock["turnover_rate"] = existing_turnover.fillna(daily_turnover)
+            else:
+                stock["turnover_rate"] = daily_turnover
+        for column in (
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "vol",
+            "amount",
+            "turnover_rate",
+            "volume_ratio",
+            "circ_mv",
+            "total_mv",
+            "raw_open",
+            "raw_high",
+            "raw_low",
+            "raw_close",
+            "raw_pre_close",
+        ):
+            if column in stock.columns:
+                stock[column] = pd.to_numeric(stock[column], errors="coerce").astype("float32")
+        stock_qfq_dict[str(ts_code)] = stock.set_index("trade_date_str")
+    del merged
     gc.collect()
     return stock_qfq_dict, basic_indexed, available_dates
 
 
 def load_optimized_market_data(
-    start_date: str, end_date: str, token: str, whitelist_keys, heartbeat=None
+    start_date: str, end_date: str, token: str, whitelist_keys
 ):
     whitelist_set = set(whitelist_keys)
-    valid_dates, cache_dir, pool_hash, failed_dates = sync_market_data_incrementally(
-        start_date, end_date, token, whitelist_set, heartbeat=heartbeat
+    valid_dates, cache_dir, pool_hash, failed_dates, sync_stats = sync_market_data_incrementally(
+        start_date, end_date, token, whitelist_set
     )
     if not valid_dates:
-        return {}, pd.DataFrame(), [], [], failed_dates
-    paths = [os.path.join(cache_dir, f"{item}.pkl") for item in valid_dates]
-    existing_paths = [path for path in paths if os.path.exists(path)]
-    stamp = (
-        len(existing_paths),
-        max((os.path.getmtime(path) for path in existing_paths), default=0),
-    )
+        return {}, pd.DataFrame(), [], [], failed_dates, sync_stats
     stocks, basic, available_dates = _build_market_index_from_partitions(
-        tuple(valid_dates), cache_dir, pool_hash, tuple(sorted(whitelist_set)), stamp
+        tuple(valid_dates), cache_dir, pool_hash
     )
-    return stocks, basic, valid_dates, available_dates, failed_dates
+    return stocks, basic, valid_dates, available_dates, failed_dates, sync_stats
 
 
 # -----------------------------------------------------------------------------
@@ -1910,13 +1811,10 @@ def main():
 - **历史执行**：信号周结束后，下一交易日开盘买入；固定观察W1—W8并扣除设置的往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
             """
-        )
+    )
 
     today = datetime.now().date()
     default_start = today - timedelta(days=820)
-    if "r1_session_owner" not in st.session_state:
-        st.session_state["r1_session_owner"] = uuid.uuid4().hex
-    session_owner = str(st.session_state["r1_session_owner"])
     with st.sidebar:
         st.header("研究配置")
         mode = st.radio(
@@ -1952,10 +1850,6 @@ def main():
         st.markdown("---")
         clear_market_clicked = st.button("清空R1行情缓存")
         clear_history_clicked = st.button("清除R1历史结果")
-        clear_stale_lock_clicked = st.button(
-            "修复失效运行锁",
-            help="只清除没有真实后台任务持有的遗留锁，不会强拆正在运行的批次。",
-        )
 
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
@@ -1965,35 +1859,15 @@ def main():
         return
 
     if clear_market_clicked:
-        if acquire_run_lock(session_owner, "清空行情缓存"):
-            try:
-                if os.path.isdir(MARKET_CACHE_ROOT):
-                    shutil.rmtree(MARKET_CACHE_ROOT)
-                st.cache_resource.clear()
-                st.success("R1行情缓存已清空。")
-            finally:
-                release_run_lock(session_owner)
-        else:
-            st.warning("当前有任务正在使用缓存。")
+        if os.path.isdir(MARKET_CACHE_ROOT):
+            shutil.rmtree(MARKET_CACHE_ROOT)
+        st.success("R1行情缓存已清空。")
 
     if clear_history_clicked:
-        if acquire_run_lock(session_owner, "清除历史结果"):
-            try:
-                for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
-                    remove_with_backup(path)
-                st.session_state.pop("r1_preview", None)
-                st.success("R1历史结果和断点任务已清除。")
-            finally:
-                release_run_lock(session_owner)
-        else:
-            st.warning("当前有任务正在写入结果。")
-
-    if clear_stale_lock_clicked:
-        cleared, clear_message = clear_stale_run_lock()
-        if cleared:
-            st.success(clear_message)
-        else:
-            st.warning(clear_message)
+        for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
+            remove_with_backup(path)
+        st.session_state.pop("r1_preview", None)
+        st.success("R1历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
@@ -2032,9 +1906,7 @@ def main():
         start_precheck_valid = bool(valid)
         if not valid:
             st.error(f"Token预检失败：{message}")
-        elif is_preview_mode:
-            st.cache_resource.clear()
-        else:
+        elif not is_preview_mode:
             task_start = start_input.strftime("%Y%m%d")
             task_end = end_input.strftime("%Y%m%d")
             invalidate_recent_ledger_once(config_id, task_start, task_end)
@@ -2055,7 +1927,6 @@ def main():
                 "Error_Count": 0,
             }
             save_task(task)
-            st.cache_resource.clear()
 
     active_task = read_json_safe(RUN_TASK_FILE)
     run_history = active_task.get("State") == "RUNNING" and not stop_clicked
@@ -2070,28 +1941,6 @@ def main():
                 save_task(active_task)
             st.error("Token为空，历史断点已经保留。")
         else:
-            lock_purpose = "历史R1验证" if run_history else "最新选股预览"
-            lock_acquired = acquire_run_lock(session_owner, lock_purpose)
-            if not lock_acquired:
-                status = run_lock_status()
-                if not status.get("Active", False):
-                    clear_stale_run_lock()
-                    lock_acquired = acquire_run_lock(session_owner, lock_purpose)
-            if not lock_acquired:
-                status = run_lock_status()
-                age = _safe_float(status.get("Age_Seconds"))
-                age_text = f"，最近心跳{age:.0f}秒前" if math.isfinite(age) else ""
-                st.warning(
-                    "检测到后台确有一个R1批次仍在运行"
-                    f"（进程{status.get('PID', '未知')}{age_text}）。"
-                    "当前页面只读取已保存进度，不会启动第二份下载。"
-                )
-                lock_status_blocked = True
-            else:
-                lock_status_blocked = False
-                touch_run_lock(session_owner)
-
-        if (run_history or run_preview) and token_clean and not locals().get("lock_status_blocked", True):
             try:
                 if run_history:
                     params = active_task["Params"]
@@ -2113,10 +1962,8 @@ def main():
 
                 ts.set_token(token_clean)
                 pro = ts.pro_api(token_clean)
-                touch_run_lock(session_owner)
                 with st.spinner("构建固定科技股研究池……"):
                     whitelist_set, name_map, industry_map = load_custom_tech_whitelist(token_clean)
-                touch_run_lock(session_owner)
                 whitelist_keys = tuple(sorted(whitelist_set))
                 if not whitelist_keys:
                     raise RuntimeError("未取得科技股研究池，请检查Token权限或网络。")
@@ -2125,7 +1972,6 @@ def main():
                 requested_dates, pending_dates, latest_is_completed_week = build_run_dates(
                     pro, run_start, run_end, run_preview, run_config_id
                 )
-                touch_run_lock(session_owner)
                 if run_history:
                     active_task["Total_Weeks"] = len(requested_dates)
                     active_task["Completed_Weeks"] = len(requested_dates) - len(pending_dates)
@@ -2139,35 +1985,50 @@ def main():
                         st.warning("没有可扫描日期。")
                 else:
                     batch_dates = pending_dates if run_preview else pending_dates[:WEEKS_PER_BATCH]
+                    # 每批只装载3个扫描周所需的数据，避免两年全量行情同时驻留内存。
                     fetch_start = (
-                        datetime.strptime(min(requested_dates), "%Y%m%d") - timedelta(days=500)
+                        datetime.strptime(min(batch_dates), "%Y%m%d") - timedelta(days=420)
                     ).strftime("%Y%m%d")
-                    requested_fetch_end = datetime.strptime(max(requested_dates), "%Y%m%d") + timedelta(days=110)
+                    requested_fetch_end = datetime.strptime(max(batch_dates), "%Y%m%d") + timedelta(days=75)
                     fetch_end = min(requested_fetch_end.date(), today).strftime("%Y%m%d")
-                    stocks, basic_indexed, market_dates, loaded_dates, failed_dates = load_optimized_market_data(
+                    st.caption(
+                        f"本批扫描{batch_dates[0]}—{batch_dates[-1]}；"
+                        f"只加载必要行情窗口{fetch_start}—{fetch_end}。"
+                    )
+                    (
+                        stocks,
+                        basic_indexed,
+                        market_dates,
+                        loaded_dates,
+                        failed_dates,
+                        sync_stats,
+                    ) = load_optimized_market_data(
                         fetch_start,
                         fetch_end,
                         token_clean,
                         whitelist_keys,
-                        heartbeat=lambda: touch_run_lock(session_owner),
                     )
-                    touch_run_lock(session_owner)
+                    st.caption(
+                        f"行情分片：复用{sync_stats.get('cached_days', 0)}天，"
+                        f"本次保存{sync_stats.get('downloaded_days', 0)}天；"
+                        f"daily_basic仅下载{sync_stats.get('weekly_basic_days', 0)}个周末交易日。"
+                    )
+                    if failed_dates:
+                        raise RuntimeError(
+                            f"仍有{len(failed_dates)}个交易日下载失败；成功分片已保存，"
+                            "重试时只补这些日期。"
+                        )
                     if not stocks:
                         raise RuntimeError("未加载到行情；已成功下载的分片仍然保留。")
-                    if failed_dates:
-                        st.warning(
-                            f"有{len(failed_dates)}个交易日暂未下载成功；本批继续使用完整分片，"
-                            "下次只补失败日期。"
-                        )
 
+                    loaded_date_set = set(loaded_dates)
                     progress = st.progress(0, text="开始扫描第一根红柱候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
-                        touch_run_lock(session_owner)
                         if run_history and read_json_safe(RUN_TASK_FILE).get("State") == "STOPPED":
                             stopped_during_batch = True
                             break
-                        if signal_date not in set(loaded_dates):
+                        if signal_date not in loaded_date_set:
                             raise RuntimeError(f"扫描日{signal_date}行情分片不完整，断点已保留。")
                         weekly_mode = (
                             "已完成周线"
@@ -2218,9 +2079,11 @@ def main():
                                 f"趋势延续候选{eligible_count}只，入选{selected_count}只"
                             ),
                         )
-                        touch_run_lock(session_owner)
                     progress.empty()
 
+                    # 进入下一批前主动释放股票字典，避免Streamlit反复rerun后内存累积。
+                    del stocks, basic_indexed
+                    gc.collect()
                     if run_preview:
                         st.success("最新候选预览完成，不会写入历史验证。")
                     elif stopped_during_batch:
@@ -2234,6 +2097,7 @@ def main():
                             remove_with_backup(RUN_TASK_FILE)
                             st.success("历史R1扫描完成。")
             except Exception as exc:
+                gc.collect()
                 if run_history:
                     latest_task = read_json_safe(RUN_TASK_FILE) or active_task
                     errors = int(latest_task.get("Error_Count", 0)) + 1
@@ -2249,8 +2113,6 @@ def main():
                     save_task(latest_task)
                 else:
                     st.error(f"运行失败：{exc}")
-            finally:
-                release_run_lock(session_owner)
 
     preview = st.session_state.get("r1_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
@@ -2275,6 +2137,12 @@ def main():
                 )
             with st.expander("查看全部第一根红柱及未入选原因"):
                 st.dataframe(preview, width="stretch")
+
+    if rerun_needed:
+        # 下一批前立即重跑，不在每个小批次重复构建整份历史报告和ZIP。
+        gc.collect()
+        time.sleep(0.3)
+        st.rerun()
 
     raw_history = read_csv_safe(CHECKPOINT_FILE)
     if not raw_history.empty:
@@ -2408,11 +2276,6 @@ def main():
             file_name="r1_trend_entry_audit_results.zip",
             mime="application/zip",
         )
-
-    if rerun_needed:
-        time.sleep(0.6)
-        st.rerun()
-
 
 if __name__ == "__main__":
     main()
