@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-R4 双引擎 Top2 与 W3 主目标验证器
+R5 N6 单变量校准双引擎 Top2 与 W3 主目标验证器
 
-R3 的中性市场首红趋势模块完整保留。R4 另加独立的“弱势转复苏”周线模块，
-用于识别急跌后周 SKDJ(W22) 位于低位、价格开始修复而周 MACD 尚未正式翻红的
-早期阶段。两个模块互斥启用、分别排名和审计；单周已经暴涨的股票只进入过热
-观察，不追买。历史信号日仍为每周最后一个交易日，下一交易日开盘买入，W3 为
-主验收目标，同时固定记录 W1—W8；任何买入后信息都不进入评分。
+R3 的中性市场首红趋势模块完整保留。R5 只对上一版弱势复苏模块的 SKDJ 公式
+做单变量校正：恢复历史验证口径 N=6、M=3（RSV 两次 EMA、D 为 K 的 3 周均线）。
+市场门、复苏结构、评分权重、Top2 和 W3 标签均保持不变，以便隔离检验指标修正。
+历史信号日仍为每周最后一个交易日，下一交易日开盘买入；任何买入后信息都不
+进入评分。
 """
 
 from __future__ import annotations
@@ -37,14 +37,14 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R4.0-DUAL-ENGINE-RECOVERY-TOP2-W3-AUDIT"
-APP_TITLE = "R4 中性趋势+弱势复苏双引擎Top2验证器"
-ENGINE_PATCH = "R4.0-R3-FROZEN-CORE-W22-RECOVERY-LEASED-STABLE"
+APP_VERSION = "R5.0-N6-RECOVERY-CALIBRATION-TOP2-W3-AUDIT"
+APP_TITLE = "R5 N6复苏单变量校准双引擎Top2验证器"
+ENGINE_PATCH = "R5.0-R3-FROZEN-CORE-N6M3-RECOVERY-LEASED-STABLE"
 
-CHECKPOINT_FILE = "r4_dual_engine_candidates.csv"
-SCAN_LEDGER_FILE = "r4_dual_engine_scanned_dates.csv"
-OPPORTUNITY_FILE = "r4_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r4_dual_engine_running_task.json"
+CHECKPOINT_FILE = "r5_n6_dual_engine_candidates.csv"
+SCAN_LEDGER_FILE = "r5_n6_dual_engine_scanned_dates.csv"
+OPPORTUNITY_FILE = "r5_n6_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r5_n6_dual_engine_running_task.json"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -739,12 +739,14 @@ def _weekly_bars(stock: pd.DataFrame, end_date: str):
     weekly["kdj_k"] = rsv.ewm(alpha=1 / 3, adjust=False).mean()
     weekly["kdj_d"] = weekly["kdj_k"].ewm(alpha=1 / 3, adjust=False).mean()
 
-    # R3 原KDJ(9)继续用于六因子；W22只服务于新增复苏分支。
-    low22 = low.rolling(22).min()
-    high22 = high.rolling(22).max()
-    rsv22 = (close - low22) / (high22 - low22).replace(0, np.nan) * 100.0
-    weekly["skdj_k22"] = rsv22.ewm(alpha=1 / 3, adjust=False).mean()
-    weekly["skdj_d22"] = weekly["skdj_k22"].ewm(alpha=1 / 3, adjust=False).mean()
+    # R3 原KDJ(9)继续用于六因子；复苏分支恢复历史验证过的 SKDJ N=6、M=3。
+    # 精确口径：Raw RSV -> EMA(span=3) -> K再EMA(span=3) -> D为K的3周SMA。
+    low6 = low.rolling(6).min()
+    high6 = high.rolling(6).max()
+    raw_rsv6 = (close - low6) / (high6 - low6).replace(0, 0.001) * 100.0
+    weekly["skdj_rsv6"] = raw_rsv6.ewm(span=3, adjust=False).mean()
+    weekly["skdj_k6"] = weekly["skdj_rsv6"].ewm(span=3, adjust=False).mean()
+    weekly["skdj_d6"] = weekly["skdj_k6"].rolling(3).mean()
 
     previous_close = close.shift(1)
     true_range = pd.concat(
@@ -880,20 +882,20 @@ def compute_signal_snapshot(
     trend_eligible = bool(base_trend_eligible and setup_candidate)
 
     # 弱势复苏分支不等待MACD翻红或MA20斜率转正。它寻找26周深度回撤后，
-    # W22 SKDJ在低位开始拐头且本周强收的股票；单周暴涨只观察、不追买。
-    skdj_k22 = _safe_float(current.get("skdj_k22"))
-    skdj_d22 = _safe_float(current.get("skdj_d22"))
-    skdj_k22_prev = _safe_float(previous.get("skdj_k22"))
-    skdj_d22_prev = _safe_float(previous.get("skdj_d22"))
-    skdj_k22_prev2 = _safe_float(previous2.get("skdj_k22"))
+    # N6 SKDJ在低位开始拐头且本周强收的股票；单周暴涨只观察、不追买。
+    skdj_k6 = _safe_float(current.get("skdj_k6"))
+    skdj_d6 = _safe_float(current.get("skdj_d6"))
+    skdj_k6_prev = _safe_float(previous.get("skdj_k6"))
+    skdj_d6_prev = _safe_float(previous.get("skdj_d6"))
+    skdj_k6_prev2 = _safe_float(previous2.get("skdj_k6"))
     skdj_recent_values = [
         item
         for item in (
-            skdj_k22,
-            skdj_d22,
-            skdj_k22_prev,
-            skdj_d22_prev,
-            skdj_k22_prev2,
+            skdj_k6,
+            skdj_d6,
+            skdj_k6_prev,
+            skdj_d6_prev,
+            skdj_k6_prev2,
         )
         if math.isfinite(item)
     ]
@@ -902,8 +904,8 @@ def compute_signal_snapshot(
         math.isfinite(skdj_recent_min)
         and skdj_recent_min <= RECOVERY_OVERSOLD_LEVEL
         and (
-            (math.isfinite(skdj_k22_prev) and skdj_k22 > skdj_k22_prev)
-            or (math.isfinite(skdj_d22) and skdj_k22 > skdj_d22)
+            (math.isfinite(skdj_k6_prev) and skdj_k6 > skdj_k6_prev)
+            or (math.isfinite(skdj_d6) and skdj_k6 > skdj_d6)
         )
     )
     drawdown_26w = _safe_float(current.get("drawdown_26w_pct"))
@@ -1022,9 +1024,9 @@ def compute_signal_snapshot(
         "KDJ_K": k_now,
         "KDJ_D": d_now,
         "KDJ_Low_Cross": bool(kdj_cross and k_now <= 45.0),
-        "Weekly_SKDJ_K22": skdj_k22,
-        "Weekly_SKDJ_D22": skdj_d22,
-        "Previous_SKDJ_K22": skdj_k22_prev,
+        "Weekly_SKDJ_K6": skdj_k6,
+        "Weekly_SKDJ_D6": skdj_d6,
+        "Previous_SKDJ_K6": skdj_k6_prev,
         "SKDJ_Recent_Min": skdj_recent_min,
         "SKDJ_Low_Turn": skdj_low_turn,
         "Rebound_From_Week_Low_pct": rebound_from_week_low,
@@ -1222,8 +1224,8 @@ def _score_recovery_factors(frame: pd.DataFrame):
     return scored
 
 
-def score_r4_candidates(pool_snapshots: pd.DataFrame):
-    """R3中性趋势与R4弱势复苏互斥启用，并保留过热及被拦截候选供审计。"""
+def score_r5_candidates(pool_snapshots: pd.DataFrame):
+    """R3中性趋势与R5-N6弱势复苏互斥启用，并保留过热及被拦截候选。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
@@ -1303,7 +1305,7 @@ def score_r4_candidates(pool_snapshots: pd.DataFrame):
         candidates["Entry_Eligible"] = _bool_series(candidates, "Trend_Eligible")
         block_reason = "" if r3_eligible_count >= MIN_VALID_SELECTION_SIZE else "趋势内首红候选不足2只"
     else:
-        active_branch = "R4弱势复苏"
+        active_branch = "R5弱势复苏-N6"
         active_eligible_count = recovery_eligible_count
         candidates["Rank"] = candidates["Recovery_Rank"]
         candidates["Entry_Eligible"] = _bool_series(candidates, "Recovery_Eligible")
@@ -1630,7 +1632,7 @@ def build_major_winner_audit(
     )
     strategy_branch = {
         "强势": "R3强势观察",
-        "弱势": "R4弱势复苏",
+        "弱势": "R5弱势复苏-N6",
         "中性": "R3中性趋势",
     }[market_regime]
     rows = []
@@ -1679,7 +1681,7 @@ def build_major_winner_audit(
             elif not miss_reason:
                 miss_reason = "个股结构触发但未通过资格"
         else:
-            miss_reason = "未触发R3首红或R4周线超卖修复结构"
+            miss_reason = "未触发R3首红或R5-N6周线超卖修复结构"
         rows.append(
             {
                 "Signal_Date": signal_date,
@@ -1713,8 +1715,8 @@ def build_major_winner_audit(
                 "Return_13W_pct": pool_row.get("Return_13W_pct"),
                 "Drawdown_26W_pct": pool_row.get("Drawdown_26W_pct"),
                 "Price_to_MA10_Ratio": pool_row.get("Price_to_MA10_Ratio"),
-                "Weekly_SKDJ_K22": pool_row.get("Weekly_SKDJ_K22"),
-                "Weekly_SKDJ_D22": pool_row.get("Weekly_SKDJ_D22"),
+                "Weekly_SKDJ_K6": pool_row.get("Weekly_SKDJ_K6"),
+                "Weekly_SKDJ_D6": pool_row.get("Weekly_SKDJ_D6"),
             }
         )
     return pd.DataFrame(rows)
@@ -2098,7 +2100,7 @@ def scan_one_date(
     if not pool_records:
         return pd.DataFrame(), pd.DataFrame(), 0, 0
     pool = pd.DataFrame(pool_records)
-    candidates, raw_count, eligible_count = score_r4_candidates(pool)
+    candidates, raw_count, eligible_count = score_r5_candidates(pool)
 
     if is_preview_mode:
         if not candidates.empty:
@@ -2144,7 +2146,7 @@ def scan_one_date(
 
 
 # -----------------------------------------------------------------------------
-# R4双引擎稳健性报告
+# R5-N6双引擎稳健性报告
 # -----------------------------------------------------------------------------
 def _bool_series(frame: pd.DataFrame, column: str):
     if column not in frame.columns:
@@ -2362,7 +2364,7 @@ def recovery_candidate_audit(history: pd.DataFrame):
         (
             "实际入选复苏Top2",
             _bool_series(frame, "Selected_Top2")
-            & frame["Strategy_Branch"].astype(str).eq("R4弱势复苏"),
+            & frame["Strategy_Branch"].astype(str).eq("R5弱势复苏-N6"),
         ),
         (
             "合格但未入选",
@@ -2462,7 +2464,7 @@ def regime_gate_summary(history: pd.DataFrame):
         rows.append(
             {
                 "市场状态": regime,
-                "R4动作": action,
+                "R5动作": action,
                 "交易数": len(returns),
                 "信号周": group["Signal_Date"].nunique(),
                 "胜率%": (returns > 0).mean() * 100.0,
@@ -2659,7 +2661,7 @@ def recovery_research_gates(completed: pd.DataFrame):
         selected = pd.DataFrame()
     else:
         selected = completed[
-            completed["Strategy_Branch"].astype(str).eq("R4弱势复苏")
+            completed["Strategy_Branch"].astype(str).eq("R5弱势复苏-N6")
             & pd.to_numeric(completed["Rank"], errors="coerce").le(TOP_N)
         ].copy()
     returns = pd.to_numeric(
@@ -2712,7 +2714,7 @@ def build_export_zip(
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r4_dual_engine_candidates.csv": history,
+        "01_all_r5_n6_dual_engine_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -2752,21 +2754,22 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R3中性趋势模块保持不变；R4在弱势期仅当市场短期广度转正时启用周线超卖修复Top2。"
-        "W22 SKDJ负责识别低位拐头，单周涨幅超过25%只观察。W3主验收，W1—W8固定记录。"
+        "R3中性趋势模块保持不变；R5仅将弱势复苏指标校正为历史N=6、M=3公式。"
+        "其他门槛与权重完全沿用R4，单周涨幅超过25%只观察。W3主验收，W1—W8固定记录。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R4复苏分支是新研究假设，必须单独达到样本数和收益门槛；不能用R3的优秀结果替它背书。"
+        "R5是N6单变量校准版；复苏分支仍须独立过关，不能用R3的优秀结果替它背书。"
     )
-    with st.expander("查看R4双引擎规则边界"):
+    with st.expander("查看R5-N6双引擎规则边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
-- **R4弱势复苏**：13周市场仍弱，但1周中位涨幅转正、上涨家数不少于55%，且超卖修复候选达到全池广度要求。
-- **复苏个股**：26周回撤至少20%，W22 SKDJ近三周进入35以下后拐头，本周上涨并强收，价格至少达到MA10的75%。
+- **R5弱势复苏**：13周市场仍弱，但1周中位涨幅转正、上涨家数不少于55%，且超卖修复候选达到全池广度要求。
+- **唯一改动**：复苏SKDJ恢复N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
+- **复苏个股**：26周回撤至少20%，N6 SKDJ近三周进入35以下后拐头，本周上涨并强收，价格至少达到MA10的75%。
 - **防追高**：单周涨幅超过25%或收盘距离本周低点超过40%时只进入过热观察，不参与排名。
-- **分支隔离**：中性期只运行R3；弱势复苏期只运行R4；强势期仍只观察。两套排名和报告分开保存。
+- **分支隔离**：中性期只运行R3；弱势复苏期只运行R5-N6；强势期仍只观察。两套排名和报告分开保存。
 - **组合**：每个有效周只选Top2，不设置“候选拥挤”门，避免再次误删相对更好的周。
 - **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
@@ -2779,11 +2782,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R4验证", "最新选股预览"],
+            ["历史R5-N6验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R4验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R5-N6验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -2797,7 +2800,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R4两个分支的W1—W8固定周收益都会扣除该成本。",
+            help="R5两个分支的W1—W8固定周收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -2809,12 +2812,12 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R4历史结果")
+        clear_history_clicked = st.button("清除R5历史结果")
 
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R4验证":
+    if start_input > end_input and mode == "历史R5-N6验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -2826,15 +2829,15 @@ def main():
     if clear_history_clicked:
         for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE, OPPORTUNITY_FILE):
             remove_with_backup(path)
-        st.session_state.pop("r4_preview", None)
-        st.success("R4历史结果和断点任务已清除。")
+        st.session_state.pop("r5_preview", None)
+        st.success("R5历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     is_preview_mode = mode == "最新选股预览"
-    if "r4_worker_id" not in st.session_state:
-        st.session_state["r4_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r4_worker_id"])
+    if "r5_worker_id" not in st.session_state:
+        st.session_state["r5_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r5_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -2858,7 +2861,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R4验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R5-N6验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -2999,7 +3002,7 @@ def main():
                         raise RuntimeError("未加载到行情；已成功下载的分片仍然保留。")
 
                     loaded_date_set = set(loaded_dates)
-                    progress = st.progress(0, text="开始扫描R4双引擎候选……")
+                    progress = st.progress(0, text="开始扫描R5-N6双引擎候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -3037,7 +3040,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r4_preview"] = candidates
+                            st.session_state["r5_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -3091,7 +3094,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R4扫描完成。")
+                            st.success("历史R5-N6扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -3118,12 +3121,12 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r4_preview")
+    preview = st.session_state.get("r5_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R4双引擎结构候选。")
+            st.info("最新交易日没有R5-N6双引擎结构候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -3135,7 +3138,7 @@ def main():
                 preview_columns = [
                     "Signal_Date", "Weekly_Data_Mode", "Rank", "name", "ts_code", "Industry",
                     "Strategy_Branch", "R3_Setup_Type", "Recovery_Setup_Type",
-                    "Recovery_Score_100", "Weekly_SKDJ_K22", "Weekly_SKDJ_D22",
+                    "Recovery_Score_100", "Weekly_SKDJ_K6", "Weekly_SKDJ_D6",
                     "Drawdown_26W_pct", "Price_to_MA10_Ratio", "Return_1W_pct",
                     "Rebound_From_Week_Low_pct",
                     "Score_Trend_20", "Score_Risk_10",
@@ -3202,7 +3205,7 @@ def main():
         opportunity_summary = major_winner_coverage_summary(opportunities)
 
         st.markdown("---")
-        st.header("R4双引擎历史验证报告")
+        st.header("R5-N6双引擎历史验证报告")
         st.caption(
             "主报告以已经走满15个交易日的W3样本验收入场排序；W4—W8只统计实际已经走到"
             "相应周数的记录，并在表中明确显示每个持有期的完整样本数。"
@@ -3247,11 +3250,11 @@ def main():
             not recovery_gates.empty and recovery_gates["结果"].eq("通过").all()
         )
         if all_overall_passed and all_recovery_passed:
-            st.success("R4总体与复苏分支均通过一年快速验收，可进入更长区间样本外验证。")
+            st.success("R5总体与N6复苏分支均通过一年快速验收，可进入更长区间样本外验证。")
         else:
-            st.error("R4或复苏分支尚未通过全部验收，当前代码不能进入实盘。")
+            st.error("R5或N6复苏分支尚未通过全部验收，当前代码不能进入实盘。")
 
-        st.subheader("R3与R4分支分别表现")
+        st.subheader("R3与R5-N6分支分别表现")
         st.dataframe(_format_report_frame(branches), width="stretch", hide_index=True)
 
         st.subheader("周线超卖修复与过热观察审计")
@@ -3318,7 +3321,7 @@ def main():
             detail_columns = [
                 "Signal_Date", "Entry_Date", "Rank", "name", "ts_code", "Industry",
                 "Strategy_Branch", "R3_Setup_Type", "Recovery_Setup_Type",
-                "Recovery_Score_100", "Weekly_SKDJ_K22", "Weekly_SKDJ_D22",
+                "Recovery_Score_100", "Weekly_SKDJ_K6", "Weekly_SKDJ_D6",
                 "Drawdown_26W_pct", "Price_to_MA10_Ratio", "Return_1W_pct",
                 "Rebound_From_Week_Low_pct",
                 "Score_Trend_20", "Score_Risk_10", "Entry_Score_100",
@@ -3354,9 +3357,9 @@ def main():
             opportunity_summary,
         )
         st.download_button(
-            "下载R4完整研究结果",
+            "下载R5-N6完整研究结果",
             data=export_bytes,
-            file_name="r4_dual_engine_recovery_w3_audit_results.zip",
+            file_name="r5_n6_dual_engine_recovery_w3_audit_results.zip",
             mime="application/zip",
         )
 
