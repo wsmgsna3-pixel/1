@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-R2 周线结构候选与W3主目标排序验证器
+R3 中性市场首红 Top2 与 W3 主目标验证器
 
-研究问题：只使用信号当日及以前的数据，能否把未来3周表现更好的股票稳定排入
-Top1/Top2/Top3，并继续观察W1—W8以研究延长持股条件？
-
-R2不沿用R1六因子总分：候选由突破、回调再启动、MACD第一根红柱三种结构产生，
-再按当周横截面的领先度、趋势质量、启动质量和风险位置排序。历史信号日为每周
-最后一个交易日；历史买价为下一交易日开盘价。
+R2 已证明“突破/回调/首红混合候选 + 横截面追强评分”在一年样本中会把较差股票
+排到前面。R3 因此恢复经过逐行复核的 R1 六因子首红评分，并把排序简化为
+“趋势分优先、风险分次优、六因子总分只破同分”。每周由 Top3 收缩为 Top2；
+仅在科技池 13 周中位涨幅处于 -5% 到 +5% 的中性阶段
+形成可交易组合。历史信号日为每周最后一个交易日，下一交易日开盘买入，W3 为
+主验收目标，同时固定记录 W1—W8；任何买入后信息都不进入评分。
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ import uuid
 import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -37,25 +38,26 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R2.0-W3-CROSS-SECTION-AUDIT"
-APP_TITLE = "R2 周线结构候选与W3主目标排序验证器"
-ENGINE_PATCH = "R2.0-W3-CROSS-SECTION-ON-R1.1-STABLE-ENGINE"
+APP_VERSION = "R3.0-NEUTRAL-FIRST-RED-TOP2-W3-AUDIT"
+APP_TITLE = "R3 中性市场首红Top2与W3主目标验证器"
+ENGINE_PATCH = "R3.0-R1-EXACT-SCORE-LEASED-STABLE-ENGINE"
 
-CHECKPOINT_FILE = "r2_w3_cross_section_candidates.csv"
-SCAN_LEDGER_FILE = "r2_w3_cross_section_scanned_dates.csv"
-RUN_TASK_FILE = "r2_w3_cross_section_running_task.json"
+CHECKPOINT_FILE = "r3_neutral_first_red_candidates.csv"
+SCAN_LEDGER_FILE = "r3_neutral_first_red_scanned_dates.csv"
+RUN_TASK_FILE = "r3_neutral_first_red_running_task.json"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
-TOP_N = 3
-MIN_VALID_SELECTION_SIZE = 3
+TOP_N = 2
+MIN_VALID_SELECTION_SIZE = 2
 PRIMARY_HOLD_WEEKS = 3
 HOLD_WEEKS = 8
 MARKET_DAYS_PER_WEEK = 5
 WEEKS_PER_BATCH = 3
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
-MARKET_OVERHEAT_13W_PCT = 20.0
-MAX_ELIGIBLE_CANDIDATES = 50
+MARKET_NEUTRAL_LOWER_PCT = -5.0
+MARKET_NEUTRAL_UPPER_PCT = 5.0
+TASK_LEASE_SECONDS = 45
 PRIMARY_RETURN_COLUMN = f"Fixed_Return_W{PRIMARY_HOLD_WEEKS}_Net_pct"
 
 
@@ -357,7 +359,11 @@ def _download_one_market_partition(
 ):
     """下载单日后立即原子落盘；线程之间不共享大表。"""
     pro = ts.pro_api(token)
-    daily_all = safe_tushare_call(pro.daily, trade_date=trade_date)
+    daily_all = safe_tushare_call(
+        pro.daily,
+        trade_date=trade_date,
+        fields="ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount",
+    )
     basic_columns = [
         "ts_code",
         "trade_date",
@@ -408,6 +414,7 @@ def sync_market_data_incrementally(
     end_date: str,
     token: str,
     whitelist_set: set[str],
+    lease_heartbeat=None,
 ):
     token_c = clean_token_str(token)
     ts.set_token(token_c)
@@ -483,6 +490,8 @@ def sync_market_data_incrementally(
                 else:
                     failed_dates.append(trade_date)
                 if idx % 4 == 0 or idx == len(missing_dates):
+                    if callable(lease_heartbeat) and lease_heartbeat() is False:
+                        raise RuntimeError("任务租约已经转移，停止本页的行情同步。")
                     progress.progress(
                         idx / len(missing_dates),
                         text=(
@@ -640,11 +649,11 @@ def _build_market_index_from_partitions(
 
 
 def load_optimized_market_data(
-    start_date: str, end_date: str, token: str, whitelist_keys
+    start_date: str, end_date: str, token: str, whitelist_keys, lease_heartbeat=None
 ):
     whitelist_set = set(whitelist_keys)
     valid_dates, cache_dir, pool_hash, failed_dates, sync_stats = sync_market_data_incrementally(
-        start_date, end_date, token, whitelist_set
+        start_date, end_date, token, whitelist_set, lease_heartbeat=lease_heartbeat
     )
     if not valid_dates:
         return {}, pd.DataFrame(), [], [], failed_dates, sync_stats
@@ -797,13 +806,13 @@ def compute_signal_snapshot(
     ma20_slope = _safe_float(current.get("ma20_slope_4w_pct"))
     distance_ma20 = _safe_float(current.get("distance_ma20_pct"))
     weekly_range = _safe_float(current.get("weekly_range_pct"))
+    # R1 的硬资格只有两个条件：收盘不低于 MA20，且 MA20 四周斜率为正。
+    # MA20/MA40 排列、离均线距离和周振幅仍进入六因子评分，但不在这里二次加门。
     base_trend_eligible = (
         math.isfinite(current_close)
         and math.isfinite(ma20)
-        and math.isfinite(ma40)
         and math.isfinite(ma20_slope)
         and current_close >= ma20
-        and ma20 >= ma40
         and ma20_slope > 0.0
     )
 
@@ -843,22 +852,15 @@ def compute_signal_snapshot(
             or (math.isfinite(previous2_return_1w) and previous2_return_1w <= 0.0)
         )
     )
-    if fresh_breakout:
-        setup_type = "13W新高突破"
-    elif pullback_restart:
-        setup_type = "回调再启动"
-    elif is_first_red:
-        setup_type = "MACD首红"
-    else:
-        setup_type = ""
-    setup_candidate = bool(setup_type)
+    setup_type = "趋势内MACD首红" if is_first_red else ""
+    setup_candidate = bool(is_first_red)
     position_risk_ok = (
         math.isfinite(distance_ma20)
         and 0.0 <= distance_ma20 <= 25.0
         and math.isfinite(weekly_range)
         and weekly_range <= 25.0
     )
-    trend_eligible = bool(base_trend_eligible and setup_candidate and position_risk_ok)
+    trend_eligible = bool(base_trend_eligible and setup_candidate)
 
     recent_26 = weekly.tail(26).reset_index(drop=True)
     weeks_since_high = np.nan
@@ -880,8 +882,8 @@ def compute_signal_snapshot(
         "Is_First_Red": bool(is_first_red),
         "Fresh_13W_Breakout": bool(fresh_breakout),
         "Pullback_Restart": bool(pullback_restart),
-        "R2_Setup_Candidate": bool(setup_candidate),
-        "R2_Setup_Type": setup_type,
+        "R3_Setup_Candidate": bool(setup_candidate),
+        "R3_Setup_Type": setup_type,
         "Base_Trend_Eligible": bool(base_trend_eligible),
         "Position_Risk_OK": bool(position_risk_ok),
         "Trend_Eligible": bool(trend_eligible),
@@ -934,109 +936,169 @@ def _percentile_rank(values: pd.Series, higher_is_better: bool = True):
     return ranked_source.rank(method="average", pct=True).fillna(0.5)
 
 
-def score_r2_candidates(pool_snapshots: pd.DataFrame):
-    """只用信号周及以前数据，在当周候选之间做横截面排序。"""
+def _score_r1_six_factors(frame: pd.DataFrame):
+    """R1 六因子原公式；已用 R1 导出的 2,103 条候选逐行精确复现。"""
+    scored = frame.copy()
+    close = _numeric_series(scored, "Signal_Close")
+    ma20 = _numeric_series(scored, "MA20")
+    ma40 = _numeric_series(scored, "MA40")
+    slope20 = _numeric_series(scored, "MA20_Slope_4W_pct")
+    dif = _numeric_series(scored, "MACD_DIF")
+    drawdown = _numeric_series(scored, "Drawdown_26W_pct")
+    weeks_high = _numeric_series(scored, "Weeks_Since_26W_High")
+    presignal = _numeric_series(scored, "PreSignal_4W_Return_pct")
+    atr = _numeric_series(scored, "ATR_Contraction")
+    volume = _numeric_series(scored, "Volume_Contraction")
+    turnover = _numeric_series(scored, "Turnover_Contraction")
+    impulse_pct = _numeric_series(scored, "MACD_Impulse_Pct")
+    startup = _numeric_series(scored, "Startup_Volume_Ratio")
+    close_location = _numeric_series(scored, "Weekly_Close_Location")
+    kdj_k = _numeric_series(scored, "KDJ_K")
+    kdj_d = _numeric_series(scored, "KDJ_D")
+    distance = _numeric_series(scored, "Distance_MA20_pct")
+    week_range = _numeric_series(scored, "Weekly_Range_pct")
+    upper_shadow = _numeric_series(scored, "Weekly_Upper_Shadow_Ratio")
+
+    scored["Score_Trend_20"] = (
+        1.0
+        + (close >= ma20).astype(float) * 5.0
+        + (close >= ma40).astype(float) * 3.0
+        + (ma20 >= ma40).astype(float) * 4.0
+        + np.select([slope20 > 1.0, slope20 > 0.0], [5.0, 3.0], default=0.0)
+        + (dif > 0.0).astype(float) * 2.0
+    )
+    scored["Score_Pullback_15"] = (
+        np.select(
+            [
+                drawdown <= -40.0,
+                drawdown <= -30.0,
+                drawdown <= -8.0,
+                drawdown <= -3.0,
+            ],
+            [0.0, 3.0, 8.0, 4.0],
+            default=1.0,
+        )
+        + np.select(
+            [weeks_high <= 0.0, weeks_high <= 2.0, weeks_high <= 12.0],
+            [0.0, 1.0, 3.0],
+            default=0.0,
+        )
+        + np.select(
+            [
+                presignal <= -25.0,
+                presignal <= -20.0,
+                presignal <= -5.0,
+                presignal <= 0.0,
+            ],
+            [0.0, 2.0, 4.0, 2.0],
+            default=0.0,
+        )
+    )
+    scored["Score_Contraction_15"] = (
+        np.select([atr <= 0.8, atr <= 1.0, atr <= 1.2], [6.0, 4.0, 2.0], default=0.0)
+        + np.select(
+            [volume <= 0.8, volume <= 1.0, volume <= 1.2],
+            [5.0, 3.0, 1.0],
+            default=0.0,
+        )
+        + np.select(
+            [turnover <= 0.8, turnover <= 1.0, turnover <= 1.2],
+            [4.0, 3.0, 1.0],
+            default=0.0,
+        )
+    )
+    startup_score = np.select(
+        [
+            (startup > 0.8) & (startup <= 2.5),
+            (startup > 2.5) & (startup <= 4.0),
+            startup > 4.0,
+        ],
+        [4.0, 2.0, -1.0],
+        default=0.0,
+    )
+    location_score = np.select(
+        [close_location > 0.7, close_location > 0.5], [4.0, 2.0], default=0.0
+    )
+    kdj_score = np.select(
+        [
+            _bool_series(scored, "KDJ_Low_Cross"),
+            (kdj_k <= 60.0) & (kdj_k > kdj_d),
+        ],
+        [4.0, 3.0],
+        default=1.0,
+    )
+    scored["Score_Restart_15"] = (
+        impulse_pct * 3.0 + startup_score + location_score + kdj_score
+    )
+    scored["Score_RS_25"] = (
+        _numeric_series(scored, "RS_4W_Pct") * 5.0
+        + _numeric_series(scored, "RS_8W_Pct") * 8.0
+        + _numeric_series(scored, "RS_13W_Pct") * 8.0
+        + _numeric_series(scored, "Industry_Excess_Pct") * 4.0
+    )
+    distance_score = np.select(
+        [(distance > 0.0) & (distance <= 10.0), (distance > 10.0) & (distance <= 20.0)],
+        [4.0, 2.0],
+        default=0.0,
+    )
+    range_score = np.select(
+        [week_range <= 8.0, week_range <= 12.0, week_range <= 18.0],
+        [3.0, 2.0, 1.0],
+        default=0.0,
+    )
+    shadow_score = np.select(
+        [upper_shadow <= 0.20, upper_shadow <= 0.35], [3.0, 1.5], default=0.0
+    )
+    scored["Score_Risk_10"] = distance_score + range_score + shadow_score
+    factor_columns = [
+        "Score_Trend_20",
+        "Score_Pullback_15",
+        "Score_Contraction_15",
+        "Score_Restart_15",
+        "Score_RS_25",
+        "Score_Risk_10",
+    ]
+    scored["Entry_Score_100"] = scored[factor_columns].sum(axis=1).clip(0.0, 100.0)
+    return scored
+
+
+def score_r3_candidates(pool_snapshots: pd.DataFrame):
+    """用全池当周百分位复现 R1 评分，再用中性市场门决定是否形成 Top2。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
+    return_13w = _numeric_series(pool, "Return_13W_pct")
     industry_median = pool.groupby("Industry", dropna=False)["Return_13W_pct"].transform(
         "median"
     )
-    pool["Industry_13W_Excess_pct"] = (
-        _numeric_series(pool, "Return_13W_pct") - pd.to_numeric(industry_median, errors="coerce")
+    pool["Industry_13W_Excess_pct"] = return_13w - pd.to_numeric(
+        industry_median, errors="coerce"
     )
-    candidates = pool[_bool_series(pool, "R2_Setup_Candidate")].copy()
+    pool["RS_4W_Pct"] = _percentile_rank(_numeric_series(pool, "Return_4W_pct"))
+    pool["RS_8W_Pct"] = _percentile_rank(_numeric_series(pool, "Return_8W_pct"))
+    pool["RS_13W_Pct"] = _percentile_rank(return_13w)
+    pool["Industry_Excess_Pct"] = _percentile_rank(
+        _numeric_series(pool, "Industry_13W_Excess_pct")
+    )
+    pool["MACD_Impulse_Pct"] = _percentile_rank(_numeric_series(pool, "MACD_Impulse_pct"))
+
+    candidates = pool[_bool_series(pool, "R3_Setup_Candidate")].copy()
     raw_count = len(candidates)
     if candidates.empty:
         return candidates, 0, 0
-
+    candidates = _score_r1_six_factors(candidates)
     candidates["Rank"] = np.nan
-    candidates["Selected_Top3"] = False
-    score_columns = [
-        "Score_Leadership_35",
-        "Score_Trend_25",
-        "Score_Setup_25",
-        "Score_Risk_15",
-        "Entry_Score_100",
-    ]
-    for column in score_columns:
-        candidates[column] = np.nan
-
+    candidates["Selected_Top2"] = False
     eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
     eligible_count = len(eligible)
-    if eligible_count:
-        return_4w = _numeric_series(eligible, "Return_4W_pct")
-        return_8w = _numeric_series(eligible, "Return_8W_pct")
-        return_13w = _numeric_series(eligible, "Return_13W_pct")
-        industry_excess = _numeric_series(eligible, "Industry_13W_Excess_pct")
-        slope20 = _numeric_series(eligible, "MA20_Slope_4W_pct")
-        slope10 = _numeric_series(eligible, "MA10_Slope_2W_pct")
-        ma20 = _numeric_series(eligible, "MA20")
-        ma40 = _numeric_series(eligible, "MA40")
-        trend_spread = (ma20 / ma40.replace(0, np.nan) - 1.0) * 100.0
-        breakout_distance = _numeric_series(eligible, "Breakout_13W_pct")
-        proximity_13w_high = -breakout_distance.abs()
-        macd_impulse = _numeric_series(eligible, "MACD_Impulse_pct")
-        close_location = _numeric_series(eligible, "Weekly_Close_Location")
-        return_1w = _numeric_series(eligible, "Return_1W_pct")
-        startup_volume = _numeric_series(eligible, "Startup_Volume_Ratio").clip(0.2, 5.0)
-        startup_quality = -(np.log(startup_volume / 1.5)).abs()
-        distance_ma20 = _numeric_series(eligible, "Distance_MA20_pct")
-        distance_quality = -(distance_ma20 - 8.0).abs()
-        atr_contract = _numeric_series(eligible, "ATR_Contraction")
-        volume_contract = _numeric_series(eligible, "Volume_Contraction")
-        turnover_contract = _numeric_series(eligible, "Turnover_Contraction")
-        week_range = _numeric_series(eligible, "Weekly_Range_pct")
-        upper_shadow = _numeric_series(eligible, "Weekly_Upper_Shadow_Ratio")
 
-        eligible["Score_Leadership_35"] = (
-            _percentile_rank(return_4w) * 8.0
-            + _percentile_rank(return_8w) * 10.0
-            + _percentile_rank(return_13w) * 10.0
-            + _percentile_rank(industry_excess) * 7.0
-        )
-        eligible["Score_Trend_25"] = (
-            _percentile_rank(slope20) * 8.0
-            + _percentile_rank(slope10) * 6.0
-            + _percentile_rank(trend_spread) * 6.0
-            + _percentile_rank(proximity_13w_high) * 5.0
-        )
-        setup_base = np.select(
-            [
-                _bool_series(eligible, "Fresh_13W_Breakout"),
-                _bool_series(eligible, "Pullback_Restart"),
-                _bool_series(eligible, "Is_First_Red"),
-            ],
-            [10.0, 8.0, 6.0],
-            default=0.0,
-        )
-        eligible["Score_Setup_25"] = (
-            setup_base
-            + _percentile_rank(macd_impulse) * 6.0
-            + _percentile_rank(close_location) * 4.0
-            + _percentile_rank(startup_quality) * 3.0
-            + _percentile_rank(return_1w) * 2.0
-        )
-        eligible["Score_Risk_15"] = (
-            _percentile_rank(distance_quality) * 5.0
-            + _percentile_rank(atr_contract, higher_is_better=False) * 3.0
-            + _percentile_rank(week_range, higher_is_better=False) * 3.0
-            + _percentile_rank(upper_shadow, higher_is_better=False) * 2.0
-            + _percentile_rank(volume_contract, higher_is_better=False) * 1.0
-            + _percentile_rank(turnover_contract, higher_is_better=False) * 1.0
-        )
-        eligible["Entry_Score_100"] = eligible[
-            ["Score_Leadership_35", "Score_Trend_25", "Score_Setup_25", "Score_Risk_15"]
-        ].sum(axis=1).clip(0.0, 100.0)
-        candidates.loc[eligible.index, score_columns] = eligible[score_columns]
-
-    market_median = _safe_float(_numeric_series(pool, "Return_13W_pct").median(), 0.0)
+    market_median = _safe_float(return_13w.median(), 0.0)
     if eligible_count < MIN_VALID_SELECTION_SIZE:
-        block_reason = "趋势结构候选不足3只"
-    elif market_median >= MARKET_OVERHEAT_13W_PCT:
-        block_reason = "科技池13周涨幅中位数达到过热阈值"
-    elif eligible_count >= MAX_ELIGIBLE_CANDIDATES:
-        block_reason = "同周结构候选达到拥挤阈值"
+        block_reason = "趋势内首红候选不足2只"
+    elif market_median <= MARKET_NEUTRAL_LOWER_PCT:
+        block_reason = "科技池13周中位涨幅不高于-5%，弱势期只观察"
+    elif market_median >= MARKET_NEUTRAL_UPPER_PCT:
+        block_reason = "科技池13周中位涨幅不低于+5%，追涨期只观察"
     else:
         block_reason = ""
     selection_valid = block_reason == ""
@@ -1044,35 +1106,31 @@ def score_r2_candidates(pool_snapshots: pd.DataFrame):
     candidates["Selection_Block_Reason"] = block_reason
 
     if eligible_count:
+        # 不再让追强与启动分主导。R3 采用趋势、位置风险、R1 总分的词典序。
         eligible = candidates.loc[eligible.index].sort_values(
             [
+                "Score_Trend_20",
+                "Score_Risk_10",
                 "Entry_Score_100",
-                "Score_Leadership_35",
-                "Score_Setup_25",
-                "Score_Risk_15",
                 "ts_code",
             ],
-            ascending=[False, False, False, False, True],
+            ascending=[False, False, False, True],
             kind="mergesort",
         )
-        rank_map = pd.Series(
-            np.arange(1, len(eligible) + 1, dtype=int), index=eligible.index
-        )
+        rank_map = pd.Series(np.arange(1, len(eligible) + 1, dtype=int), index=eligible.index)
         candidates.loc[rank_map.index, "Rank"] = rank_map.astype(float)
         if selection_valid:
             selected_index = rank_map[rank_map <= TOP_N].index
-            candidates.loc[selected_index, "Selected_Top3"] = True
+            candidates.loc[selected_index, "Selected_Top2"] = True
 
     candidates["Raw_Setup_Count"] = raw_count
     candidates["Eligible_Trend_Count"] = eligible_count
     candidates["Market_13W_Median_pct"] = market_median
     candidates["Market_Regime"] = (
-        "过热"
-        if market_median >= MARKET_OVERHEAT_13W_PCT
-        else "强势"
-        if market_median >= 5.0
+        "强势"
+        if market_median >= MARKET_NEUTRAL_UPPER_PCT
         else "弱势"
-        if market_median <= -5.0
+        if market_median <= MARKET_NEUTRAL_LOWER_PCT
         else "中性"
     )
     candidates = candidates.sort_values(
@@ -1396,6 +1454,112 @@ def save_task(task: dict[str, Any]):
     atomic_write_json(task, RUN_TASK_FILE)
 
 
+@contextmanager
+def _task_file_guard():
+    """只保护一次任务文件读改写；进程崩溃后 10 秒自动清理，不充当运行锁。"""
+    guard_path = RUN_TASK_FILE + ".guard"
+    acquired = False
+    for _ in range(80):
+        try:
+            descriptor = os.open(guard_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(descriptor)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(guard_path) > 10.0:
+                    os.remove(guard_path)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05)
+    if not acquired:
+        raise RuntimeError("任务状态文件暂时忙，请稍后重试。")
+    try:
+        yield
+    finally:
+        try:
+            os.remove(guard_path)
+        except OSError:
+            pass
+
+
+def _lease_is_fresh(task: dict[str, Any]):
+    raw = str(task.get("Lease_Expires_At", "") or "")
+    try:
+        return datetime.fromisoformat(raw) > datetime.now()
+    except (TypeError, ValueError):
+        return False
+
+
+def acquire_task_lease(worker_id: str):
+    """同一 Streamlit 会话稳定续租；旧页面失联 45 秒后由新页面自动接管。"""
+    with _task_file_guard():
+        task = read_json_safe(RUN_TASK_FILE)
+        if task.get("State") != "RUNNING":
+            return False, task
+        owner = str(task.get("Owner_ID", "") or "")
+        if owner and owner != worker_id and _lease_is_fresh(task):
+            return False, task
+        task["Owner_ID"] = worker_id
+        task["Lease_Expires_At"] = (
+            datetime.now() + timedelta(seconds=TASK_LEASE_SECONDS)
+        ).isoformat(timespec="seconds")
+        save_task(task)
+        return True, task
+
+
+def refresh_task_lease(task_id: str, worker_id: str):
+    with _task_file_guard():
+        task = read_json_safe(RUN_TASK_FILE)
+        if (
+            task.get("State") != "RUNNING"
+            or str(task.get("Task_ID", "")) != str(task_id)
+            or str(task.get("Owner_ID", "")) != str(worker_id)
+        ):
+            return False
+        task["Lease_Expires_At"] = (
+            datetime.now() + timedelta(seconds=TASK_LEASE_SECONDS)
+        ).isoformat(timespec="seconds")
+        save_task(task)
+        return True
+
+
+def save_owned_task(task: dict[str, Any], worker_id: str):
+    """仅允许当前租约持有者写任务，防止失联旧页面夺回新页面的租约。"""
+    with _task_file_guard():
+        current = read_json_safe(RUN_TASK_FILE)
+        if (
+            str(current.get("Task_ID", "")) != str(task.get("Task_ID", ""))
+            or str(current.get("Owner_ID", "")) != str(worker_id)
+        ):
+            return False
+        updated = dict(task)
+        updated["Owner_ID"] = worker_id
+        updated["Lease_Expires_At"] = (
+            datetime.now() + timedelta(seconds=TASK_LEASE_SECONDS)
+        ).isoformat(timespec="seconds")
+        save_task(updated)
+        return True
+
+
+def resume_paused_task(worker_id: str):
+    """用户明确点击继续时原子接管暂停任务。"""
+    with _task_file_guard():
+        task = read_json_safe(RUN_TASK_FILE)
+        if task.get("State") != "PAUSED_ERROR":
+            return False
+        task["State"] = "RUNNING"
+        task["Error_Count"] = 0
+        task.pop("Last_Error", None)
+        task["Owner_ID"] = worker_id
+        task["Lease_Expires_At"] = (
+            datetime.now() + timedelta(seconds=TASK_LEASE_SECONDS)
+        ).isoformat(timespec="seconds")
+        save_task(task)
+        return True
+
+
 def build_run_dates(
     pro,
     start_date: str,
@@ -1497,7 +1661,7 @@ def scan_one_date(
 
     if not pool_records:
         return pd.DataFrame(), 0, 0
-    candidates, raw_count, eligible_count = score_r2_candidates(
+    candidates, raw_count, eligible_count = score_r3_candidates(
         pd.DataFrame(pool_records)
     )
     if candidates.empty:
@@ -1536,7 +1700,7 @@ def scan_one_date(
 
 
 # -----------------------------------------------------------------------------
-# R2稳健性报告
+# R3稳健性报告
 # -----------------------------------------------------------------------------
 def _bool_series(frame: pd.DataFrame, column: str):
     if column not in frame.columns:
@@ -1605,9 +1769,8 @@ def cohort_summary(completed: pd.DataFrame):
     cohorts = [
         ("Top1", completed[completed["Rank"] == 1]),
         ("Top2", completed[completed["Rank"] == 2]),
-        ("Top3", completed[completed["Rank"] == 3]),
-        ("Top1—3合计", completed[completed["Rank"] <= 3]),
-        ("第4名以后", completed[completed["Rank"] > 3]),
+        ("Top1—2合计", completed[completed["Rank"] <= TOP_N]),
+        ("第3名以后", completed[completed["Rank"] > TOP_N]),
     ]
     rows = []
     for name, frame in cohorts:
@@ -1641,7 +1804,7 @@ def cohort_summary(completed: pd.DataFrame):
 
 
 def outlier_audit(completed: pd.DataFrame):
-    selected = completed[completed["Rank"] <= 3].copy()
+    selected = completed[completed["Rank"] <= TOP_N].copy()
     returns = pd.to_numeric(selected[PRIMARY_RETURN_COLUMN], errors="coerce").dropna()
     if returns.empty:
         return pd.DataFrame(), {}
@@ -1660,7 +1823,7 @@ def outlier_audit(completed: pd.DataFrame):
     )
 
     variants = [
-        ("原始Top3", returns),
+        ("原始Top2", returns),
         ("去掉最佳1只", returns.drop(index=returns.idxmax()) if len(returns) > 1 else pd.Series(dtype=float)),
         ("去掉收益最高1%", _remove_best_fraction(returns, 0.01)),
         ("去掉收益最高5%", _remove_best_fraction(returns, 0.05)),
@@ -1690,7 +1853,7 @@ def outlier_audit(completed: pd.DataFrame):
 def year_summary(completed: pd.DataFrame):
     if completed.empty:
         return pd.DataFrame()
-    frame = completed[completed["Rank"] <= 3].copy()
+    frame = completed[completed["Rank"] <= TOP_N].copy()
     frame["Year"] = frame["Signal_Date"].astype(str).str[:4]
     rows = []
     for year, group in frame.groupby("Year", sort=True):
@@ -1711,39 +1874,73 @@ def year_summary(completed: pd.DataFrame):
     return pd.DataFrame(rows)
 
 
-def three_stock_group_summary(completed: pd.DataFrame):
+def regime_gate_summary(history: pd.DataFrame):
+    """对中性门内外都按同一 R3 排名判卷，防止只展示被允许交易的样本。"""
+    if history.empty:
+        return pd.DataFrame()
+    frame = history[
+        _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & _bool_series(history, "Trend_Eligible")
+    ].copy()
+    frame["Rank"] = pd.to_numeric(frame.get("Rank"), errors="coerce")
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    frame = frame[
+        frame["Rank"].le(TOP_N) & frame[PRIMARY_RETURN_COLUMN].notna()
+    ]
     rows = []
-    selected = completed[completed["Rank"] <= 3].copy()
+    for regime, group in frame.groupby("Market_Regime", sort=False):
+        returns = group[PRIMARY_RETURN_COLUMN]
+        rows.append(
+            {
+                "市场状态": regime,
+                "R3动作": "允许Top2" if str(regime) == "中性" else "只观察",
+                "交易数": len(returns),
+                "信号周": group["Signal_Date"].nunique(),
+                "胜率%": (returns > 0).mean() * 100.0,
+                "中位收益%": returns.median(),
+                "平均收益%": returns.mean(),
+                "Profit_Factor": _profit_factor(returns),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def two_stock_group_summary(completed: pd.DataFrame):
+    rows = []
+    selected = completed[completed["Rank"] <= TOP_N].copy()
     for signal_date, group in selected.groupby("Signal_Date"):
         exact = group.sort_values("Rank").drop_duplicates("Rank")
-        if set(exact["Rank"].astype(int)) != {1, 2, 3}:
+        if set(exact["Rank"].astype(int)) != {1, 2}:
             continue
         returns = exact[PRIMARY_RETURN_COLUMN]
         rows.append(
             {
                 "Signal_Date": signal_date,
                 "盈利只数": int((returns > 0).sum()),
-                "三股平均收益%": returns.mean(),
-                "三股中位收益%": returns.median(),
-                "三股最差收益%": returns.min(),
-                "三股最佳收益%": returns.max(),
+                "两股平均收益%": returns.mean(),
+                "两股中位收益%": returns.median(),
+                "两股最差收益%": returns.min(),
+                "两股最佳收益%": returns.max(),
             }
         )
     detail = pd.DataFrame(rows)
     if detail.empty:
         return detail, {}
     summary = {
-        "完整三股组": len(detail),
+        "完整两股组": len(detail),
         "平均盈利只数": detail["盈利只数"].mean(),
-        "至少两只盈利比例%": detail["盈利只数"].ge(2).mean() * 100.0,
-        "三只全亏比例%": detail["盈利只数"].eq(0).mean() * 100.0,
-        "三股组平均收益中位数%": detail["三股平均收益%"].median(),
+        "两只都盈利比例%": detail["盈利只数"].eq(2).mean() * 100.0,
+        "两只全亏比例%": detail["盈利只数"].eq(0).mean() * 100.0,
+        "两股组平均收益中位数%": detail["两股平均收益%"].median(),
     }
     return detail, summary
 
 
 def horizon_summary(completed: pd.DataFrame):
-    selected = completed[completed["Rank"] <= 3].copy()
+    selected = completed[completed["Rank"] <= TOP_N].copy()
     rows = []
     for week in range(1, HOLD_WEEKS + 1):
         column = f"Fixed_Return_W{week}_Net_pct"
@@ -1767,36 +1964,35 @@ def horizon_summary(completed: pd.DataFrame):
 def ranking_diagnostics(completed: pd.DataFrame):
     if completed.empty:
         return {}
-    score = pd.to_numeric(completed.get("Entry_Score_100"), errors="coerce")
+    # R3 是词典序，不把六因子总分伪装成唯一排序分；直接审计实际名次。
+    score = -pd.to_numeric(completed.get("Rank"), errors="coerce")
     returns = pd.to_numeric(completed.get(PRIMARY_RETURN_COLUMN), errors="coerce")
     global_corr = score.rank(method="average").corr(returns.rank(method="average"))
     weekly_corrs = []
     for _, group in completed.groupby("Signal_Date"):
         if len(group) < 3:
             continue
-        group_scores = pd.to_numeric(group["Entry_Score_100"], errors="coerce").rank(
-            method="average"
-        )
+        group_scores = -pd.to_numeric(group["Rank"], errors="coerce")
         group_returns = pd.to_numeric(
             group[PRIMARY_RETURN_COLUMN], errors="coerce"
         ).rank(method="average")
         corr = group_scores.corr(group_returns)
         if pd.notna(corr):
             weekly_corrs.append(corr)
-    top3 = returns[completed["Rank"] <= 3]
-    rest = returns[completed["Rank"] > 3]
+    top2 = returns[completed["Rank"] <= TOP_N]
+    rest = returns[completed["Rank"] > TOP_N]
     paired_advantages = []
     for _, group in completed.groupby("Signal_Date"):
         selected_returns = pd.to_numeric(
-            group.loc[group["Rank"] <= 3, PRIMARY_RETURN_COLUMN], errors="coerce"
+            group.loc[group["Rank"] <= TOP_N, PRIMARY_RETURN_COLUMN], errors="coerce"
         ).dropna()
         other_returns = pd.to_numeric(
-            group.loc[group["Rank"] > 3, PRIMARY_RETURN_COLUMN], errors="coerce"
+            group.loc[group["Rank"] > TOP_N, PRIMARY_RETURN_COLUMN], errors="coerce"
         ).dropna()
         if len(selected_returns) and len(other_returns):
             paired_advantages.append(selected_returns.mean() - other_returns.mean())
 
-    selected = completed[completed["Rank"] <= 3].copy()
+    selected = completed[completed["Rank"] <= TOP_N].copy()
     signal_dates = sorted(selected["Signal_Date"].astype(str).unique().tolist())
     split_at = len(signal_dates) // 2
     first_dates = set(signal_dates[:split_at])
@@ -1810,24 +2006,24 @@ def ranking_diagnostics(completed: pd.DataFrame):
         errors="coerce",
     ).dropna()
     return {
-        "全局评分收益秩相关": global_corr,
+        "全局实际排名收益秩相关": global_corr,
         "逐周秩相关均值": np.mean(weekly_corrs) if weekly_corrs else np.nan,
         "逐周可计算周数": len(weekly_corrs),
-        "Top3中位收益%": top3.median() if len(top3) else np.nan,
+        "Top2中位收益%": top2.median() if len(top2) else np.nan,
         "其余候选中位收益%": rest.median() if len(rest) else np.nan,
-        "Top3相对其余中位优势百分点": (
-            top3.median() - rest.median() if len(top3) and len(rest) else np.nan
+        "Top2相对其余中位优势百分点": (
+            top2.median() - rest.median() if len(top2) and len(rest) else np.nan
         ),
-        "Top3逐周平均收益战胜其余比例%": (
+        "Top2逐周平均收益战胜其余比例%": (
             np.mean(np.asarray(paired_advantages) > 0.0) * 100.0
             if paired_advantages
             else np.nan
         ),
-        "Top3逐周平均收益优势均值百分点": (
+        "Top2逐周平均收益优势均值百分点": (
             np.mean(paired_advantages) if paired_advantages else np.nan
         ),
-        "前半段Top3中位收益%": first_half.median() if len(first_half) else np.nan,
-        "后半段Top3中位收益%": second_half.median() if len(second_half) else np.nan,
+        "前半段Top2中位收益%": first_half.median() if len(first_half) else np.nan,
+        "后半段Top2中位收益%": second_half.median() if len(second_half) else np.nan,
     }
 
 
@@ -1837,12 +2033,12 @@ def research_gates(
     outlier: pd.DataFrame,
     diagnostics: dict[str, Any],
 ):
-    selected = completed[completed["Rank"] <= 3]
+    selected = completed[completed["Rank"] <= TOP_N]
     returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
     weeks = selected["Signal_Date"].nunique() if not selected.empty else 0
     wins = int((returns > 0).sum()) if len(returns) else 0
     lower_bound = _wilson_lower_bound(wins, len(returns)) * 100.0 if len(returns) else np.nan
-    rest = completed[completed["Rank"] > 3][PRIMARY_RETURN_COLUMN]
+    rest = completed[completed["Rank"] > TOP_N][PRIMARY_RETURN_COLUMN]
     remove5 = outlier[outlier["口径"] == "去掉收益最高5%"] if not outlier.empty else pd.DataFrame()
     remove5_mean = _safe_float(remove5["平均收益%"].iloc[0]) if not remove5.empty else np.nan
     remove5_median = _safe_float(remove5["中位收益%"].iloc[0]) if not remove5.empty else np.nan
@@ -1853,39 +2049,38 @@ def research_gates(
             remove5_pf = np.nan
     else:
         remove5_pf = np.nan
-    rank_rows = cohort[cohort["排名组"].isin(["Top1", "Top2", "Top3"])] if not cohort.empty else pd.DataFrame()
+    rank_rows = cohort[cohort["排名组"].isin(["Top1", "Top2"])] if not cohort.empty else pd.DataFrame()
     all_rank_medians_positive = (
-        len(rank_rows) == 3 and pd.to_numeric(rank_rows["中位收益%"], errors="coerce").gt(0).all()
+        len(rank_rows) == 2 and pd.to_numeric(rank_rows["中位收益%"], errors="coerce").gt(0).all()
     )
     rank_medians = (
         rank_rows.set_index("排名组")["中位收益%"].map(_safe_float)
-        if len(rank_rows) == 3
+        if len(rank_rows) == 2
         else pd.Series(dtype=float)
     )
     rank_ordered = (
-        len(rank_medians) == 3
+        len(rank_medians) == 2
         and rank_medians.get("Top1", -np.inf) >= rank_medians.get("Top2", np.inf)
-        and rank_medians.get("Top2", -np.inf) >= rank_medians.get("Top3", np.inf)
     )
     weekly_corr = _safe_float(diagnostics.get("逐周秩相关均值"))
-    paired_beat = _safe_float(diagnostics.get("Top3逐周平均收益战胜其余比例%"))
-    first_half_median = _safe_float(diagnostics.get("前半段Top3中位收益%"))
-    second_half_median = _safe_float(diagnostics.get("后半段Top3中位收益%"))
+    paired_beat = _safe_float(diagnostics.get("Top2逐周平均收益战胜其余比例%"))
+    first_half_median = _safe_float(diagnostics.get("前半段Top2中位收益%"))
+    second_half_median = _safe_float(diagnostics.get("后半段Top2中位收益%"))
     gates = [
-        ("至少40个独立有效信号周", weeks >= 40, f"当前{weeks}周"),
-        ("至少120笔完整Top3交易", len(returns) >= 120, f"当前{len(returns)}笔"),
-        ("W3 Top3胜率至少55%", len(returns) > 0 and (returns > 0).mean() >= 0.55, f"当前{((returns > 0).mean() * 100.0 if len(returns) else np.nan):.1f}%"),
+        ("一年内至少18个独立中性信号周", weeks >= 18, f"当前{weeks}周"),
+        ("至少36笔完整Top2交易", len(returns) >= 36, f"当前{len(returns)}笔"),
+        ("W3 Top2胜率至少55%", len(returns) > 0 and (returns > 0).mean() >= 0.55, f"当前{((returns > 0).mean() * 100.0 if len(returns) else np.nan):.1f}%"),
         ("胜率95%下限高于50%", math.isfinite(lower_bound) and lower_bound > 50.0, f"当前{lower_bound:.1f}%"),
-        ("W3 Top3中位收益大于0", len(returns) > 0 and returns.median() > 0, f"当前{(returns.median() if len(returns) else np.nan):.2f}%"),
+        ("W3 Top2中位收益大于0", len(returns) > 0 and returns.median() > 0, f"当前{(returns.median() if len(returns) else np.nan):.2f}%"),
         ("去掉最高5%后平均收益大于0", math.isfinite(remove5_mean) and remove5_mean > 0, f"当前{remove5_mean:.2f}%"),
         ("去掉最高5%后中位收益大于0", math.isfinite(remove5_median) and remove5_median > 0, f"当前{remove5_median:.2f}%"),
         ("去掉最高5%后PF至少1.2", not math.isnan(remove5_pf) and remove5_pf >= 1.2, f"当前{remove5_pf:.2f}"),
-        ("Top1/2/3中位收益分别为正", all_rank_medians_positive, "逐名检查"),
-        ("Top1至Top3收益保持排名单调", rank_ordered, "Top1≥Top2≥Top3"),
-        ("逐周评分收益秩相关至少0.10", math.isfinite(weekly_corr) and weekly_corr >= 0.10, f"当前{weekly_corr:.3f}"),
-        ("Top3逐周战胜其余候选至少60%", math.isfinite(paired_beat) and paired_beat >= 60.0, f"当前{paired_beat:.1f}%"),
-        ("前后半段Top3中位收益均为正", math.isfinite(first_half_median) and math.isfinite(second_half_median) and first_half_median > 0 and second_half_median > 0, f"前{first_half_median:.2f}% / 后{second_half_median:.2f}%"),
-        ("Top3中位收益优于其余候选", len(returns) > 0 and len(rest) > 0 and returns.median() > rest.median(), f"差{(returns.median() - rest.median() if len(returns) and len(rest) else np.nan):.2f}个百分点"),
+        ("Top1和Top2中位收益分别为正", all_rank_medians_positive, "逐名检查"),
+        ("Top1中位收益不低于Top2", rank_ordered, "Top1≥Top2"),
+        ("逐周实际排名收益秩相关至少0.05", math.isfinite(weekly_corr) and weekly_corr >= 0.05, f"当前{weekly_corr:.3f}"),
+        ("Top2逐周战胜其余候选至少55%", math.isfinite(paired_beat) and paired_beat >= 55.0, f"当前{paired_beat:.1f}%"),
+        ("前后半段Top2中位收益均为正", math.isfinite(first_half_median) and math.isfinite(second_half_median) and first_half_median > 0 and second_half_median > 0, f"前{first_half_median:.2f}% / 后{second_half_median:.2f}%"),
+        ("Top2中位收益优于其余候选", len(returns) > 0 and len(rest) > 0 and returns.median() > rest.median(), f"差{(returns.median() - rest.median() if len(returns) and len(rest) else np.nan):.2f}个百分点"),
     ]
     return pd.DataFrame(
         [{"验收项目": name, "结果": "通过" if passed else "未通过", "当前值": value} for name, passed, value in gates]
@@ -1901,19 +2096,21 @@ def build_export_zip(
     horizon: pd.DataFrame,
     gates: pd.DataFrame,
     diagnostics: dict[str, Any],
+    regimes: pd.DataFrame,
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r2_structure_candidates.csv": history,
+        "01_all_r3_first_red_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
-        "05_complete_three_stock_groups.csv": groups,
+        "05_complete_two_stock_groups.csv": groups,
         "06_w1_w8_fixed_horizon.csv": horizon,
         "07_research_acceptance_gates.csv": gates,
         "08_ranking_diagnostics.csv": pd.DataFrame(
             [{"指标": key, "数值": value} for key, value in diagnostics.items()]
         ),
+        "09_market_regime_gate_audit.csv": regimes,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -1938,20 +2135,20 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R2用13周新高突破、回调再启动和MACD首红产生候选；只使用信号周及以前数据，"
-        "在当周候选内按领先度、趋势、启动和风险排序。W3是主验收目标，W1—W8继续记录。"
+        "R3只保留趋势内MACD第一根红柱；按趋势分、风险分、R1总分依次破同分。"
+        "仅在科技池13周中位涨幅处于-5%到+5%时选择Top2。W3主验收，W1—W8固定记录。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R2仍是研究验证版。只有一年快速验收及随后更长区间样本外验证都通过，才允许进入实盘开发。"
+        "R3仍是研究验证版。当前规则来自R1/R2结果，只能用新的回测结果判卷；通过一年验收后仍需更长样本外验证。"
     )
-    with st.expander("查看R2规则边界"):
+    with st.expander("查看R3规则边界"):
         st.markdown(
             """
-- **候选触发**：13周新高首次突破、上涨趋势中的回调再启动、或趋势内MACD第一根红柱。
-- **硬资格**：收盘不低于20周均线、20周均线不低于40周均线、20周斜率为正，且不过度偏离均线。
-- **横截面排序**：领先度35分、趋势质量25分、启动质量25分、风险位置15分；只在同周候选之间排名。
-- **风险门**：至少3只合格候选；科技池13周涨幅中位数达到20%或同周候选达到50只时整周跳过。
+- **候选触发**：本周MACD柱由非正转正，且收盘不低于20周均线、20周均线四周斜率为正。
+- **排序**：R1六因子完整保留用于审计；实际名次先看趋势20分，再看风险10分，最后才用六因子总分破同分。
+- **市场门**：科技池13周涨幅中位数必须严格处于-5%到+5%；弱势和追涨阶段均只观察，不选股。
+- **组合**：每个有效周只选Top2，不设置“候选拥挤”门，避免再次误删相对更好的周。
 - **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
             """
@@ -1963,11 +2160,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R2验证", "最新选股预览"],
+            ["历史R3验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R2验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R3验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -1981,7 +2178,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R2所有W1—W8固定周收益都会扣除该成本。",
+            help="R3所有W1—W8固定周收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -1993,12 +2190,12 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R2历史结果")
+        clear_history_clicked = st.button("清除R3历史结果")
 
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R2验证":
+    if start_input > end_input and mode == "历史R3验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -2010,12 +2207,15 @@ def main():
     if clear_history_clicked:
         for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
             remove_with_backup(path)
-        st.session_state.pop("r2_preview", None)
-        st.success("R2历史结果和断点任务已清除。")
+        st.session_state.pop("r3_preview", None)
+        st.success("R3历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     is_preview_mode = mode == "最新选股预览"
+    if "r3_worker_id" not in st.session_state:
+        st.session_state["r3_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r3_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -2036,13 +2236,10 @@ def main():
         save_task(stopped)
         st.warning("任务已停止，已经完成的数据仍保留。")
     if resume_clicked:
-        resumed = read_json_safe(RUN_TASK_FILE)
-        resumed["State"] = "RUNNING"
-        resumed["Error_Count"] = 0
-        resumed.pop("Last_Error", None)
-        save_task(resumed)
+        if not resume_paused_task(worker_id):
+            st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R2验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R3验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -2069,11 +2266,22 @@ def main():
                 "Completed_Weeks": 0,
                 "Total_Weeks": 0,
                 "Error_Count": 0,
+                "Owner_ID": worker_id,
+                "Lease_Expires_At": (
+                    datetime.now() + timedelta(seconds=TASK_LEASE_SECONDS)
+                ).isoformat(timespec="seconds"),
             }
             save_task(task)
 
     active_task = read_json_safe(RUN_TASK_FILE)
-    run_history = active_task.get("State") == "RUNNING" and not stop_clicked
+    run_history = False
+    if active_task.get("State") == "RUNNING" and not stop_clicked:
+        run_history, active_task = acquire_task_lease(worker_id)
+        if not run_history:
+            st.info(
+                "另一个页面正在处理同一断点；本页不会重复写入。若原页面已崩溃，"
+                f"租约最多{TASK_LEASE_SECONDS}秒自动失效，刷新本页即可从断点接管。"
+            )
     run_preview = start_clicked and is_preview_mode and start_precheck_valid
     rerun_needed = False
 
@@ -2082,7 +2290,7 @@ def main():
             if run_history:
                 active_task["State"] = "PAUSED_ERROR"
                 active_task["Last_Error"] = "Token为空。"
-                save_task(active_task)
+                save_owned_task(active_task, worker_id)
             st.error("Token为空，历史断点已经保留。")
         else:
             try:
@@ -2119,7 +2327,7 @@ def main():
                 if run_history:
                     active_task["Total_Weeks"] = len(requested_dates)
                     active_task["Completed_Weeks"] = len(requested_dates) - len(pending_dates)
-                    save_task(active_task)
+                    save_owned_task(active_task, worker_id)
 
                 if not pending_dates:
                     if run_history:
@@ -2129,7 +2337,7 @@ def main():
                         st.warning("没有可扫描日期。")
                 else:
                     batch_dates = pending_dates if run_preview else pending_dates[:WEEKS_PER_BATCH]
-                    # 每批只装载3个扫描周所需的数据，避免两年全量行情同时驻留内存。
+                    # 保留R1/R2稳定的420日指标预热窗口；每批只装载3个扫描周。
                     fetch_start = (
                         datetime.strptime(min(batch_dates), "%Y%m%d") - timedelta(days=420)
                     ).strftime("%Y%m%d")
@@ -2139,6 +2347,11 @@ def main():
                         f"本批扫描{batch_dates[0]}—{batch_dates[-1]}；"
                         f"只加载必要行情窗口{fetch_start}—{fetch_end}。"
                     )
+                    lease_heartbeat = (
+                        lambda: refresh_task_lease(
+                            str(active_task.get("Task_ID", "")), worker_id
+                        )
+                    ) if run_history else None
                     (
                         stocks,
                         basic_indexed,
@@ -2151,6 +2364,7 @@ def main():
                         fetch_end,
                         token_clean,
                         whitelist_keys,
+                        lease_heartbeat=lease_heartbeat,
                     )
                     st.caption(
                         f"行情分片：复用{sync_stats.get('cached_days', 0)}天，"
@@ -2166,9 +2380,13 @@ def main():
                         raise RuntimeError("未加载到行情；已成功下载的分片仍然保留。")
 
                     loaded_date_set = set(loaded_dates)
-                    progress = st.progress(0, text="开始扫描R2周线结构候选……")
+                    progress = st.progress(0, text="开始扫描R3趋势内首红候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
+                        if run_history and not refresh_task_lease(
+                            str(active_task.get("Task_ID", "")), worker_id
+                        ):
+                            raise RuntimeError("任务租约已经转移，本页停止写入。")
                         if run_history and read_json_safe(RUN_TASK_FILE).get("State") == "STOPPED":
                             stopped_during_batch = True
                             break
@@ -2195,15 +2413,19 @@ def main():
                             weekly_mode,
                         )
                         selected_count = (
-                            int(_bool_series(candidates, "Selected_Top3").sum())
+                            int(_bool_series(candidates, "Selected_Top2").sum())
                             if not candidates.empty
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r2_preview"] = candidates
+                            st.session_state["r3_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
+                            if not refresh_task_lease(
+                                str(active_task.get("Task_ID", "")), worker_id
+                            ):
+                                raise RuntimeError("任务租约已经转移，本页停止写入回测断点。")
                             replace_checkpoint_date(candidates, signal_date, run_config_id)
                             mark_scan_complete(
                                 signal_date,
@@ -2221,11 +2443,11 @@ def main():
                             active_task["Completed_Weeks"] = int(active_task.get("Completed_Weeks", 0)) + 1
                             active_task["Last_Date"] = signal_date
                             active_task["Error_Count"] = 0
-                            save_task(active_task)
+                            save_owned_task(active_task, worker_id)
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：结构触发{raw_count}只，"
+                                f"{signal_date}：首红触发{raw_count}只，"
                                 f"合格候选{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -2245,50 +2467,59 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R2扫描完成。")
+                            st.success("历史R3扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
                     latest_task = read_json_safe(RUN_TASK_FILE) or active_task
-                    errors = int(latest_task.get("Error_Count", 0)) + 1
-                    latest_task["Error_Count"] = errors
-                    latest_task["Last_Error"] = str(exc)
-                    if errors < 3:
-                        latest_task["State"] = "RUNNING"
-                        rerun_needed = True
-                        st.warning(f"临时异常，断点已保留，将自动重试（{errors}/3）：{exc}")
+                    still_owner = (
+                        str(latest_task.get("Task_ID", ""))
+                        == str(active_task.get("Task_ID", ""))
+                        and str(latest_task.get("Owner_ID", "")) == worker_id
+                    )
+                    if not still_owner:
+                        st.warning(f"任务已由其他页面接管，本页停止：{exc}")
                     else:
-                        latest_task["State"] = "PAUSED_ERROR"
-                        st.error(f"连续3次失败，任务已暂停：{exc}")
-                    save_task(latest_task)
+                        errors = int(latest_task.get("Error_Count", 0)) + 1
+                        latest_task["Error_Count"] = errors
+                        latest_task["Last_Error"] = str(exc)
+                        if errors < 3:
+                            latest_task["State"] = "RUNNING"
+                            rerun_needed = True
+                            st.warning(f"临时异常，断点已保留，将自动重试（{errors}/3）：{exc}")
+                        else:
+                            latest_task["State"] = "PAUSED_ERROR"
+                            st.error(f"连续3次失败，任务已暂停：{exc}")
+                        save_owned_task(latest_task, worker_id)
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r2_preview")
+    preview = st.session_state.get("r3_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R2周线结构候选。")
+            st.info("最新交易日没有R3趋势内首红候选。")
         else:
-            selected_preview = preview[_bool_series(preview, "Selected_Top3")].copy()
+            selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
                 block_reason = ""
                 if "Selection_Block_Reason" in preview.columns and not preview.empty:
                     block_reason = str(preview["Selection_Block_Reason"].iloc[0] or "")
-                st.warning(block_reason or "本周没有形成有效Top3选股组。")
+                st.warning(block_reason or "本周没有形成有效Top2选股组。")
             else:
                 preview_columns = [
                     "Signal_Date", "Weekly_Data_Mode", "Rank", "name", "ts_code", "Industry",
-                    "R2_Setup_Type", "Entry_Score_100", "Score_Leadership_35",
-                    "Score_Trend_25", "Score_Setup_25", "Score_Risk_15",
+                    "R3_Setup_Type", "Score_Trend_20", "Score_Risk_10",
+                    "Entry_Score_100", "Score_Pullback_15", "Score_Contraction_15",
+                    "Score_Restart_15", "Score_RS_25",
                     "Raw_Close", "Circ_MV_Billion", "Market_Regime", "Selection_Block_Reason",
                 ]
                 st.dataframe(
                     selected_preview[[column for column in preview_columns if column in selected_preview.columns]],
                     width="stretch",
                 )
-            with st.expander("查看全部R2结构候选及未入选原因"):
+            with st.expander("查看全部R3首红候选及未入选原因"):
                 st.dataframe(preview, width="stretch")
 
     if rerun_needed:
@@ -2314,13 +2545,14 @@ def main():
         cohort = cohort_summary(completed)
         outlier, outlier_details = outlier_audit(completed)
         yearly = year_summary(completed)
-        group_detail, group_stats = three_stock_group_summary(completed)
+        regimes = regime_gate_summary(history)
+        group_detail, group_stats = two_stock_group_summary(completed)
         horizons = horizon_summary(completed)
         diagnostics = ranking_diagnostics(completed)
         gates = research_gates(completed, cohort, outlier, diagnostics)
 
         st.markdown("---")
-        st.header("R2历史验证报告")
+        st.header("R3历史验证报告")
         st.caption(
             "主报告以已经走满15个交易日的W3样本验收入场排序；W4—W8只统计实际已经走到"
             "相应周数的记录，并在表中明确显示每个持有期的完整样本数。"
@@ -2341,29 +2573,29 @@ def main():
             if not ledger.empty
             else 0
         )
-        selected = completed[completed["Rank"] <= 3]
+        selected = completed[completed["Rank"] <= TOP_N]
         selected_returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
         metric_columns = st.columns(5)
         metric_columns[0].metric("已扫描周数", scanned_weeks)
-        metric_columns[1].metric("无有效Top3周", invalid_selection_weeks)
-        metric_columns[2].metric("W3完整Top3交易", len(selected))
+        metric_columns[1].metric("无有效Top2周", invalid_selection_weeks)
+        metric_columns[2].metric("W3完整Top2交易", len(selected))
         metric_columns[3].metric(
-            "Top3胜率",
+            "Top2胜率",
             f"{((selected_returns > 0).mean() * 100.0 if len(selected_returns) else np.nan):.1f}%",
         )
         metric_columns[4].metric(
-            "W3 Top3中位收益",
+            "W3 Top2中位收益",
             f"{(selected_returns.median() if len(selected_returns) else np.nan):.2f}%",
         )
 
         st.subheader("研究验收门槛")
         st.dataframe(gates, width="stretch", hide_index=True)
         if not gates.empty and gates["结果"].eq("通过").all():
-            st.success("R2一年快速验收全部通过，可以冻结规则并进入更长区间样本外验证。")
+            st.success("R3一年快速验收全部通过，可以冻结规则并进入更长区间样本外验证。")
         else:
-            st.error("R2尚未通过全部验收，当前代码不能进入实盘，也不应靠止盈止损掩盖入口问题。")
+            st.error("R3尚未通过全部验收，当前代码不能进入实盘，也不应靠止盈止损掩盖入口问题。")
 
-        st.subheader("Top1、Top2、Top3与其余候选")
+        st.subheader("Top1、Top2与其余候选")
         st.dataframe(_format_report_frame(cohort), width="stretch", hide_index=True)
 
         st.subheader("极端牛股依赖审计")
@@ -2381,15 +2613,15 @@ def main():
             )
             st.dataframe(diagnostic_frame, width="stretch", hide_index=True)
 
-        st.subheader("完整三股组")
+        st.subheader("完整两股组")
         if group_stats:
             group_cols = st.columns(4)
-            group_cols[0].metric("完整三股组", group_stats["完整三股组"])
-            group_cols[1].metric("平均盈利只数", f"{group_stats['平均盈利只数']:.2f}/3")
-            group_cols[2].metric("至少两只盈利", f"{group_stats['至少两只盈利比例%']:.1f}%")
-            group_cols[3].metric("三只全亏", f"{group_stats['三只全亏比例%']:.1f}%")
+            group_cols[0].metric("完整两股组", group_stats["完整两股组"])
+            group_cols[1].metric("平均盈利只数", f"{group_stats['平均盈利只数']:.2f}/2")
+            group_cols[2].metric("两只都盈利", f"{group_stats['两只都盈利比例%']:.1f}%")
+            group_cols[3].metric("两只全亏", f"{group_stats['两只全亏比例%']:.1f}%")
         else:
-            st.info("尚无三只都走满W3的完整选股组。")
+            st.info("尚无两只都走满W3的完整选股组。")
 
         st.subheader("固定持有W1—W8路径")
         st.dataframe(_format_report_frame(horizons), width="stretch", hide_index=True)
@@ -2397,16 +2629,19 @@ def main():
         st.subheader("分年稳定性")
         st.dataframe(_format_report_frame(yearly), width="stretch", hide_index=True)
 
-        with st.expander("查看Top3历史明细"):
+        st.subheader("中性市场门内外对照")
+        st.dataframe(_format_report_frame(regimes), width="stretch", hide_index=True)
+
+        with st.expander("查看Top2历史明细"):
             detail_columns = [
                 "Signal_Date", "Entry_Date", "Rank", "name", "ts_code", "Industry",
-                "R2_Setup_Type", "Entry_Score_100", "Score_Leadership_35",
-                "Score_Trend_25", "Score_Setup_25", "Score_Risk_15",
+                "R3_Setup_Type", "Score_Trend_20", "Score_Risk_10", "Entry_Score_100",
+                "Score_Pullback_15", "Score_Contraction_15", "Score_Restart_15", "Score_RS_25",
                 "Entry_Open", PRIMARY_RETURN_COLUMN, "MFE_W3_Net_pct", "MAE_W3_Raw_pct",
                 "Path_10_vs_Minus5", "Early_Failure_2W", "Outcome_Grade", "Market_Regime",
             ]
             selected_detail = history[
-                _bool_series(history, "Selected_Top3")
+                _bool_series(history, "Selected_Top2")
             ].copy()
             selected_detail = selected_detail.sort_values(
                 ["Signal_Date", "Rank"], ascending=[False, True]
@@ -2425,11 +2660,12 @@ def main():
             horizons,
             gates,
             diagnostics,
+            regimes,
         )
         st.download_button(
-            "下载R2完整研究结果",
+            "下载R3完整研究结果",
             data=export_bytes,
-            file_name="r2_w3_cross_section_audit_results.zip",
+            file_name="r3_neutral_first_red_w3_audit_results.zip",
             mime="application/zip",
         )
 
