@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-R7 强势抗跌新高 + R3 中性首红 + R6 N6 弱势首次转折三引擎 Top2 验证器
+R8 延伸强势有序再扩散 + R7 早期强势回调 + R3 中性首红 + R6 N6 弱势
+首次转折四分支 Top2 验证器
 
-R3 中性市场首红模块与 R6 弱势首次转折模块逐行冻结。R7 只研究尚未解决的
-强势市场：不把普通首红、连续上涨或高位加速重新包装成买点，而是在科技池
-13周仍强、当周普遍回调时，寻找趋势完整且逆势首次创13周新高的股票。只有
-“早期强势回调”允许实际 Top2；扩张期和13周涨幅已经过高的阶段继续观察。
+R3、R6 与 R7 的原触发、资格和排名逐行冻结。R8 不把全部“13周仍强”的星期
+都放开，而是先识别一个市场事件：科技池已经连续三周处于延伸强势，上一周
+出现普遍回调，本周以不过热的速度重新扩散。只有这个事件允许 R8 研究入口。
 
-R7 强势候选采用五项等权、只使用买入前数据的“抗跌但不追高”指数。R2 的
-混合结构和领导力总分、R3 在强势期的首红排名均保留为审计对照，不参与 R7
-实际入选。历史信号日仍为每周最后一个交易日，下一交易日开盘买入；任何买入
-后信息都不进入触发、排名或市场背景标签。
+R8 个股入口不是持续状态，而是上升趋势股票在市场回调周保持相对韧性后，
+本周第一次收复上周高点并恢复动量。候选采用五项等权、只使用买入前数据的
+再加速指数。R7 抗跌新高与 R3 首红在相同市场事件中的名次保留为反事实对照，
+不参与 R8 实际入选。信号日仍为每周最后一个交易日，下一交易日开盘买入。
 """
 
 from __future__ import annotations
@@ -41,14 +41,14 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R7.0-STRONG-RESET-RESILIENCE-THREE-ENGINE-TOP2-W3-AUDIT"
-APP_TITLE = "R7强势抗跌新高三引擎Top2验证器"
-ENGINE_PATCH = "R7.0-R3-R6-FROZEN-STRONG-RESET-RESILIENCE-STABLE"
+APP_VERSION = "R8.0-ORDERLY-REEXPANSION-FOUR-BRANCH-TOP2-W3-AUDIT"
+APP_TITLE = "R8延伸强势有序再扩散四分支Top2验证器"
+ENGINE_PATCH = "R8.0-R3-R6-R7-FROZEN-ORDERLY-REEXPANSION-STABLE"
 
-CHECKPOINT_FILE = "r7_three_engine_candidates.csv"
-SCAN_LEDGER_FILE = "r7_three_engine_scanned_dates.csv"
-OPPORTUNITY_FILE = "r7_three_engine_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r7_three_engine_running_task.json"
+CHECKPOINT_FILE = "r8_four_branch_candidates.csv"
+SCAN_LEDGER_FILE = "r8_four_branch_scanned_dates.csv"
+OPPORTUNITY_FILE = "r8_four_branch_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r8_four_branch_running_task.json"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -67,6 +67,20 @@ STRONG_RESET_MAX_POSITIVE_BREADTH = 0.55
 STRONG_MAX_WEEKLY_RETURN_PCT = 15.0
 STRONG_MAX_DISTANCE_MA20_PCT = 25.0
 STRONG_MAX_WEEKLY_RANGE_PCT = 25.0
+REEXPANSION_MIN_MARKET_13W_PCT = 10.0
+REEXPANSION_MAX_MARKET_13W_PCT = 30.0
+REEXPANSION_MAX_MARKET_13W_ACCEL_PCT = 5.0
+REEXPANSION_MAX_MARKET_1W_PCT = 5.0
+REEXPANSION_MIN_POSITIVE_BREADTH = 0.55
+REEXPANSION_MAX_POSITIVE_BREADTH = 0.80
+REEXPANSION_MAX_PREVIOUS_MARKET_1W_PCT = 0.0
+REEXPANSION_MAX_PREVIOUS_POSITIVE_BREADTH = 0.50
+REACCEL_MIN_PREVIOUS_RETURN_PCT = -8.0
+REACCEL_MAX_PREVIOUS_RETURN_PCT = 5.0
+REACCEL_MAX_WEEKLY_RETURN_PCT = 12.0
+REACCEL_MAX_DISTANCE_MA20_PCT = 25.0
+REACCEL_MAX_WEEKLY_RANGE_PCT = 25.0
+REACCEL_MIN_CLOSE_LOCATION = 0.60
 RECOVERY_OVERSOLD_LEVEL = 35.0
 RECOVERY_DEEP_DRAWDOWN_PCT = -20.0
 RECOVERY_MAX_WEEKLY_RETURN_PCT = 25.0
@@ -849,8 +863,11 @@ def compute_signal_snapshot(
     return_1w = _safe_float(current.get("return_1w_pct"))
     previous_return_1w = _safe_float(previous.get("return_1w_pct"))
     previous2_return_1w = _safe_float(previous2.get("return_1w_pct"))
+    previous_return_13w = _safe_float(previous.get("return_13w_pct"))
+    previous2_return_13w = _safe_float(previous2.get("return_13w_pct"))
     prior_high_13w = _safe_float(current.get("prior_high_13w"))
     previous_prior_high_13w = _safe_float(previous.get("prior_high_13w"))
+    previous_high_value = _safe_float(previous.get("high"))
     close_location_now = _safe_float(current.get("close_location"))
     fresh_breakout = (
         all(
@@ -912,6 +929,44 @@ def compute_signal_snapshot(
     )
     strong_overheated = bool(strong_resilience_trigger and not strong_risk_ok)
     strong_eligible = bool(strong_resilience_trigger and strong_risk_ok)
+
+    # R8 只定义个股的一次性“整理后再加速”事件，市场是否处于可交易的有序
+    # 再扩散阶段在完整科技池形成后另行判定。这里不使用未来收益，也不把
+    # K>D、MACD持续改善等可连续维持的状态单独当作买点。
+    strong_reacceleration_trigger = bool(
+        strong_trend_eligible
+        and all(
+            math.isfinite(item)
+            for item in (
+                current_close,
+                previous_high_value,
+                ma10,
+                return_1w,
+                previous_return_1w,
+                current_hist,
+                previous_hist,
+                close_location_now,
+            )
+        )
+        and REACCEL_MIN_PREVIOUS_RETURN_PCT
+        <= previous_return_1w
+        <= REACCEL_MAX_PREVIOUS_RETURN_PCT
+        and current_close > previous_high_value
+        and current_close >= ma10
+        and 0.0 < return_1w <= REACCEL_MAX_WEEKLY_RETURN_PCT
+        and current_hist > previous_hist
+        and close_location_now >= REACCEL_MIN_CLOSE_LOCATION
+    )
+    strong_reacceleration_risk_ok = bool(
+        strong_reacceleration_trigger
+        and math.isfinite(distance_ma20)
+        and 0.0 <= distance_ma20 <= REACCEL_MAX_DISTANCE_MA20_PCT
+        and math.isfinite(weekly_range)
+        and weekly_range <= REACCEL_MAX_WEEKLY_RANGE_PCT
+    )
+    strong_reacceleration_overheated = bool(
+        strong_reacceleration_trigger and not strong_reacceleration_risk_ok
+    )
 
     # R6弱势分支不等待MACD翻红或MA20斜率转正。实际入口必须是一个“事件”而
     # 不是能连续维持数周的状态：深跌且近期超卖后，K本周首次转升，同时价格
@@ -1076,6 +1131,16 @@ def compute_signal_snapshot(
             else ""
         ),
         "Strong_Trend_Eligible": strong_trend_eligible,
+        "Strong_Reacceleration_Trigger": strong_reacceleration_trigger,
+        "Strong_Reacceleration_Risk_OK": strong_reacceleration_risk_ok,
+        "Strong_Reacceleration_Overheated": strong_reacceleration_overheated,
+        "Strong_Reacceleration_Setup_Type": (
+            "整理后再加速-过热观察"
+            if strong_reacceleration_overheated
+            else "整理后再加速"
+            if strong_reacceleration_trigger
+            else ""
+        ),
         "Recovery_Structure_Trigger": recovery_first_turn_event,
         "Recovery_Overheated": recovery_overheated,
         "Recovery_Eligible": recovery_eligible,
@@ -1115,10 +1180,13 @@ def compute_signal_snapshot(
         "Weeks_Since_26W_High": weeks_since_high,
         "PreSignal_4W_Return_pct": _safe_float(current.get("pre_signal_4w_return_pct")),
         "Return_1W_pct": return_1w,
+        "Previous_Return_1W_pct": previous_return_1w,
         "Return_2W_pct": _safe_float(current.get("return_2w_pct")),
         "Return_4W_pct": _safe_float(current.get("return_4w_pct")),
         "Return_8W_pct": _safe_float(current.get("return_8w_pct")),
         "Return_13W_pct": _safe_float(current.get("return_13w_pct")),
+        "Previous_Return_13W_pct": previous_return_13w,
+        "Previous2_Return_13W_pct": previous2_return_13w,
         "Prior_High_13W": prior_high_13w,
         "Breakout_13W_pct": _safe_float(current.get("breakout_13w_pct")),
         "ATR_Contraction": _safe_float(current.get("atr_contraction")),
@@ -1375,8 +1443,109 @@ def _score_strong_resilience(frame: pd.DataFrame):
     return scored
 
 
-def score_r7_candidates(pool_snapshots: pd.DataFrame):
-    """R7强势、R3中性、R6弱势互斥启用；既有R3/R6计算保持不变。"""
+def _score_strong_reacceleration(frame: pd.DataFrame):
+    """R8整理后再加速五项等权指数；权重在回测前固定且不读取未来收益。"""
+    scored = frame.copy()
+    factors = [
+        ("Previous_Return_1W_pct", "Reaccel_Score_PriorResilience20", True),
+        ("RS_13W_Pct", "Reaccel_Score_RS13_20", True),
+        ("Industry_13W_Excess_pct", "Reaccel_Score_Industry20", True),
+        ("ATR_Contraction", "Reaccel_Score_ATR20", False),
+        ("Return_1W_pct", "Reaccel_Score_NonChase20", False),
+    ]
+    component_columns = []
+    for source, target, higher_is_better in factors:
+        scored[target] = _percentile_rank(
+            _numeric_series(scored, source), higher_is_better=higher_is_better
+        ) * 20.0
+        component_columns.append(target)
+    scored["Strong_Reacceleration_100"] = scored[component_columns].sum(axis=1)
+    return scored
+
+
+def _market_state_metrics(pool: pd.DataFrame):
+    """从当周完整科技池计算当前及前两周的市场状态；全部字段在信号日已知。"""
+    current_13w = _numeric_series(pool, "Return_13W_pct")
+    previous_13w = _numeric_series(pool, "Previous_Return_13W_pct")
+    previous2_13w = _numeric_series(pool, "Previous2_Return_13W_pct")
+    current_1w = _numeric_series(pool, "Return_1W_pct")
+    previous_1w = _numeric_series(pool, "Previous_Return_1W_pct")
+    market_13w = _safe_float(current_13w.median(), 0.0)
+    previous_market_13w = _safe_float(previous_13w.median(), 0.0)
+    previous2_market_13w = _safe_float(previous2_13w.median(), 0.0)
+    market_1w = _safe_float(current_1w.median(), 0.0)
+    previous_market_1w = _safe_float(previous_1w.median(), 0.0)
+    positive_breadth = float((current_1w > 0.0).mean()) if len(pool) else 0.0
+    previous_positive_breadth = (
+        float((previous_1w > 0.0).mean()) if len(pool) else 0.0
+    )
+    acceleration = market_13w - previous_market_13w
+    regime = (
+        "强势"
+        if market_13w >= MARKET_NEUTRAL_UPPER_PCT
+        else "弱势"
+        if market_13w <= MARKET_NEUTRAL_LOWER_PCT
+        else "中性"
+    )
+    reset_pass = bool(
+        MARKET_NEUTRAL_UPPER_PCT <= market_13w < STRONG_EARLY_UPPER_PCT
+        and market_1w <= STRONG_RESET_MAX_MARKET_1W_MEDIAN_PCT
+        and positive_breadth < STRONG_RESET_MAX_POSITIVE_BREADTH
+    )
+    reexpansion_pass = bool(
+        REEXPANSION_MIN_MARKET_13W_PCT
+        <= market_13w
+        <= REEXPANSION_MAX_MARKET_13W_PCT
+        and previous_market_13w >= REEXPANSION_MIN_MARKET_13W_PCT
+        and previous2_market_13w >= REEXPANSION_MIN_MARKET_13W_PCT
+        and 0.0 <= acceleration <= REEXPANSION_MAX_MARKET_13W_ACCEL_PCT
+        and 0.0 < market_1w <= REEXPANSION_MAX_MARKET_1W_PCT
+        and REEXPANSION_MIN_POSITIVE_BREADTH
+        <= positive_breadth
+        <= REEXPANSION_MAX_POSITIVE_BREADTH
+        and previous_market_1w <= REEXPANSION_MAX_PREVIOUS_MARKET_1W_PCT
+        and previous_positive_breadth < REEXPANSION_MAX_PREVIOUS_POSITIVE_BREADTH
+    )
+    context = (
+        "早期强势回调"
+        if reset_pass
+        else "早期强势扩张"
+        if market_13w < STRONG_EARLY_UPPER_PCT
+        else "延伸强势回调"
+        if (
+            market_1w <= STRONG_RESET_MAX_MARKET_1W_MEDIAN_PCT
+            and positive_breadth < STRONG_RESET_MAX_POSITIVE_BREADTH
+        )
+        else "延伸强势扩张"
+    )
+    stage = (
+        f"{regime}市场"
+        if regime != "强势"
+        else "早期强势回调-R7"
+        if reset_pass
+        else "延伸强势有序再扩散-R8"
+        if reexpansion_pass
+        else f"{context}-观察"
+    )
+    return {
+        "Market_13W_Median_pct": market_13w,
+        "Previous_Market_13W_Median_pct": previous_market_13w,
+        "Previous2_Market_13W_Median_pct": previous2_market_13w,
+        "Market_13W_Acceleration_pct": acceleration,
+        "Market_1W_Median_pct": market_1w,
+        "Previous_Market_1W_Median_pct": previous_market_1w,
+        "Market_1W_Positive_Breadth": positive_breadth,
+        "Previous_Market_1W_Positive_Breadth": previous_positive_breadth,
+        "Market_Regime": regime,
+        "Strong_Reset_Context_Pass": reset_pass,
+        "Strong_Reexpansion_Context_Pass": reexpansion_pass,
+        "Strong_Market_Context": context,
+        "Strong_Market_Stage": stage,
+    }
+
+
+def score_r8_candidates(pool_snapshots: pd.DataFrame):
+    """R8/R7/R3/R6按互斥市场事件启用；既有三个分支计算保持不变。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
@@ -1395,14 +1564,38 @@ def score_r7_candidates(pool_snapshots: pd.DataFrame):
     )
     pool["MACD_Impulse_Pct"] = _percentile_rank(_numeric_series(pool, "MACD_Impulse_pct"))
 
+    market_state = _market_state_metrics(pool)
+    previous_market_1w = _safe_float(
+        market_state.get("Previous_Market_1W_Median_pct"), 0.0
+    )
+    reacceleration_trigger = _bool_series(pool, "Strong_Reacceleration_Trigger")
+    reacceleration_risk_ok = _bool_series(pool, "Strong_Reacceleration_Risk_OK")
+    prior_resilience_pass = (
+        _numeric_series(pool, "Previous_Return_1W_pct") >= previous_market_1w
+    )
+    pool["Strong_Reacceleration_Resilience_Pass"] = prior_resilience_pass
+    pool["Strong_Reacceleration_Eligible"] = (
+        reacceleration_trigger & reacceleration_risk_ok & prior_resilience_pass
+    )
+    pool["Strong_Reacceleration_Overheated"] = (
+        reacceleration_trigger & ~reacceleration_risk_ok
+    )
+
     r3_trigger = _bool_series(pool, "R3_Setup_Candidate")
     strong_trigger = _bool_series(pool, "Strong_Resilience_Trigger")
+    reacceleration_trigger = _bool_series(pool, "Strong_Reacceleration_Trigger")
     recovery_trigger = _bool_series(pool, "Recovery_Structure_Trigger")
     r5_baseline_trigger = _bool_series(pool, "R5_Baseline_Recovery_Structure_Trigger")
     candidates = pool[
-        r3_trigger | strong_trigger | recovery_trigger | r5_baseline_trigger
+        r3_trigger
+        | strong_trigger
+        | reacceleration_trigger
+        | recovery_trigger
+        | r5_baseline_trigger
     ].copy()
-    raw_count = int((r3_trigger | strong_trigger | recovery_trigger).sum())
+    raw_count = int(
+        (r3_trigger | strong_trigger | reacceleration_trigger | recovery_trigger).sum()
+    )
     if candidates.empty:
         return candidates, 0, 0
     candidates = _score_r1_six_factors(candidates)
@@ -1410,6 +1603,7 @@ def score_r7_candidates(pool_snapshots: pd.DataFrame):
     candidates["Rank"] = np.nan
     candidates["R3_Rank"] = np.nan
     candidates["Strong_Rank"] = np.nan
+    candidates["Strong_Reacceleration_Rank"] = np.nan
     candidates["Recovery_Rank"] = np.nan
     for column in (
         "Recovery_Early_Return2W_20",
@@ -1429,16 +1623,29 @@ def score_r7_candidates(pool_snapshots: pd.DataFrame):
         "Strong_Resilience_100",
     ):
         candidates[column] = np.nan
+    for column in (
+        "Reaccel_Score_PriorResilience20",
+        "Reaccel_Score_RS13_20",
+        "Reaccel_Score_Industry20",
+        "Reaccel_Score_ATR20",
+        "Reaccel_Score_NonChase20",
+        "Strong_Reacceleration_100",
+    ):
+        candidates[column] = np.nan
     candidates["Selected_Top2"] = False
     candidates["Entry_Eligible"] = False
     r3_eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
     strong_eligible = candidates[_bool_series(candidates, "Strong_Eligible")].copy()
+    reacceleration_eligible = candidates[
+        _bool_series(candidates, "Strong_Reacceleration_Eligible")
+    ].copy()
     recovery_eligible = candidates[_bool_series(candidates, "Recovery_Eligible")].copy()
     r5_baseline_eligible = candidates[
         _bool_series(candidates, "R5_Baseline_Recovery_Eligible")
     ].copy()
     r3_eligible_count = len(r3_eligible)
     strong_eligible_count = len(strong_eligible)
+    reacceleration_eligible_count = len(reacceleration_eligible)
     recovery_eligible_count = len(recovery_eligible)
     r5_baseline_eligible_count = len(r5_baseline_eligible)
 
@@ -1474,6 +1681,36 @@ def score_r7_candidates(pool_snapshots: pd.DataFrame):
         )
         rank_map = pd.Series(np.arange(1, len(ordered) + 1, dtype=int), index=ordered.index)
         candidates.loc[rank_map.index, "Strong_Rank"] = rank_map.astype(float)
+    if reacceleration_eligible_count:
+        reacceleration_scored = _score_strong_reacceleration(reacceleration_eligible)
+        reacceleration_columns = [
+            "Reaccel_Score_PriorResilience20",
+            "Reaccel_Score_RS13_20",
+            "Reaccel_Score_Industry20",
+            "Reaccel_Score_ATR20",
+            "Reaccel_Score_NonChase20",
+            "Strong_Reacceleration_100",
+        ]
+        for column in reacceleration_columns:
+            candidates.loc[reacceleration_scored.index, column] = (
+                reacceleration_scored[column]
+            )
+        ordered = reacceleration_scored.sort_values(
+            [
+                "Strong_Reacceleration_100",
+                "Previous_Return_1W_pct",
+                "Return_1W_pct",
+                "ts_code",
+            ],
+            ascending=[False, False, True, True],
+            kind="mergesort",
+        )
+        rank_map = pd.Series(
+            np.arange(1, len(ordered) + 1, dtype=int), index=ordered.index
+        )
+        candidates.loc[rank_map.index, "Strong_Reacceleration_Rank"] = (
+            rank_map.astype(float)
+        )
     if recovery_eligible_count:
         early_scored = _score_recovery_early_stage(recovery_eligible)
         early_columns = [
@@ -1499,10 +1736,25 @@ def score_r7_candidates(pool_snapshots: pd.DataFrame):
         rank_map = pd.Series(np.arange(1, len(ordered) + 1, dtype=int), index=ordered.index)
         candidates.loc[rank_map.index, "Recovery_Rank"] = rank_map.astype(float)
 
-    market_median = _safe_float(return_13w.median(), 0.0)
-    market_1w_median = _safe_float(_numeric_series(pool, "Return_1W_pct").median(), 0.0)
-    positive_breadth = (
-        float((_numeric_series(pool, "Return_1W_pct") > 0.0).mean()) if len(pool) else 0.0
+    market_median = _safe_float(market_state.get("Market_13W_Median_pct"), 0.0)
+    previous_market_13w = _safe_float(
+        market_state.get("Previous_Market_13W_Median_pct"), 0.0
+    )
+    previous2_market_13w = _safe_float(
+        market_state.get("Previous2_Market_13W_Median_pct"), 0.0
+    )
+    market_13w_acceleration = _safe_float(
+        market_state.get("Market_13W_Acceleration_pct"), 0.0
+    )
+    market_1w_median = _safe_float(market_state.get("Market_1W_Median_pct"), 0.0)
+    previous_market_1w = _safe_float(
+        market_state.get("Previous_Market_1W_Median_pct"), 0.0
+    )
+    positive_breadth = _safe_float(
+        market_state.get("Market_1W_Positive_Breadth"), 0.0
+    )
+    previous_positive_breadth = _safe_float(
+        market_state.get("Previous_Market_1W_Positive_Breadth"), 0.0
     )
     r5_baseline_required_count = max(
         R5_BASELINE_MIN_CANDIDATES,
@@ -1520,42 +1772,45 @@ def score_r7_candidates(pool_snapshots: pd.DataFrame):
         if market_1w_median > 0.0 or positive_breadth >= 0.50
         else "逆风修复"
     )
-    market_regime = (
-        "强势" if market_median >= MARKET_NEUTRAL_UPPER_PCT else
-        "弱势" if market_median <= MARKET_NEUTRAL_LOWER_PCT else "中性"
-    )
+    market_regime = str(market_state.get("Market_Regime", "中性"))
     strong_reset_context_pass = bool(
-        MARKET_NEUTRAL_UPPER_PCT <= market_median < STRONG_EARLY_UPPER_PCT
-        and market_1w_median <= STRONG_RESET_MAX_MARKET_1W_MEDIAN_PCT
-        and positive_breadth < STRONG_RESET_MAX_POSITIVE_BREADTH
+        market_state.get("Strong_Reset_Context_Pass", False)
     )
-    strong_market_context = (
-        "早期强势回调"
-        if strong_reset_context_pass
-        else "早期强势扩张"
-        if market_median < STRONG_EARLY_UPPER_PCT
-        else "延伸强势回调"
-        if (
-            market_1w_median <= STRONG_RESET_MAX_MARKET_1W_MEDIAN_PCT
-            and positive_breadth < STRONG_RESET_MAX_POSITIVE_BREADTH
-        )
-        else "延伸强势扩张"
+    strong_reexpansion_context_pass = bool(
+        market_state.get("Strong_Reexpansion_Context_Pass", False)
     )
+    strong_market_context = str(market_state.get("Strong_Market_Context", ""))
+    strong_market_stage = str(market_state.get("Strong_Market_Stage", ""))
     if market_regime == "强势":
-        active_eligible_count = strong_eligible_count
-        candidates["Rank"] = candidates["Strong_Rank"]
-        candidates["Entry_Eligible"] = _bool_series(candidates, "Strong_Eligible")
         if strong_reset_context_pass:
+            active_eligible_count = strong_eligible_count
+            candidates["Rank"] = candidates["Strong_Rank"]
+            candidates["Entry_Eligible"] = _bool_series(candidates, "Strong_Eligible")
             active_branch = "R7强势抗跌新高"
             block_reason = (
                 ""
                 if strong_eligible_count >= MIN_VALID_SELECTION_SIZE
                 else "强势抗跌新高候选不足2只"
             )
-        else:
-            active_branch = "R7强势观察"
+        elif strong_reexpansion_context_pass:
+            active_eligible_count = reacceleration_eligible_count
+            candidates["Rank"] = candidates["Strong_Reacceleration_Rank"]
+            candidates["Entry_Eligible"] = _bool_series(
+                candidates, "Strong_Reacceleration_Eligible"
+            )
+            active_branch = "R8延伸强势有序再扩散"
             block_reason = (
-                f"{strong_market_context}只观察；仅早期强势回调允许抗跌新高Top2"
+                ""
+                if reacceleration_eligible_count >= MIN_VALID_SELECTION_SIZE
+                else "整理后再加速候选不足2只"
+            )
+        else:
+            active_eligible_count = strong_eligible_count
+            candidates["Rank"] = candidates["Strong_Rank"]
+            candidates["Entry_Eligible"] = _bool_series(candidates, "Strong_Eligible")
+            active_branch = "R8强势观察"
+            block_reason = (
+                f"{strong_market_stage}；仅R7早期回调或R8有序再扩散允许Top2"
             )
     elif market_regime == "中性":
         active_branch = "R3中性趋势"
@@ -1587,36 +1842,58 @@ def score_r7_candidates(pool_snapshots: pd.DataFrame):
     candidates["Observation_Row_Count"] = len(candidates)
     candidates["R3_Raw_First_Red_Count"] = int(r3_trigger.sum())
     candidates["Strong_Structure_Count"] = int(strong_trigger.sum())
+    candidates["Strong_Reacceleration_Structure_Count"] = int(
+        reacceleration_trigger.sum()
+    )
     candidates["Recovery_Structure_Count"] = int(recovery_trigger.sum())
     candidates["R5_Baseline_Recovery_Structure_Count"] = int(r5_baseline_trigger.sum())
     candidates["Recovery_Overheated_Count"] = int(_bool_series(pool, "Recovery_Overheated").sum())
     candidates["Strong_Overheated_Count"] = int(_bool_series(pool, "Strong_Overheated").sum())
+    candidates["Strong_Reacceleration_Overheated_Count"] = int(
+        _bool_series(pool, "Strong_Reacceleration_Overheated").sum()
+    )
     candidates["Eligible_Trend_Count"] = r3_eligible_count
     candidates["Strong_Eligible_Count"] = strong_eligible_count
+    candidates["Strong_Reacceleration_Eligible_Count"] = (
+        reacceleration_eligible_count
+    )
     candidates["Recovery_Eligible_Count"] = recovery_eligible_count
     candidates["R5_Baseline_Recovery_Eligible_Count"] = r5_baseline_eligible_count
     candidates["Active_Eligible_Count"] = active_eligible_count
     candidates["Strong_Required_Count"] = MIN_VALID_SELECTION_SIZE
+    candidates["Strong_Reacceleration_Required_Count"] = MIN_VALID_SELECTION_SIZE
     candidates["Recovery_Required_Count"] = MIN_VALID_SELECTION_SIZE
     candidates["R5_Baseline_Required_Count"] = r5_baseline_required_count
     candidates["R5_Baseline_Market_Gate_Pass"] = r5_baseline_market_gate_pass
     candidates["Market_13W_Median_pct"] = market_median
+    candidates["Previous_Market_13W_Median_pct"] = previous_market_13w
+    candidates["Previous2_Market_13W_Median_pct"] = previous2_market_13w
+    candidates["Market_13W_Acceleration_pct"] = market_13w_acceleration
     candidates["Market_1W_Median_pct"] = market_1w_median
+    candidates["Previous_Market_1W_Median_pct"] = previous_market_1w
     candidates["Market_1W_Positive_Breadth_pct"] = positive_breadth * 100.0
+    candidates["Previous_Market_1W_Positive_Breadth_pct"] = (
+        previous_positive_breadth * 100.0
+    )
     candidates["Market_Recovery_Context"] = market_context
     candidates["Strong_Market_Context"] = strong_market_context
+    candidates["Strong_Market_Stage"] = strong_market_stage
     candidates["Strong_Reset_Context_Pass"] = strong_reset_context_pass
+    candidates["Strong_Reexpansion_Context_Pass"] = (
+        strong_reexpansion_context_pass
+    )
     candidates["Market_Regime"] = market_regime
     candidates = candidates.sort_values(
         [
             "Entry_Eligible",
             "Rank",
+            "Strong_Reacceleration_100",
             "Strong_Resilience_100",
             "Recovery_Early_Stage_100",
             "Entry_Score_100",
             "ts_code",
         ],
-        ascending=[False, True, False, False, False, True],
+        ascending=[False, True, False, False, False, False, True],
         na_position="last",
         kind="mergesort",
     )
@@ -1889,38 +2166,51 @@ def build_major_winner_audit(
             str(row["ts_code"]): row
             for _, row in candidates.drop_duplicates("ts_code", keep="last").iterrows()
         }
+    market_state = _market_state_metrics(pool)
     market_13w_median = _safe_float(
-        pd.to_numeric(pool.get("Return_13W_pct"), errors="coerce").median(), 0.0
+        market_state.get("Market_13W_Median_pct"), 0.0
     )
-    market_1w = pd.to_numeric(pool.get("Return_1W_pct"), errors="coerce")
-    market_1w_median = _safe_float(market_1w.median(), 0.0)
-    market_positive_breadth = float((market_1w > 0.0).mean() * 100.0)
-    market_regime = (
-        "强势"
-        if market_13w_median >= MARKET_NEUTRAL_UPPER_PCT
-        else "弱势"
-        if market_13w_median <= MARKET_NEUTRAL_LOWER_PCT
-        else "中性"
+    previous_market_13w = _safe_float(
+        market_state.get("Previous_Market_13W_Median_pct"), 0.0
     )
-    strong_reset_context_pass = bool(
-        MARKET_NEUTRAL_UPPER_PCT <= market_13w_median < STRONG_EARLY_UPPER_PCT
-        and market_1w_median <= STRONG_RESET_MAX_MARKET_1W_MEDIAN_PCT
-        and market_positive_breadth / 100.0 < STRONG_RESET_MAX_POSITIVE_BREADTH
+    previous2_market_13w = _safe_float(
+        market_state.get("Previous2_Market_13W_Median_pct"), 0.0
     )
-    strong_market_context = (
-        "早期强势回调"
-        if strong_reset_context_pass
-        else "早期强势扩张"
-        if market_13w_median < STRONG_EARLY_UPPER_PCT
-        else "延伸强势回调"
-        if (
-            market_1w_median <= STRONG_RESET_MAX_MARKET_1W_MEDIAN_PCT
-            and market_positive_breadth / 100.0 < STRONG_RESET_MAX_POSITIVE_BREADTH
+    market_13w_acceleration = _safe_float(
+        market_state.get("Market_13W_Acceleration_pct"), 0.0
+    )
+    market_1w_median = _safe_float(
+        market_state.get("Market_1W_Median_pct"), 0.0
+    )
+    previous_market_1w = _safe_float(
+        market_state.get("Previous_Market_1W_Median_pct"), 0.0
+    )
+    market_positive_breadth = (
+        _safe_float(market_state.get("Market_1W_Positive_Breadth"), 0.0) * 100.0
+    )
+    previous_market_positive_breadth = (
+        _safe_float(
+            market_state.get("Previous_Market_1W_Positive_Breadth"), 0.0
         )
-        else "延伸强势扩张"
+        * 100.0
     )
+    market_regime = str(market_state.get("Market_Regime", "中性"))
+    strong_reset_context_pass = bool(
+        market_state.get("Strong_Reset_Context_Pass", False)
+    )
+    strong_reexpansion_context_pass = bool(
+        market_state.get("Strong_Reexpansion_Context_Pass", False)
+    )
+    strong_market_context = str(market_state.get("Strong_Market_Context", ""))
+    strong_market_stage = str(market_state.get("Strong_Market_Stage", ""))
     strategy_branch = {
-        "强势": "R7强势抗跌新高" if strong_reset_context_pass else "R7强势观察",
+        "强势": (
+            "R7强势抗跌新高"
+            if strong_reset_context_pass
+            else "R8延伸强势有序再扩散"
+            if strong_reexpansion_context_pass
+            else "R8强势观察"
+        ),
         "弱势": "R6弱势首次转折-N6",
         "中性": "R3中性趋势",
     }[market_regime]
@@ -1955,6 +2245,9 @@ def build_major_winner_audit(
         ).iloc[0])
         r3_trigger = bool(pool_row.get("R3_Setup_Candidate", False))
         strong_trigger = bool(pool_row.get("Strong_Resilience_Trigger", False))
+        reacceleration_trigger = bool(
+            pool_row.get("Strong_Reacceleration_Trigger", False)
+        )
         recovery_trigger = bool(pool_row.get("Recovery_Structure_Trigger", False))
         r5_baseline_trigger = bool(
             pool_row.get("R5_Baseline_Recovery_Structure_Trigger", False)
@@ -1964,15 +2257,15 @@ def build_major_winner_audit(
             status = "已入选Top2"
         elif entry_eligible and selection_valid:
             status = "合格但排名未入选"
-        elif r3_trigger or strong_trigger or recovery_trigger:
+        elif r3_trigger or strong_trigger or reacceleration_trigger or recovery_trigger:
             status = "已发现但被规则拦截"
         else:
             status = "完全未发现"
-        if not (r3_trigger or strong_trigger or recovery_trigger):
+        if not (r3_trigger or strong_trigger or reacceleration_trigger or recovery_trigger):
             miss_reason = (
                 "仅R5旧宽触发，R6首次事件未触发"
                 if r5_baseline_trigger
-                else "未触发R3首红、R7抗跌新高或R6-N6首次转折事件"
+                else "未触发R3首红、R7抗跌新高、R8再加速或R6-N6首次转折事件"
             )
         elif candidate_row is not None:
             miss_reason = str(candidate_row.get("Selection_Block_Reason", "") or "")
@@ -1983,7 +2276,7 @@ def build_major_winner_audit(
             elif not miss_reason:
                 miss_reason = "个股结构触发但未通过资格"
         else:
-            miss_reason = "未触发R3首红、R7抗跌新高或R6-N6首次转折事件"
+            miss_reason = "未触发R3首红、R7抗跌新高、R8再加速或R6-N6首次转折事件"
         rows.append(
             {
                 "Signal_Date": signal_date,
@@ -1999,6 +2292,10 @@ def build_major_winner_audit(
                 "R3_Setup_Candidate": r3_trigger,
                 "Strong_Resilience_Trigger": strong_trigger,
                 "Strong_Overheated": bool(pool_row.get("Strong_Overheated", False)),
+                "Strong_Reacceleration_Trigger": reacceleration_trigger,
+                "Strong_Reacceleration_Overheated": bool(
+                    pool_row.get("Strong_Reacceleration_Overheated", False)
+                ),
                 "Recovery_Structure_Trigger": recovery_trigger,
                 "Recovery_Overheated": overheated,
                 "R5_Baseline_Recovery_Structure_Trigger": r5_baseline_trigger,
@@ -2015,10 +2312,21 @@ def build_major_winner_audit(
                     else market_regime
                 ),
                 "Market_13W_Median_pct": market_13w_median,
+                "Previous_Market_13W_Median_pct": previous_market_13w,
+                "Previous2_Market_13W_Median_pct": previous2_market_13w,
+                "Market_13W_Acceleration_pct": market_13w_acceleration,
                 "Market_1W_Median_pct": market_1w_median,
+                "Previous_Market_1W_Median_pct": previous_market_1w,
                 "Market_1W_Positive_Breadth_pct": market_positive_breadth,
+                "Previous_Market_1W_Positive_Breadth_pct": (
+                    previous_market_positive_breadth
+                ),
                 "Strong_Market_Context": strong_market_context,
+                "Strong_Market_Stage": strong_market_stage,
                 "Strong_Reset_Context_Pass": strong_reset_context_pass,
+                "Strong_Reexpansion_Context_Pass": (
+                    strong_reexpansion_context_pass
+                ),
                 "Return_1W_pct": pool_row.get("Return_1W_pct"),
                 "Return_13W_pct": pool_row.get("Return_13W_pct"),
                 "Drawdown_26W_pct": pool_row.get("Drawdown_26W_pct"),
@@ -2409,7 +2717,7 @@ def scan_one_date(
     if not pool_records:
         return pd.DataFrame(), pd.DataFrame(), 0, 0
     pool = pd.DataFrame(pool_records)
-    candidates, raw_count, eligible_count = score_r7_candidates(pool)
+    candidates, raw_count, eligible_count = score_r8_candidates(pool)
 
     if is_preview_mode:
         if not candidates.empty:
@@ -2455,7 +2763,7 @@ def scan_one_date(
 
 
 # -----------------------------------------------------------------------------
-# R7三引擎稳健性报告
+# R8四分支稳健性报告
 # -----------------------------------------------------------------------------
 def _bool_series(frame: pd.DataFrame, column: str):
     if column not in frame.columns:
@@ -2782,6 +3090,160 @@ def strong_baseline_comparison_audit(history: pd.DataFrame):
     return pd.DataFrame(rows)
 
 
+def reacceleration_candidate_audit(history: pd.DataFrame):
+    """R8延伸强势再扩散分支独立判卷，不借用R7早期回调收益。"""
+    if history.empty or "Strong_Reacceleration_Trigger" not in history.columns:
+        return pd.DataFrame()
+    frame = history[
+        _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & _bool_series(history, "Strong_Reacceleration_Trigger")
+    ].copy()
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    actual = (
+        _bool_series(frame, "Selected_Top2")
+        & frame.get("Strategy_Branch", pd.Series("", index=frame.index))
+        .astype(str)
+        .eq("R8延伸强势有序再扩散")
+    )
+    eligible = _bool_series(frame, "Strong_Reacceleration_Eligible")
+    context_pass = _bool_series(frame, "Strong_Reexpansion_Context_Pass")
+    resilience_pass = _bool_series(
+        frame, "Strong_Reacceleration_Resilience_Pass"
+    )
+    risk_ok = _bool_series(frame, "Strong_Reacceleration_Risk_OK")
+    masks = [
+        ("实际入选R8再扩散Top2", actual),
+        ("R8市场门内合格但未入选", eligible & context_pass & ~actual),
+        ("相同个股事件但市场门未通过", eligible & ~context_pass),
+        ("未强于上周市场中位数", risk_ok & ~resilience_pass),
+        ("整理后再加速过热观察", _bool_series(frame, "Strong_Reacceleration_Overheated")),
+        ("全部整理后再加速结构", pd.Series(True, index=frame.index)),
+    ]
+    rows = []
+    for label, mask in masks:
+        group = frame[mask & frame[PRIMARY_RETURN_COLUMN].notna()]
+        returns = group[PRIMARY_RETURN_COLUMN]
+        rows.append(
+            {
+                "R8再扩散审计组": label,
+                "交易数": len(returns),
+                "信号周": group["Signal_Date"].nunique(),
+                "胜率%": (returns > 0).mean() * 100.0 if len(returns) else np.nan,
+                "中位收益%": returns.median() if len(returns) else np.nan,
+                "平均收益%": returns.mean() if len(returns) else np.nan,
+                "Profit_Factor": _profit_factor(returns),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def reexpansion_comparison_audit(history: pd.DataFrame):
+    """在同一批延伸强势周比较R8、R7和R3，市场门与个股触发分开判卷。"""
+    if history.empty:
+        return pd.DataFrame()
+    frame = history[
+        _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & history.get("Market_Regime", pd.Series("", index=history.index))
+        .astype(str)
+        .eq("强势")
+    ].copy()
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    reacceleration_rank = pd.to_numeric(
+        frame.get("Strong_Reacceleration_Rank"), errors="coerce"
+    )
+    strong_rank = pd.to_numeric(frame.get("Strong_Rank"), errors="coerce")
+    r3_rank = pd.to_numeric(frame.get("R3_Rank"), errors="coerce")
+    context_pass = _bool_series(frame, "Strong_Reexpansion_Context_Pass")
+    actual = (
+        _bool_series(frame, "Selected_Top2")
+        & frame.get("Strategy_Branch", pd.Series("", index=frame.index))
+        .astype(str)
+        .eq("R8延伸强势有序再扩散")
+    )
+    extended_expansion = frame.get(
+        "Strong_Market_Context", pd.Series("", index=frame.index)
+    ).astype(str).eq("延伸强势扩张")
+    groups = [
+        ("R8实际有序再扩散Top2", actual),
+        (
+            "R8若覆盖全部延伸强势扩张",
+            extended_expansion
+            & _bool_series(frame, "Strong_Reacceleration_Eligible")
+            & reacceleration_rank.le(TOP_N),
+        ),
+        (
+            "同一R8市场门内R7抗跌新高Top2",
+            context_pass
+            & _bool_series(frame, "Strong_Eligible")
+            & strong_rank.le(TOP_N),
+        ),
+        (
+            "同一R8市场门内R3首红Top2",
+            context_pass
+            & _bool_series(frame, "Trend_Eligible")
+            & r3_rank.le(TOP_N),
+        ),
+    ]
+    rows = []
+    for label, mask in groups:
+        group = frame[mask & frame[PRIMARY_RETURN_COLUMN].notna()]
+        returns = group[PRIMARY_RETURN_COLUMN]
+        rows.append(
+            {
+                "延伸强势方案": label,
+                "交易数": len(returns),
+                "信号周": group["Signal_Date"].nunique(),
+                "胜率%": (returns > 0).mean() * 100.0 if len(returns) else np.nan,
+                "中位收益%": returns.median() if len(returns) else np.nan,
+                "平均收益%": returns.mean() if len(returns) else np.nan,
+                "Profit_Factor": _profit_factor(returns),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def strong_stage_week_audit(history: pd.DataFrame):
+    """逐个市场阶段核对周数、候选数与真实入选，防止观察样本被当作交易。"""
+    if history.empty or "Strong_Market_Stage" not in history.columns:
+        return pd.DataFrame()
+    frame = history[
+        history.get("Market_Regime", pd.Series("", index=history.index))
+        .astype(str)
+        .eq("强势")
+    ].copy()
+    rows = []
+    for stage, group in frame.groupby("Strong_Market_Stage", dropna=False, sort=False):
+        action = (
+            "R7抗跌新高Top2"
+            if str(stage) == "早期强势回调-R7"
+            else "R8整理后再加速Top2"
+            if str(stage) == "延伸强势有序再扩散-R8"
+            else "只观察"
+        )
+        rows.append(
+            {
+                "强势市场阶段": stage,
+                "R8动作": action,
+                "市场周数": group["Signal_Date"].nunique(),
+                "R7合格股票周数": int(_bool_series(group, "Strong_Eligible").sum()),
+                "R8合格股票周数": int(
+                    _bool_series(group, "Strong_Reacceleration_Eligible").sum()
+                ),
+                "实际入选交易": int(_bool_series(group, "Selected_Top2").sum()),
+                "实际入选周": group.loc[
+                    _bool_series(group, "Selected_Top2"), "Signal_Date"
+                ].nunique(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def recovery_candidate_audit(history: pd.DataFrame):
     """R6首次转折分支单独判卷；过热观察不混入实际Top2收益。"""
     if history.empty or "Recovery_Structure_Trigger" not in history.columns:
@@ -2958,17 +3420,13 @@ def major_winner_coverage_summary(opportunities: pd.DataFrame):
 
 
 def regime_gate_summary(history: pd.DataFrame):
-    """按各市场状态对应的潜在分支名次判卷，防止只展示被允许交易的样本。"""
+    """只统计真实入选；强势观察样本另表展示，避免把反事实写成实际交易。"""
     if history.empty:
         return pd.DataFrame()
     frame = history[
         _bool_series(history, "Outcome_Complete")
         & _bool_series(history, "Entry_Tradable")
-        & (
-            _bool_series(history, "Entry_Eligible")
-            if "Entry_Eligible" in history.columns
-            else _bool_series(history, "Trend_Eligible")
-        )
+        & _bool_series(history, "Selected_Top2")
     ].copy()
     frame["Rank"] = pd.to_numeric(frame.get("Rank"), errors="coerce")
     frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
@@ -2985,11 +3443,11 @@ def regime_gate_summary(history: pd.DataFrame):
         elif str(regime) == "弱势":
             action = "R6首次转折Top2；市场仅分层不否决"
         else:
-            action = "R7抗跌新高；仅早期强势回调允许Top2"
+            action = "R7早期回调或R8有序再扩散Top2"
         rows.append(
             {
                 "市场状态": regime,
-                "R7动作": action,
+                "R8动作": action,
                 "交易数": len(returns),
                 "信号周": group["Signal_Date"].nunique(),
                 "胜率%": (returns > 0).mean() * 100.0,
@@ -3160,7 +3618,7 @@ def research_gates(
     first_half_median = _safe_float(diagnostics.get("前半段Top2中位收益%"))
     second_half_median = _safe_float(diagnostics.get("后半段Top2中位收益%"))
     gates = [
-        ("一年内至少18个独立三引擎信号周", weeks >= 18, f"当前{weeks}周"),
+        ("一年内至少18个独立四分支信号周", weeks >= 18, f"当前{weeks}周"),
         ("至少36笔完整Top2交易", len(returns) >= 36, f"当前{len(returns)}笔"),
         ("W3 Top2胜率至少55%", len(returns) > 0 and (returns > 0).mean() >= 0.55, f"当前{((returns > 0).mean() * 100.0 if len(returns) else np.nan):.1f}%"),
         ("胜率95%下限高于50%", math.isfinite(lower_bound) and lower_bound > 50.0, f"当前{lower_bound:.1f}%"),
@@ -3231,6 +3689,121 @@ def strong_research_gates(completed: pd.DataFrame):
     )
 
 
+def reacceleration_ranking_diagnostics(history: pd.DataFrame):
+    if history.empty:
+        return {}
+    frame = history[
+        _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & _bool_series(history, "Strong_Reacceleration_Eligible")
+        & _bool_series(history, "Strong_Reexpansion_Context_Pass")
+    ].copy()
+    if frame.empty:
+        return {}
+    frame["Rank"] = pd.to_numeric(
+        frame.get("Strong_Reacceleration_Rank"), errors="coerce"
+    )
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    frame = frame.dropna(subset=["Rank", PRIMARY_RETURN_COLUMN])
+    return ranking_diagnostics(frame)
+
+
+def reacceleration_research_gates(
+    completed: pd.DataFrame,
+    history: pd.DataFrame,
+    diagnostics: dict[str, Any],
+):
+    """R8延伸强势分支独立过关；不能与R7三周样本合并凑门槛。"""
+    if completed.empty or "Strategy_Branch" not in completed.columns:
+        selected = pd.DataFrame()
+    else:
+        selected = completed[
+            completed["Strategy_Branch"].astype(str).eq("R8延伸强势有序再扩散")
+            & pd.to_numeric(completed["Rank"], errors="coerce").le(TOP_N)
+        ].copy()
+    returns = pd.to_numeric(
+        selected.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    weeks = selected.loc[returns.index, "Signal_Date"].nunique() if len(returns) else 0
+    pf = _profit_factor(returns)
+    without_best = (
+        returns.drop(index=returns.idxmax())
+        if len(returns) > 1
+        else pd.Series(dtype=float)
+    )
+    without_best_week = pd.Series(dtype=float)
+    if len(returns) and weeks > 1:
+        valid = selected.loc[returns.index].copy()
+        valid[PRIMARY_RETURN_COLUMN] = returns
+        best_week = (
+            valid.groupby("Signal_Date")[PRIMARY_RETURN_COLUMN].mean().idxmax()
+        )
+        without_best_week = valid.loc[
+            valid["Signal_Date"] != best_week, PRIMARY_RETURN_COLUMN
+        ]
+    without_best_week_pf = _profit_factor(without_best_week)
+    weekly_corr = _safe_float(diagnostics.get("逐周秩相关均值"))
+    paired_beat = _safe_float(diagnostics.get("Top2逐周平均收益战胜其余比例%"))
+    top2_median = _safe_float(diagnostics.get("Top2中位收益%"))
+    rest_median = _safe_float(diagnostics.get("其余候选中位收益%"))
+    gates = [
+        ("R8再扩散至少6个独立信号周", weeks >= 6, f"当前{weeks}周"),
+        ("R8再扩散至少12笔完整交易", len(returns) >= 12, f"当前{len(returns)}笔"),
+        (
+            "R8再扩散W3胜率至少55%",
+            len(returns) > 0 and (returns > 0).mean() >= 0.55,
+            f"当前{((returns > 0).mean() * 100.0 if len(returns) else np.nan):.1f}%",
+        ),
+        (
+            "R8再扩散W3中位收益大于0",
+            len(returns) > 0 and returns.median() > 0.0,
+            f"当前{(returns.median() if len(returns) else np.nan):.2f}%",
+        ),
+        (
+            "R8去最佳一只后平均收益大于0",
+            len(without_best) > 0 and without_best.mean() > 0.0,
+            f"当前{(without_best.mean() if len(without_best) else np.nan):.2f}%",
+        ),
+        (
+            "R8去最佳整周后平均收益大于0且PF至少1.2",
+            len(without_best_week) > 0
+            and without_best_week.mean() > 0.0
+            and pd.notna(without_best_week_pf)
+            and without_best_week_pf >= 1.2,
+            (
+                f"均益{(without_best_week.mean() if len(without_best_week) else np.nan):.2f}% / "
+                f"PF{without_best_week_pf:.2f}"
+            ),
+        ),
+        ("R8再扩散PF至少1.2", pd.notna(pf) and pf >= 1.2, f"当前{pf:.2f}"),
+        (
+            "R8逐周排名收益秩相关至少0.05",
+            math.isfinite(weekly_corr) and weekly_corr >= 0.05,
+            f"当前{weekly_corr:.3f}",
+        ),
+        (
+            "R8 Top2逐周战胜其余候选至少55%",
+            math.isfinite(paired_beat) and paired_beat >= 55.0,
+            f"当前{paired_beat:.1f}%",
+        ),
+        (
+            "R8 Top2中位收益优于其余候选",
+            math.isfinite(top2_median)
+            and math.isfinite(rest_median)
+            and top2_median > rest_median,
+            f"差{(top2_median - rest_median):.2f}个百分点",
+        ),
+    ]
+    return pd.DataFrame(
+        [
+            {"R8验收项目": name, "结果": "通过" if passed else "未通过", "当前值": value}
+            for name, passed, value in gates
+        ]
+    )
+
+
 def recovery_research_gates(completed: pd.DataFrame):
     """R6首次转折模块必须单独过关；总体结果不能替它掩盖样本不足。"""
     if completed.empty or "Strategy_Branch" not in completed.columns:
@@ -3287,6 +3860,11 @@ def build_export_zip(
     strong_gates: pd.DataFrame,
     strong_context_audit: pd.DataFrame,
     strong_baseline_comparison: pd.DataFrame,
+    reacceleration_audit: pd.DataFrame,
+    reacceleration_gates: pd.DataFrame,
+    reacceleration_diagnostics: dict[str, Any],
+    reexpansion_comparison: pd.DataFrame,
+    strong_stage_audit: pd.DataFrame,
     recovery_audit: pd.DataFrame,
     recovery_gates: pd.DataFrame,
     opportunities: pd.DataFrame,
@@ -3296,7 +3874,7 @@ def build_export_zip(
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r7_three_engine_candidates.csv": history,
+        "01_all_r8_four_branch_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -3308,16 +3886,23 @@ def build_export_zip(
         ),
         "09_market_regime_gate_audit.csv": regimes,
         "10_strategy_branch_summary.csv": branches,
-        "11_strong_candidate_audit.csv": strong_audit,
-        "12_strong_acceptance_gates.csv": strong_gates,
-        "13_strong_market_context_audit.csv": strong_context_audit,
-        "14_strong_r3_baseline_comparison.csv": strong_baseline_comparison,
-        "15_recovery_candidate_audit.csv": recovery_audit,
-        "16_recovery_acceptance_gates.csv": recovery_gates,
-        "17_w3_major_winner_opportunities.csv": opportunities,
-        "18_major_winner_coverage_summary.csv": opportunity_summary,
-        "19_r5_r6_trigger_comparison.csv": trigger_comparison,
-        "20_recovery_market_context_audit.csv": market_context_audit,
+        "11_r7_reset_candidate_audit.csv": strong_audit,
+        "12_r7_reset_acceptance_gates.csv": strong_gates,
+        "13_r7_all_strong_context_audit.csv": strong_context_audit,
+        "14_r7_r3_strong_baseline_comparison.csv": strong_baseline_comparison,
+        "15_r8_reexpansion_candidate_audit.csv": reacceleration_audit,
+        "16_r8_reexpansion_acceptance_gates.csv": reacceleration_gates,
+        "17_r8_reexpansion_ranking_diagnostics.csv": pd.DataFrame(
+            [{"指标": key, "数值": value} for key, value in reacceleration_diagnostics.items()]
+        ),
+        "18_r8_reexpansion_alternative_comparison.csv": reexpansion_comparison,
+        "19_strong_market_stage_week_audit.csv": strong_stage_audit,
+        "20_recovery_candidate_audit.csv": recovery_audit,
+        "21_recovery_acceptance_gates.csv": recovery_gates,
+        "22_w3_major_winner_opportunities.csv": opportunities,
+        "23_major_winner_coverage_summary.csv": opportunity_summary,
+        "24_r5_r6_trigger_comparison.csv": trigger_comparison,
+        "25_recovery_market_context_audit.csv": market_context_audit,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -3342,25 +3927,28 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R3中性趋势与R6弱势首次转折逐行冻结；R7只新增强势抗跌新高分支。"
-        "三个市场状态互斥启用、分别排名和独立验收；W3主验收，W1—W8固定记录。"
+        "R3、R6与R7逐行冻结；R8只新增延伸强势有序再扩散分支。"
+        "四个分支互斥启用、分别排名和独立验收；W3主验收，W1—W8固定记录。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R7仍是研究验证版；强势抗跌新高与弱势首次转折都必须独立过关，不能用R3结果背书。"
+        "R8仍是研究验证版；R7早期回调、R8延伸再扩散与R6弱势转折都必须独立过关。"
     )
-    with st.expander("查看R7三引擎规则边界"):
+    with st.expander("查看R8四分支规则边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
 - **R6弱势首次转折**：26周深跌且N6 SKDJ近期进入35以下，K首次转升，并出现周涨或强收之一；此前两周已有同类转折则不重复触发。
 - **R7强势抗跌新高**：科技池13周中位涨幅位于+5%至+10%，当周中位收益不高于0且上涨家数低于55%时，寻找趋势完整、逆势首次创13周新高且不过热的股票。
 - **R7实际排名**：前四周停顿、ATR收缩、本周不过度上涨、行业相对强度、距离MA20五项等权；分数只决定强势候选内部名次。
+- **R8市场事件**：科技池当前、前一周和前两周13周中位涨幅均至少10%；上一周中位收益不高于0且上涨家数低于50%；本周以0%至5%的中位涨幅、55%至80%的上涨家数重新扩散，13周动量只允许有序增加0至5个百分点。
+- **R8个股事件**：趋势完整，上一周涨幅位于-8%至+5%，本周首次收复上周高点、站上MA10、MACD柱增强且强收盘；上一周表现还必须不弱于科技池中位数。
+- **R8实际排名**：上周抗跌、13周相对强度、行业13周超额、ATR收缩、本周不过度上涨五项等权。
 - **指标口径**：SKDJ固定N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
 - **删除硬门**：不再要求价格达到MA10的75%，不再用1周中位涨幅和55%上涨家数整周归零；市场只做分层审计。
 - **实际排名**：两周涨幅、价格/MA10、K6、8周相对强度、MACD冲量五项均按越早越优等权；R5旧100分只保留对照。
 - **防追高**：单周涨幅超过25%或收盘距离本周低点超过40%时只进入过热观察，不参与排名。
-- **分支隔离**：中性期只运行R3；弱势期只运行R6-N6；强势期只有“早期强势回调”允许R7 Top2，其余强势背景继续观察。
+- **分支隔离**：中性期只运行R3；弱势期只运行R6-N6；早期强势回调运行R7；只有延伸强势有序再扩散事件运行R8；其余强势背景继续观察。
 - **组合**：每个有效周只选Top2，不设置“候选拥挤”门，避免再次误删相对更好的周。
 - **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
@@ -3373,11 +3961,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R7三引擎验证", "最新选股预览"],
+            ["历史R8四分支验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R7三引擎验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R8四分支验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -3391,7 +3979,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R7三个分支的W1—W8固定周收益都会扣除该成本。",
+            help="R8四个分支的W1—W8固定周收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -3403,12 +3991,12 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R7历史结果")
+        clear_history_clicked = st.button("清除R8历史结果")
 
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R7三引擎验证":
+    if start_input > end_input and mode == "历史R8四分支验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -3420,15 +4008,15 @@ def main():
     if clear_history_clicked:
         for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE, OPPORTUNITY_FILE):
             remove_with_backup(path)
-        st.session_state.pop("r7_preview", None)
-        st.success("R7历史结果和断点任务已清除。")
+        st.session_state.pop("r8_preview", None)
+        st.success("R8历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     is_preview_mode = mode == "最新选股预览"
-    if "r7_worker_id" not in st.session_state:
-        st.session_state["r7_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r7_worker_id"])
+    if "r8_worker_id" not in st.session_state:
+        st.session_state["r8_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r8_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -3452,7 +4040,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R7三引擎验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R8四分支验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -3593,7 +4181,7 @@ def main():
                         raise RuntimeError("未加载到行情；已成功下载的分片仍然保留。")
 
                     loaded_date_set = set(loaded_dates)
-                    progress = st.progress(0, text="开始扫描R7三引擎候选……")
+                    progress = st.progress(0, text="开始扫描R8四分支候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -3631,7 +4219,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r7_preview"] = candidates
+                            st.session_state["r8_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -3665,7 +4253,7 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：R7/R3/R6结构{raw_count}只，"
+                                f"{signal_date}：R8/R7/R3/R6结构{raw_count}只，"
                                 f"当前分支合格{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -3685,7 +4273,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R7三引擎扫描完成。")
+                            st.success("历史R8四分支扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -3712,12 +4300,12 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r7_preview")
+    preview = st.session_state.get("r8_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R7三引擎结构候选。")
+            st.info("最新交易日没有R8四分支结构候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -3728,7 +4316,12 @@ def main():
             else:
                 preview_columns = [
                     "Signal_Date", "Weekly_Data_Mode", "Rank", "name", "ts_code", "Industry",
-                    "Strategy_Branch", "R3_Setup_Type", "Strong_Setup_Type", "Recovery_Setup_Type",
+                    "Strategy_Branch", "R3_Setup_Type", "Strong_Setup_Type",
+                    "Strong_Reacceleration_Setup_Type", "Recovery_Setup_Type",
+                    "Strong_Reacceleration_100",
+                    "Reaccel_Score_PriorResilience20", "Reaccel_Score_RS13_20",
+                    "Reaccel_Score_Industry20", "Reaccel_Score_ATR20",
+                    "Reaccel_Score_NonChase20",
                     "Strong_Resilience_100", "Strong_Score_Pause20",
                     "Strong_Score_ATR20", "Strong_Score_NonChase20",
                     "Strong_Score_Industry20", "Strong_Score_Position20",
@@ -3739,15 +4332,18 @@ def main():
                     "Score_Trend_20", "Score_Risk_10",
                     "Entry_Score_100", "Score_Pullback_15", "Score_Contraction_15",
                     "Score_Restart_15", "Score_RS_25",
-                    "Raw_Close", "Circ_MV_Billion", "Market_Regime", "Strong_Market_Context",
-                    "Market_1W_Median_pct", "Market_1W_Positive_Breadth_pct",
+                    "Raw_Close", "Circ_MV_Billion", "Market_Regime",
+                    "Strong_Market_Context", "Strong_Market_Stage",
+                    "Market_1W_Median_pct", "Previous_Market_1W_Median_pct",
+                    "Market_1W_Positive_Breadth_pct",
+                    "Previous_Market_1W_Positive_Breadth_pct",
                     "Selection_Block_Reason",
                 ]
                 st.dataframe(
                     selected_preview[[column for column in preview_columns if column in selected_preview.columns]],
                     width="stretch",
                 )
-            with st.expander("查看全部三引擎候选、过热观察及未入选原因"):
+            with st.expander("查看全部四分支候选、过热观察及未入选原因"):
                 st.dataframe(preview, width="stretch")
 
     if rerun_needed:
@@ -3794,19 +4390,26 @@ def main():
         strong_audit = strong_candidate_audit(history)
         strong_context_audit = strong_market_context_audit(history)
         strong_baseline_comparison = strong_baseline_comparison_audit(history)
+        reacceleration_audit = reacceleration_candidate_audit(history)
+        reexpansion_comparison = reexpansion_comparison_audit(history)
+        strong_stage_audit = strong_stage_week_audit(history)
         recovery_audit = recovery_candidate_audit(history)
         group_detail, group_stats = two_stock_group_summary(completed)
         horizons = horizon_summary(completed)
         diagnostics = ranking_diagnostics(completed)
         gates = research_gates(completed, cohort, outlier, diagnostics)
         strong_gates = strong_research_gates(completed)
+        reacceleration_diagnostics = reacceleration_ranking_diagnostics(history)
+        reacceleration_gates = reacceleration_research_gates(
+            completed, history, reacceleration_diagnostics
+        )
         recovery_gates = recovery_research_gates(completed)
         opportunity_summary = major_winner_coverage_summary(opportunities)
         trigger_comparison = recovery_trigger_comparison_audit(history)
         market_context_audit = recovery_market_context_audit(history)
 
         st.markdown("---")
-        st.header("R7三引擎历史验证报告")
+        st.header("R8四分支历史验证报告")
         st.caption(
             "主报告以已经走满15个交易日的W3样本验收入场排序；W4—W8只统计实际已经走到"
             "相应周数的记录，并在表中明确显示每个持有期的完整样本数。"
@@ -3844,23 +4447,34 @@ def main():
 
         st.subheader("研究验收门槛")
         st.dataframe(gates, width="stretch", hide_index=True)
-        st.subheader("强势抗跌新高分支独立验收")
+        st.subheader("R7早期强势回调分支独立验收")
         st.dataframe(strong_gates, width="stretch", hide_index=True)
+        st.subheader("R8延伸强势有序再扩散分支独立验收")
+        st.dataframe(reacceleration_gates, width="stretch", hide_index=True)
         st.subheader("弱势复苏分支独立验收")
         st.dataframe(recovery_gates, width="stretch", hide_index=True)
         all_overall_passed = not gates.empty and gates["结果"].eq("通过").all()
         all_strong_passed = (
             not strong_gates.empty and strong_gates["结果"].eq("通过").all()
         )
+        all_reacceleration_passed = (
+            not reacceleration_gates.empty
+            and reacceleration_gates["结果"].eq("通过").all()
+        )
         all_recovery_passed = (
             not recovery_gates.empty and recovery_gates["结果"].eq("通过").all()
         )
-        if all_overall_passed and all_strong_passed and all_recovery_passed:
-            st.success("R7总体、强势抗跌新高与N6首次转折分支均通过一年快速验收，可进入样本外验证。")
+        if (
+            all_overall_passed
+            and all_strong_passed
+            and all_reacceleration_passed
+            and all_recovery_passed
+        ):
+            st.success("R8总体与R7、R8强势子分支及N6首次转折均通过，可进入样本外验证。")
         else:
-            st.error("R7任一独立分支尚未通过全部验收，当前代码不能进入实盘。")
+            st.error("R8任一独立分支尚未通过全部验收，当前代码不能进入实盘。")
 
-        st.subheader("R7、R3与R6-N6分支分别表现")
+        st.subheader("R8、R7、R3与R6-N6分支分别表现")
         st.dataframe(_format_report_frame(branches), width="stretch", hide_index=True)
 
         st.subheader("R7抗跌新高、过热和观察候选审计")
@@ -3878,6 +4492,34 @@ def main():
             width="stretch",
             hide_index=True,
         )
+
+        st.subheader("R8整理后再加速候选独立审计")
+        st.dataframe(
+            _format_report_frame(reacceleration_audit), width="stretch", hide_index=True
+        )
+
+        st.subheader("延伸强势：R8、R7与R3同场对照")
+        st.dataframe(
+            _format_report_frame(reexpansion_comparison),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("R8延伸强势排名是否有效")
+        if reacceleration_diagnostics:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"指标": key, "数值": value}
+                        for key, value in reacceleration_diagnostics.items()
+                    ]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.subheader("强势市场阶段与实际动作")
+        st.dataframe(strong_stage_audit, width="stretch", hide_index=True)
 
         st.subheader("R6首次转折与过热观察审计")
         st.dataframe(_format_report_frame(recovery_audit), width="stretch", hide_index=True)
@@ -3953,6 +4595,10 @@ def main():
             detail_columns = [
                 "Signal_Date", "Entry_Date", "Rank", "name", "ts_code", "Industry",
                 "Strategy_Branch", "R3_Setup_Type", "Strong_Setup_Type", "Recovery_Setup_Type",
+                "Strong_Reacceleration_Setup_Type", "Strong_Reacceleration_100",
+                "Reaccel_Score_PriorResilience20", "Reaccel_Score_RS13_20",
+                "Reaccel_Score_Industry20", "Reaccel_Score_ATR20",
+                "Reaccel_Score_NonChase20",
                 "Strong_Resilience_100", "Strong_Score_Pause20",
                 "Strong_Score_ATR20", "Strong_Score_NonChase20",
                 "Strong_Score_Industry20", "Strong_Score_Position20",
@@ -3964,7 +4610,7 @@ def main():
                 "Score_Pullback_15", "Score_Contraction_15", "Score_Restart_15", "Score_RS_25",
                 "Entry_Open", PRIMARY_RETURN_COLUMN, "MFE_W3_Net_pct", "MAE_W3_Raw_pct",
                 "Path_10_vs_Minus5", "Early_Failure_2W", "Outcome_Grade", "Market_Regime",
-                "Strong_Market_Context",
+                "Strong_Market_Context", "Strong_Market_Stage",
             ]
             selected_detail = history[
                 _bool_series(history, "Selected_Top2")
@@ -3992,6 +4638,11 @@ def main():
             strong_gates,
             strong_context_audit,
             strong_baseline_comparison,
+            reacceleration_audit,
+            reacceleration_gates,
+            reacceleration_diagnostics,
+            reexpansion_comparison,
+            strong_stage_audit,
             recovery_audit,
             recovery_gates,
             opportunities.drop(columns=["Config_ID"], errors="ignore"),
@@ -4000,9 +4651,9 @@ def main():
             market_context_audit,
         )
         st.download_button(
-            "下载R7三引擎完整研究结果",
+            "下载R8四分支完整研究结果",
             data=export_bytes,
-            file_name="r7_strong_reset_three_engine_w3_audit_results.zip",
+            file_name="r8_orderly_reexpansion_four_branch_w3_audit_results.zip",
             mime="application/zip",
         )
 
