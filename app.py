@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-R1 趋势延续候选与入场排序验证器
+R2 周线结构候选与W3主目标排序验证器
 
-研究问题：只使用信号当日及以前的数据，能否把未来 1—8 周表现更好的股票
-稳定排入 Top1/Top2/Top3？
+研究问题：只使用信号当日及以前的数据，能否把未来3周表现更好的股票稳定排入
+Top1/Top2/Top3，并继续观察W1—W8以研究延长持股条件？
 
-本版本刻意不做三仓资金曲线，也不使用止损、止盈或买入后的确认信息参与排序。
-历史信号日为每周最后一个交易日；历史买价为下一交易日开盘价。
+R2不沿用R1六因子总分：候选由突破、回调再启动、MACD第一根红柱三种结构产生，
+再按当周横截面的领先度、趋势质量、启动质量和风险位置排序。历史信号日为每周
+最后一个交易日；历史买价为下一交易日开盘价。
 """
 
 from __future__ import annotations
@@ -36,22 +37,26 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R1.1-TREND-ENTRY-AUDIT"
-APP_TITLE = "R1 趋势延续候选与入场排序验证器"
-ENGINE_PATCH = "R1.1-BOUNDED-MEMORY-PARALLEL-DOWNLOAD"
+APP_VERSION = "R2.0-W3-CROSS-SECTION-AUDIT"
+APP_TITLE = "R2 周线结构候选与W3主目标排序验证器"
+ENGINE_PATCH = "R2.0-W3-CROSS-SECTION-ON-R1.1-STABLE-ENGINE"
 
-CHECKPOINT_FILE = "r1_trend_entry_candidates.csv"
-SCAN_LEDGER_FILE = "r1_trend_entry_scanned_dates.csv"
-RUN_TASK_FILE = "r1_trend_entry_running_task.json"
+CHECKPOINT_FILE = "r2_w3_cross_section_candidates.csv"
+SCAN_LEDGER_FILE = "r2_w3_cross_section_scanned_dates.csv"
+RUN_TASK_FILE = "r2_w3_cross_section_running_task.json"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 3
-MIN_VALID_SELECTION_SIZE = 2
+MIN_VALID_SELECTION_SIZE = 3
+PRIMARY_HOLD_WEEKS = 3
 HOLD_WEEKS = 8
 MARKET_DAYS_PER_WEEK = 5
 WEEKS_PER_BATCH = 3
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
+MARKET_OVERHEAT_13W_PCT = 20.0
+MAX_ELIGIBLE_CANDIDATES = 50
+PRIMARY_RETURN_COLUMN = f"Fixed_Return_W{PRIMARY_HOLD_WEEKS}_Net_pct"
 
 
 # -----------------------------------------------------------------------------
@@ -650,7 +655,7 @@ def load_optimized_market_data(
 
 
 # -----------------------------------------------------------------------------
-# 买入前特征：周线第一根红柱 + 趋势延续结构
+# 买入前特征：周线结构候选 + 趋势资格
 # -----------------------------------------------------------------------------
 def _safe_float(value: Any, default: float = np.nan):
     try:
@@ -692,8 +697,10 @@ def _weekly_bars(stock: pd.DataFrame, end_date: str):
     low = pd.to_numeric(weekly["low"], errors="coerce")
     volume = pd.to_numeric(weekly["vol"], errors="coerce")
 
+    weekly["ma10"] = close.rolling(10).mean()
     weekly["ma20"] = close.rolling(20).mean()
     weekly["ma40"] = close.rolling(40).mean()
+    weekly["ma10_slope_2w_pct"] = (weekly["ma10"] / weekly["ma10"].shift(2) - 1.0) * 100.0
     weekly["ma20_slope_4w_pct"] = (weekly["ma20"] / weekly["ma20"].shift(4) - 1.0) * 100.0
 
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -739,10 +746,15 @@ def _weekly_bars(stock: pd.DataFrame, end_date: str):
     else:
         weekly["turnover_contraction"] = np.nan
 
+    weekly["return_1w_pct"] = (close / close.shift(1) - 1.0) * 100.0
+    weekly["return_2w_pct"] = (close / close.shift(2) - 1.0) * 100.0
     weekly["return_4w_pct"] = (close / close.shift(4) - 1.0) * 100.0
     weekly["return_8w_pct"] = (close / close.shift(8) - 1.0) * 100.0
     weekly["return_13w_pct"] = (close / close.shift(13) - 1.0) * 100.0
     weekly["pre_signal_4w_return_pct"] = (close.shift(1) / close.shift(5) - 1.0) * 100.0
+    weekly["prior_high_13w"] = high.shift(1).rolling(13).max()
+    weekly["prior_high_26w"] = high.shift(1).rolling(26).max()
+    weekly["breakout_13w_pct"] = (close / weekly["prior_high_13w"] - 1.0) * 100.0
     weekly["high_26w"] = high.rolling(26).max()
     weekly["drawdown_26w_pct"] = (close / weekly["high_26w"] - 1.0) * 100.0
 
@@ -777,16 +789,76 @@ def compute_signal_snapshot(
         and previous_hist <= 0.0
     )
     current_close = _safe_float(current.get("close"))
+    previous_close_value = _safe_float(previous.get("close"))
+    ma10 = _safe_float(current.get("ma10"))
     ma20 = _safe_float(current.get("ma20"))
     ma40 = _safe_float(current.get("ma40"))
+    ma10_slope = _safe_float(current.get("ma10_slope_2w_pct"))
     ma20_slope = _safe_float(current.get("ma20_slope_4w_pct"))
-    trend_eligible = (
+    distance_ma20 = _safe_float(current.get("distance_ma20_pct"))
+    weekly_range = _safe_float(current.get("weekly_range_pct"))
+    base_trend_eligible = (
         math.isfinite(current_close)
         and math.isfinite(ma20)
+        and math.isfinite(ma40)
         and math.isfinite(ma20_slope)
         and current_close >= ma20
+        and ma20 >= ma40
         and ma20_slope > 0.0
     )
+
+    return_1w = _safe_float(current.get("return_1w_pct"))
+    previous_return_1w = _safe_float(previous.get("return_1w_pct"))
+    previous2_return_1w = _safe_float(previous2.get("return_1w_pct"))
+    prior_high_13w = _safe_float(current.get("prior_high_13w"))
+    previous_prior_high_13w = _safe_float(previous.get("prior_high_13w"))
+    close_location_now = _safe_float(current.get("close_location"))
+    fresh_breakout = (
+        all(
+            math.isfinite(item)
+            for item in (
+                current_close,
+                previous_close_value,
+                prior_high_13w,
+                previous_prior_high_13w,
+                return_1w,
+            )
+        )
+        and current_close >= prior_high_13w * 0.995
+        and previous_close_value < previous_prior_high_13w * 0.995
+        and return_1w > 0.0
+    )
+    pullback_restart = (
+        base_trend_eligible
+        and all(
+            math.isfinite(item)
+            for item in (current_close, ma10, return_1w, current_hist, previous_hist, close_location_now)
+        )
+        and current_close >= ma10
+        and 0.0 < return_1w <= 12.0
+        and current_hist > previous_hist
+        and close_location_now >= 0.55
+        and (
+            (math.isfinite(previous_return_1w) and previous_return_1w <= 0.0)
+            or (math.isfinite(previous2_return_1w) and previous2_return_1w <= 0.0)
+        )
+    )
+    if fresh_breakout:
+        setup_type = "13W新高突破"
+    elif pullback_restart:
+        setup_type = "回调再启动"
+    elif is_first_red:
+        setup_type = "MACD首红"
+    else:
+        setup_type = ""
+    setup_candidate = bool(setup_type)
+    position_risk_ok = (
+        math.isfinite(distance_ma20)
+        and 0.0 <= distance_ma20 <= 25.0
+        and math.isfinite(weekly_range)
+        and weekly_range <= 25.0
+    )
+    trend_eligible = bool(base_trend_eligible and setup_candidate and position_risk_ok)
 
     recent_26 = weekly.tail(26).reset_index(drop=True)
     weeks_since_high = np.nan
@@ -806,6 +878,12 @@ def compute_signal_snapshot(
 
     return {
         "Is_First_Red": bool(is_first_red),
+        "Fresh_13W_Breakout": bool(fresh_breakout),
+        "Pullback_Restart": bool(pullback_restart),
+        "R2_Setup_Candidate": bool(setup_candidate),
+        "R2_Setup_Type": setup_type,
+        "Base_Trend_Eligible": bool(base_trend_eligible),
+        "Position_Risk_OK": bool(position_risk_ok),
         "Trend_Eligible": bool(trend_eligible),
         "Signal_Close": current_close,
         "Weekly_Date": str(current.get("trade_date_str")),
@@ -815,16 +893,22 @@ def compute_signal_snapshot(
         "Previous_MACD_Hist": previous_hist,
         "Previous2_MACD_Hist": _safe_float(previous2.get("macd_hist")),
         "MACD_Impulse_pct": _safe_float(current.get("macd_impulse_pct")),
+        "MA10": ma10,
         "MA20": ma20,
         "MA40": ma40,
+        "MA10_Slope_2W_pct": ma10_slope,
         "MA20_Slope_4W_pct": ma20_slope,
-        "Distance_MA20_pct": _safe_float(current.get("distance_ma20_pct")),
+        "Distance_MA20_pct": distance_ma20,
         "Drawdown_26W_pct": _safe_float(current.get("drawdown_26w_pct")),
         "Weeks_Since_26W_High": weeks_since_high,
         "PreSignal_4W_Return_pct": _safe_float(current.get("pre_signal_4w_return_pct")),
+        "Return_1W_pct": return_1w,
+        "Return_2W_pct": _safe_float(current.get("return_2w_pct")),
         "Return_4W_pct": _safe_float(current.get("return_4w_pct")),
         "Return_8W_pct": _safe_float(current.get("return_8w_pct")),
         "Return_13W_pct": _safe_float(current.get("return_13w_pct")),
+        "Prior_High_13W": prior_high_13w,
+        "Breakout_13W_pct": _safe_float(current.get("breakout_13w_pct")),
         "ATR_Contraction": _safe_float(current.get("atr_contraction")),
         "Volume_Contraction": _safe_float(current.get("volume_contraction")),
         "Turnover_Contraction": _safe_float(current.get("turnover_contraction")),
@@ -844,167 +928,128 @@ def _numeric_series(frame: pd.DataFrame, column: str):
     return pd.to_numeric(frame[column], errors="coerce")
 
 
-def score_first_red_candidates(pool_snapshots: pd.DataFrame):
+def _percentile_rank(values: pd.Series, higher_is_better: bool = True):
+    numeric = pd.to_numeric(values, errors="coerce")
+    ranked_source = numeric if higher_is_better else -numeric
+    return ranked_source.rank(method="average", pct=True).fillna(0.5)
+
+
+def score_r2_candidates(pool_snapshots: pd.DataFrame):
+    """只用信号周及以前数据，在当周候选之间做横截面排序。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
-    for horizon in (4, 8, 13):
-        values = _numeric_series(pool, f"Return_{horizon}W_pct")
-        pool[f"RS_{horizon}W_Pct"] = values.rank(method="average", pct=True).fillna(0.5)
-    industry_median = pool.groupby("Industry", dropna=False)["Return_13W_pct"].transform("median")
-    pool["Industry_13W_Excess_pct"] = _numeric_series(pool, "Return_13W_pct") - industry_median
-    pool["Industry_Excess_Pct"] = pool["Industry_13W_Excess_pct"].rank(
-        method="average", pct=True
-    ).fillna(0.5)
-    pool["MACD_Impulse_Pct"] = _numeric_series(pool, "MACD_Impulse_pct").rank(
-        method="average", pct=True
-    ).fillna(0.5)
-
-    candidates = pool[pool["Is_First_Red"].astype(bool)].copy()
+    industry_median = pool.groupby("Industry", dropna=False)["Return_13W_pct"].transform(
+        "median"
+    )
+    pool["Industry_13W_Excess_pct"] = (
+        _numeric_series(pool, "Return_13W_pct") - pd.to_numeric(industry_median, errors="coerce")
+    )
+    candidates = pool[_bool_series(pool, "R2_Setup_Candidate")].copy()
     raw_count = len(candidates)
     if candidates.empty:
         return candidates, 0, 0
 
-    close = _numeric_series(candidates, "Signal_Close")
-    ma20 = _numeric_series(candidates, "MA20")
-    ma40 = _numeric_series(candidates, "MA40")
-    slope = _numeric_series(candidates, "MA20_Slope_4W_pct")
-    dif = _numeric_series(candidates, "MACD_DIF")
-    drawdown = _numeric_series(candidates, "Drawdown_26W_pct")
-    pre4 = _numeric_series(candidates, "PreSignal_4W_Return_pct")
-    since_high = _numeric_series(candidates, "Weeks_Since_26W_High")
-    atr_contract = _numeric_series(candidates, "ATR_Contraction")
-    vol_contract = _numeric_series(candidates, "Volume_Contraction")
-    turn_contract = _numeric_series(candidates, "Turnover_Contraction")
-    startup_volume = _numeric_series(candidates, "Startup_Volume_Ratio")
-    close_location = _numeric_series(candidates, "Weekly_Close_Location")
-    kdj_k = _numeric_series(candidates, "KDJ_K")
-    distance = _numeric_series(candidates, "Distance_MA20_pct")
-    week_range = _numeric_series(candidates, "Weekly_Range_pct")
-    upper_shadow = _numeric_series(candidates, "Weekly_Upper_Shadow_Ratio")
-
-    candidates["Score_Trend_20"] = (
-        np.where(close.ge(ma20), 5.0, 0.0)
-        + np.select([slope.ge(1.0), slope.gt(0.0)], [5.0, 3.0], default=0.0)
-        + np.where(ma20.ge(ma40), 4.0, 0.0)
-        + np.where(close.ge(ma40), 3.0, 0.0)
-        + np.where(dif.gt(0.0), 3.0, 1.0)
-    )
-
-    drawdown_score = np.select(
-        [
-            drawdown.between(-30.0, -8.0, inclusive="both"),
-            drawdown.between(-40.0, -30.0, inclusive="left"),
-            drawdown.between(-8.0, -3.0, inclusive="left"),
-            drawdown.gt(-3.0),
-        ],
-        [8.0, 3.0, 4.0, 1.0],
-        default=0.0,
-    )
-    pullback_score = np.select(
-        [
-            pre4.between(-20.0, -5.0, inclusive="both"),
-            pre4.between(-30.0, -20.0, inclusive="left"),
-            pre4.between(-5.0, 0.0, inclusive="left"),
-        ],
-        [4.0, 2.0, 2.0],
-        default=0.0,
-    )
-    timing_score = np.select(
-        [since_high.between(3.0, 12.0), since_high.between(1.0, 2.0)],
-        [3.0, 1.0],
-        default=0.0,
-    )
-    candidates["Score_Pullback_15"] = drawdown_score + pullback_score + timing_score
-
-    atr_score = np.select(
-        [atr_contract.le(0.80), atr_contract.le(1.00), atr_contract.le(1.20)],
-        [6.0, 4.0, 2.0],
-        default=0.0,
-    )
-    volume_score = np.select(
-        [vol_contract.le(0.80), vol_contract.le(1.00), vol_contract.le(1.20)],
-        [5.0, 3.0, 1.0],
-        default=0.0,
-    )
-    turnover_score = np.select(
-        [turn_contract.le(0.80), turn_contract.le(1.00), turn_contract.le(1.20)],
-        [4.0, 3.0, 1.0],
-        default=0.0,
-    )
-    candidates["Score_Contraction_15"] = atr_score + volume_score + turnover_score
-
-    startup_score = np.select(
-        [
-            startup_volume.between(0.8, 2.5, inclusive="both"),
-            startup_volume.between(2.5, 4.0, inclusive="right"),
-            startup_volume.lt(0.8),
-        ],
-        [5.0, 3.0, 1.0],
-        default=0.0,
-    )
-    candle_score = np.select(
-        [close_location.ge(0.70), close_location.ge(0.50)],
-        [4.0, 2.0],
-        default=0.0,
-    )
-    kdj_score = np.select(
-        [candidates["KDJ_Low_Cross"].astype(bool), (kdj_k.gt(_numeric_series(candidates, "KDJ_D")) & kdj_k.le(60.0))],
-        [3.0, 2.0],
-        default=0.0,
-    )
-    candidates["Score_Restart_15"] = (
-        startup_score
-        + candle_score
-        + candidates["MACD_Impulse_Pct"].fillna(0.5) * 3.0
-        + kdj_score
-    ).clip(0.0, 15.0)
-
-    candidates["Score_RS_25"] = (
-        candidates["RS_4W_Pct"].fillna(0.5) * 5.0
-        + candidates["RS_8W_Pct"].fillna(0.5) * 8.0
-        + candidates["RS_13W_Pct"].fillna(0.5) * 8.0
-        + candidates["Industry_Excess_Pct"].fillna(0.5) * 4.0
-    )
-
-    distance_score = np.select(
-        [distance.between(0.0, 10.0), distance.between(10.0, 20.0, inclusive="right")],
-        [4.0, 2.0],
-        default=0.0,
-    )
-    range_score = np.select(
-        [week_range.le(8.0), week_range.le(12.0), week_range.le(18.0)],
-        [3.0, 2.0, 1.0],
-        default=0.0,
-    )
-    shadow_score = np.select(
-        [upper_shadow.le(0.20), upper_shadow.le(0.35)],
-        [3.0, 1.5],
-        default=0.0,
-    )
-    candidates["Score_Risk_10"] = distance_score + range_score + shadow_score
-    score_columns = [
-        "Score_Trend_20",
-        "Score_Pullback_15",
-        "Score_Contraction_15",
-        "Score_Restart_15",
-        "Score_RS_25",
-        "Score_Risk_10",
-    ]
-    candidates["Entry_Score_100"] = candidates[score_columns].sum(axis=1).clip(0.0, 100.0)
-
-    eligible = candidates[candidates["Trend_Eligible"].astype(bool)].copy()
-    eligible_count = len(eligible)
     candidates["Rank"] = np.nan
     candidates["Selected_Top3"] = False
-    candidates["Selection_Valid"] = eligible_count >= MIN_VALID_SELECTION_SIZE
+    score_columns = [
+        "Score_Leadership_35",
+        "Score_Trend_25",
+        "Score_Setup_25",
+        "Score_Risk_15",
+        "Entry_Score_100",
+    ]
+    for column in score_columns:
+        candidates[column] = np.nan
+
+    eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
+    eligible_count = len(eligible)
     if eligible_count:
-        eligible = eligible.sort_values(
+        return_4w = _numeric_series(eligible, "Return_4W_pct")
+        return_8w = _numeric_series(eligible, "Return_8W_pct")
+        return_13w = _numeric_series(eligible, "Return_13W_pct")
+        industry_excess = _numeric_series(eligible, "Industry_13W_Excess_pct")
+        slope20 = _numeric_series(eligible, "MA20_Slope_4W_pct")
+        slope10 = _numeric_series(eligible, "MA10_Slope_2W_pct")
+        ma20 = _numeric_series(eligible, "MA20")
+        ma40 = _numeric_series(eligible, "MA40")
+        trend_spread = (ma20 / ma40.replace(0, np.nan) - 1.0) * 100.0
+        breakout_distance = _numeric_series(eligible, "Breakout_13W_pct")
+        proximity_13w_high = -breakout_distance.abs()
+        macd_impulse = _numeric_series(eligible, "MACD_Impulse_pct")
+        close_location = _numeric_series(eligible, "Weekly_Close_Location")
+        return_1w = _numeric_series(eligible, "Return_1W_pct")
+        startup_volume = _numeric_series(eligible, "Startup_Volume_Ratio").clip(0.2, 5.0)
+        startup_quality = -(np.log(startup_volume / 1.5)).abs()
+        distance_ma20 = _numeric_series(eligible, "Distance_MA20_pct")
+        distance_quality = -(distance_ma20 - 8.0).abs()
+        atr_contract = _numeric_series(eligible, "ATR_Contraction")
+        volume_contract = _numeric_series(eligible, "Volume_Contraction")
+        turnover_contract = _numeric_series(eligible, "Turnover_Contraction")
+        week_range = _numeric_series(eligible, "Weekly_Range_pct")
+        upper_shadow = _numeric_series(eligible, "Weekly_Upper_Shadow_Ratio")
+
+        eligible["Score_Leadership_35"] = (
+            _percentile_rank(return_4w) * 8.0
+            + _percentile_rank(return_8w) * 10.0
+            + _percentile_rank(return_13w) * 10.0
+            + _percentile_rank(industry_excess) * 7.0
+        )
+        eligible["Score_Trend_25"] = (
+            _percentile_rank(slope20) * 8.0
+            + _percentile_rank(slope10) * 6.0
+            + _percentile_rank(trend_spread) * 6.0
+            + _percentile_rank(proximity_13w_high) * 5.0
+        )
+        setup_base = np.select(
+            [
+                _bool_series(eligible, "Fresh_13W_Breakout"),
+                _bool_series(eligible, "Pullback_Restart"),
+                _bool_series(eligible, "Is_First_Red"),
+            ],
+            [10.0, 8.0, 6.0],
+            default=0.0,
+        )
+        eligible["Score_Setup_25"] = (
+            setup_base
+            + _percentile_rank(macd_impulse) * 6.0
+            + _percentile_rank(close_location) * 4.0
+            + _percentile_rank(startup_quality) * 3.0
+            + _percentile_rank(return_1w) * 2.0
+        )
+        eligible["Score_Risk_15"] = (
+            _percentile_rank(distance_quality) * 5.0
+            + _percentile_rank(atr_contract, higher_is_better=False) * 3.0
+            + _percentile_rank(week_range, higher_is_better=False) * 3.0
+            + _percentile_rank(upper_shadow, higher_is_better=False) * 2.0
+            + _percentile_rank(volume_contract, higher_is_better=False) * 1.0
+            + _percentile_rank(turnover_contract, higher_is_better=False) * 1.0
+        )
+        eligible["Entry_Score_100"] = eligible[
+            ["Score_Leadership_35", "Score_Trend_25", "Score_Setup_25", "Score_Risk_15"]
+        ].sum(axis=1).clip(0.0, 100.0)
+        candidates.loc[eligible.index, score_columns] = eligible[score_columns]
+
+    market_median = _safe_float(_numeric_series(pool, "Return_13W_pct").median(), 0.0)
+    if eligible_count < MIN_VALID_SELECTION_SIZE:
+        block_reason = "趋势结构候选不足3只"
+    elif market_median >= MARKET_OVERHEAT_13W_PCT:
+        block_reason = "科技池13周涨幅中位数达到过热阈值"
+    elif eligible_count >= MAX_ELIGIBLE_CANDIDATES:
+        block_reason = "同周结构候选达到拥挤阈值"
+    else:
+        block_reason = ""
+    selection_valid = block_reason == ""
+    candidates["Selection_Valid"] = bool(selection_valid)
+    candidates["Selection_Block_Reason"] = block_reason
+
+    if eligible_count:
+        eligible = candidates.loc[eligible.index].sort_values(
             [
                 "Entry_Score_100",
-                "Score_RS_25",
-                "Score_Risk_10",
-                "Score_Contraction_15",
+                "Score_Leadership_35",
+                "Score_Setup_25",
+                "Score_Risk_15",
                 "ts_code",
             ],
             ascending=[False, False, False, False, True],
@@ -1014,16 +1059,21 @@ def score_first_red_candidates(pool_snapshots: pd.DataFrame):
             np.arange(1, len(eligible) + 1, dtype=int), index=eligible.index
         )
         candidates.loc[rank_map.index, "Rank"] = rank_map.astype(float)
-        if eligible_count >= MIN_VALID_SELECTION_SIZE:
+        if selection_valid:
             selected_index = rank_map[rank_map <= TOP_N].index
             candidates.loc[selected_index, "Selected_Top3"] = True
 
-    candidates["Raw_First_Red_Count"] = raw_count
+    candidates["Raw_Setup_Count"] = raw_count
     candidates["Eligible_Trend_Count"] = eligible_count
-    candidates["Market_13W_Median_pct"] = _numeric_series(pool, "Return_13W_pct").median()
-    market_median = _safe_float(candidates["Market_13W_Median_pct"].iloc[0], 0.0)
+    candidates["Market_13W_Median_pct"] = market_median
     candidates["Market_Regime"] = (
-        "强势" if market_median >= 5.0 else "弱势" if market_median <= -5.0 else "中性"
+        "过热"
+        if market_median >= MARKET_OVERHEAT_13W_PCT
+        else "强势"
+        if market_median >= 5.0
+        else "弱势"
+        if market_median <= -5.0
+        else "中性"
     )
     candidates = candidates.sort_values(
         ["Trend_Eligible", "Rank", "Entry_Score_100", "ts_code"],
@@ -1052,9 +1102,14 @@ def track_fixed_future_path(
         "Entry_Open": np.nan,
         "Entry_Gap_pct": np.nan,
         "Outcome_Complete": False,
+        "Outcome_Complete_8W": False,
+        "Primary_Outcome_Date": None,
+        "Primary_Return_Net_pct": np.nan,
         "Available_Future_Days": 0,
         "Available_Price_Days": 0,
         "Fixed_W8_Return_Net_pct": np.nan,
+        "MFE_W3_Net_pct": np.nan,
+        "MAE_W3_Raw_pct": np.nan,
         "MFE_8W_Net_pct": np.nan,
         "MAE_8W_Raw_pct": np.nan,
         "Path_10_vs_Minus5": "PENDING",
@@ -1129,6 +1184,9 @@ def track_fixed_future_path(
                 result[f"Fixed_Return_W{week}_Net_pct"] = (
                     (exit_close / buy_price - 1.0) * 100.0 - roundtrip_cost_pct
                 )
+    result["Fixed_W8_Return_Net_pct"] = _safe_float(
+        result.get("Fixed_Return_W8_Net_pct")
+    )
 
     highs = pd.to_numeric(future["high"], errors="coerce")
     lows = pd.to_numeric(future["low"], errors="coerce")
@@ -1139,10 +1197,21 @@ def track_fixed_future_path(
     if lows.notna().any():
         result["MAE_8W_Raw_pct"] = (lows.min() / buy_price - 1.0) * 100.0
 
+    primary_days = PRIMARY_HOLD_WEEKS * MARKET_DAYS_PER_WEEK
+    primary_future = future.head(primary_days)
+    primary_highs = pd.to_numeric(primary_future["high"], errors="coerce")
+    primary_lows = pd.to_numeric(primary_future["low"], errors="coerce")
+    if primary_highs.notna().any():
+        result["MFE_W3_Net_pct"] = (
+            (primary_highs.max() / buy_price - 1.0) * 100.0 - roundtrip_cost_pct
+        )
+    if primary_lows.notna().any():
+        result["MAE_W3_Raw_pct"] = (primary_lows.min() / buy_price - 1.0) * 100.0
+
     path = "NEITHER"
     first_plus10_day = None
     first_minus5_day = None
-    for day_number, (_, row) in enumerate(future.iterrows(), start=1):
+    for day_number, (_, row) in enumerate(primary_future.iterrows(), start=1):
         hit_plus = _safe_float(row.get("high"), -np.inf) >= buy_price * 1.10
         hit_minus = _safe_float(row.get("low"), np.inf) <= buy_price * 0.95
         if hit_plus and first_plus10_day is None:
@@ -1168,17 +1237,24 @@ def track_fixed_future_path(
         and path != "PLUS10_FIRST"
     )
 
-    complete = len(future) >= HOLD_WEEKS * MARKET_DAYS_PER_WEEK
-    result["Outcome_Complete"] = bool(complete)
-    if complete:
-        w8_return = _safe_float(result["Fixed_Return_W8_Net_pct"])
-        result["Fixed_W8_Return_Net_pct"] = w8_return
-        mfe = _safe_float(result["MFE_8W_Net_pct"], -np.inf)
-        if mfe >= 20.0 and w8_return > 0.0:
+    primary_return = _safe_float(result.get(PRIMARY_RETURN_COLUMN))
+    primary_complete = len(future) >= primary_days and math.isfinite(primary_return)
+    complete_8w = (
+        len(future) >= HOLD_WEEKS * MARKET_DAYS_PER_WEEK
+        and math.isfinite(_safe_float(result.get("Fixed_Return_W8_Net_pct")))
+    )
+    result["Outcome_Complete"] = bool(primary_complete)
+    result["Outcome_Complete_8W"] = bool(complete_8w)
+    result["Primary_Return_Net_pct"] = primary_return
+    if len(future) >= primary_days:
+        result["Primary_Outcome_Date"] = str(future.index[primary_days - 1])
+    if primary_complete:
+        mfe = _safe_float(result["MFE_W3_Net_pct"], -np.inf)
+        if mfe >= 15.0 and primary_return >= 5.0:
             grade = "S"
-        elif path == "PLUS10_FIRST" or w8_return >= 5.0:
+        elif path == "PLUS10_FIRST" or primary_return >= 5.0:
             grade = "A"
-        elif w8_return >= 0.0:
+        elif primary_return >= 0.0:
             grade = "B"
         else:
             grade = "F"
@@ -1259,15 +1335,17 @@ def mark_scan_complete(
     eligible_count: int,
     selected_count: int,
     config_id: str,
+    selection_block_reason: str = "",
 ):
     ledger = read_csv_safe(SCAN_LEDGER_FILE)
     row = pd.DataFrame(
         [
             {
                 "Signal_Date": str(signal_date),
-                "Raw_First_Red_Count": int(raw_signal_count),
+                "Raw_Setup_Count": int(raw_signal_count),
                 "Eligible_Trend_Count": int(eligible_count),
                 "Selected_Count": int(selected_count),
+                "Selection_Block_Reason": str(selection_block_reason or ""),
                 "Scan_Status": "COMPLETED",
                 "Config_ID": config_id,
                 "Updated_At": datetime.now().isoformat(timespec="seconds"),
@@ -1419,7 +1497,7 @@ def scan_one_date(
 
     if not pool_records:
         return pd.DataFrame(), 0, 0
-    candidates, raw_count, eligible_count = score_first_red_candidates(
+    candidates, raw_count, eligible_count = score_r2_candidates(
         pd.DataFrame(pool_records)
     )
     if candidates.empty:
@@ -1429,6 +1507,9 @@ def scan_one_date(
         for column, value in {
             "Entry_Tradable": np.nan,
             "Outcome_Complete": False,
+            "Outcome_Complete_8W": False,
+            "Primary_Outcome_Date": None,
+            "Primary_Return_Net_pct": np.nan,
             "Entry_Status": "最新预览不计算未来结果",
             "Outcome_Grade": "待发生",
         }.items():
@@ -1455,7 +1536,7 @@ def scan_one_date(
 
 
 # -----------------------------------------------------------------------------
-# R1稳健性报告
+# R2稳健性报告
 # -----------------------------------------------------------------------------
 def _bool_series(frame: pd.DataFrame, column: str):
     if column not in frame.columns:
@@ -1514,10 +1595,10 @@ def completed_research_rows(history: pd.DataFrame):
     valid_selection = _bool_series(history, "Selection_Valid")
     result = history[complete & tradable & trend & valid_selection].copy()
     result["Rank"] = pd.to_numeric(result.get("Rank"), errors="coerce")
-    result["Fixed_W8_Return_Net_pct"] = pd.to_numeric(
-        result.get("Fixed_W8_Return_Net_pct"), errors="coerce"
+    result[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        result.get(PRIMARY_RETURN_COLUMN), errors="coerce"
     )
-    return result.dropna(subset=["Rank", "Fixed_W8_Return_Net_pct"])
+    return result.dropna(subset=["Rank", PRIMARY_RETURN_COLUMN])
 
 
 def cohort_summary(completed: pd.DataFrame):
@@ -1530,7 +1611,7 @@ def cohort_summary(completed: pd.DataFrame):
     ]
     rows = []
     for name, frame in cohorts:
-        returns = pd.to_numeric(frame["Fixed_W8_Return_Net_pct"], errors="coerce").dropna()
+        returns = pd.to_numeric(frame[PRIMARY_RETURN_COLUMN], errors="coerce").dropna()
         without_best = returns.drop(index=returns.idxmax()) if len(returns) > 1 else pd.Series(dtype=float)
         rows.append(
             {
@@ -1561,7 +1642,7 @@ def cohort_summary(completed: pd.DataFrame):
 
 def outlier_audit(completed: pd.DataFrame):
     selected = completed[completed["Rank"] <= 3].copy()
-    returns = pd.to_numeric(selected["Fixed_W8_Return_Net_pct"], errors="coerce").dropna()
+    returns = pd.to_numeric(selected[PRIMARY_RETURN_COLUMN], errors="coerce").dropna()
     if returns.empty:
         return pd.DataFrame(), {}
     positive_total = returns[returns > 0].sum()
@@ -1613,7 +1694,7 @@ def year_summary(completed: pd.DataFrame):
     frame["Year"] = frame["Signal_Date"].astype(str).str[:4]
     rows = []
     for year, group in frame.groupby("Year", sort=True):
-        returns = group["Fixed_W8_Return_Net_pct"]
+        returns = group[PRIMARY_RETURN_COLUMN]
         rows.append(
             {
                 "年份": year,
@@ -1637,7 +1718,7 @@ def three_stock_group_summary(completed: pd.DataFrame):
         exact = group.sort_values("Rank").drop_duplicates("Rank")
         if set(exact["Rank"].astype(int)) != {1, 2, 3}:
             continue
-        returns = exact["Fixed_W8_Return_Net_pct"]
+        returns = exact[PRIMARY_RETURN_COLUMN]
         rows.append(
             {
                 "Signal_Date": signal_date,
@@ -1687,7 +1768,7 @@ def ranking_diagnostics(completed: pd.DataFrame):
     if completed.empty:
         return {}
     score = pd.to_numeric(completed.get("Entry_Score_100"), errors="coerce")
-    returns = pd.to_numeric(completed.get("Fixed_W8_Return_Net_pct"), errors="coerce")
+    returns = pd.to_numeric(completed.get(PRIMARY_RETURN_COLUMN), errors="coerce")
     global_corr = score.rank(method="average").corr(returns.rank(method="average"))
     weekly_corrs = []
     for _, group in completed.groupby("Signal_Date"):
@@ -1697,13 +1778,37 @@ def ranking_diagnostics(completed: pd.DataFrame):
             method="average"
         )
         group_returns = pd.to_numeric(
-            group["Fixed_W8_Return_Net_pct"], errors="coerce"
+            group[PRIMARY_RETURN_COLUMN], errors="coerce"
         ).rank(method="average")
         corr = group_scores.corr(group_returns)
         if pd.notna(corr):
             weekly_corrs.append(corr)
     top3 = returns[completed["Rank"] <= 3]
     rest = returns[completed["Rank"] > 3]
+    paired_advantages = []
+    for _, group in completed.groupby("Signal_Date"):
+        selected_returns = pd.to_numeric(
+            group.loc[group["Rank"] <= 3, PRIMARY_RETURN_COLUMN], errors="coerce"
+        ).dropna()
+        other_returns = pd.to_numeric(
+            group.loc[group["Rank"] > 3, PRIMARY_RETURN_COLUMN], errors="coerce"
+        ).dropna()
+        if len(selected_returns) and len(other_returns):
+            paired_advantages.append(selected_returns.mean() - other_returns.mean())
+
+    selected = completed[completed["Rank"] <= 3].copy()
+    signal_dates = sorted(selected["Signal_Date"].astype(str).unique().tolist())
+    split_at = len(signal_dates) // 2
+    first_dates = set(signal_dates[:split_at])
+    second_dates = set(signal_dates[split_at:])
+    first_half = pd.to_numeric(
+        selected.loc[selected["Signal_Date"].astype(str).isin(first_dates), PRIMARY_RETURN_COLUMN],
+        errors="coerce",
+    ).dropna()
+    second_half = pd.to_numeric(
+        selected.loc[selected["Signal_Date"].astype(str).isin(second_dates), PRIMARY_RETURN_COLUMN],
+        errors="coerce",
+    ).dropna()
     return {
         "全局评分收益秩相关": global_corr,
         "逐周秩相关均值": np.mean(weekly_corrs) if weekly_corrs else np.nan,
@@ -1713,18 +1818,34 @@ def ranking_diagnostics(completed: pd.DataFrame):
         "Top3相对其余中位优势百分点": (
             top3.median() - rest.median() if len(top3) and len(rest) else np.nan
         ),
+        "Top3逐周平均收益战胜其余比例%": (
+            np.mean(np.asarray(paired_advantages) > 0.0) * 100.0
+            if paired_advantages
+            else np.nan
+        ),
+        "Top3逐周平均收益优势均值百分点": (
+            np.mean(paired_advantages) if paired_advantages else np.nan
+        ),
+        "前半段Top3中位收益%": first_half.median() if len(first_half) else np.nan,
+        "后半段Top3中位收益%": second_half.median() if len(second_half) else np.nan,
     }
 
 
-def research_gates(completed: pd.DataFrame, cohort: pd.DataFrame, outlier: pd.DataFrame):
+def research_gates(
+    completed: pd.DataFrame,
+    cohort: pd.DataFrame,
+    outlier: pd.DataFrame,
+    diagnostics: dict[str, Any],
+):
     selected = completed[completed["Rank"] <= 3]
-    returns = selected["Fixed_W8_Return_Net_pct"] if not selected.empty else pd.Series(dtype=float)
+    returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
     weeks = selected["Signal_Date"].nunique() if not selected.empty else 0
     wins = int((returns > 0).sum()) if len(returns) else 0
     lower_bound = _wilson_lower_bound(wins, len(returns)) * 100.0 if len(returns) else np.nan
-    rest = completed[completed["Rank"] > 3]["Fixed_W8_Return_Net_pct"]
+    rest = completed[completed["Rank"] > 3][PRIMARY_RETURN_COLUMN]
     remove5 = outlier[outlier["口径"] == "去掉收益最高5%"] if not outlier.empty else pd.DataFrame()
     remove5_mean = _safe_float(remove5["平均收益%"].iloc[0]) if not remove5.empty else np.nan
+    remove5_median = _safe_float(remove5["中位收益%"].iloc[0]) if not remove5.empty else np.nan
     if not remove5.empty:
         try:
             remove5_pf = float(remove5["Profit_Factor"].iloc[0])
@@ -1736,15 +1857,34 @@ def research_gates(completed: pd.DataFrame, cohort: pd.DataFrame, outlier: pd.Da
     all_rank_medians_positive = (
         len(rank_rows) == 3 and pd.to_numeric(rank_rows["中位收益%"], errors="coerce").gt(0).all()
     )
+    rank_medians = (
+        rank_rows.set_index("排名组")["中位收益%"].map(_safe_float)
+        if len(rank_rows) == 3
+        else pd.Series(dtype=float)
+    )
+    rank_ordered = (
+        len(rank_medians) == 3
+        and rank_medians.get("Top1", -np.inf) >= rank_medians.get("Top2", np.inf)
+        and rank_medians.get("Top2", -np.inf) >= rank_medians.get("Top3", np.inf)
+    )
+    weekly_corr = _safe_float(diagnostics.get("逐周秩相关均值"))
+    paired_beat = _safe_float(diagnostics.get("Top3逐周平均收益战胜其余比例%"))
+    first_half_median = _safe_float(diagnostics.get("前半段Top3中位收益%"))
+    second_half_median = _safe_float(diagnostics.get("后半段Top3中位收益%"))
     gates = [
-        ("至少50个独立信号周", weeks >= 50, f"当前{weeks}周"),
-        ("至少150笔完整Top3交易", len(returns) >= 150, f"当前{len(returns)}笔"),
-        ("Top3胜率达到66.7%目标", len(returns) > 0 and (returns > 0).mean() >= 2 / 3, f"当前{((returns > 0).mean() * 100.0 if len(returns) else np.nan):.1f}%"),
+        ("至少40个独立有效信号周", weeks >= 40, f"当前{weeks}周"),
+        ("至少120笔完整Top3交易", len(returns) >= 120, f"当前{len(returns)}笔"),
+        ("W3 Top3胜率至少55%", len(returns) > 0 and (returns > 0).mean() >= 0.55, f"当前{((returns > 0).mean() * 100.0 if len(returns) else np.nan):.1f}%"),
         ("胜率95%下限高于50%", math.isfinite(lower_bound) and lower_bound > 50.0, f"当前{lower_bound:.1f}%"),
-        ("Top3中位收益大于0", len(returns) > 0 and returns.median() > 0, f"当前{(returns.median() if len(returns) else np.nan):.2f}%"),
+        ("W3 Top3中位收益大于0", len(returns) > 0 and returns.median() > 0, f"当前{(returns.median() if len(returns) else np.nan):.2f}%"),
         ("去掉最高5%后平均收益大于0", math.isfinite(remove5_mean) and remove5_mean > 0, f"当前{remove5_mean:.2f}%"),
-        ("去掉最高5%后PF大于1", not math.isnan(remove5_pf) and remove5_pf > 1.0, f"当前{remove5_pf:.2f}"),
+        ("去掉最高5%后中位收益大于0", math.isfinite(remove5_median) and remove5_median > 0, f"当前{remove5_median:.2f}%"),
+        ("去掉最高5%后PF至少1.2", not math.isnan(remove5_pf) and remove5_pf >= 1.2, f"当前{remove5_pf:.2f}"),
         ("Top1/2/3中位收益分别为正", all_rank_medians_positive, "逐名检查"),
+        ("Top1至Top3收益保持排名单调", rank_ordered, "Top1≥Top2≥Top3"),
+        ("逐周评分收益秩相关至少0.10", math.isfinite(weekly_corr) and weekly_corr >= 0.10, f"当前{weekly_corr:.3f}"),
+        ("Top3逐周战胜其余候选至少60%", math.isfinite(paired_beat) and paired_beat >= 60.0, f"当前{paired_beat:.1f}%"),
+        ("前后半段Top3中位收益均为正", math.isfinite(first_half_median) and math.isfinite(second_half_median) and first_half_median > 0 and second_half_median > 0, f"前{first_half_median:.2f}% / 后{second_half_median:.2f}%"),
         ("Top3中位收益优于其余候选", len(returns) > 0 and len(rest) > 0 and returns.median() > rest.median(), f"差{(returns.median() - rest.median() if len(returns) and len(rest) else np.nan):.2f}个百分点"),
     ]
     return pd.DataFrame(
@@ -1760,16 +1900,20 @@ def build_export_zip(
     groups: pd.DataFrame,
     horizon: pd.DataFrame,
     gates: pd.DataFrame,
+    diagnostics: dict[str, Any],
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_first_red_candidates.csv": history,
+        "01_all_r2_structure_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
         "05_complete_three_stock_groups.csv": groups,
         "06_w1_w8_fixed_horizon.csv": horizon,
         "07_research_acceptance_gates.csv": gates,
+        "08_ranking_diagnostics.csv": pd.DataFrame(
+            [{"指标": key, "数值": value} for key, value in diagnostics.items()]
+        ),
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -1794,36 +1938,36 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "本版只检验买入前排序能力：周线第一根红柱是候选标志，趋势、回调、收缩、启动、"
-        "相对强度和位置风险共同排序。所有未来收益只用于事后验收。"
+        "R2用13周新高突破、回调再启动和MACD首红产生候选；只使用信号周及以前数据，"
+        "在当周候选内按领先度、趋势、启动和风险排序。W3是主验收目标，W1—W8继续记录。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R1不是实盘交易版。只有稳健性验收通过后，才进入W1—W8持仓管理和30万元三仓组合开发。"
+        "R2仍是研究验证版。只有一年快速验收及随后更长区间样本外验证都通过，才允许进入实盘开发。"
     )
-    with st.expander("查看R1规则边界"):
+    with st.expander("查看R2规则边界"):
         st.markdown(
             """
-- **候选触发**：周线MACD柱由非红转为第一根红柱。
-- **趋势延续资格**：信号周收盘不低于20周均线，且20周均线近4周斜率为正。
-- **排序证据**：趋势20分、回调15分、风险收缩15分、重新启动15分、相对强度25分、位置风险10分。
-- **有效选股组**：至少出现2只趋势延续候选；最多选前3名。只有1只时不计入Top3成绩。
-- **历史执行**：信号周结束后，下一交易日开盘买入；固定观察W1—W8并扣除设置的往返成本。
+- **候选触发**：13周新高首次突破、上涨趋势中的回调再启动、或趋势内MACD第一根红柱。
+- **硬资格**：收盘不低于20周均线、20周均线不低于40周均线、20周斜率为正，且不过度偏离均线。
+- **横截面排序**：领先度35分、趋势质量25分、启动质量25分、风险位置15分；只在同周候选之间排名。
+- **风险门**：至少3只合格候选；科技池13周涨幅中位数达到20%或同周候选达到50只时整周跳过。
+- **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
             """
-    )
+        )
 
     today = datetime.now().date()
-    default_start = today - timedelta(days=820)
+    default_start = today - timedelta(days=365)
     with st.sidebar:
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R1验证", "最新选股预览"],
+            ["历史R2验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R1验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R2验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -1837,7 +1981,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R1所有固定周收益都会扣除该成本。",
+            help="R2所有W1—W8固定周收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -1848,26 +1992,26 @@ def main():
         token_input = st.text_input("Tushare Token", value=secret_token, type="password")
 
         st.markdown("---")
-        clear_market_clicked = st.button("清空R1行情缓存")
-        clear_history_clicked = st.button("清除R1历史结果")
+        clear_market_clicked = st.button("清空行情缓存")
+        clear_history_clicked = st.button("清除R2历史结果")
 
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R1验证":
+    if start_input > end_input and mode == "历史R2验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
     if clear_market_clicked:
         if os.path.isdir(MARKET_CACHE_ROOT):
             shutil.rmtree(MARKET_CACHE_ROOT)
-        st.success("R1行情缓存已清空。")
+        st.success("行情缓存已清空。")
 
     if clear_history_clicked:
         for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
             remove_with_backup(path)
-        st.session_state.pop("r1_preview", None)
-        st.success("R1历史结果和断点任务已清除。")
+        st.session_state.pop("r2_preview", None)
+        st.success("R2历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
@@ -1898,7 +2042,7 @@ def main():
         resumed.pop("Last_Error", None)
         save_task(resumed)
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R1验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R2验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -2022,7 +2166,7 @@ def main():
                         raise RuntimeError("未加载到行情；已成功下载的分片仍然保留。")
 
                     loaded_date_set = set(loaded_dates)
-                    progress = st.progress(0, text="开始扫描第一根红柱候选……")
+                    progress = st.progress(0, text="开始扫描R2周线结构候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and read_json_safe(RUN_TASK_FILE).get("State") == "STOPPED":
@@ -2056,7 +2200,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r1_preview"] = candidates
+                            st.session_state["r2_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -2067,6 +2211,12 @@ def main():
                                 eligible_count,
                                 selected_count,
                                 run_config_id,
+                                (
+                                    str(candidates["Selection_Block_Reason"].iloc[0] or "")
+                                    if not candidates.empty
+                                    and "Selection_Block_Reason" in candidates.columns
+                                    else "没有结构触发"
+                                ),
                             )
                             active_task["Completed_Weeks"] = int(active_task.get("Completed_Weeks", 0)) + 1
                             active_task["Last_Date"] = signal_date
@@ -2075,8 +2225,8 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：第一根红柱{raw_count}只，"
-                                f"趋势延续候选{eligible_count}只，入选{selected_count}只"
+                                f"{signal_date}：结构触发{raw_count}只，"
+                                f"合格候选{eligible_count}只，入选{selected_count}只"
                             ),
                         )
                     progress.empty()
@@ -2095,7 +2245,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R1扫描完成。")
+                            st.success("历史R2扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -2114,28 +2264,31 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r1_preview")
+    preview = st.session_state.get("r2_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有第一根红柱候选。")
+            st.info("最新交易日没有R2周线结构候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top3")].copy()
             if selected_preview.empty:
-                st.warning("出现第一根红柱，但没有至少两只趋势延续候选，因此不形成有效选股组。")
+                block_reason = ""
+                if "Selection_Block_Reason" in preview.columns and not preview.empty:
+                    block_reason = str(preview["Selection_Block_Reason"].iloc[0] or "")
+                st.warning(block_reason or "本周没有形成有效Top3选股组。")
             else:
                 preview_columns = [
                     "Signal_Date", "Weekly_Data_Mode", "Rank", "name", "ts_code", "Industry",
-                    "Entry_Score_100", "Score_Trend_20", "Score_Pullback_15",
-                    "Score_Contraction_15", "Score_Restart_15", "Score_RS_25", "Score_Risk_10",
-                    "Raw_Close", "Circ_MV_Billion", "Market_Regime",
+                    "R2_Setup_Type", "Entry_Score_100", "Score_Leadership_35",
+                    "Score_Trend_25", "Score_Setup_25", "Score_Risk_15",
+                    "Raw_Close", "Circ_MV_Billion", "Market_Regime", "Selection_Block_Reason",
                 ]
                 st.dataframe(
                     selected_preview[[column for column in preview_columns if column in selected_preview.columns]],
                     width="stretch",
                 )
-            with st.expander("查看全部第一根红柱及未入选原因"):
+            with st.expander("查看全部R2结构候选及未入选原因"):
                 st.dataframe(preview, width="stretch")
 
     if rerun_needed:
@@ -2164,12 +2317,13 @@ def main():
         group_detail, group_stats = three_stock_group_summary(completed)
         horizons = horizon_summary(completed)
         diagnostics = ranking_diagnostics(completed)
-        gates = research_gates(completed, cohort, outlier)
+        gates = research_gates(completed, cohort, outlier, diagnostics)
 
         st.markdown("---")
-        st.header("R1历史验证报告")
+        st.header("R2历史验证报告")
         st.caption(
-            "所有W1—W8统计使用同一批已经走满40个交易日的样本，不把尚未走到后期的股票从后期统计中悄悄剔除。"
+            "主报告以已经走满15个交易日的W3样本验收入场排序；W4—W8只统计实际已经走到"
+            "相应周数的记录，并在表中明确显示每个持有期的完整样本数。"
         )
 
         ledger = read_csv_safe(SCAN_LEDGER_FILE)
@@ -2179,35 +2333,35 @@ def main():
         invalid_selection_weeks = (
             int(
                 (
-                    pd.to_numeric(ledger.get("Eligible_Trend_Count"), errors="coerce")
+                    pd.to_numeric(ledger.get("Selected_Count"), errors="coerce")
                     .fillna(0)
-                    .lt(MIN_VALID_SELECTION_SIZE)
+                    .lt(TOP_N)
                 ).sum()
             )
             if not ledger.empty
             else 0
         )
         selected = completed[completed["Rank"] <= 3]
-        selected_returns = selected["Fixed_W8_Return_Net_pct"] if not selected.empty else pd.Series(dtype=float)
+        selected_returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
         metric_columns = st.columns(5)
         metric_columns[0].metric("已扫描周数", scanned_weeks)
-        metric_columns[1].metric("不足2只候选周", invalid_selection_weeks)
-        metric_columns[2].metric("完整Top3交易", len(selected))
+        metric_columns[1].metric("无有效Top3周", invalid_selection_weeks)
+        metric_columns[2].metric("W3完整Top3交易", len(selected))
         metric_columns[3].metric(
             "Top3胜率",
             f"{((selected_returns > 0).mean() * 100.0 if len(selected_returns) else np.nan):.1f}%",
         )
         metric_columns[4].metric(
-            "Top3中位收益",
+            "W3 Top3中位收益",
             f"{(selected_returns.median() if len(selected_returns) else np.nan):.2f}%",
         )
 
         st.subheader("研究验收门槛")
         st.dataframe(gates, width="stretch", hide_index=True)
         if not gates.empty and gates["结果"].eq("通过").all():
-            st.success("R1全部验收项目通过，可以冻结入口并进入持仓生命周期研究。")
+            st.success("R2一年快速验收全部通过，可以冻结规则并进入更长区间样本外验证。")
         else:
-            st.error("R1尚未通过全部验收，当前代码不能进入实盘，也不应通过修改止盈止损掩盖入口问题。")
+            st.error("R2尚未通过全部验收，当前代码不能进入实盘，也不应靠止盈止损掩盖入口问题。")
 
         st.subheader("Top1、Top2、Top3与其余候选")
         st.dataframe(_format_report_frame(cohort), width="stretch", hide_index=True)
@@ -2215,7 +2369,7 @@ def main():
         st.subheader("极端牛股依赖审计")
         if outlier_details:
             outlier_cols = st.columns(3)
-            outlier_cols[0].metric("最佳一笔W8收益", f"{outlier_details['best_return']:.2f}%")
+            outlier_cols[0].metric("最佳一笔W3收益", f"{outlier_details['best_return']:.2f}%")
             outlier_cols[1].metric("最佳一笔占正利润", f"{outlier_details['best_contribution']:.1f}%")
             outlier_cols[2].metric("最高5%占正利润", f"{outlier_details['top5_contribution']:.1f}%")
         st.dataframe(_format_report_frame(outlier), width="stretch", hide_index=True)
@@ -2235,7 +2389,7 @@ def main():
             group_cols[2].metric("至少两只盈利", f"{group_stats['至少两只盈利比例%']:.1f}%")
             group_cols[3].metric("三只全亏", f"{group_stats['三只全亏比例%']:.1f}%")
         else:
-            st.info("尚无三只都走满8周的完整选股组。")
+            st.info("尚无三只都走满W3的完整选股组。")
 
         st.subheader("固定持有W1—W8路径")
         st.dataframe(_format_report_frame(horizons), width="stretch", hide_index=True)
@@ -2246,9 +2400,10 @@ def main():
         with st.expander("查看Top3历史明细"):
             detail_columns = [
                 "Signal_Date", "Entry_Date", "Rank", "name", "ts_code", "Industry",
-                "Entry_Score_100", "Entry_Open", "Fixed_W8_Return_Net_pct",
-                "MFE_8W_Net_pct", "MAE_8W_Raw_pct", "Path_10_vs_Minus5",
-                "Early_Failure_2W", "Outcome_Grade", "Market_Regime",
+                "R2_Setup_Type", "Entry_Score_100", "Score_Leadership_35",
+                "Score_Trend_25", "Score_Setup_25", "Score_Risk_15",
+                "Entry_Open", PRIMARY_RETURN_COLUMN, "MFE_W3_Net_pct", "MAE_W3_Raw_pct",
+                "Path_10_vs_Minus5", "Early_Failure_2W", "Outcome_Grade", "Market_Regime",
             ]
             selected_detail = history[
                 _bool_series(history, "Selected_Top3")
@@ -2269,11 +2424,12 @@ def main():
             group_detail,
             horizons,
             gates,
+            diagnostics,
         )
         st.download_button(
-            "下载R1完整研究结果",
+            "下载R2完整研究结果",
             data=export_bytes,
-            file_name="r1_trend_entry_audit_results.zip",
+            file_name="r2_w3_cross_section_audit_results.zip",
             mime="application/zip",
         )
 
