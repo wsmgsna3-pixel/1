@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-R11.1 中性R3 + 弱势R6实际选股、强势温和收缩Top1研究验证器。
+R12 中性R3与弱势R6保留为实际失败对照，R11强势Top1继续冻结研究，
+新增弱势市场“深跌结构优先、价格修复打破并列”的Top2研究验证器。
 
-R3与R6的原触发、资格和排名逐行冻结。实际组合仍只允许R3 Top2和R6 Top2；
-全部强势市场实际入选为0。
-
-R11只增加一条强势研究假设：原R9再启动结构按ATR3/ATR13从小到大排名，
-只观察第一名；第一名的比值必须固定落在0.70—0.90。参数不随回测结果调整，
-研究Top1记录W1—W8未来路径，但不进入实际收益或实盘候选。
+R3、R6与R11的触发、资格、原排名和实际组合逐行保持R11.1不变；R12不改变
+任何历史实际收益。R12只在弱势市场的R6-N6合格池中，先按既有
+Score_Pullback_15从低到高排序，再按Price_to_MA10_Ratio从高到低打破并列，
+只记录研究Top2的W1—W8未来路径。规则只使用信号周已知数据，不增加阈值，
+不允许研究标记进入实际入选或持股统计。
 """
 
 from __future__ import annotations
@@ -39,15 +39,15 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R11.1-TRANSACTIONAL-RESULT-STATE-MODERATE-ATR-TOP1"
-APP_TITLE = "R11.1中弱双分支与强势温和收缩Top1验证器"
-ENGINE_PATCH = "R11.1-TRANSACTIONAL-IMPORT-CONSISTENCY-REPAIR"
+APP_VERSION = "R12-CROSS-YEAR-WEAK-REPAIR-RANK-RESEARCH"
+APP_TITLE = "R12跨年度弱势修复排名验证器"
+ENGINE_PATCH = "R12-PULLBACK-THEN-PRICE-REPAIR-RESEARCH"
 
-CHECKPOINT_FILE = "r11_moderate_atr_top1_candidates.csv"
-SCAN_LEDGER_FILE = "r11_moderate_atr_top1_scanned_dates.csv"
-OPPORTUNITY_FILE = "r11_moderate_atr_top1_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r11_moderate_atr_top1_running_task.json"
-RESULT_STATE_GUARD_FILE = "r11_moderate_atr_top1_result_state.guard"
+CHECKPOINT_FILE = "r12_weak_repair_rank_candidates.csv"
+SCAN_LEDGER_FILE = "r12_weak_repair_rank_scanned_dates.csv"
+OPPORTUNITY_FILE = "r12_weak_repair_rank_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r12_weak_repair_rank_running_task.json"
+RESULT_STATE_GUARD_FILE = "r12_weak_repair_rank_result_state.guard"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -1652,8 +1652,8 @@ def _market_state_metrics(pool: pd.DataFrame):
     }
 
 
-def score_r11_candidates(pool_snapshots: pd.DataFrame):
-    """R3/R6允许实际入选；R11强势温和收缩Top1只研究，不实际交易。"""
+def score_r12_candidates(pool_snapshots: pd.DataFrame):
+    """R3/R6保持原实际基线；R11强势与R12弱势新排名均只研究。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
@@ -1716,6 +1716,7 @@ def score_r11_candidates(pool_snapshots: pd.DataFrame):
     candidates["Strong_Reacceleration_Rank"] = np.nan
     candidates["R11_Strong_Rank"] = np.nan
     candidates["Recovery_Rank"] = np.nan
+    candidates["R12_Recovery_Repair_Rank"] = np.nan
     for column in (
         "Recovery_Early_Return2W_20",
         "Recovery_Early_MA10_Distance_20",
@@ -1751,6 +1752,7 @@ def score_r11_candidates(pool_snapshots: pd.DataFrame):
     candidates["R9_Failure_Control_Top2"] = False
     candidates["R11_ATR_Band_Pass"] = False
     candidates["R11_Strong_Research_Top1"] = False
+    candidates["R12_Recovery_Repair_Top2"] = False
     r3_eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
     strong_eligible = candidates[_bool_series(candidates, "Strong_Eligible")].copy()
     reacceleration_eligible = candidates[
@@ -1886,6 +1888,22 @@ def score_r11_candidates(pool_snapshots: pd.DataFrame):
         rank_map = pd.Series(np.arange(1, len(ordered) + 1, dtype=int), index=ordered.index)
         candidates.loc[rank_map.index, "Recovery_Rank"] = rank_map.astype(float)
 
+        # R12只增加一个弱势研究排名，不改R6实际排名：优先保留R1既有
+        # Score_Pullback_15较低的深跌结构，同分时选择价格相对MA10修复更充分者。
+        # 两项均在信号周已知；不设新阈值，不读取未来收益，不允许递补扩容。
+        repair_ordered = recovery_eligible.sort_values(
+            ["Score_Pullback_15", "Price_to_MA10_Ratio", "ts_code"],
+            ascending=[True, False, True],
+            kind="mergesort",
+        )
+        repair_rank_map = pd.Series(
+            np.arange(1, len(repair_ordered) + 1, dtype=int),
+            index=repair_ordered.index,
+        )
+        candidates.loc[repair_rank_map.index, "R12_Recovery_Repair_Rank"] = (
+            repair_rank_map.astype(float)
+        )
+
     market_median = _safe_float(market_state.get("Market_13W_Median_pct"), 0.0)
     previous_market_13w = _safe_float(
         market_state.get("Previous_Market_13W_Median_pct"), 0.0
@@ -1978,6 +1996,14 @@ def score_r11_candidates(pool_snapshots: pd.DataFrame):
         market_regime == "强势"
     ) & pd.to_numeric(candidates["R11_Strong_Rank"], errors="coerce").eq(1) & _bool_series(
         candidates, "R11_ATR_Band_Pass"
+    )
+    candidates["R12_Recovery_Repair_Top2"] = (
+        (market_regime == "弱势")
+        & (recovery_eligible_count >= MIN_VALID_SELECTION_SIZE)
+        & _bool_series(candidates, "Recovery_Eligible")
+        & pd.to_numeric(
+            candidates["R12_Recovery_Repair_Rank"], errors="coerce"
+        ).le(TOP_N)
     )
     if selection_valid:
         selected = (
@@ -2457,6 +2483,18 @@ def build_major_winner_audit(
                         pd.DataFrame([candidate_row]), "R11_Strong_Research_Top1"
                     ).iloc[0]
                 ),
+                "R12_Recovery_Repair_Rank": (
+                    candidate_row.get("R12_Recovery_Repair_Rank")
+                    if candidate_row is not None
+                    else np.nan
+                ),
+                "R12_Recovery_Repair_Top2": bool(
+                    candidate_row is not None
+                    and _bool_series(
+                        pd.DataFrame([candidate_row]),
+                        "R12_Recovery_Repair_Top2",
+                    ).iloc[0]
+                ),
                 "Miss_Reason": miss_reason,
                 "Rank": candidate_row.get("Rank") if candidate_row is not None else np.nan,
                 "Strategy_Branch": (
@@ -2488,6 +2526,11 @@ def build_major_winner_audit(
                 "Return_1W_pct": pool_row.get("Return_1W_pct"),
                 "Return_13W_pct": pool_row.get("Return_13W_pct"),
                 "Drawdown_26W_pct": pool_row.get("Drawdown_26W_pct"),
+                "Score_Pullback_15": (
+                    candidate_row.get("Score_Pullback_15")
+                    if candidate_row is not None
+                    else np.nan
+                ),
                 "Price_to_MA10_Ratio": pool_row.get("Price_to_MA10_Ratio"),
                 "Return_2W_pct": pool_row.get("Return_2W_pct"),
                 "Weekly_SKDJ_K6": pool_row.get("Weekly_SKDJ_K6"),
@@ -2895,7 +2938,7 @@ def scan_one_date(
     if not pool_records:
         return pd.DataFrame(), pd.DataFrame(), 0, 0
     pool = pd.DataFrame(pool_records)
-    candidates, raw_count, eligible_count = score_r11_candidates(pool)
+    candidates, raw_count, eligible_count = score_r12_candidates(pool)
 
     if is_preview_mode:
         if not candidates.empty:
@@ -2941,7 +2984,7 @@ def scan_one_date(
 
 
 # -----------------------------------------------------------------------------
-# R11双实际分支与强势Top1研究报告
+# R12实际失败基线与双研究排名报告
 # -----------------------------------------------------------------------------
 def _bool_series(frame: pd.DataFrame, column: str):
     if column not in frame.columns:
@@ -3531,6 +3574,176 @@ def recovery_candidate_audit(history: pd.DataFrame):
     return pd.DataFrame(rows)
 
 
+def _r12_research_performance_row(label: str, group: pd.DataFrame):
+    returns = pd.to_numeric(
+        group.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    valid = group.loc[returns.index].copy() if len(returns) else group.iloc[0:0].copy()
+    without_best = (
+        returns.drop(index=returns.idxmax())
+        if len(returns) > 1
+        else pd.Series(dtype=float)
+    )
+    positive_total = returns[returns > 0.0].sum()
+    best_contribution = (
+        returns.max() / positive_total * 100.0
+        if len(returns) and positive_total > 0.0
+        else np.nan
+    )
+    return {
+        "R12弱势修复研究组": label,
+        "样本数": len(returns),
+        "信号周": valid["Signal_Date"].nunique() if len(returns) else 0,
+        "胜率%": (returns > 0.0).mean() * 100.0 if len(returns) else np.nan,
+        "中位收益%": returns.median() if len(returns) else np.nan,
+        "平均收益%": returns.mean() if len(returns) else np.nan,
+        "Profit_Factor": _profit_factor(returns),
+        "去最佳一只平均收益%": (
+            without_best.mean() if len(without_best) else np.nan
+        ),
+        "去最佳一只PF": _profit_factor(without_best),
+        "最佳一只占正利润%": best_contribution,
+    }
+
+
+def r12_recovery_repair_candidate_audit(history: pd.DataFrame):
+    """R12只判卷弱势R6合格池的新研究名次，不改R6原实际收益。"""
+    columns = [
+        "R12弱势修复研究组",
+        "样本数",
+        "信号周",
+        "胜率%",
+        "中位收益%",
+        "平均收益%",
+        "Profit_Factor",
+        "去最佳一只平均收益%",
+        "去最佳一只PF",
+        "最佳一只占正利润%",
+    ]
+    if history.empty or "R12_Recovery_Repair_Rank" not in history.columns:
+        return pd.DataFrame(columns=columns)
+    weak = history.get(
+        "Market_Regime", pd.Series("", index=history.index)
+    ).astype(str).eq("弱势")
+    base = history[weak & _bool_series(history, "Recovery_Eligible")].copy()
+    if base.empty:
+        return pd.DataFrame(columns=columns)
+    base["R12_Recovery_Repair_Rank"] = pd.to_numeric(
+        base.get("R12_Recovery_Repair_Rank"), errors="coerce"
+    )
+    complete = _bool_series(base, "Outcome_Complete") & _bool_series(
+        base, "Entry_Tradable"
+    )
+    evaluable = base[complete].copy()
+    research = _bool_series(evaluable, "R12_Recovery_Repair_Top2")
+    research_dates = set(
+        evaluable.loc[research, "Signal_Date"].astype(str).tolist()
+    )
+    same_week = evaluable["Signal_Date"].astype(str).isin(research_dates)
+    old_actual = (
+        _bool_series(evaluable, "Selected_Top2")
+        & evaluable.get(
+            "Strategy_Branch", pd.Series("", index=evaluable.index)
+        ).astype(str).eq("R6弱势首次转折-N6")
+    )
+    groups = [
+        (
+            "R12深跌结构优先、价格修复并列项Top2（只研究）",
+            evaluable[research],
+        ),
+        (
+            "R12研究Top1",
+            evaluable[
+                research & evaluable["R12_Recovery_Repair_Rank"].eq(1)
+            ],
+        ),
+        (
+            "R12研究Top2中的第二名",
+            evaluable[
+                research & evaluable["R12_Recovery_Repair_Rank"].eq(2)
+            ],
+        ),
+        ("R6原早期阶段排名Top2（实际基线）", evaluable[old_actual]),
+        (
+            "R12信号周其余弱势合格候选",
+            evaluable[same_week & ~research],
+        ),
+    ]
+    return pd.DataFrame(
+        [_r12_research_performance_row(label, group) for label, group in groups],
+        columns=columns,
+    )
+
+
+def _r12_top2_by_sort(
+    frame: pd.DataFrame,
+    columns: list[str],
+    ascending: list[bool],
+):
+    if frame.empty or any(column not in frame.columns for column in columns):
+        return frame.iloc[0:0].copy()
+    ordered = frame.copy()
+    for column in columns:
+        ordered[column] = pd.to_numeric(ordered[column], errors="coerce")
+    ordered["_code"] = ordered.get(
+        "ts_code", pd.Series("", index=ordered.index)
+    ).astype(str)
+    ordered = ordered.sort_values(
+        ["Signal_Date"] + columns + ["_code"],
+        ascending=[True] + ascending + [True],
+        na_position="last",
+        kind="mergesort",
+    )
+    return ordered.groupby("Signal_Date", sort=False).head(TOP_N)
+
+
+def r12_recovery_factor_comparison_audit(history: pd.DataFrame):
+    """固定比较四种预先声明的弱势排名，避免只展示胜出的R12规则。"""
+    if history.empty:
+        return pd.DataFrame()
+    weak = history.get(
+        "Market_Regime", pd.Series("", index=history.index)
+    ).astype(str).eq("弱势")
+    eligible = history[weak & _bool_series(history, "Recovery_Eligible")].copy()
+    if eligible.empty:
+        return pd.DataFrame()
+    counts = eligible.groupby("Signal_Date", sort=False).size()
+    valid_dates = set(counts[counts >= MIN_VALID_SELECTION_SIZE].index.astype(str))
+    eligible = eligible[
+        eligible["Signal_Date"].astype(str).isin(valid_dates)
+    ].copy()
+    old_rank = pd.to_numeric(eligible.get("Recovery_Rank"), errors="coerce")
+    groups = [
+        ("R6原五项越早越好排名", eligible[old_rank.le(TOP_N)]),
+        (
+            "R12深跌结构优先、价格修复打破并列",
+            _r12_top2_by_sort(
+                eligible,
+                ["Score_Pullback_15", "Price_to_MA10_Ratio"],
+                [True, False],
+            ),
+        ),
+        (
+            "仅深跌结构分从低到高",
+            _r12_top2_by_sort(eligible, ["Score_Pullback_15"], [True]),
+        ),
+        (
+            "仅价格相对MA10从高到低",
+            _r12_top2_by_sort(eligible, ["Price_to_MA10_Ratio"], [False]),
+        ),
+    ]
+    rows = []
+    for label, group in groups:
+        evaluable = group[
+            _bool_series(group, "Outcome_Complete")
+            & _bool_series(group, "Entry_Tradable")
+        ].copy()
+        row = _r12_research_performance_row(label, evaluable)
+        row["弱势排名方案"] = row.pop("R12弱势修复研究组")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def recovery_trigger_comparison_audit(history: pd.DataFrame):
     """同一批未来路径比较R6首次事件与R5旧宽触发，不改变任何入选结果。"""
     if history.empty:
@@ -3635,12 +3848,14 @@ def major_winner_coverage_summary(opportunities: pd.DataFrame):
         & _bool_series(frame, "Selection_Valid")
     ]
     selected = frame[_bool_series(frame, "Selected_Top2")]
+    r12_selected = frame[_bool_series(frame, "R12_Recovery_Repair_Top2")]
     missed = frame[frame["Detection_Status"].astype(str).eq("完全未发现")]
     groups = [
         (f"全部未来W3≥{MAJOR_WINNER_W3_PCT:.0f}%机会", frame),
         ("任一结构已发现", detected),
         ("当周分支合格", eligible),
         ("最终实际入选", selected),
+        ("R12弱势修复研究Top2命中", r12_selected),
         ("完全未发现", missed),
     ]
     rows = []
@@ -4289,6 +4504,156 @@ def recovery_research_gates(completed: pd.DataFrame):
     )
 
 
+def r12_recovery_repair_ranking_diagnostics(history: pd.DataFrame):
+    if history.empty or "R12_Recovery_Repair_Rank" not in history.columns:
+        return {}
+    weak = history.get(
+        "Market_Regime", pd.Series("", index=history.index)
+    ).astype(str).eq("弱势")
+    frame = history[
+        weak
+        & _bool_series(history, "Recovery_Eligible")
+        & _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+    ].copy()
+    frame["Rank"] = pd.to_numeric(
+        frame.get("R12_Recovery_Repair_Rank"), errors="coerce"
+    )
+    frame["Selected_Top2"] = _bool_series(
+        frame, "R12_Recovery_Repair_Top2"
+    )
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    frame = frame.dropna(subset=["Rank", PRIMARY_RETURN_COLUMN])
+    return ranking_diagnostics(frame)
+
+
+def r12_recovery_repair_gates(history: pd.DataFrame):
+    """R12独立验收；通过只代表值得继续样本外研究，不改变实际组合。"""
+    if history.empty:
+        selected = pd.DataFrame()
+    else:
+        selected = history[
+            _bool_series(history, "R12_Recovery_Repair_Top2")
+            & _bool_series(history, "Outcome_Complete")
+            & _bool_series(history, "Entry_Tradable")
+        ].copy()
+    returns = pd.to_numeric(
+        selected.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    selected = selected.loc[returns.index].copy() if len(returns) else selected.iloc[0:0]
+    weeks = selected["Signal_Date"].nunique() if len(returns) else 0
+    pf = _profit_factor(returns)
+    without_best = (
+        returns.drop(index=returns.idxmax())
+        if len(returns) > 1
+        else pd.Series(dtype=float)
+    )
+    without_best_pf = _profit_factor(without_best)
+    positive_total = returns[returns > 0.0].sum()
+    best_contribution = (
+        returns.max() / positive_total * 100.0
+        if len(returns) and positive_total > 0.0
+        else np.nan
+    )
+    diagnostics = r12_recovery_repair_ranking_diagnostics(history)
+    first_median = _safe_float(diagnostics.get("前半段实际入选中位收益%"))
+    second_median = _safe_float(diagnostics.get("后半段实际入选中位收益%"))
+    paired_beat = _safe_float(
+        diagnostics.get("实际入选逐周平均收益战胜未入选比例%")
+    )
+    selected_median = _safe_float(diagnostics.get("实际入选中位收益%"))
+    rest_median = _safe_float(diagnostics.get("未入选候选中位收益%"))
+    old_actual = history[
+        _bool_series(history, "Selected_Top2")
+        & _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & history.get(
+            "Strategy_Branch", pd.Series("", index=history.index)
+        ).astype(str).eq("R6弱势首次转折-N6")
+    ].copy() if not history.empty else pd.DataFrame()
+    old_returns = pd.to_numeric(
+        old_actual.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    old_median = old_returns.median() if len(old_returns) else np.nan
+    gates = [
+        ("R12弱势研究至少6个独立信号周", weeks >= 6, f"当前{weeks}周"),
+        ("R12弱势研究至少12笔完整样本", len(returns) >= 12, f"当前{len(returns)}笔"),
+        (
+            "R12每个信号周严格只有Top2",
+            len(returns) == weeks * TOP_N,
+            f"当前{len(returns)}笔/{weeks}周",
+        ),
+        (
+            "R12 W3胜率至少50%",
+            len(returns) > 0 and (returns > 0.0).mean() >= 0.50,
+            f"当前{((returns > 0.0).mean() * 100.0 if len(returns) else np.nan):.1f}%",
+        ),
+        (
+            "R12 W3中位收益大于0",
+            len(returns) > 0 and returns.median() > 0.0,
+            f"当前{(returns.median() if len(returns) else np.nan):.2f}%",
+        ),
+        (
+            "R12 W3平均收益大于0",
+            len(returns) > 0 and returns.mean() > 0.0,
+            f"当前{(returns.mean() if len(returns) else np.nan):.2f}%",
+        ),
+        ("R12 Profit Factor至少1.2", pd.notna(pf) and pf >= 1.2, f"当前{pf:.2f}"),
+        (
+            "R12去最佳一只后平均收益大于0",
+            len(without_best) > 0 and without_best.mean() > 0.0,
+            f"当前{(without_best.mean() if len(without_best) else np.nan):.2f}%",
+        ),
+        (
+            "R12去最佳一只后PF至少1.2",
+            pd.notna(without_best_pf) and without_best_pf >= 1.2,
+            f"当前{without_best_pf:.2f}",
+        ),
+        (
+            "R12最佳一只占正利润不超过40%",
+            math.isfinite(best_contribution) and best_contribution <= 40.0,
+            f"当前{best_contribution:.1f}%",
+        ),
+        (
+            "R12前后半段中位收益均为正",
+            math.isfinite(first_median)
+            and math.isfinite(second_median)
+            and first_median > 0.0
+            and second_median > 0.0,
+            f"前{first_median:.2f}% / 后{second_median:.2f}%",
+        ),
+        (
+            "R12逐周战胜其余弱势合格候选至少55%",
+            math.isfinite(paired_beat) and paired_beat >= 55.0,
+            f"当前{paired_beat:.1f}%",
+        ),
+        (
+            "R12中位收益优于其余弱势合格候选",
+            math.isfinite(selected_median)
+            and math.isfinite(rest_median)
+            and selected_median > rest_median,
+            f"差{(selected_median - rest_median):.2f}个百分点",
+        ),
+        (
+            "R12中位收益优于R6原排名",
+            len(returns) > 0
+            and math.isfinite(old_median)
+            and returns.median() > old_median,
+            f"R12{(returns.median() if len(returns) else np.nan):.2f}% / R6{old_median:.2f}%",
+        ),
+    ]
+    return pd.DataFrame(
+        [
+            {"R12验收项目": name, "结果": "通过" if passed else "未通过", "当前值": value}
+            for name, passed, value in gates
+        ]
+    )
+
+
 def market_data_gap_audit(ledger: pd.DataFrame):
     columns = [
         "Signal_Date",
@@ -4478,8 +4843,8 @@ def repair_inconsistent_completed_ledger(config_id: str):
     return bad_dates
 
 
-def _apply_r11_selection_policy(frame: pd.DataFrame):
-    """把R9—R11候选转换为R11：R3/R6实盘，强势Top1只研究。"""
+def _apply_r12_selection_policy(frame: pd.DataFrame):
+    """兼容导入R9—R12：实际组合不变，重算R11与R12研究标记。"""
     result = frame.copy()
     market_regime = result.get(
         "Market_Regime", pd.Series("", index=result.index)
@@ -4544,6 +4909,56 @@ def _apply_r11_selection_policy(frame: pd.DataFrame):
         & _bool_series(result, "R11_ATR_Band_Pass")
     )
 
+    # R12弱势研究排名必须从完整当周R6合格池重算。主键是既有深跌结构分，
+    # 价格/MA10只负责打破同分；Top2研究标记不改变R6原实际入选。
+    weak_market = market_regime.eq("弱势")
+    recovery_eligible = weak_market & _bool_series(result, "Recovery_Eligible")
+    result["R12_Recovery_Repair_Rank"] = np.nan
+    repair_rows = result.loc[recovery_eligible].copy()
+    if not repair_rows.empty:
+        repair_rows["_pullback"] = pd.to_numeric(
+            repair_rows.get(
+                "Score_Pullback_15", pd.Series(np.nan, index=repair_rows.index)
+            ),
+            errors="coerce",
+        )
+        repair_rows["_price_repair"] = pd.to_numeric(
+            repair_rows.get(
+                "Price_to_MA10_Ratio", pd.Series(np.nan, index=repair_rows.index)
+            ),
+            errors="coerce",
+        )
+        repair_rows["_code"] = repair_rows.get(
+            "ts_code", pd.Series("", index=repair_rows.index)
+        ).astype(str)
+        repair_rows = repair_rows.sort_values(
+            ["Signal_Date", "_pullback", "_price_repair", "_code"],
+            ascending=[True, True, False, True],
+            na_position="last",
+            kind="mergesort",
+        )
+        repair_rows["_rank"] = (
+            repair_rows.groupby("Signal_Date", sort=False).cumcount() + 1
+        )
+        result.loc[
+            repair_rows.index, "R12_Recovery_Repair_Rank"
+        ] = repair_rows["_rank"]
+    recovery_count_by_week = (
+        result.loc[recovery_eligible]
+        .groupby("Signal_Date", sort=False)
+        .size()
+    )
+    enough_recovery = result["Signal_Date"].map(recovery_count_by_week).fillna(0).ge(
+        MIN_VALID_SELECTION_SIZE
+    )
+    result["R12_Recovery_Repair_Top2"] = (
+        recovery_eligible
+        & enough_recovery
+        & pd.to_numeric(
+            result["R12_Recovery_Repair_Rank"], errors="coerce"
+        ).le(TOP_N)
+    )
+
     if "Selected_Top2" not in result.columns:
         result["Selected_Top2"] = False
     if "Selection_Valid" not in result.columns:
@@ -4568,7 +4983,7 @@ def _apply_r11_selection_policy(frame: pd.DataFrame):
     return result
 
 
-def import_r11_results_zip(zip_bytes: bytes, config_id: str):
+def import_r12_results_zip(zip_bytes: bytes, config_id: str):
     """先完整验证、后事务提交；失败时不允许留下候选或账本半成品。"""
     if not zip_bytes:
         raise ValueError("结果包为空。")
@@ -4589,11 +5004,12 @@ def import_r11_results_zip(zip_bytes: bytes, config_id: str):
                 name.startswith("01_all_r9")
                 or name.startswith("01_all_r10")
                 or name.startswith("01_all_r11")
+                or name.startswith("01_all_r12")
             )
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R9/R10/R11候选明细。")
+            raise ValueError("结果包中未找到唯一的R9/R10/R11/R12候选明细。")
         candidate_info = infos[candidate_names[0]]
         if candidate_info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -4610,7 +5026,7 @@ def import_r11_results_zip(zip_bytes: bytes, config_id: str):
             raise ValueError("候选明细为空。")
         if candidates.duplicated(["Signal_Date", "ts_code"]).any():
             raise ValueError("候选明细存在重复的日期与股票代码。")
-        candidates = _apply_r11_selection_policy(candidates)
+        candidates = _apply_r12_selection_policy(candidates)
         candidates["Config_ID"] = str(config_id)
 
         opportunity_name = next(
@@ -4641,28 +5057,33 @@ def import_r11_results_zip(zip_bytes: bytes, config_id: str):
             ).copy()
             if opportunities.duplicated(["Signal_Date", "ts_code"]).any():
                 raise ValueError("大牛股机会明细存在重复的日期与股票代码。")
-            opportunities = _apply_r11_selection_policy(opportunities)
-            # 机会表只是全池子集，R11名次必须从完整候选表回填。
-            r11_map_columns = [
+            opportunities = _apply_r12_selection_policy(opportunities)
+            # 机会表只是全池子集，R11/R12名次必须从完整候选表回填。
+            research_map_columns = [
                 "Signal_Date",
                 "ts_code",
                 "R11_Strong_Rank",
                 "R11_ATR_Band_Pass",
                 "R11_Strong_Research_Top1",
+                "R12_Recovery_Repair_Rank",
+                "R12_Recovery_Repair_Top2",
             ]
-            r11_map = candidates[r11_map_columns].drop_duplicates(
+            research_map = candidates[research_map_columns].drop_duplicates(
                 ["Signal_Date", "ts_code"], keep="last"
             )
             mapped = opportunities[["Signal_Date", "ts_code"]].merge(
-                r11_map,
+                research_map,
                 on=["Signal_Date", "ts_code"],
                 how="left",
                 sort=False,
             )
-            for column in r11_map_columns[2:]:
+            for column in research_map_columns[2:]:
                 opportunities[column] = mapped[column].to_numpy()
             opportunities["R11_Strong_Research_Top1"] = _bool_series(
                 opportunities, "R11_Strong_Research_Top1"
+            )
+            opportunities["R12_Recovery_Repair_Top2"] = _bool_series(
+                opportunities, "R12_Recovery_Repair_Top2"
             )
             strong_opportunities = opportunities.get(
                 "Market_Regime", pd.Series("", index=opportunities.index)
@@ -4921,10 +5342,14 @@ def build_export_zip(
     r11_gates: pd.DataFrame,
     r11_diagnostics: dict[str, Any],
     state_consistency_audit: pd.DataFrame,
+    r12_audit: pd.DataFrame,
+    r12_gates: pd.DataFrame,
+    r12_diagnostics: dict[str, Any],
+    r12_factor_comparison: pd.DataFrame,
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r11_1_moderate_atr_top1_candidates.csv": history,
+        "01_all_r12_weak_repair_rank_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -4962,6 +5387,12 @@ def build_export_zip(
             [{"指标": key, "数值": value} for key, value in r11_diagnostics.items()]
         ),
         "32_result_state_consistency_audit.csv": state_consistency_audit,
+        "33_r12_weak_repair_candidate_audit.csv": r12_audit,
+        "34_r12_weak_repair_acceptance_gates.csv": r12_gates,
+        "35_r12_weak_repair_ranking_diagnostics.csv": pd.DataFrame(
+            [{"指标": key, "数值": value} for key, value in r12_diagnostics.items()]
+        ),
+        "36_r12_weak_repair_factor_comparison.csv": r12_factor_comparison,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -4986,14 +5417,14 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R11.1的实际交易仍只使用冻结的R3中性Top2和R6弱势Top2；"
-        "强势市场的温和ATR收缩Top1只做研究，不进入组合。"
+        "R12保持R11.1实际组合不变：R3中性Top2与R6弱势Top2仅作历史基线；"
+        "R11强势Top1和R12弱势修复Top2全部只研究，不进入组合。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R11.1仍不能直接用于实盘：强势Top1必须通过旧时段和新时段独立验证。"
+        "R12是跨年度诊断版本，不是实盘版本；R3、R6已经在旧年度出现结构性失败。"
     )
-    with st.expander("查看R11.1交易与研究边界"):
+    with st.expander("查看R12交易与研究边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
@@ -5001,13 +5432,15 @@ def main():
 - **R11统一强势事件**：沿用R9的“整理后首次再启动”触发和风险边界，不叠加新引擎。
 - **R11排名**：在当周合格股中只按ATR3/ATR13从小到大排名，股票代码仅用于并列时确定顺序。
 - **R11固定接受带**：只检查排名第一的股票；ATR3/ATR13位于0.70至0.90才记为研究信号。第一名不合格时不用第二名补位。
+- **R12弱势研究排名**：只在R6-N6合格池中，先按既有Score_Pullback_15从低到高，再按价格/MA10从高到低打破并列，观察Top2。
+- **R12不增加硬门**：没有新的阈值、市场门或候选数量扩容；新名次不覆盖R6原名次。
 - **R7/R9对照**：旧触发和旧排名仅保留在报告中用于比较，不下单、不影响R11。
 - **指标口径**：SKDJ固定N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
 - **删除硬门**：不再要求价格达到MA10的75%，不再用1周中位涨幅和55%上涨家数整周归零；市场只做分层审计。
 - **实际排名**：两周涨幅、价格/MA10、K6、8周相对强度、MACD冲量五项均按越早越优等权；R5旧100分只保留对照。
 - **防追高**：单周涨幅超过25%或收盘距离本周低点超过40%时只进入过热观察，不参与排名。
 - **实际组合**：中性期只运行R3 Top2；弱势期只运行R6-N6 Top2；所有强势周持有现金。
-- **研究隔离**：R11强势Top1、R7与R9对照均使用独立标记，永远不能进入实际收益或持股统计。
+- **研究隔离**：R11强势Top1、R12弱势修复Top2、R7与R9对照均使用独立标记，永远不能进入实际收益或持股统计。
 - **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
             """
@@ -5019,11 +5452,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R11.1强势研究验证", "最新选股预览"],
+            ["历史R12跨年度研究验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R11.1强势研究验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R12跨年度研究验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -5037,7 +5470,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R11实际R3/R6与强势研究样本的W1—W8固定周收益都会扣除该成本。",
+            help="R3/R6实际基线、R11与R12研究样本的W1—W8固定周收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -5049,9 +5482,9 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R11.1历史结果")
+        clear_history_clicked = st.button("清除R12历史结果")
         imported_results = st.file_uploader(
-            "导入已下载的R9/R10/R11结果包",
+            "导入已下载的R9/R10/R11/R12结果包",
             type=["zip"],
             help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
         )
@@ -5063,7 +5496,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R11.1强势研究验证":
+    if start_input > end_input and mode == "历史R12跨年度研究验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -5083,14 +5516,14 @@ def main():
             ):
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
-        st.session_state.pop("r11_preview", None)
-        st.success("R11.1历史结果和断点任务已清除。")
+        st.session_state.pop("r12_preview", None)
+        st.success("R12历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     if import_results_clicked and imported_results is not None:
         try:
-            import_stats = import_r11_results_zip(
+            import_stats = import_r12_results_zip(
                 imported_results.getvalue(), config_id
             )
             inferred_note = (
@@ -5101,14 +5534,14 @@ def main():
             st.success(
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个已知候选周"
-                f"{inferred_note}。可直接查看R11.1研究报告，无需重新下载行情。"
+                f"{inferred_note}。R11与R12研究名次已重算，无需重新下载行情。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
-    if "r11_worker_id" not in st.session_state:
-        st.session_state["r11_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r11_worker_id"])
+    if "r12_worker_id" not in st.session_state:
+        st.session_state["r12_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r12_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -5132,7 +5565,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R11.1强势研究验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R12跨年度研究验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -5289,7 +5722,7 @@ def main():
 
                     loaded_date_set = set(loaded_dates)
                     batch_gap_dates = sorted(set(failed_dates))
-                    progress = st.progress(0, text="开始扫描R11双分支与强势Top1研究候选……")
+                    progress = st.progress(0, text="开始扫描R12实际基线与双研究排名候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -5373,7 +5806,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r11_preview"] = candidates
+                            st.session_state["r12_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -5419,7 +5852,7 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：R11结构与观察候选{raw_count}只，"
+                                f"{signal_date}：R12结构与研究候选{raw_count}只，"
                                 f"当前分支合格{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -5439,7 +5872,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R11.1强势研究扫描完成。")
+                            st.success("历史R12跨年度研究扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -5466,12 +5899,12 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r11_preview")
+    preview = st.session_state.get("r12_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R11结构或研究观察候选。")
+            st.info("最新交易日没有R12结构或研究观察候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -5530,6 +5963,33 @@ def main():
                 st.dataframe(
                     selected_preview[[column for column in preview_columns if column in selected_preview.columns]],
                     width="stretch",
+                )
+            r12_preview = preview[
+                _bool_series(preview, "R12_Recovery_Repair_Top2")
+            ].copy()
+            if not r12_preview.empty:
+                st.caption(
+                    "以下是R12弱势深跌结构+价格修复Top2，只作研究对照，"
+                    "不属于实际买入名单。"
+                )
+                r12_columns = [
+                    "Signal_Date",
+                    "R12_Recovery_Repair_Rank",
+                    "name",
+                    "ts_code",
+                    "Industry",
+                    "Score_Pullback_15",
+                    "Price_to_MA10_Ratio",
+                    "Weekly_SKDJ_K6",
+                    "MACD_Impulse_Pct",
+                    "R12_Recovery_Repair_Top2",
+                ]
+                st.dataframe(
+                    r12_preview[
+                        [column for column in r12_columns if column in r12_preview.columns]
+                    ],
+                    width="stretch",
+                    hide_index=True,
                 )
             with st.expander("查看全部实际候选、研究观察及未入选原因"):
                 st.dataframe(preview, width="stretch")
@@ -5608,7 +6068,7 @@ def main():
             st.error(
                 f"发现{len(state_consistency_rows)}周账本与候选明细不一致。"
                 "当前结果禁止判定策略优劣，也不提供正式下载。"
-                "点击“启动历史R11.1强势研究验证”后，程序会只补扫这些日期。"
+                "点击“启动历史R12跨年度研究验证”后，程序会只补扫这些日期。"
             )
             st.dataframe(
                 state_consistency_rows, width="stretch", hide_index=True
@@ -5667,11 +6127,16 @@ def main():
         opportunity_summary = major_winner_coverage_summary(opportunities)
         trigger_comparison = recovery_trigger_comparison_audit(history)
         market_context_audit = recovery_market_context_audit(history)
+        r12_audit = r12_recovery_repair_candidate_audit(history)
+        r12_diagnostics = r12_recovery_repair_ranking_diagnostics(history)
+        r12_gates = r12_recovery_repair_gates(history)
+        r12_factor_comparison = r12_recovery_factor_comparison_audit(history)
 
         st.markdown("---")
-        st.header("R11.1中弱双分支与强势温和收缩Top1验证报告")
+        st.header("R12跨年度弱势修复排名验证报告")
         st.caption(
-            "主报告只统计R3/R6实际交易。R11强势Top1、R7与R9对照均不进入组合；"
+            "主报告仍只统计R3/R6原实际基线。R11强势Top1、R12弱势修复Top2、"
+            "R7与R9对照均不进入组合；"
             "W3为主验收周期，W4—W8只统计已经走满相应天数的记录。"
         )
 
@@ -5718,12 +6183,18 @@ def main():
             with st.expander("查看行情缺失与跳过明细", expanded=True):
                 st.dataframe(data_gap_rows, width="stretch", hide_index=True)
 
-        st.subheader("R11实际组合总体验收（仅R3/R6）")
+        st.subheader("R11.1原实际组合总体验收（仅R3/R6基线）")
         st.dataframe(gates, width="stretch", hide_index=True)
         st.subheader("R3中性分支独立验收")
         st.dataframe(neutral_gates, width="stretch", hide_index=True)
         st.subheader("R6弱势首次转折分支独立验收")
         st.dataframe(recovery_gates, width="stretch", hide_index=True)
+        st.subheader("R12弱势深跌结构+价格修复排名验收（只研究）")
+        st.caption(
+            "固定顺序：Score_Pullback_15从低到高；同分时Price_to_MA10_Ratio"
+            "从高到低。没有阈值、没有第二套引擎，也不替换R6原实际名次。"
+        )
+        st.dataframe(r12_gates, width="stretch", hide_index=True)
         st.subheader("R11强势温和ATR收缩Top1验收（只研究）")
         st.caption(
             "固定顺序是：先按ATR3/ATR13排名，再检查第一名是否位于0.70—0.90；"
@@ -5750,7 +6221,7 @@ def main():
                 "R3/R6实际分支与总体门槛均通过；强势仍保持空仓，可进入跨年度样本外验证。"
             )
         else:
-            st.error("R3、R6或总体门槛尚未全部通过，R11当前不能进入实盘。")
+            st.error("R3、R6或总体门槛尚未全部通过；R12所有研究信号仍禁止进入实盘。")
 
         st.subheader("R3与R6实际分支分别表现")
         st.dataframe(_format_report_frame(branches), width="stretch", hide_index=True)
@@ -5814,6 +6285,27 @@ def main():
 
         st.subheader("R6首次转折与过热观察审计")
         st.dataframe(_format_report_frame(recovery_audit), width="stretch", hide_index=True)
+
+        st.subheader("R12弱势修复Top2与R6原排名同场对照")
+        st.dataframe(_format_report_frame(r12_audit), width="stretch", hide_index=True)
+
+        st.subheader("R12弱势排名是否真的有效")
+        if r12_diagnostics:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"指标": key, "数值": value} for key, value in r12_diagnostics.items()]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.subheader("R12预先声明的弱势排名方案对照")
+        st.caption("同时展示失败基线和两个单因子对照，避免只报告胜出的组合顺序。")
+        st.dataframe(
+            _format_report_frame(r12_factor_comparison),
+            width="stretch",
+            hide_index=True,
+        )
 
         st.subheader("R5旧触发与R6首次事件同场对照")
         st.dataframe(
@@ -5949,11 +6441,15 @@ def main():
             r11_gates,
             r11_diagnostics,
             state_consistency_rows,
+            r12_audit,
+            r12_gates,
+            r12_diagnostics,
+            r12_factor_comparison,
         )
         st.download_button(
-            "下载R11.1强势温和收缩Top1完整研究结果",
+            "下载R12跨年度弱势修复排名完整研究结果",
             data=export_bytes,
-            file_name="r11_1_transactional_result_state_w3_audit_results.zip",
+            file_name="r12_cross_year_weak_repair_rank_w3_audit_results.zip",
             mime="application/zip",
         )
 
