@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-R10 中性R3 + 弱势R6实际选股、强势市场全部空仓验证器。
+R11 中性R3 + 弱势R6实际选股、强势温和收缩Top1研究验证器。
 
-R3、R6、R7与R9的原触发、资格和排名逐行冻结。R10不再增加强势方法：
-中性市场只允许R3 Top2，弱势市场只允许R6 Top2；全部强势市场实际入选为0。
+R3与R6的原触发、资格和排名逐行冻结。实际组合仍只允许R3 Top2和R6 Top2；
+全部强势市场实际入选为0。
 
-R7早期强势回调Top2继续作为不交易的研究观察；R9再启动Top2继续作为失败
-对照。两者都记录W1—W8未来路径，但不进入实际收益、总体排名或实盘候选。
+R11只增加一条强势研究假设：原R9再启动结构按ATR3/ATR13从小到大排名，
+只观察第一名；第一名的比值必须固定落在0.70—0.90。参数不随回测结果调整，
+研究Top1记录W1—W8未来路径，但不进入实际收益或实盘候选。
 """
 
 from __future__ import annotations
@@ -38,14 +39,14 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R10.0-TWO-LIVE-BRANCH-STRONG-CASH-OBSERVATION-W3-AUDIT"
-APP_TITLE = "R10中弱双分支实际选股与强势空仓验证器"
-ENGINE_PATCH = "R10.0-R3-R6-LIVE-R7-R9-OBSERVE-ONLY-DATA-STABLE"
+APP_VERSION = "R11.0-MODERATE-ATR-RESTART-TOP1-RESEARCH-W3-AUDIT"
+APP_TITLE = "R11中弱双分支与强势温和收缩Top1验证器"
+ENGINE_PATCH = "R11.0-R3-R6-LIVE-STRONG-MODERATE-ATR-TOP1-RESEARCH-ONLY"
 
-CHECKPOINT_FILE = "r10_two_live_branch_candidates.csv"
-SCAN_LEDGER_FILE = "r10_two_live_branch_scanned_dates.csv"
-OPPORTUNITY_FILE = "r10_two_live_branch_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r10_two_live_branch_running_task.json"
+CHECKPOINT_FILE = "r11_moderate_atr_top1_candidates.csv"
+SCAN_LEDGER_FILE = "r11_moderate_atr_top1_scanned_dates.csv"
+OPPORTUNITY_FILE = "r11_moderate_atr_top1_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r11_moderate_atr_top1_running_task.json"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -73,6 +74,8 @@ R9_MAX_POSITIVE_BREADTH = 0.90
 R9_MIN_VALID_SELECTION_SIZE = 1
 R9_SECOND_MIN_SCORE = 60.0
 R9_SECOND_MAX_DISTANCE_MA20_PCT = 18.0
+R11_ATR_CONTRACTION_MIN = 0.70
+R11_ATR_CONTRACTION_MAX = 0.90
 REACCEL_MIN_PREVIOUS_RETURN_PCT = -8.0
 REACCEL_MAX_PREVIOUS_RETURN_PCT = 5.0
 REACCEL_MAX_WEEKLY_RETURN_PCT = 12.0
@@ -1570,8 +1573,8 @@ def _market_state_metrics(pool: pd.DataFrame):
     }
 
 
-def score_r10_candidates(pool_snapshots: pd.DataFrame):
-    """R3/R6允许实际入选；R7/R9只观察，强势市场全部空仓。"""
+def score_r11_candidates(pool_snapshots: pd.DataFrame):
+    """R3/R6允许实际入选；R11强势温和收缩Top1只研究，不实际交易。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
@@ -1632,6 +1635,7 @@ def score_r10_candidates(pool_snapshots: pd.DataFrame):
     candidates["R3_Rank"] = np.nan
     candidates["Strong_Rank"] = np.nan
     candidates["Strong_Reacceleration_Rank"] = np.nan
+    candidates["R11_Strong_Rank"] = np.nan
     candidates["Recovery_Rank"] = np.nan
     for column in (
         "Recovery_Early_Return2W_20",
@@ -1666,6 +1670,8 @@ def score_r10_candidates(pool_snapshots: pd.DataFrame):
     candidates["R9_Selection_Qualified"] = False
     candidates["R7_Research_Top2"] = False
     candidates["R9_Failure_Control_Top2"] = False
+    candidates["R11_ATR_Band_Pass"] = False
+    candidates["R11_Strong_Research_Top1"] = False
     r3_eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
     strong_eligible = candidates[_bool_series(candidates, "Strong_Eligible")].copy()
     reacceleration_eligible = candidates[
@@ -1761,6 +1767,21 @@ def score_r10_candidates(pool_snapshots: pd.DataFrame):
         candidates.loc[
             r9_rank.eq(1) | second_qualified, "R9_Selection_Qualified"
         ] = True
+        # R11只使用一个预先冻结的强势排名：ATR3/ATR13由小到大，代码仅作
+        # 稳定并列项。先排全体合格候选，再审查第一名是否落在0.70—0.90；
+        # 第一名越界时不允许用第二名递补。
+        r11_ordered = reacceleration_eligible.sort_values(
+            ["ATR_Contraction", "ts_code"],
+            ascending=[True, True],
+            kind="mergesort",
+        )
+        r11_rank_map = pd.Series(
+            np.arange(1, len(r11_ordered) + 1, dtype=int),
+            index=r11_ordered.index,
+        )
+        candidates.loc[r11_rank_map.index, "R11_Strong_Rank"] = (
+            r11_rank_map.astype(float)
+        )
     if recovery_eligible_count:
         early_scored = _score_recovery_early_stage(recovery_eligible)
         early_columns = [
@@ -1832,26 +1853,13 @@ def score_r10_candidates(pool_snapshots: pd.DataFrame):
     strong_market_context = str(market_state.get("Strong_Market_Context", ""))
     strong_market_stage = str(market_state.get("Strong_Market_Stage", ""))
     if market_regime == "强势":
-        if strong_reset_context_pass:
-            active_eligible_count = strong_eligible_count
-            candidates["Rank"] = candidates["Strong_Rank"]
-            candidates["Entry_Eligible"] = _bool_series(candidates, "Strong_Eligible")
-            active_branch = "R7强势抗跌观察"
-            block_reason = "R7样本不足，R10强势市场强制空仓"
-        elif strong_continuation_context_pass:
-            active_eligible_count = reacceleration_eligible_count
-            candidates["Rank"] = candidates["Strong_Reacceleration_Rank"]
-            candidates["Entry_Eligible"] = _bool_series(
-                candidates, "Strong_Reacceleration_Eligible"
-            )
-            active_branch = "R9失败对照观察"
-            block_reason = "R9样本外失败，R10强势市场强制空仓"
-        else:
-            active_eligible_count = strong_eligible_count
-            candidates["Rank"] = candidates["Strong_Rank"]
-            candidates["Entry_Eligible"] = _bool_series(candidates, "Strong_Eligible")
-            active_branch = "强势空仓观察"
-            block_reason = f"{strong_market_stage}；R10全部强势市场强制空仓"
+        active_eligible_count = reacceleration_eligible_count
+        candidates["Rank"] = candidates["R11_Strong_Rank"]
+        candidates["Entry_Eligible"] = _bool_series(
+            candidates, "Strong_Reacceleration_Eligible"
+        )
+        active_branch = "R11强势温和收缩Top1观察"
+        block_reason = "R11仍为研究验证，强势市场实际强制空仓"
     elif market_regime == "中性":
         active_branch = "R3中性趋势"
         active_eligible_count = r3_eligible_count
@@ -1880,6 +1888,17 @@ def score_r10_candidates(pool_snapshots: pd.DataFrame):
         strong_continuation_context_pass
         & _bool_series(candidates, "Strong_Reacceleration_Eligible")
         & _bool_series(candidates, "R9_Selection_Qualified")
+    )
+    r11_atr = pd.to_numeric(candidates["ATR_Contraction"], errors="coerce")
+    candidates["R11_ATR_Band_Pass"] = r11_atr.between(
+        R11_ATR_CONTRACTION_MIN,
+        R11_ATR_CONTRACTION_MAX,
+        inclusive="both",
+    )
+    candidates["R11_Strong_Research_Top1"] = (
+        market_regime == "强势"
+    ) & pd.to_numeric(candidates["R11_Strong_Rank"], errors="coerce").eq(1) & _bool_series(
+        candidates, "R11_ATR_Band_Pass"
     )
     if selection_valid:
         selected = (
@@ -2254,13 +2273,7 @@ def build_major_winner_audit(
     strong_market_context = str(market_state.get("Strong_Market_Context", ""))
     strong_market_stage = str(market_state.get("Strong_Market_Stage", ""))
     strategy_branch = {
-        "强势": (
-            "R7强势抗跌观察"
-            if strong_reset_context_pass
-            else "R9失败对照观察"
-            if strong_continuation_context_pass
-            else "强势空仓观察"
-        ),
+        "强势": "R11强势温和收缩Top1观察",
         "弱势": "R6弱势首次转折-N6",
         "中性": "R3中性趋势",
     }[market_regime]
@@ -2329,7 +2342,7 @@ def build_major_winner_audit(
                 miss_reason = (
                     "R9第二名未通过分数或MA20距离独立资格"
                     if is_r9_second
-                    else "R10强势市场强制空仓或排名未进入Top2"
+                    else "R11强势只研究Top1，实际组合强制空仓"
                 )
             elif selected:
                 miss_reason = "已入选"
@@ -2359,6 +2372,12 @@ def build_major_winner_audit(
                 "Recovery_Structure_Trigger": recovery_trigger,
                 "Recovery_Overheated": overheated,
                 "R5_Baseline_Recovery_Structure_Trigger": r5_baseline_trigger,
+                "R11_Strong_Research_Top1": bool(
+                    candidate_row is not None
+                    and _bool_series(
+                        pd.DataFrame([candidate_row]), "R11_Strong_Research_Top1"
+                    ).iloc[0]
+                ),
                 "Miss_Reason": miss_reason,
                 "Rank": candidate_row.get("Rank") if candidate_row is not None else np.nan,
                 "Strategy_Branch": (
@@ -2791,7 +2810,7 @@ def scan_one_date(
     if not pool_records:
         return pd.DataFrame(), pd.DataFrame(), 0, 0
     pool = pd.DataFrame(pool_records)
-    candidates, raw_count, eligible_count = score_r10_candidates(pool)
+    candidates, raw_count, eligible_count = score_r11_candidates(pool)
 
     if is_preview_mode:
         if not candidates.empty:
@@ -2837,7 +2856,7 @@ def scan_one_date(
 
 
 # -----------------------------------------------------------------------------
-# R10双实际分支与强势研究对照报告
+# R11双实际分支与强势Top1研究报告
 # -----------------------------------------------------------------------------
 def _bool_series(frame: pd.DataFrame, column: str):
     if column not in frame.columns:
@@ -3284,6 +3303,65 @@ def reexpansion_comparison_audit(history: pd.DataFrame):
     return pd.DataFrame(rows)
 
 
+def r11_strong_candidate_audit(history: pd.DataFrame):
+    """R11温和ATR收缩Top1独立判卷；全部样本均为研究观察。"""
+    if history.empty or "R11_Strong_Rank" not in history.columns:
+        return pd.DataFrame()
+    frame = history[
+        _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & history.get("Market_Regime", pd.Series("", index=history.index))
+        .astype(str)
+        .eq("强势")
+        & _bool_series(history, "Strong_Reacceleration_Eligible")
+    ].copy()
+    frame["R11_Strong_Rank"] = pd.to_numeric(
+        frame.get("R11_Strong_Rank"), errors="coerce"
+    )
+    frame["ATR_Contraction"] = pd.to_numeric(
+        frame.get("ATR_Contraction"), errors="coerce"
+    )
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    rank1 = frame["R11_Strong_Rank"].eq(1)
+    research = _bool_series(frame, "R11_Strong_Research_Top1")
+    selected_dates = set(frame.loc[research, "Signal_Date"].astype(str))
+    same_week_rank2 = (
+        frame["R11_Strong_Rank"].eq(2)
+        & frame["Signal_Date"].astype(str).isin(selected_dates)
+    )
+    groups = [
+        ("R11温和收缩研究Top1（不交易）", research),
+        (
+            f"Top1收缩过度（ATR比<{R11_ATR_CONTRACTION_MIN:.2f}）",
+            rank1 & frame["ATR_Contraction"].lt(R11_ATR_CONTRACTION_MIN),
+        ),
+        (
+            f"Top1收缩不足（ATR比>{R11_ATR_CONTRACTION_MAX:.2f}）",
+            rank1 & frame["ATR_Contraction"].gt(R11_ATR_CONTRACTION_MAX),
+        ),
+        ("研究信号周同池第二名", same_week_rank2),
+        ("全部强势周ATR最小第一名", rank1),
+    ]
+    rows = []
+    for label, mask in groups:
+        group = frame[mask & frame[PRIMARY_RETURN_COLUMN].notna()]
+        returns = group[PRIMARY_RETURN_COLUMN]
+        rows.append(
+            {
+                "R11强势研究组": label,
+                "样本数": len(returns),
+                "信号周": group["Signal_Date"].nunique(),
+                "胜率%": (returns > 0).mean() * 100.0 if len(returns) else np.nan,
+                "中位收益%": returns.median() if len(returns) else np.nan,
+                "平均收益%": returns.mean() if len(returns) else np.nan,
+                "Profit_Factor": _profit_factor(returns),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def strong_stage_week_audit(history: pd.DataFrame):
     """逐个市场阶段核对周数、候选数与真实入选，防止观察样本被当作交易。"""
     if history.empty or "Strong_Market_Stage" not in history.columns:
@@ -3295,11 +3373,11 @@ def strong_stage_week_audit(history: pd.DataFrame):
     ].copy()
     rows = []
     for stage, group in frame.groupby("Strong_Market_Stage", dropna=False, sort=False):
-        action = "全部强势阶段实际空仓；R7/R9仅研究观察"
+        action = "全部强势阶段实际空仓；R11温和收缩Top1仅研究观察"
         rows.append(
             {
                 "强势市场阶段": stage,
-                "R10动作": action,
+                "R11动作": action,
                 "市场周数": group["Signal_Date"].nunique(),
                 "R7合格股票周数": int(_bool_series(group, "Strong_Eligible").sum()),
                 "R9合格股票周数": int(
@@ -3308,6 +3386,9 @@ def strong_stage_week_audit(history: pd.DataFrame):
                 "R7研究Top2": int(_bool_series(group, "R7_Research_Top2").sum()),
                 "R9失败对照Top2": int(
                     _bool_series(group, "R9_Failure_Control_Top2").sum()
+                ),
+                "R11研究Top1": int(
+                    _bool_series(group, "R11_Strong_Research_Top1").sum()
                 ),
                 "实际入选交易": int(_bool_series(group, "Selected_Top2").sum()),
                 "实际入选周": group.loc[
@@ -3521,7 +3602,7 @@ def regime_gate_summary(history: pd.DataFrame):
         rows.append(
             {
                 "市场状态": regime,
-                "R10动作": action,
+                "R11动作": action,
                 "交易数": len(returns),
                 "信号周": group["Signal_Date"].nunique(),
                 "胜率%": (returns > 0).mean() * 100.0,
@@ -3833,6 +3914,137 @@ def strong_research_gates(history: pd.DataFrame):
     )
 
 
+def r11_strong_ranking_diagnostics(history: pd.DataFrame):
+    if history.empty:
+        return {}
+    frame = history[
+        _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & history.get("Market_Regime", pd.Series("", index=history.index))
+        .astype(str)
+        .eq("强势")
+        & _bool_series(history, "Strong_Reacceleration_Eligible")
+    ].copy()
+    if frame.empty:
+        return {}
+    frame["Rank"] = pd.to_numeric(frame.get("R11_Strong_Rank"), errors="coerce")
+    frame["Selected_Top2"] = _bool_series(frame, "R11_Strong_Research_Top1")
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    frame = frame.dropna(subset=["Rank", PRIMARY_RETURN_COLUMN])
+    return ranking_diagnostics(frame)
+
+
+def r11_strong_research_gates(history: pd.DataFrame):
+    """R11强势Top1独立验收；仅判定是否值得继续研究，不影响实际组合。"""
+    if history.empty:
+        selected = pd.DataFrame()
+        rank2 = pd.DataFrame()
+    else:
+        complete = _bool_series(history, "Outcome_Complete")
+        tradable = _bool_series(history, "Entry_Tradable")
+        research = _bool_series(history, "R11_Strong_Research_Top1")
+        selected = history[complete & tradable & research].copy()
+        selected_dates = set(selected.get("Signal_Date", pd.Series(dtype=str)).astype(str))
+        r11_rank = pd.to_numeric(history.get("R11_Strong_Rank"), errors="coerce")
+        rank2 = history[
+            complete
+            & tradable
+            & r11_rank.eq(2)
+            & history.get("Signal_Date", pd.Series("", index=history.index))
+            .astype(str)
+            .isin(selected_dates)
+        ].copy()
+    selected = selected.sort_values(["Signal_Date", "R11_Strong_Rank"])
+    returns = pd.to_numeric(
+        selected.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    weeks = selected.loc[returns.index, "Signal_Date"].nunique() if len(returns) else 0
+    pf = _profit_factor(returns)
+    without_best = (
+        returns.drop(index=returns.idxmax())
+        if len(returns) > 1
+        else pd.Series(dtype=float)
+    )
+    without_best_pf = _profit_factor(without_best)
+    positive_profit = returns[returns > 0].sum()
+    best_contribution = (
+        returns.max() / positive_profit * 100.0
+        if len(returns) and positive_profit > 0
+        else np.nan
+    )
+    midpoint = len(returns) // 2
+    first_half = returns.iloc[:midpoint]
+    second_half = returns.iloc[midpoint:]
+    rank2_returns = pd.to_numeric(
+        rank2.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    rank2_median = rank2_returns.median() if len(rank2_returns) else np.nan
+    gates = [
+        ("R11强势研究信号至少8周", weeks >= 8, f"当前{weeks}周"),
+        ("R11强势研究信号不超过14周", weeks <= 14, f"当前{weeks}周"),
+        ("R11每个信号周严格只有Top1", len(returns) == weeks, f"当前{len(returns)}笔/{weeks}周"),
+        (
+            "R11 W3胜率至少50%",
+            len(returns) > 0 and (returns > 0).mean() >= 0.50,
+            f"当前{((returns > 0).mean() * 100.0 if len(returns) else np.nan):.1f}%",
+        ),
+        (
+            "R11 W3中位收益大于0",
+            len(returns) > 0 and returns.median() > 0.0,
+            f"当前{(returns.median() if len(returns) else np.nan):.2f}%",
+        ),
+        (
+            "R11 Profit Factor至少1.2",
+            pd.notna(pf) and pf >= 1.2,
+            f"当前{pf:.2f}",
+        ),
+        (
+            "R11去最佳一只后平均收益大于0",
+            len(without_best) > 0 and without_best.mean() > 0.0,
+            f"当前{(without_best.mean() if len(without_best) else np.nan):.2f}%",
+        ),
+        (
+            "R11去最佳一只后PF至少1.2",
+            pd.notna(without_best_pf) and without_best_pf >= 1.2,
+            f"当前{without_best_pf:.2f}",
+        ),
+        (
+            "R11最佳一只占正利润不超过40%",
+            pd.notna(best_contribution) and best_contribution <= 40.0,
+            f"当前{best_contribution:.1f}%",
+        ),
+        (
+            "R11前后半段中位收益均为正",
+            len(first_half) > 0
+            and len(second_half) > 0
+            and first_half.median() > 0.0
+            and second_half.median() > 0.0,
+            (
+                f"前{(first_half.median() if len(first_half) else np.nan):.2f}% / "
+                f"后{(second_half.median() if len(second_half) else np.nan):.2f}%"
+            ),
+        ),
+        (
+            "R11 Top1中位收益高于同周第二名",
+            len(returns) > 0
+            and len(rank2_returns) > 0
+            and returns.median() > rank2_median,
+            (
+                f"Top1{(returns.median() if len(returns) else np.nan):.2f}% / "
+                f"第二名{rank2_median:.2f}%"
+            ),
+        ),
+    ]
+    return pd.DataFrame(
+        [
+            {"R11验收项目": name, "结果": "通过" if passed else "未通过", "当前值": value}
+            for name, passed, value in gates
+        ]
+    )
+
+
 def reacceleration_ranking_diagnostics(history: pd.DataFrame):
     if history.empty:
         return {}
@@ -3859,7 +4071,7 @@ def reacceleration_research_gates(
     history: pd.DataFrame,
     diagnostics: dict[str, Any],
 ):
-    """R9失败对照独立判卷；结果不影响R10实际组合。"""
+    """R9失败对照独立判卷；结果不影响R11实际组合。"""
     if history.empty:
         selected = pd.DataFrame()
     else:
@@ -4019,8 +4231,8 @@ def market_data_gap_audit(ledger: pd.DataFrame):
     return result[columns].sort_values("Signal_Date").reset_index(drop=True)
 
 
-def _apply_r10_selection_policy(frame: pd.DataFrame):
-    """把R9/R9.1候选无损转换为R10：R3/R6实盘，全部强势周空仓。"""
+def _apply_r11_selection_policy(frame: pd.DataFrame):
+    """把R9—R11候选转换为R11：R3/R6实盘，强势Top1只研究。"""
     result = frame.copy()
     market_regime = result.get(
         "Market_Regime", pd.Series("", index=result.index)
@@ -4047,6 +4259,44 @@ def _apply_r10_selection_policy(frame: pd.DataFrame):
         & _bool_series(result, "R9_Selection_Qualified")
     )
 
+    # 老结果包可能保存的是较早版本的“合格”字段；R11统一由同一时点的
+    # 再启动触发与风险边界重算，随后按ATR3/ATR13从小到大排一次名。
+    reacceleration_eligible = (
+        strong_market
+        & _bool_series(result, "Strong_Reacceleration_Trigger")
+        & _bool_series(result, "Strong_Reacceleration_Risk_OK")
+    )
+    result["Strong_Reacceleration_Eligible"] = reacceleration_eligible
+    result["R11_Strong_Rank"] = np.nan
+    atr = pd.to_numeric(
+        result.get("ATR_Contraction", pd.Series(np.nan, index=result.index)),
+        errors="coerce",
+    )
+    eligible_rows = result.loc[reacceleration_eligible].copy()
+    if not eligible_rows.empty:
+        eligible_rows["_atr"] = atr.loc[eligible_rows.index]
+        eligible_rows["_code"] = eligible_rows.get(
+            "ts_code", pd.Series("", index=eligible_rows.index)
+        ).astype(str)
+        eligible_rows = eligible_rows.sort_values(
+            ["Signal_Date", "_atr", "_code"],
+            ascending=[True, True, True],
+            na_position="last",
+            kind="mergesort",
+        )
+        eligible_rows["_rank"] = (
+            eligible_rows.groupby("Signal_Date", sort=False).cumcount() + 1
+        )
+        result.loc[eligible_rows.index, "R11_Strong_Rank"] = eligible_rows["_rank"]
+    result["R11_ATR_Band_Pass"] = atr.between(
+        R11_ATR_CONTRACTION_MIN, R11_ATR_CONTRACTION_MAX, inclusive="both"
+    )
+    result["R11_Strong_Research_Top1"] = (
+        strong_market
+        & pd.to_numeric(result["R11_Strong_Rank"], errors="coerce").eq(1)
+        & _bool_series(result, "R11_ATR_Band_Pass")
+    )
+
     if "Selected_Top2" not in result.columns:
         result["Selected_Top2"] = False
     if "Selection_Valid" not in result.columns:
@@ -4058,32 +4308,21 @@ def _apply_r10_selection_policy(frame: pd.DataFrame):
 
     result.loc[strong_market, "Selected_Top2"] = False
     result.loc[strong_market, "Selection_Valid"] = False
-    reset_rows = strong_market & reset_context
-    continuation_rows = strong_market & ~reset_context & continuation_context
-    other_strong_rows = strong_market & ~reset_rows & ~continuation_rows
-    result.loc[reset_rows, "Strategy_Branch"] = "R7强势抗跌观察"
+    result.loc[strong_market, "Strategy_Branch"] = "R11强势温和收缩Top1观察"
     result.loc[
-        reset_rows, "Selection_Block_Reason"
-    ] = "R7样本不足，R10强势市场强制空仓"
-    result.loc[continuation_rows, "Strategy_Branch"] = "R9失败对照观察"
-    result.loc[
-        continuation_rows, "Selection_Block_Reason"
-    ] = "R9样本外失败，R10强势市场强制空仓"
-    result.loc[other_strong_rows, "Strategy_Branch"] = "强势空仓观察"
-    if "Strong_Market_Stage" in result.columns:
-        stage_text = result["Strong_Market_Stage"].fillna("强势阶段").astype(str)
-        result.loc[other_strong_rows, "Selection_Block_Reason"] = (
-            stage_text.loc[other_strong_rows] + "；R10全部强势市场强制空仓"
-        )
-    else:
-        result.loc[
-            other_strong_rows, "Selection_Block_Reason"
-        ] = "R10全部强势市场强制空仓"
+        strong_market, "Selection_Block_Reason"
+    ] = "R11强势温和收缩Top1仅研究，实际组合强制空仓"
+    result.loc[strong_market, "Rank"] = result.loc[
+        strong_market, "R11_Strong_Rank"
+    ]
+    result.loc[strong_market, "Entry_Eligible"] = result.loc[
+        strong_market, "Strong_Reacceleration_Eligible"
+    ]
     return result
 
 
-def import_r10_results_zip(zip_bytes: bytes, config_id: str):
-    """恢复R9/R9.1/R10结果并应用R10组合口径；不解压任意路径。"""
+def import_r11_results_zip(zip_bytes: bytes, config_id: str):
+    """恢复R9—R11结果并应用R11组合口径；不解压任意路径。"""
     if not zip_bytes:
         raise ValueError("结果包为空。")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
@@ -4092,12 +4331,14 @@ def import_r10_results_zip(zip_bytes: bytes, config_id: str):
             name
             for name in infos
             if (
-                name.startswith("01_all_r9") or name.startswith("01_all_r10")
+                name.startswith("01_all_r9")
+                or name.startswith("01_all_r10")
+                or name.startswith("01_all_r11")
             )
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R9/R10候选明细。")
+            raise ValueError("结果包中未找到唯一的R9/R10/R11候选明细。")
         candidate_info = infos[candidate_names[0]]
         if candidate_info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -4110,7 +4351,7 @@ def import_r10_results_zip(zip_bytes: bytes, config_id: str):
             raise ValueError("候选明细缺少Signal_Date或ts_code。")
         candidates["Signal_Date"] = candidates["Signal_Date"].map(parse_yyyymmdd)
         candidates = candidates.dropna(subset=["Signal_Date", "ts_code"]).copy()
-        candidates = _apply_r10_selection_policy(candidates)
+        candidates = _apply_r11_selection_policy(candidates)
         candidates["Config_ID"] = str(config_id)
         append_checkpoint_atomic(candidates)
 
@@ -4136,7 +4377,31 @@ def import_r10_results_zip(zip_bytes: bytes, config_id: str):
                 opportunities = opportunities.dropna(
                     subset=["Signal_Date", "ts_code"]
                 ).copy()
-                opportunities = _apply_r10_selection_policy(opportunities)
+                opportunities = _apply_r11_selection_policy(opportunities)
+                # 大牛股机会表只是全池的子集，不能在子集内部重新决定R11第一名；
+                # 必须从完整候选表按“日期+代码”回填研究名次，防止未来赢家被伪装成Top1。
+                r11_map_columns = [
+                    "Signal_Date",
+                    "ts_code",
+                    "R11_Strong_Rank",
+                    "R11_ATR_Band_Pass",
+                    "R11_Strong_Research_Top1",
+                ]
+                r11_map = candidates[
+                    [column for column in r11_map_columns if column in candidates.columns]
+                ].drop_duplicates(["Signal_Date", "ts_code"], keep="last")
+                mapped = opportunities[["Signal_Date", "ts_code"]].merge(
+                    r11_map,
+                    on=["Signal_Date", "ts_code"],
+                    how="left",
+                    sort=False,
+                )
+                for column in r11_map_columns[2:]:
+                    if column in mapped.columns:
+                        opportunities[column] = mapped[column].to_numpy()
+                opportunities["R11_Strong_Research_Top1"] = _bool_series(
+                    opportunities, "R11_Strong_Research_Top1"
+                )
                 strong_opportunities = opportunities.get(
                     "Market_Regime", pd.Series("", index=opportunities.index)
                 ).astype(str).eq("强势")
@@ -4152,7 +4417,7 @@ def import_r10_results_zip(zip_bytes: bytes, config_id: str):
                 if "Miss_Reason" in opportunities.columns:
                     opportunities.loc[
                         strong_opportunities, "Miss_Reason"
-                    ] = "R10强势市场强制空仓"
+                    ] = "R11强势Top1仅研究，实际组合强制空仓"
                 opportunities["Config_ID"] = str(config_id)
                 existing = read_csv_safe(OPPORTUNITY_FILE)
                 combined = (
@@ -4285,10 +4550,13 @@ def build_export_zip(
     scan_ledger: pd.DataFrame,
     data_gap_audit: pd.DataFrame,
     neutral_gates: pd.DataFrame,
+    r11_audit: pd.DataFrame,
+    r11_gates: pd.DataFrame,
+    r11_diagnostics: dict[str, Any],
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r10_two_live_branch_candidates.csv": history,
+        "01_all_r11_moderate_atr_top1_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -4320,6 +4588,11 @@ def build_export_zip(
         "26_scan_ledger.csv": scan_ledger,
         "27_market_data_gap_audit.csv": data_gap_audit,
         "28_r3_neutral_acceptance_gates.csv": neutral_gates,
+        "29_r11_moderate_atr_top1_candidate_audit.csv": r11_audit,
+        "30_r11_moderate_atr_top1_acceptance_gates.csv": r11_gates,
+        "31_r11_moderate_atr_top1_ranking_diagnostics.csv": pd.DataFrame(
+            [{"指标": key, "数值": value} for key, value in r11_diagnostics.items()]
+        ),
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -4344,28 +4617,28 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R10只允许冻结的R3中性Top2和R6弱势Top2形成实际交易；"
-        "所有强势市场统一空仓，R7与R9仅保留研究对照。"
+        "R11的实际交易仍只使用冻结的R3中性Top2和R6弱势Top2；"
+        "强势市场的温和ATR收缩Top1只做研究，不进入组合。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R10仍不能直接用于实盘：R3、R6必须分别通过验收并完成跨年度样本外验证。"
+        "R11仍不能直接用于实盘：强势Top1必须通过旧时段和新时段独立验证。"
     )
-    with st.expander("查看R10交易与研究边界"):
+    with st.expander("查看R11交易与研究边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
 - **R6弱势首次转折**：26周深跌且N6 SKDJ近期进入35以下，K首次转升，并出现周涨或强收之一；此前两周已有同类转折则不重复触发。
-- **R7研究观察**：原早期强势回调触发与排名完全保留，但Top2只记录未来收益，不下单、不计入组合。
-- **R9宽市场阶段**：R7早期回调优先；其余强势周只要求科技池13周中位涨幅位于+5%至+30%，本周中位涨幅在0%至+6%，上涨家数在50%至90%。不再要求前两周同步、上一周全市场回调或13周动量只能增加0至5个百分点。
-- **R9个股事件**：趋势完整，上一周涨幅位于-8%至+5%，本周首次收复上周高点、站上MA10、MACD柱增强且强收盘；删除“上一周必须强于市场中位数”的硬条件。
-- **R9失败对照**：原个股事件和排名完全保留，用于持续验证失败是否稳定；不下单、不计入组合。
+- **R11统一强势事件**：沿用R9的“整理后首次再启动”触发和风险边界，不叠加新引擎。
+- **R11排名**：在当周合格股中只按ATR3/ATR13从小到大排名，股票代码仅用于并列时确定顺序。
+- **R11固定接受带**：只检查排名第一的股票；ATR3/ATR13位于0.70至0.90才记为研究信号。第一名不合格时不用第二名补位。
+- **R7/R9对照**：旧触发和旧排名仅保留在报告中用于比较，不下单、不影响R11。
 - **指标口径**：SKDJ固定N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
 - **删除硬门**：不再要求价格达到MA10的75%，不再用1周中位涨幅和55%上涨家数整周归零；市场只做分层审计。
 - **实际排名**：两周涨幅、价格/MA10、K6、8周相对强度、MACD冲量五项均按越早越优等权；R5旧100分只保留对照。
 - **防追高**：单周涨幅超过25%或收盘距离本周低点超过40%时只进入过热观察，不参与排名。
 - **实际组合**：中性期只运行R3 Top2；弱势期只运行R6-N6 Top2；所有强势周持有现金。
-- **研究隔离**：R7研究Top2与R9失败对照Top2使用独立标记，永远不能进入实际收益、胜率、排名或持股统计。
+- **研究隔离**：R11强势Top1、R7与R9对照均使用独立标记，永远不能进入实际收益或持股统计。
 - **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
             """
@@ -4377,11 +4650,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R10双分支验证", "最新选股预览"],
+            ["历史R11强势研究验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R10双分支验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R11强势研究验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -4395,7 +4668,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R10实际R3/R6与研究R7/R9的W1—W8固定周收益都会扣除该成本。",
+            help="R11实际R3/R6与强势研究样本的W1—W8固定周收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -4407,9 +4680,9 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R10历史结果")
+        clear_history_clicked = st.button("清除R11历史结果")
         imported_results = st.file_uploader(
-            "导入已下载的R9.1/R10结果包",
+            "导入已下载的R9/R10/R11结果包",
             type=["zip"],
             help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
         )
@@ -4421,7 +4694,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R10双分支验证":
+    if start_input > end_input and mode == "历史R11强势研究验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -4433,14 +4706,14 @@ def main():
     if clear_history_clicked:
         for path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE, OPPORTUNITY_FILE):
             remove_with_backup(path)
-        st.session_state.pop("r10_preview", None)
-        st.success("R10历史结果和断点任务已清除。")
+        st.session_state.pop("r11_preview", None)
+        st.success("R11历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     if import_results_clicked and imported_results is not None:
         try:
-            import_stats = import_r10_results_zip(
+            import_stats = import_r11_results_zip(
                 imported_results.getvalue(), config_id
             )
             inferred_note = (
@@ -4451,14 +4724,14 @@ def main():
             st.success(
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个已知候选周"
-                f"{inferred_note}。旧强势入选已转换为空仓，可直接查看R10报告。"
+                f"{inferred_note}。可直接查看R11研究报告，无需重新下载行情。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
-    if "r10_worker_id" not in st.session_state:
-        st.session_state["r10_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r10_worker_id"])
+    if "r11_worker_id" not in st.session_state:
+        st.session_state["r11_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r11_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -4482,7 +4755,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R10双分支验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R11强势研究验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -4631,7 +4904,7 @@ def main():
 
                     loaded_date_set = set(loaded_dates)
                     batch_gap_dates = sorted(set(failed_dates))
-                    progress = st.progress(0, text="开始扫描R10双分支与强势观察候选……")
+                    progress = st.progress(0, text="开始扫描R11双分支与强势Top1研究候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -4711,7 +4984,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r10_preview"] = candidates
+                            st.session_state["r11_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -4751,7 +5024,7 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：R10结构与观察候选{raw_count}只，"
+                                f"{signal_date}：R11结构与观察候选{raw_count}只，"
                                 f"当前分支合格{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -4771,7 +5044,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R10双分支扫描完成。")
+                            st.success("历史R11强势研究扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -4798,12 +5071,12 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r10_preview")
+    preview = st.session_state.get("r11_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R10结构或研究观察候选。")
+            st.info("最新交易日没有R11结构或研究观察候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -4812,16 +5085,15 @@ def main():
                     block_reason = str(preview["Selection_Block_Reason"].iloc[0] or "")
                 st.warning(block_reason or "本周没有形成有效入选组。")
                 research_preview = preview[
-                    _bool_series(preview, "R7_Research_Top2")
-                    | _bool_series(preview, "R9_Failure_Control_Top2")
+                    _bool_series(preview, "R11_Strong_Research_Top1")
                 ].copy()
                 if not research_preview.empty:
-                    st.caption("以下股票只用于记录强势研究结果，不属于买入名单。")
+                    st.caption("以下是R11强势温和收缩Top1，只记录未来收益，不属于买入名单。")
                     research_columns = [
-                        "Signal_Date", "Rank", "name", "ts_code", "Industry",
-                        "Strategy_Branch", "R7_Research_Top2",
-                        "R9_Failure_Control_Top2", "Strong_Resilience_100",
-                        "Strong_Reacceleration_100", "Selection_Block_Reason",
+                        "Signal_Date", "R11_Strong_Rank", "name", "ts_code", "Industry",
+                        "Strategy_Branch", "ATR_Contraction", "R11_ATR_Band_Pass",
+                        "R11_Strong_Research_Top1", "Strong_Reacceleration_100",
+                        "Selection_Block_Reason",
                     ]
                     st.dataframe(
                         research_preview[
@@ -4947,15 +5219,18 @@ def main():
         reacceleration_gates = reacceleration_research_gates(
             history, reacceleration_diagnostics
         )
+        r11_audit = r11_strong_candidate_audit(history)
+        r11_diagnostics = r11_strong_ranking_diagnostics(history)
+        r11_gates = r11_strong_research_gates(history)
         recovery_gates = recovery_research_gates(completed)
         opportunity_summary = major_winner_coverage_summary(opportunities)
         trigger_comparison = recovery_trigger_comparison_audit(history)
         market_context_audit = recovery_market_context_audit(history)
 
         st.markdown("---")
-        st.header("R10中弱双分支与强势空仓验证报告")
+        st.header("R11中弱双分支与强势温和收缩Top1验证报告")
         st.caption(
-            "主报告只统计R3/R6实际交易。R7研究Top2与R9失败对照不进入组合；"
+            "主报告只统计R3/R6实际交易。R11强势Top1、R7与R9对照均不进入组合；"
             "W3为主验收周期，W4—W8只统计已经走满相应天数的记录。"
         )
 
@@ -5002,12 +5277,18 @@ def main():
             with st.expander("查看行情缺失与跳过明细", expanded=True):
                 st.dataframe(data_gap_rows, width="stretch", hide_index=True)
 
-        st.subheader("R10实际组合总体验收")
+        st.subheader("R11实际组合总体验收（仅R3/R6）")
         st.dataframe(gates, width="stretch", hide_index=True)
         st.subheader("R3中性分支独立验收")
         st.dataframe(neutral_gates, width="stretch", hide_index=True)
         st.subheader("R6弱势首次转折分支独立验收")
         st.dataframe(recovery_gates, width="stretch", hide_index=True)
+        st.subheader("R11强势温和ATR收缩Top1验收（只研究）")
+        st.caption(
+            "固定顺序是：先按ATR3/ATR13排名，再检查第一名是否位于0.70—0.90；"
+            "第一名失败时不补第二名。"
+        )
+        st.dataframe(r11_gates, width="stretch", hide_index=True)
         st.subheader("R7早期强势回调研究观察（不交易）")
         st.dataframe(strong_gates, width="stretch", hide_index=True)
         st.subheader("R9强势再启动失败对照（不交易）")
@@ -5028,10 +5309,23 @@ def main():
                 "R3/R6实际分支与总体门槛均通过；强势仍保持空仓，可进入跨年度样本外验证。"
             )
         else:
-            st.error("R3、R6或总体门槛尚未全部通过，R10当前不能进入实盘。")
+            st.error("R3、R6或总体门槛尚未全部通过，R11当前不能进入实盘。")
 
         st.subheader("R3与R6实际分支分别表现")
         st.dataframe(_format_report_frame(branches), width="stretch", hide_index=True)
+
+        st.subheader("R11强势Top1候选审计")
+        st.dataframe(_format_report_frame(r11_audit), width="stretch", hide_index=True)
+
+        st.subheader("R11的ATR排名是否有效")
+        if r11_diagnostics:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"指标": key, "数值": value} for key, value in r11_diagnostics.items()]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
 
         st.subheader("R7抗跌新高、过热和观察候选审计")
         st.dataframe(_format_report_frame(strong_audit), width="stretch", hide_index=True)
@@ -5210,11 +5504,14 @@ def main():
             ledger.drop(columns=["Config_ID"], errors="ignore"),
             data_gap_rows,
             neutral_gates,
+            r11_audit,
+            r11_gates,
+            r11_diagnostics,
         )
         st.download_button(
-            "下载R10双分支与强势空仓完整研究结果",
+            "下载R11强势温和收缩Top1完整研究结果",
             data=export_bytes,
-            file_name="r10_two_live_branch_strong_cash_w3_audit_results.zip",
+            file_name="r11_moderate_atr_restart_top1_w3_audit_results.zip",
             mime="application/zip",
         )
 
