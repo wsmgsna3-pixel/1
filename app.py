@@ -34,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -42,9 +43,9 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R9.0-ORDERLY-STOCK-RESTART-FOUR-BRANCH-MAX2-W3-AUDIT"
-APP_TITLE = "R9强势有序个股再启动四分支最多Top2验证器"
-ENGINE_PATCH = "R9.0-R3-R6-R7-FROZEN-BROAD-PHASE-OPTIONAL-SECOND-STABLE"
+APP_VERSION = "R9.1-ORDERLY-STOCK-RESTART-DATA-GAP-RESUME-W3-AUDIT"
+APP_TITLE = "R9.1强势有序个股再启动四分支最多Top2验证器"
+ENGINE_PATCH = "R9.1-R3-R6-R7-FROZEN-DATA-READY-CUTOFF-GAP-AUDIT-IMPORT"
 
 CHECKPOINT_FILE = "r9_four_branch_candidates.csv"
 SCAN_LEDGER_FILE = "r9_four_branch_scanned_dates.csv"
@@ -94,6 +95,7 @@ R5_BASELINE_MIN_POOL_FRACTION = 0.005
 R5_BASELINE_MIN_CANDIDATES = 3
 MAJOR_WINNER_W3_PCT = 20.0
 TASK_LEASE_SECONDS = 45
+DATA_READY_HOUR_SHANGHAI = 18
 PRIMARY_RETURN_COLUMN = f"Fixed_Return_W{PRIMARY_HOLD_WEEKS}_Net_pct"
 
 
@@ -104,6 +106,19 @@ def clean_token_str(raw_token: str) -> str:
     if not raw_token:
         return ""
     return re.sub(r"[\s\u3000\ufeff\xa0\r\n]+", "", str(raw_token)).strip()
+
+
+def _shanghai_now():
+    return datetime.now(ZoneInfo("Asia/Shanghai"))
+
+
+def _latest_data_ready_date(now_shanghai=None):
+    """Tushare日线在交易日盘中并不完整；18点前只使用上一自然日。"""
+    current = now_shanghai or _shanghai_now()
+    ready_date = current.date()
+    if current.hour < DATA_READY_HOUR_SHANGHAI:
+        ready_date -= timedelta(days=1)
+    return ready_date
 
 
 def safe_tushare_call(func, max_retries: int = 3, sleep_time: float = 0.8, **kwargs):
@@ -395,11 +410,20 @@ def _download_one_market_partition(
 ):
     """下载单日后立即原子落盘；线程之间不共享大表。"""
     pro = ts.pro_api(token)
+    daily_fields = "ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount"
     daily_all = safe_tushare_call(
         pro.daily,
         trade_date=trade_date,
-        fields="ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount",
+        fields=daily_fields,
     )
+    # 个别Tushare节点对trade_date查询偶发返回空表，再用等价日期区间补一次。
+    if daily_all.empty:
+        daily_all = safe_tushare_call(
+            pro.daily,
+            start_date=trade_date,
+            end_date=trade_date,
+            fields=daily_fields,
+        )
     basic_columns = [
         "ts_code",
         "trade_date",
@@ -414,6 +438,13 @@ def _download_one_market_partition(
             trade_date=trade_date,
             fields=",".join(basic_columns),
         )
+        if basic_all.empty:
+            basic_all = safe_tushare_call(
+                pro.daily_basic,
+                start_date=trade_date,
+                end_date=trade_date,
+                fields=",".join(basic_columns),
+            )
     else:
         basic_all = pd.DataFrame(columns=basic_columns)
 
@@ -460,10 +491,10 @@ def sync_market_data_incrementally(
     )
     if calendar.empty:
         return [], "", "", [], {}
-    today_str = datetime.now().strftime("%Y%m%d")
+    data_ready_str = _latest_data_ready_date().strftime("%Y%m%d")
     open_calendar = calendar[
         pd.to_numeric(calendar["is_open"], errors="coerce").eq(1)
-        & (calendar["cal_date"].astype(str) <= today_str)
+        & (calendar["cal_date"].astype(str) <= data_ready_str)
     ].copy()
     open_calendar["cal_date"] = open_calendar["cal_date"].astype(str)
     open_calendar = open_calendar.sort_values("cal_date")
@@ -541,6 +572,8 @@ def sync_market_data_incrementally(
         "cached_days": len(valid_dates) - len(missing_dates),
         "downloaded_days": len(downloaded_dates),
         "failed_days": len(failed_dates),
+        "failed_dates": ",".join(sorted(failed_dates)),
+        "data_ready_through": data_ready_str,
         "weekly_basic_days": sum(item in week_end_dates for item in missing_dates),
     }
     return valid_dates, cache_dir, pool_hash, failed_dates, stats
@@ -2485,7 +2518,10 @@ def mark_scan_complete(
     selected_count: int,
     config_id: str,
     selection_block_reason: str = "",
+    scan_status: str = "COMPLETED",
+    data_gap_dates=None,
 ):
+    gap_dates = sorted(set(str(item) for item in (data_gap_dates or []) if item))
     ledger = read_csv_safe(SCAN_LEDGER_FILE)
     row = pd.DataFrame(
         [
@@ -2495,7 +2531,9 @@ def mark_scan_complete(
                 "Eligible_Trend_Count": int(eligible_count),
                 "Selected_Count": int(selected_count),
                 "Selection_Block_Reason": str(selection_block_reason or ""),
-                "Scan_Status": "COMPLETED",
+                "Scan_Status": str(scan_status),
+                "Market_Data_Gap_Count": len(gap_dates),
+                "Market_Data_Gap_Dates": ",".join(gap_dates),
                 "Config_ID": config_id,
                 "Updated_At": datetime.now().isoformat(timespec="seconds"),
             }
@@ -2513,24 +2551,31 @@ def completed_scan_dates(config_id: str):
         return set()
     match = ledger[
         (ledger["Config_ID"].astype(str) == str(config_id))
-        & (ledger["Scan_Status"].astype(str) == "COMPLETED")
+        & ledger["Scan_Status"].astype(str).isin(
+            {"COMPLETED", "COMPLETED_WITH_GAPS", "SKIPPED_DATA_GAP"}
+        )
     ]
     return set(filter(None, (parse_yyyymmdd(value) for value in match["Signal_Date"])))
 
 
 def invalidate_recent_ledger_once(config_id: str, start_date: str, end_date: str):
-    """新任务启动时让最近10周重算一次；自动批次续跑不会再次失效。"""
+    """新任务重算最近10周，并重试此前因数据缺口降级或跳过的所有周。"""
     ledger = read_csv_safe(SCAN_LEDGER_FILE)
     if ledger.empty or not {"Signal_Date", "Config_ID"}.issubset(ledger.columns):
         return
     dates = ledger["Signal_Date"].map(parse_yyyymmdd)
     recent_cutoff = (datetime.now() - timedelta(days=75)).strftime("%Y%m%d")
     lower = max(str(start_date), recent_cutoff)
-    remove_mask = (
+    same_range = (
         ledger["Config_ID"].astype(str).eq(str(config_id))
-        & dates.ge(lower)
+        & dates.ge(str(start_date))
         & dates.le(str(end_date))
     )
+    recent = dates.ge(lower) & dates.le(str(end_date))
+    status = ledger.get(
+        "Scan_Status", pd.Series("COMPLETED", index=ledger.index)
+    ).astype(str)
+    remove_mask = same_range & (recent | status.ne("COMPLETED"))
     if remove_mask.any():
         remaining = ledger[~remove_mask].copy()
         if remaining.empty:
@@ -2670,10 +2715,12 @@ def build_run_dates(
     )
     if calendar.empty:
         raise RuntimeError("无法获取交易日历。")
-    today_str = datetime.now().strftime("%Y%m%d")
+    data_ready_str = _latest_data_ready_date().strftime("%Y%m%d")
     open_days = calendar[calendar["is_open"] == 1].copy()
     open_days["cal_date"] = open_days["cal_date"].astype(str)
-    available_days = open_days[open_days["cal_date"] <= min(end_date, today_str)]
+    available_days = open_days[
+        open_days["cal_date"] <= min(end_date, data_ready_str)
+    ]
     if available_days.empty:
         raise RuntimeError("所选区间没有已完成的交易日。")
     open_days["dt"] = pd.to_datetime(open_days["cal_date"])
@@ -3899,6 +3946,161 @@ def recovery_research_gates(completed: pd.DataFrame):
     )
 
 
+def market_data_gap_audit(ledger: pd.DataFrame):
+    columns = [
+        "Signal_Date",
+        "Scan_Status",
+        "Market_Data_Gap_Count",
+        "Market_Data_Gap_Dates",
+        "Selection_Block_Reason",
+    ]
+    if ledger.empty:
+        return pd.DataFrame(columns=columns)
+    frame = ledger.copy()
+    status = frame.get(
+        "Scan_Status", pd.Series("COMPLETED", index=frame.index)
+    ).astype(str)
+    gap_source = (
+        frame["Market_Data_Gap_Count"]
+        if "Market_Data_Gap_Count" in frame.columns
+        else pd.Series(0, index=frame.index, dtype=int)
+    )
+    gap_count = pd.to_numeric(gap_source, errors="coerce").fillna(0)
+    result = frame[status.ne("COMPLETED") | gap_count.gt(0)].copy()
+    for column in columns:
+        if column not in result.columns:
+            result[column] = "" if column != "Market_Data_Gap_Count" else 0
+    return result[columns].sort_values("Signal_Date").reset_index(drop=True)
+
+
+def import_r9_results_zip(zip_bytes: bytes, config_id: str):
+    """恢复已下载的R9/R9.1结果；只读取固定CSV名，不解压任意路径。"""
+    if not zip_bytes:
+        raise ValueError("结果包为空。")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+        infos = {item.filename: item for item in archive.infolist()}
+        candidate_names = [
+            name
+            for name in infos
+            if name.startswith("01_all_r9") and name.endswith("_candidates.csv")
+        ]
+        if len(candidate_names) != 1:
+            raise ValueError("结果包中未找到唯一的R9候选明细。")
+        candidate_info = infos[candidate_names[0]]
+        if candidate_info.file_size > 200 * 1024 * 1024:
+            raise ValueError("候选明细超过200MB，拒绝导入。")
+        candidates = pd.read_csv(
+            io.BytesIO(archive.read(candidate_info)),
+            encoding="utf-8-sig",
+            low_memory=False,
+        )
+        if not {"Signal_Date", "ts_code"}.issubset(candidates.columns):
+            raise ValueError("候选明细缺少Signal_Date或ts_code。")
+        candidates["Signal_Date"] = candidates["Signal_Date"].map(parse_yyyymmdd)
+        candidates = candidates.dropna(subset=["Signal_Date", "ts_code"]).copy()
+        candidates["Config_ID"] = str(config_id)
+        append_checkpoint_atomic(candidates)
+
+        opportunity_name = next(
+            (
+                name
+                for name in infos
+                if name.startswith("22_") and name.endswith("opportunities.csv")
+            ),
+            None,
+        )
+        opportunity_count = 0
+        if opportunity_name:
+            opportunities = pd.read_csv(
+                io.BytesIO(archive.read(infos[opportunity_name])),
+                encoding="utf-8-sig",
+                low_memory=False,
+            )
+            if {"Signal_Date", "ts_code"}.issubset(opportunities.columns):
+                opportunities["Signal_Date"] = opportunities["Signal_Date"].map(
+                    parse_yyyymmdd
+                )
+                opportunities = opportunities.dropna(
+                    subset=["Signal_Date", "ts_code"]
+                ).copy()
+                opportunities["Config_ID"] = str(config_id)
+                existing = read_csv_safe(OPPORTUNITY_FILE)
+                combined = (
+                    pd.concat([existing, opportunities], ignore_index=True, sort=False)
+                    if not existing.empty
+                    else opportunities
+                )
+                combined = combined.drop_duplicates(
+                    ["Config_ID", "Signal_Date", "ts_code"], keep="last"
+                )
+                atomic_write_csv(
+                    combined.sort_values(
+                        ["Signal_Date", PRIMARY_RETURN_COLUMN],
+                        ascending=[True, False],
+                        kind="mergesort",
+                    ).reset_index(drop=True),
+                    OPPORTUNITY_FILE,
+                )
+                opportunity_count = len(opportunities)
+
+        ledger_name = next(
+            (name for name in infos if name == "26_scan_ledger.csv"), None
+        )
+        if ledger_name:
+            imported_ledger = pd.read_csv(
+                io.BytesIO(archive.read(infos[ledger_name])),
+                encoding="utf-8-sig",
+                low_memory=False,
+            )
+            imported_ledger["Signal_Date"] = imported_ledger["Signal_Date"].map(
+                parse_yyyymmdd
+            )
+            imported_ledger = imported_ledger.dropna(subset=["Signal_Date"]).copy()
+            imported_ledger["Config_ID"] = str(config_id)
+        else:
+            # R9.0旧结果没有账本，只能把确实存在候选明细的周标为完成；
+            # 零候选周会在新任务中自动重扫，不会伪造其完成状态。
+            grouped = candidates.groupby("Signal_Date", as_index=False)
+            imported_ledger = grouped.agg(
+                Raw_Setup_Count=("ts_code", "size"),
+                Eligible_Trend_Count=("Entry_Eligible", lambda values: int(_bool_series(pd.DataFrame({"v": values}), "v").sum())),
+                Selected_Count=("Selected_Top2", lambda values: int(_bool_series(pd.DataFrame({"v": values}), "v").sum())),
+            )
+            imported_ledger["Selection_Block_Reason"] = "由R9.0结果包恢复；零候选周将重扫"
+            imported_ledger["Scan_Status"] = "COMPLETED"
+            imported_ledger["Market_Data_Gap_Count"] = 0
+            imported_ledger["Market_Data_Gap_Dates"] = ""
+            imported_ledger["Config_ID"] = str(config_id)
+            imported_ledger["Updated_At"] = datetime.now().isoformat(
+                timespec="seconds"
+            )
+
+        existing_ledger = read_csv_safe(SCAN_LEDGER_FILE)
+        merged_ledger = (
+            pd.concat([existing_ledger, imported_ledger], ignore_index=True, sort=False)
+            if not existing_ledger.empty
+            else imported_ledger
+        )
+        merged_ledger["Signal_Date"] = merged_ledger["Signal_Date"].map(
+            parse_yyyymmdd
+        )
+        merged_ledger = merged_ledger.dropna(subset=["Signal_Date"])
+        merged_ledger = merged_ledger.drop_duplicates(
+            ["Signal_Date", "Config_ID"], keep="last"
+        )
+        atomic_write_csv(
+            merged_ledger.sort_values("Signal_Date").reset_index(drop=True),
+            SCAN_LEDGER_FILE,
+        )
+    return {
+        "candidate_rows": len(candidates),
+        "known_weeks": candidates["Signal_Date"].nunique(),
+        "opportunity_rows": opportunity_count,
+        "ledger_rows": len(imported_ledger),
+        "ledger_inferred": ledger_name is None,
+    }
+
+
 def build_export_zip(
     history: pd.DataFrame,
     cohort: pd.DataFrame,
@@ -3925,6 +4127,8 @@ def build_export_zip(
     opportunity_summary: pd.DataFrame,
     trigger_comparison: pd.DataFrame,
     market_context_audit: pd.DataFrame,
+    scan_ledger: pd.DataFrame,
+    data_gap_audit: pd.DataFrame,
 ):
     buffer = io.BytesIO()
     files = {
@@ -3957,6 +4161,8 @@ def build_export_zip(
         "23_major_winner_coverage_summary.csv": opportunity_summary,
         "24_r5_r6_trigger_comparison.csv": trigger_comparison,
         "25_recovery_market_context_audit.csv": market_context_audit,
+        "26_scan_ledger.csv": scan_ledger,
+        "27_market_data_gap_audit.csv": data_gap_audit,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -3981,8 +4187,8 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R3、R6与R7逐行冻结；R9只重做强势扩张期的个股再启动分支。"
-        "四个分支互斥启用、分别排名和独立验收；R9最多选2只，W3主验收，W1—W8固定记录。"
+        "R3、R6、R7及R9选股规则保持不变；R9.1只修复行情就绪时间、"
+        "单日缺失降级继续、缺口审计和结果恢复。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
@@ -4009,7 +4215,7 @@ def main():
             """
         )
 
-    today = datetime.now().date()
+    today = _shanghai_now().date()
     default_start = today - timedelta(days=365)
     with st.sidebar:
         st.header("研究配置")
@@ -4046,6 +4252,15 @@ def main():
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
         clear_history_clicked = st.button("清除R9历史结果")
+        imported_results = st.file_uploader(
+            "导入已下载的R9/R9.1结果包",
+            type=["zip"],
+            help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
+        )
+        import_results_clicked = st.button(
+            "恢复结果包中的断点",
+            disabled=imported_results is None,
+        )
 
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
@@ -4067,6 +4282,23 @@ def main():
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
+    if import_results_clicked and imported_results is not None:
+        try:
+            import_stats = import_r9_results_zip(
+                imported_results.getvalue(), config_id
+            )
+            inferred_note = (
+                "；旧包没有扫描账本，已有候选周已恢复，零候选周会自动重扫"
+                if import_stats["ledger_inferred"]
+                else ""
+            )
+            st.success(
+                f"已恢复{import_stats['candidate_rows']}条候选、"
+                f"{import_stats['known_weeks']}个已知候选周"
+                f"{inferred_note}。请设置原回测区间后启动历史验证。"
+            )
+        except Exception as exc:
+            st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
     if "r9_worker_id" not in st.session_state:
         st.session_state["r9_worker_id"] = uuid.uuid4().hex
@@ -4197,7 +4429,10 @@ def main():
                         datetime.strptime(min(batch_dates), "%Y%m%d") - timedelta(days=420)
                     ).strftime("%Y%m%d")
                     requested_fetch_end = datetime.strptime(max(batch_dates), "%Y%m%d") + timedelta(days=75)
-                    fetch_end = min(requested_fetch_end.date(), today).strftime("%Y%m%d")
+                    data_ready_date = _latest_data_ready_date()
+                    fetch_end = min(
+                        requested_fetch_end.date(), data_ready_date
+                    ).strftime("%Y%m%d")
                     st.caption(
                         f"本批扫描{batch_dates[0]}—{batch_dates[-1]}；"
                         f"只加载必要行情窗口{fetch_start}—{fetch_end}。"
@@ -4224,17 +4459,22 @@ def main():
                     st.caption(
                         f"行情分片：复用{sync_stats.get('cached_days', 0)}天，"
                         f"本次保存{sync_stats.get('downloaded_days', 0)}天；"
-                        f"daily_basic仅下载{sync_stats.get('weekly_basic_days', 0)}个周末交易日。"
+                        f"daily_basic仅下载{sync_stats.get('weekly_basic_days', 0)}个周末交易日；"
+                        f"数据就绪截止{sync_stats.get('data_ready_through', fetch_end)}。"
                     )
                     if failed_dates:
-                        raise RuntimeError(
-                            f"仍有{len(failed_dates)}个交易日下载失败；成功分片已保存，"
-                            "重试时只补这些日期。"
+                        failed_preview = "、".join(sorted(failed_dates)[:8])
+                        more_text = "……" if len(failed_dates) > 8 else ""
+                        st.warning(
+                            f"{len(failed_dates)}个历史交易日仍未取得："
+                            f"{failed_preview}{more_text}。任务继续运行并写入缺口审计；"
+                            "含缺口结果不能通过数据完整性验收。"
                         )
                     if not stocks:
                         raise RuntimeError("未加载到行情；已成功下载的分片仍然保留。")
 
                     loaded_date_set = set(loaded_dates)
+                    batch_gap_dates = sorted(set(failed_dates))
                     progress = st.progress(0, text="开始扫描R9四分支候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
@@ -4246,7 +4486,40 @@ def main():
                             stopped_during_batch = True
                             break
                         if signal_date not in loaded_date_set:
-                            raise RuntimeError(f"扫描日{signal_date}行情分片不完整，断点已保留。")
+                            if run_preview:
+                                st.warning(
+                                    f"预览日{signal_date}行情尚未就绪，本次预览跳过。"
+                                )
+                                continue
+                            replace_checkpoint_date(
+                                pd.DataFrame(), signal_date, run_config_id
+                            )
+                            replace_opportunity_date(
+                                pd.DataFrame(), signal_date, run_config_id
+                            )
+                            mark_scan_complete(
+                                signal_date,
+                                0,
+                                0,
+                                0,
+                                run_config_id,
+                                f"扫描日行情缺失，已跳过：{signal_date}",
+                                scan_status="SKIPPED_DATA_GAP",
+                                data_gap_dates=sorted(
+                                    set(batch_gap_dates) | {signal_date}
+                                ),
+                            )
+                            active_task["Completed_Weeks"] = int(
+                                active_task.get("Completed_Weeks", 0)
+                            ) + 1
+                            active_task["Last_Date"] = signal_date
+                            active_task["Error_Count"] = 0
+                            save_owned_task(active_task, worker_id)
+                            progress.progress(
+                                (idx + 1) / len(batch_dates),
+                                text=f"{signal_date}：扫描日行情缺失，已记录并跳过",
+                            )
+                            continue
                         weekly_mode = (
                             "已完成周线"
                             if run_history or latest_is_completed_week
@@ -4267,6 +4540,15 @@ def main():
                             run_preview,
                             weekly_mode,
                         )
+                        for frame in (candidates, major_winners):
+                            if not frame.empty:
+                                frame["Market_Data_Gap_Count"] = len(batch_gap_dates)
+                                frame["Market_Data_Gap_Dates"] = ",".join(
+                                    batch_gap_dates
+                                )
+                                frame["Backtest_Data_Complete"] = not bool(
+                                    batch_gap_dates
+                                )
                         selected_count = (
                             int(_bool_series(candidates, "Selected_Top2").sum())
                             if not candidates.empty
@@ -4299,6 +4581,12 @@ def main():
                                     and "Selection_Block_Reason" in candidates.columns
                                     else "没有结构触发"
                                 ),
+                                scan_status=(
+                                    "COMPLETED_WITH_GAPS"
+                                    if batch_gap_dates
+                                    else "COMPLETED"
+                                ),
+                                data_gap_dates=batch_gap_dates,
                             )
                             active_task["Completed_Weeks"] = int(active_task.get("Completed_Weeks", 0)) + 1
                             active_task["Last_Date"] = signal_date
@@ -4435,6 +4723,13 @@ def main():
                 kind="mergesort",
             )
 
+        ledger = read_csv_safe(SCAN_LEDGER_FILE)
+        if not ledger.empty and "Config_ID" in ledger.columns:
+            ledger = ledger[
+                ledger["Config_ID"].astype(str) == report_config_id
+            ].copy()
+        data_gap_rows = market_data_gap_audit(ledger)
+
         completed = completed_research_rows(history)
         cohort = cohort_summary(completed)
         outlier, outlier_details = outlier_audit(completed)
@@ -4452,6 +4747,21 @@ def main():
         horizons = horizon_summary(completed)
         diagnostics = ranking_diagnostics(completed)
         gates = research_gates(completed, cohort, outlier, diagnostics)
+        gates = pd.concat(
+            [
+                gates,
+                pd.DataFrame(
+                    [
+                        {
+                            "验收项目": "行情缺失或跳过周数必须为0",
+                            "结果": "通过" if data_gap_rows.empty else "未通过",
+                            "当前值": f"当前{len(data_gap_rows)}周",
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
         strong_gates = strong_research_gates(completed)
         reacceleration_diagnostics = reacceleration_ranking_diagnostics(history)
         reacceleration_gates = reacceleration_research_gates(
@@ -4463,22 +4773,25 @@ def main():
         market_context_audit = recovery_market_context_audit(history)
 
         st.markdown("---")
-        st.header("R9四分支历史验证报告")
+        st.header("R9.1四分支历史验证报告")
         st.caption(
             "主报告以已经走满15个交易日的W3样本验收入场排序；W4—W8只统计实际已经走到"
             "相应周数的记录，并在表中明确显示每个持有期的完整样本数。"
         )
 
-        ledger = read_csv_safe(SCAN_LEDGER_FILE)
-        if not ledger.empty and "Config_ID" in ledger.columns:
-            ledger = ledger[ledger["Config_ID"].astype(str) == report_config_id].copy()
         scanned_weeks = len(ledger)
+        ledger_status = ledger.get(
+            "Scan_Status", pd.Series("COMPLETED", index=ledger.index)
+        ).astype(str)
+        data_gap_weeks = int(ledger_status.ne("COMPLETED").sum())
+        skipped_data_weeks = int(ledger_status.eq("SKIPPED_DATA_GAP").sum())
         invalid_selection_weeks = (
             int(
                 (
                     pd.to_numeric(ledger.get("Selected_Count"), errors="coerce")
                     .fillna(0)
                     .lt(1)
+                    & ~ledger_status.eq("SKIPPED_DATA_GAP")
                 ).sum()
             )
             if not ledger.empty
@@ -4486,18 +4799,28 @@ def main():
         )
         selected = completed[_actual_selected_mask(completed)]
         selected_returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
-        metric_columns = st.columns(5)
+        metric_columns = st.columns(7)
         metric_columns[0].metric("已扫描周数", scanned_weeks)
-        metric_columns[1].metric("无有效入选周", invalid_selection_weeks)
-        metric_columns[2].metric("W3完整入选交易", len(selected))
-        metric_columns[3].metric(
+        metric_columns[1].metric("数据缺口周", data_gap_weeks)
+        metric_columns[2].metric("跳过扫描周", skipped_data_weeks)
+        metric_columns[3].metric("无有效入选周", invalid_selection_weeks)
+        metric_columns[4].metric("W3完整入选交易", len(selected))
+        metric_columns[5].metric(
             "实际入选胜率",
             f"{((selected_returns > 0).mean() * 100.0 if len(selected_returns) else np.nan):.1f}%",
         )
-        metric_columns[4].metric(
+        metric_columns[6].metric(
             "W3实际入选中位收益",
             f"{(selected_returns.median() if len(selected_returns) else np.nan):.2f}%",
         )
+
+        if not data_gap_rows.empty:
+            st.error(
+                "回测已继续完成，但存在行情缺失或跳过周；这些周不会被伪装成完整样本，"
+                "当前结果不能进入实盘判断。"
+            )
+            with st.expander("查看行情缺失与跳过明细", expanded=True):
+                st.dataframe(data_gap_rows, width="stretch", hide_index=True)
 
         st.subheader("研究验收门槛")
         st.dataframe(gates, width="stretch", hide_index=True)
@@ -4705,11 +5028,13 @@ def main():
             opportunity_summary,
             trigger_comparison,
             market_context_audit,
+            ledger.drop(columns=["Config_ID"], errors="ignore"),
+            data_gap_rows,
         )
         st.download_button(
-            "下载R9四分支完整研究结果",
+            "下载R9.1四分支完整研究结果",
             data=export_bytes,
-            file_name="r9_orderly_stock_restart_four_branch_w3_audit_results.zip",
+            file_name="r9_1_orderly_stock_restart_four_branch_w3_audit_results.zip",
             mime="application/zip",
         )
 
