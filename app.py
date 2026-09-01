@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-R12 中性R3与弱势R6保留为实际失败对照，R11强势Top1继续冻结研究，
-新增弱势市场“深跌结构优先、价格修复打破并列”的Top2研究验证器。
+R13 日线重启质量挑战排名研究版。
 
-R3、R6与R11的触发、资格、原排名和实际组合逐行保持R11.1不变；R12不改变
-任何历史实际收益。R12只在弱势市场的R6-N6合格池中，先按既有
-Score_Pullback_15从低到高排序，再按Price_to_MA10_Ratio从高到低打破并列，
-只记录研究Top2的W1—W8未来路径。规则只使用信号周已知数据，不增加阈值，
-不允许研究标记进入实际入选或持股统计。
+R3、R6与R11.1实际组合逐行保持不变；R11强势Top1、R12弱势修复Top2继续
+冻结为研究对照。R13只在弱势市场既有R6-N6合格池中，使用信号日收盘前已经
+可见的五项日线信息进行等权横截面排名：价格/MA20、MA5三日斜率、MACD柱
+加速度、全池五日相对强度、五日低点抬升。R13不增加硬门、不扩充候选、不读取买入后
+结果，并独立记录Top1/Top2的W1—W8路径；任何R13标记均不得进入实际组合。
 """
 
 from __future__ import annotations
@@ -39,15 +38,15 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R12-CROSS-YEAR-WEAK-REPAIR-RANK-RESEARCH"
-APP_TITLE = "R12跨年度弱势修复排名验证器"
-ENGINE_PATCH = "R12-PULLBACK-THEN-PRICE-REPAIR-RESEARCH"
+APP_VERSION = "R13-DAILY-RESTART-QUALITY-RANK-RESEARCH"
+APP_TITLE = "R13日线重启质量挑战排名验证器"
+ENGINE_PATCH = "R13-DAILY-RESTART-FIVE-FACTOR-RESEARCH"
 
-CHECKPOINT_FILE = "r12_weak_repair_rank_candidates.csv"
-SCAN_LEDGER_FILE = "r12_weak_repair_rank_scanned_dates.csv"
-OPPORTUNITY_FILE = "r12_weak_repair_rank_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r12_weak_repair_rank_running_task.json"
-RESULT_STATE_GUARD_FILE = "r12_weak_repair_rank_result_state.guard"
+CHECKPOINT_FILE = "r13_daily_restart_rank_candidates.csv"
+SCAN_LEDGER_FILE = "r13_daily_restart_rank_scanned_dates.csv"
+OPPORTUNITY_FILE = "r13_daily_restart_rank_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r13_daily_restart_rank_running_task.json"
+RESULT_STATE_GUARD_FILE = "r13_daily_restart_rank_result_state.guard"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -930,6 +929,143 @@ def _weekly_bars(stock: pd.DataFrame, end_date: str):
     return weekly
 
 
+def _daily_restart_snapshot(stock: pd.DataFrame, end_date: str):
+    """R13日线快照；所有滚动值严格截止信号日，不读取下一交易日。"""
+    fields = {
+        "Daily_Restart_Data_Available": False,
+        "Daily_Close": np.nan,
+        "Daily_MA5": np.nan,
+        "Daily_MA10": np.nan,
+        "Daily_MA20": np.nan,
+        "Daily_MA30": np.nan,
+        "Daily_Close_to_MA20_Ratio": np.nan,
+        "Daily_MA5_Slope_3D_pct": np.nan,
+        "Daily_MACD_Hist": np.nan,
+        "Daily_Previous_MACD_Hist": np.nan,
+        "Daily_MACD_Hist_Delta_pct": np.nan,
+        "Daily_Return_5D_pct": np.nan,
+        "Daily_Close_to_Prior_10D_High_Ratio": np.nan,
+        "Daily_Higher_Low_5D_pct": np.nan,
+        "Daily_Close_Location_5D": np.nan,
+        "Daily_MA5_Above_MA10": False,
+        "Daily_MACD_Improving": False,
+    }
+    daily = stock[stock.index <= end_date].tail(90).copy()
+    if len(daily) < 35:
+        return fields
+    close = pd.to_numeric(daily.get("close"), errors="coerce")
+    high = pd.to_numeric(daily.get("high"), errors="coerce")
+    low = pd.to_numeric(daily.get("low"), errors="coerce")
+    if close.isna().all() or high.isna().all() or low.isna().all():
+        return fields
+
+    ma5 = close.rolling(5).mean()
+    ma10 = close.rolling(10).mean()
+    ma20 = close.rolling(20).mean()
+    ma30 = close.rolling(30).mean()
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    hist = 2.0 * (dif - dea)
+    prior_high10 = high.shift(1).rolling(10).max()
+    current_low5 = low.rolling(5).min()
+    previous_low5 = low.shift(5).rolling(5).min()
+    current_high5 = high.rolling(5).max()
+
+    current_close = _safe_float(close.iloc[-1])
+    current_ma5 = _safe_float(ma5.iloc[-1])
+    current_ma10 = _safe_float(ma10.iloc[-1])
+    current_ma20 = _safe_float(ma20.iloc[-1])
+    current_ma30 = _safe_float(ma30.iloc[-1])
+    current_hist = _safe_float(hist.iloc[-1])
+    previous_hist = _safe_float(hist.iloc[-2])
+    hist_delta_pct = (
+        (current_hist - previous_hist) / current_close * 100.0
+        if all(math.isfinite(item) for item in (current_hist, previous_hist, current_close))
+        and current_close > 0.0
+        else np.nan
+    )
+    close_to_ma20 = (
+        current_close / current_ma20
+        if all(math.isfinite(item) for item in (current_close, current_ma20))
+        and current_ma20 > 0.0
+        else np.nan
+    )
+    prior_high10_value = _safe_float(prior_high10.iloc[-1])
+    close_to_high10 = (
+        current_close / prior_high10_value
+        if all(math.isfinite(item) for item in (current_close, prior_high10_value))
+        and prior_high10_value > 0.0
+        else np.nan
+    )
+    low5_value = _safe_float(current_low5.iloc[-1])
+    prior_low5_value = _safe_float(previous_low5.iloc[-1])
+    higher_low5 = (
+        (low5_value / prior_low5_value - 1.0) * 100.0
+        if all(math.isfinite(item) for item in (low5_value, prior_low5_value))
+        and prior_low5_value > 0.0
+        else np.nan
+    )
+    high5_value = _safe_float(current_high5.iloc[-1])
+    close_location5 = (
+        (current_close - low5_value) / (high5_value - low5_value)
+        if all(math.isfinite(item) for item in (current_close, low5_value, high5_value))
+        and high5_value > low5_value
+        else np.nan
+    )
+    ma5_slope3 = (
+        (current_ma5 / _safe_float(ma5.iloc[-4]) - 1.0) * 100.0
+        if math.isfinite(current_ma5)
+        and math.isfinite(_safe_float(ma5.iloc[-4]))
+        and _safe_float(ma5.iloc[-4]) > 0.0
+        else np.nan
+    )
+    return5 = (
+        (current_close / _safe_float(close.iloc[-6]) - 1.0) * 100.0
+        if math.isfinite(current_close)
+        and math.isfinite(_safe_float(close.iloc[-6]))
+        and _safe_float(close.iloc[-6]) > 0.0
+        else np.nan
+    )
+    required = [
+        close_to_ma20,
+        ma5_slope3,
+        hist_delta_pct,
+        return5,
+        higher_low5,
+    ]
+    fields.update(
+        {
+            "Daily_Restart_Data_Available": all(
+                math.isfinite(item) for item in required
+            ),
+            "Daily_Close": current_close,
+            "Daily_MA5": current_ma5,
+            "Daily_MA10": current_ma10,
+            "Daily_MA20": current_ma20,
+            "Daily_MA30": current_ma30,
+            "Daily_Close_to_MA20_Ratio": close_to_ma20,
+            "Daily_MA5_Slope_3D_pct": ma5_slope3,
+            "Daily_MACD_Hist": current_hist,
+            "Daily_Previous_MACD_Hist": previous_hist,
+            "Daily_MACD_Hist_Delta_pct": hist_delta_pct,
+            "Daily_Return_5D_pct": return5,
+            "Daily_Close_to_Prior_10D_High_Ratio": close_to_high10,
+            "Daily_Higher_Low_5D_pct": higher_low5,
+            "Daily_Close_Location_5D": close_location5,
+            "Daily_MA5_Above_MA10": bool(
+                all(math.isfinite(item) for item in (current_ma5, current_ma10))
+                and current_ma5 >= current_ma10
+            ),
+            "Daily_MACD_Improving": bool(
+                math.isfinite(hist_delta_pct) and hist_delta_pct > 0.0
+            ),
+        }
+    )
+    return fields
+
+
 def compute_signal_snapshot(
     ts_code: str,
     end_date: str,
@@ -937,7 +1073,8 @@ def compute_signal_snapshot(
 ):
     if ts_code not in stock_qfq_dict:
         return {}
-    weekly = _weekly_bars(stock_qfq_dict[ts_code], end_date)
+    stock = stock_qfq_dict[ts_code]
+    weekly = _weekly_bars(stock, end_date)
     if weekly.empty or len(weekly) < 45:
         return {}
     current = weekly.iloc[-1]
@@ -1226,7 +1363,7 @@ def compute_signal_snapshot(
         and k_prev <= d_prev
     )
 
-    return {
+    snapshot = {
         "Is_First_Red": bool(is_first_red),
         "Fresh_13W_Breakout": bool(fresh_breakout),
         "Pullback_Restart": bool(pullback_restart),
@@ -1322,6 +1459,8 @@ def compute_signal_snapshot(
         "Rebound_From_Week_Low_pct": rebound_from_week_low,
         "Price_to_MA10_Ratio": price_to_ma10_ratio,
     }
+    snapshot.update(_daily_restart_snapshot(stock, end_date))
+    return snapshot
 
 
 def _numeric_series(frame: pd.DataFrame, column: str):
@@ -1535,6 +1674,27 @@ def _score_recovery_early_stage(frame: pd.DataFrame):
     return scored
 
 
+def _score_daily_restart_quality(frame: pd.DataFrame):
+    """R13五项日线重启等权分；只在同周R6合格池内做横截面排序。"""
+    scored = frame.copy()
+    factors = [
+        ("Daily_Close_to_MA20_Ratio", "R13_Daily_Price_Repair_20"),
+        ("Daily_MA5_Slope_3D_pct", "R13_Daily_MA5_Slope_20"),
+        ("Daily_MACD_Hist_Delta_pct", "R13_Daily_MACD_Accel_20"),
+        ("Daily_RS_5D_Pct", "R13_Daily_RS5_20"),
+        ("Daily_Higher_Low_5D_pct", "R13_Daily_Higher_Low_20"),
+    ]
+    component_columns = []
+    for source, target in factors:
+        scored[target] = (
+            _percentile_rank(_numeric_series(scored, source), higher_is_better=True)
+            * 20.0
+        )
+        component_columns.append(target)
+    scored["R13_Daily_Restart_100"] = scored[component_columns].sum(axis=1)
+    return scored
+
+
 def _score_strong_resilience(frame: pd.DataFrame):
     """R7强势抗跌新高五项等权指数；只使用当周横截面和买入前数据。"""
     scored = frame.copy()
@@ -1652,11 +1812,19 @@ def _market_state_metrics(pool: pd.DataFrame):
     }
 
 
-def score_r12_candidates(pool_snapshots: pd.DataFrame):
-    """R3/R6保持原实际基线；R11强势与R12弱势新排名均只研究。"""
+def score_r13_candidates(pool_snapshots: pd.DataFrame):
+    """R3/R6保持原实际基线；R11、R12、R13全部只研究。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
+    daily_return5 = _numeric_series(pool, "Daily_Return_5D_pct")
+    pool["Daily_RS_5D_Pct"] = _percentile_rank(daily_return5)
+    daily_industry_median = pool.groupby(
+        "Industry", dropna=False
+    )["Daily_Return_5D_pct"].transform("median")
+    pool["Daily_Industry_5D_Excess_pct"] = daily_return5 - pd.to_numeric(
+        daily_industry_median, errors="coerce"
+    )
     return_13w = _numeric_series(pool, "Return_13W_pct")
     industry_median = pool.groupby("Industry", dropna=False)["Return_13W_pct"].transform(
         "median"
@@ -1717,6 +1885,7 @@ def score_r12_candidates(pool_snapshots: pd.DataFrame):
     candidates["R11_Strong_Rank"] = np.nan
     candidates["Recovery_Rank"] = np.nan
     candidates["R12_Recovery_Repair_Rank"] = np.nan
+    candidates["R13_Daily_Restart_Rank"] = np.nan
     for column in (
         "Recovery_Early_Return2W_20",
         "Recovery_Early_MA10_Distance_20",
@@ -1733,6 +1902,15 @@ def score_r12_candidates(pool_snapshots: pd.DataFrame):
         "Strong_Score_Industry20",
         "Strong_Score_Position20",
         "Strong_Resilience_100",
+    ):
+        candidates[column] = np.nan
+    for column in (
+        "R13_Daily_Price_Repair_20",
+        "R13_Daily_MA5_Slope_20",
+        "R13_Daily_MACD_Accel_20",
+        "R13_Daily_RS5_20",
+        "R13_Daily_Higher_Low_20",
+        "R13_Daily_Restart_100",
     ):
         candidates[column] = np.nan
     for column in (
@@ -1753,6 +1931,8 @@ def score_r12_candidates(pool_snapshots: pd.DataFrame):
     candidates["R11_ATR_Band_Pass"] = False
     candidates["R11_Strong_Research_Top1"] = False
     candidates["R12_Recovery_Repair_Top2"] = False
+    candidates["R13_Daily_Restart_Top1"] = False
+    candidates["R13_Daily_Restart_Top2"] = False
     r3_eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
     strong_eligible = candidates[_bool_series(candidates, "Strong_Eligible")].copy()
     reacceleration_eligible = candidates[
@@ -1904,6 +2084,42 @@ def score_r12_candidates(pool_snapshots: pd.DataFrame):
             repair_rank_map.astype(float)
         )
 
+        # R13只挑战R6弱势合格池的名次，不改变触发、资格、原名次或实际组合。
+        # 五项日线特征均严格截止信号日，并固定等权；缺少完整日线快照的旧结果
+        # 不允许按股票代码伪造R13名次。
+        daily_available = _bool_series(
+            recovery_eligible, "Daily_Restart_Data_Available"
+        )
+        daily_rows = recovery_eligible[daily_available].copy()
+        if not daily_rows.empty:
+            daily_scored = _score_daily_restart_quality(daily_rows)
+            daily_columns = [
+                "R13_Daily_Price_Repair_20",
+                "R13_Daily_MA5_Slope_20",
+                "R13_Daily_MACD_Accel_20",
+                "R13_Daily_RS5_20",
+                "R13_Daily_Higher_Low_20",
+                "R13_Daily_Restart_100",
+            ]
+            for column in daily_columns:
+                candidates.loc[daily_scored.index, column] = daily_scored[column]
+            daily_ordered = daily_scored.sort_values(
+                [
+                    "R13_Daily_Restart_100",
+                    "Daily_Close_to_MA20_Ratio",
+                    "ts_code",
+                ],
+                ascending=[False, False, True],
+                kind="mergesort",
+            )
+            daily_rank_map = pd.Series(
+                np.arange(1, len(daily_ordered) + 1, dtype=int),
+                index=daily_ordered.index,
+            )
+            candidates.loc[
+                daily_rank_map.index, "R13_Daily_Restart_Rank"
+            ] = daily_rank_map.astype(float)
+
     market_median = _safe_float(market_state.get("Market_13W_Median_pct"), 0.0)
     previous_market_13w = _safe_float(
         market_state.get("Previous_Market_13W_Median_pct"), 0.0
@@ -2005,6 +2221,26 @@ def score_r12_candidates(pool_snapshots: pd.DataFrame):
             candidates["R12_Recovery_Repair_Rank"], errors="coerce"
         ).le(TOP_N)
     )
+    r13_rank = pd.to_numeric(
+        candidates["R13_Daily_Restart_Rank"], errors="coerce"
+    )
+    r13_available_count = int(
+        (
+            _bool_series(candidates, "Recovery_Eligible")
+            & _bool_series(candidates, "Daily_Restart_Data_Available")
+        ).sum()
+    )
+    r13_research_context = (
+        (market_regime == "弱势")
+        & (recovery_eligible_count >= MIN_VALID_SELECTION_SIZE)
+        & (r13_available_count >= MIN_VALID_SELECTION_SIZE)
+        & _bool_series(candidates, "Recovery_Eligible")
+        & _bool_series(candidates, "Daily_Restart_Data_Available")
+    )
+    candidates["R13_Daily_Restart_Top1"] = r13_research_context & r13_rank.eq(1)
+    candidates["R13_Daily_Restart_Top2"] = r13_research_context & r13_rank.le(
+        TOP_N
+    )
     if selection_valid:
         selected = (
             _bool_series(candidates, "Entry_Eligible")
@@ -2032,6 +2268,7 @@ def score_r12_candidates(pool_snapshots: pd.DataFrame):
         reacceleration_eligible_count
     )
     candidates["Recovery_Eligible_Count"] = recovery_eligible_count
+    candidates["R13_Daily_Available_Count"] = r13_available_count
     candidates["R5_Baseline_Recovery_Eligible_Count"] = r5_baseline_eligible_count
     candidates["Active_Eligible_Count"] = active_eligible_count
     candidates["Strong_Required_Count"] = MIN_VALID_SELECTION_SIZE
@@ -2495,6 +2732,25 @@ def build_major_winner_audit(
                         "R12_Recovery_Repair_Top2",
                     ).iloc[0]
                 ),
+                "R13_Daily_Restart_Rank": (
+                    candidate_row.get("R13_Daily_Restart_Rank")
+                    if candidate_row is not None
+                    else np.nan
+                ),
+                "R13_Daily_Restart_Top1": bool(
+                    candidate_row is not None
+                    and _bool_series(
+                        pd.DataFrame([candidate_row]),
+                        "R13_Daily_Restart_Top1",
+                    ).iloc[0]
+                ),
+                "R13_Daily_Restart_Top2": bool(
+                    candidate_row is not None
+                    and _bool_series(
+                        pd.DataFrame([candidate_row]),
+                        "R13_Daily_Restart_Top2",
+                    ).iloc[0]
+                ),
                 "Miss_Reason": miss_reason,
                 "Rank": candidate_row.get("Rank") if candidate_row is not None else np.nan,
                 "Strategy_Branch": (
@@ -2938,7 +3194,7 @@ def scan_one_date(
     if not pool_records:
         return pd.DataFrame(), pd.DataFrame(), 0, 0
     pool = pd.DataFrame(pool_records)
-    candidates, raw_count, eligible_count = score_r12_candidates(pool)
+    candidates, raw_count, eligible_count = score_r13_candidates(pool)
 
     if is_preview_mode:
         if not candidates.empty:
@@ -2984,7 +3240,7 @@ def scan_one_date(
 
 
 # -----------------------------------------------------------------------------
-# R12实际失败基线与双研究排名报告
+# R13实际失败基线与三项研究排名报告
 # -----------------------------------------------------------------------------
 def _bool_series(frame: pd.DataFrame, column: str):
     if column not in frame.columns:
@@ -3740,6 +3996,173 @@ def r12_recovery_factor_comparison_audit(history: pd.DataFrame):
         ].copy()
         row = _r12_research_performance_row(label, evaluable)
         row["弱势排名方案"] = row.pop("R12弱势修复研究组")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _r13_research_performance_row(label: str, group: pd.DataFrame):
+    returns = pd.to_numeric(
+        group.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    valid = group.loc[returns.index].copy() if len(returns) else group.iloc[0:0].copy()
+    without_best = (
+        returns.drop(index=returns.idxmax())
+        if len(returns) > 1
+        else pd.Series(dtype=float)
+    )
+    positive_total = returns[returns > 0.0].sum()
+    best_contribution = (
+        returns.max() / positive_total * 100.0
+        if len(returns) and positive_total > 0.0
+        else np.nan
+    )
+    return {
+        "R13日线重启研究组": label,
+        "样本数": len(returns),
+        "信号周": valid["Signal_Date"].nunique() if len(returns) else 0,
+        "胜率%": (returns > 0.0).mean() * 100.0 if len(returns) else np.nan,
+        "中位收益%": returns.median() if len(returns) else np.nan,
+        "平均收益%": returns.mean() if len(returns) else np.nan,
+        "Profit_Factor": _profit_factor(returns),
+        "去最佳一只平均收益%": (
+            without_best.mean() if len(without_best) else np.nan
+        ),
+        "去最佳一只PF": _profit_factor(without_best),
+        "最佳一只占正利润%": best_contribution,
+    }
+
+
+def r13_daily_restart_candidate_audit(history: pd.DataFrame):
+    """R13只判卷同一R6合格池的日线挑战名次，不改变实际入选。"""
+    columns = [
+        "R13日线重启研究组",
+        "样本数",
+        "信号周",
+        "胜率%",
+        "中位收益%",
+        "平均收益%",
+        "Profit_Factor",
+        "去最佳一只平均收益%",
+        "去最佳一只PF",
+        "最佳一只占正利润%",
+    ]
+    if history.empty or "R13_Daily_Restart_Rank" not in history.columns:
+        return pd.DataFrame(columns=columns)
+    weak = history.get(
+        "Market_Regime", pd.Series("", index=history.index)
+    ).astype(str).eq("弱势")
+    base = history[
+        weak
+        & _bool_series(history, "Recovery_Eligible")
+        & _bool_series(history, "Daily_Restart_Data_Available")
+    ].copy()
+    if base.empty:
+        return pd.DataFrame(columns=columns)
+    base["R13_Daily_Restart_Rank"] = pd.to_numeric(
+        base.get("R13_Daily_Restart_Rank"), errors="coerce"
+    )
+    evaluable = base[
+        _bool_series(base, "Outcome_Complete")
+        & _bool_series(base, "Entry_Tradable")
+    ].copy()
+    research = _bool_series(evaluable, "R13_Daily_Restart_Top2")
+    research_dates = set(
+        evaluable.loc[research, "Signal_Date"].astype(str).tolist()
+    )
+    same_week = evaluable["Signal_Date"].astype(str).isin(research_dates)
+    old_actual = (
+        _bool_series(evaluable, "Selected_Top2")
+        & evaluable.get(
+            "Strategy_Branch", pd.Series("", index=evaluable.index)
+        ).astype(str).eq("R6弱势首次转折-N6")
+        & same_week
+    )
+    r12 = _bool_series(evaluable, "R12_Recovery_Repair_Top2") & same_week
+    groups = [
+        ("R13五项日线重启Top2（只研究）", evaluable[research]),
+        (
+            "R13日线重启Top1",
+            evaluable[research & evaluable["R13_Daily_Restart_Rank"].eq(1)],
+        ),
+        (
+            "R13日线重启第二名",
+            evaluable[research & evaluable["R13_Daily_Restart_Rank"].eq(2)],
+        ),
+        ("同周R6原排名Top2（实际基线）", evaluable[old_actual]),
+        ("同周R12弱势修复Top2（研究基线）", evaluable[r12]),
+        ("R13同周其余弱势合格候选", evaluable[same_week & ~research]),
+    ]
+    return pd.DataFrame(
+        [_r13_research_performance_row(label, group) for label, group in groups],
+        columns=columns,
+    )
+
+
+def r13_daily_restart_factor_comparison_audit(history: pd.DataFrame):
+    """预先固定五种同周排名，完整展示失败对照，避免事后挑选因子。"""
+    if history.empty:
+        return pd.DataFrame()
+    weak = history.get(
+        "Market_Regime", pd.Series("", index=history.index)
+    ).astype(str).eq("弱势")
+    eligible = history[
+        weak
+        & _bool_series(history, "Recovery_Eligible")
+        & _bool_series(history, "Daily_Restart_Data_Available")
+    ].copy()
+    if eligible.empty:
+        return pd.DataFrame()
+    counts = eligible.groupby("Signal_Date", sort=False).size()
+    valid_dates = set(counts[counts >= MIN_VALID_SELECTION_SIZE].index.astype(str))
+    eligible = eligible[
+        eligible["Signal_Date"].astype(str).isin(valid_dates)
+    ].copy()
+    old_rank = pd.to_numeric(eligible.get("Recovery_Rank"), errors="coerce")
+    r12_rank = pd.to_numeric(
+        eligible.get("R12_Recovery_Repair_Rank"), errors="coerce"
+    )
+    groups = [
+        ("R6原五项早期阶段排名", eligible[old_rank.le(TOP_N)]),
+        ("R12深跌+周线价格修复排名", eligible[r12_rank.le(TOP_N)]),
+        (
+            "R13五项日线重启等权排名",
+            _r12_top2_by_sort(
+                eligible,
+                ["R13_Daily_Restart_100", "Daily_Close_to_MA20_Ratio"],
+                [False, False],
+            ),
+        ),
+        (
+            "仅日线价格/MA20从高到低",
+            _r12_top2_by_sort(
+                eligible, ["Daily_Close_to_MA20_Ratio"], [False]
+            ),
+        ),
+        (
+            "仅日线MACD柱加速度从高到低",
+            _r12_top2_by_sort(
+                eligible, ["Daily_MACD_Hist_Delta_pct"], [False]
+            ),
+        ),
+        (
+            "仅全池日线五日相对强度从高到低",
+            _r12_top2_by_sort(eligible, ["Daily_RS_5D_Pct"], [False]),
+        ),
+        (
+            "仅日线五日低点抬升从高到低",
+            _r12_top2_by_sort(
+                eligible, ["Daily_Higher_Low_5D_pct"], [False]
+            ),
+        ),
+    ]
+    rows = []
+    for label, group in groups:
+        evaluable = group[
+            _bool_series(group, "Outcome_Complete")
+            & _bool_series(group, "Entry_Tradable")
+        ].copy()
+        row = _r13_research_performance_row(label, evaluable)
+        row["弱势排名方案"] = row.pop("R13日线重启研究组")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -4654,6 +5077,178 @@ def r12_recovery_repair_gates(history: pd.DataFrame):
     )
 
 
+def r13_daily_restart_ranking_diagnostics(history: pd.DataFrame):
+    if history.empty or "R13_Daily_Restart_Rank" not in history.columns:
+        return {}
+    weak = history.get(
+        "Market_Regime", pd.Series("", index=history.index)
+    ).astype(str).eq("弱势")
+    frame = history[
+        weak
+        & _bool_series(history, "Recovery_Eligible")
+        & _bool_series(history, "Daily_Restart_Data_Available")
+        & _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+    ].copy()
+    frame["Rank"] = pd.to_numeric(
+        frame.get("R13_Daily_Restart_Rank"), errors="coerce"
+    )
+    frame["Selected_Top2"] = _bool_series(frame, "R13_Daily_Restart_Top2")
+    frame[PRIMARY_RETURN_COLUMN] = pd.to_numeric(
+        frame.get(PRIMARY_RETURN_COLUMN), errors="coerce"
+    )
+    frame = frame.dropna(subset=["Rank", PRIMARY_RETURN_COLUMN])
+    return ranking_diagnostics(frame)
+
+
+def r13_daily_restart_gates(history: pd.DataFrame):
+    """R13独立验收；通过也只代表值得继续样本外验证。"""
+    if history.empty:
+        selected = pd.DataFrame()
+    else:
+        selected = history[
+            _bool_series(history, "R13_Daily_Restart_Top2")
+            & _bool_series(history, "Outcome_Complete")
+            & _bool_series(history, "Entry_Tradable")
+        ].copy()
+    returns = pd.to_numeric(
+        selected.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    selected = selected.loc[returns.index].copy() if len(returns) else selected.iloc[0:0]
+    weeks = selected["Signal_Date"].nunique() if len(returns) else 0
+    selected_dates = set(selected["Signal_Date"].astype(str)) if len(selected) else set()
+    pf = _profit_factor(returns)
+    without_best = (
+        returns.drop(index=returns.idxmax())
+        if len(returns) > 1
+        else pd.Series(dtype=float)
+    )
+    without_best_pf = _profit_factor(without_best)
+    positive_total = returns[returns > 0.0].sum()
+    best_contribution = (
+        returns.max() / positive_total * 100.0
+        if len(returns) and positive_total > 0.0
+        else np.nan
+    )
+    diagnostics = r13_daily_restart_ranking_diagnostics(history)
+    first_median = _safe_float(diagnostics.get("前半段实际入选中位收益%"))
+    second_median = _safe_float(diagnostics.get("后半段实际入选中位收益%"))
+    paired_beat = _safe_float(
+        diagnostics.get("实际入选逐周平均收益战胜未入选比例%")
+    )
+    selected_median = _safe_float(diagnostics.get("实际入选中位收益%"))
+    rest_median = _safe_float(diagnostics.get("未入选候选中位收益%"))
+    old_actual = history[
+        _bool_series(history, "Selected_Top2")
+        & _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & history.get(
+            "Strategy_Branch", pd.Series("", index=history.index)
+        ).astype(str).eq("R6弱势首次转折-N6")
+        & history.get(
+            "Signal_Date", pd.Series("", index=history.index)
+        ).astype(str).isin(selected_dates)
+    ].copy() if not history.empty else pd.DataFrame()
+    old_returns = pd.to_numeric(
+        old_actual.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    old_median = old_returns.median() if len(old_returns) else np.nan
+    top1 = selected[
+        pd.to_numeric(selected.get("R13_Daily_Restart_Rank"), errors="coerce").eq(1)
+    ]
+    second = selected[
+        pd.to_numeric(selected.get("R13_Daily_Restart_Rank"), errors="coerce").eq(2)
+    ]
+    top1_returns = pd.to_numeric(
+        top1.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    second_returns = pd.to_numeric(
+        second.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    gates = [
+        ("R13弱势研究至少6个独立信号周", weeks >= 6, f"当前{weeks}周"),
+        ("R13弱势研究至少12笔完整样本", len(returns) >= 12, f"当前{len(returns)}笔"),
+        (
+            "R13每个信号周严格只有Top2",
+            len(returns) == weeks * TOP_N,
+            f"当前{len(returns)}笔/{weeks}周",
+        ),
+        (
+            "R13 W3胜率至少50%",
+            len(returns) > 0 and (returns > 0.0).mean() >= 0.50,
+            f"当前{((returns > 0.0).mean() * 100.0 if len(returns) else np.nan):.1f}%",
+        ),
+        (
+            "R13 W3中位收益大于0",
+            len(returns) > 0 and returns.median() > 0.0,
+            f"当前{(returns.median() if len(returns) else np.nan):.2f}%",
+        ),
+        (
+            "R13 W3平均收益大于0",
+            len(returns) > 0 and returns.mean() > 0.0,
+            f"当前{(returns.mean() if len(returns) else np.nan):.2f}%",
+        ),
+        ("R13 Profit Factor至少1.2", pd.notna(pf) and pf >= 1.2, f"当前{pf:.2f}"),
+        (
+            "R13去最佳一只后平均收益大于0",
+            len(without_best) > 0 and without_best.mean() > 0.0,
+            f"当前{(without_best.mean() if len(without_best) else np.nan):.2f}%",
+        ),
+        (
+            "R13去最佳一只后PF至少1.2",
+            pd.notna(without_best_pf) and without_best_pf >= 1.2,
+            f"当前{without_best_pf:.2f}",
+        ),
+        (
+            "R13最佳一只占正利润不超过40%",
+            math.isfinite(best_contribution) and best_contribution <= 40.0,
+            f"当前{best_contribution:.1f}%",
+        ),
+        (
+            "R13前后半段中位收益均为正",
+            math.isfinite(first_median)
+            and math.isfinite(second_median)
+            and first_median > 0.0
+            and second_median > 0.0,
+            f"前{first_median:.2f}% / 后{second_median:.2f}%",
+        ),
+        (
+            "R13逐周战胜其余弱势合格候选至少55%",
+            math.isfinite(paired_beat) and paired_beat >= 55.0,
+            f"当前{paired_beat:.1f}%",
+        ),
+        (
+            "R13中位收益优于其余弱势合格候选",
+            math.isfinite(selected_median)
+            and math.isfinite(rest_median)
+            and selected_median > rest_median,
+            f"差{(selected_median - rest_median):.2f}个百分点",
+        ),
+        (
+            "R13同周中位收益优于R6原排名",
+            len(returns) > 0
+            and math.isfinite(old_median)
+            and returns.median() > old_median,
+            f"R13{(returns.median() if len(returns) else np.nan):.2f}% / R6{old_median:.2f}%",
+        ),
+        (
+            "R13第一名中位收益不低于第二名",
+            len(top1_returns) > 0
+            and len(second_returns) > 0
+            and top1_returns.median() >= second_returns.median(),
+            f"第一名{(top1_returns.median() if len(top1_returns) else np.nan):.2f}% / 第二名{(second_returns.median() if len(second_returns) else np.nan):.2f}%",
+        ),
+    ]
+    return pd.DataFrame(
+        [
+            {"R13验收项目": name, "结果": "通过" if passed else "未通过", "当前值": value}
+            for name, passed, value in gates
+        ]
+    )
+
+
 def market_data_gap_audit(ledger: pd.DataFrame):
     columns = [
         "Signal_Date",
@@ -4721,11 +5316,15 @@ def result_state_consistency_audit(history: pd.DataFrame, ledger: pd.DataFrame):
     ledger_frame["Signal_Date"] = ledger_frame["Signal_Date"].map(parse_yyyymmdd)
     ledger_frame = ledger_frame.dropna(subset=["Signal_Date"])
     completed_statuses = {"COMPLETED", "COMPLETED_WITH_GAPS"}
-    completed = ledger_frame[
-        ledger_frame.get(
-            "Scan_Status", pd.Series("COMPLETED", index=ledger_frame.index)
-        ).astype(str).isin(completed_statuses)
-    ].copy()
+    ledger_status = ledger_frame.get(
+        "Scan_Status", pd.Series("COMPLETED", index=ledger_frame.index)
+    ).astype(str)
+    completed = ledger_frame[ledger_status.isin(completed_statuses)].copy()
+    pending_r13_dates = set(
+        ledger_frame.loc[
+            ledger_status.eq("PENDING_R13_DAILY"), "Signal_Date"
+        ].astype(str)
+    )
 
     actual_rows = (
         history_frame.groupby("Signal_Date").size().to_dict()
@@ -4779,7 +5378,9 @@ def result_state_consistency_audit(history: pd.DataFrame, ledger: pd.DataFrame):
                 }
             )
 
-    for signal_date in sorted(candidate_dates - completed_dates):
+    for signal_date in sorted(
+        candidate_dates - completed_dates - pending_r13_dates
+    ):
         group = history_frame[
             history_frame["Signal_Date"].astype(str).eq(signal_date)
         ]
@@ -4843,8 +5444,8 @@ def repair_inconsistent_completed_ledger(config_id: str):
     return bad_dates
 
 
-def _apply_r12_selection_policy(frame: pd.DataFrame):
-    """兼容导入R9—R12：实际组合不变，重算R11与R12研究标记。"""
+def _apply_r13_selection_policy(frame: pd.DataFrame):
+    """兼容导入R9—R13：实际组合不变，重算可复原的研究标记。"""
     result = frame.copy()
     market_regime = result.get(
         "Market_Regime", pd.Series("", index=result.index)
@@ -4959,6 +5560,72 @@ def _apply_r12_selection_policy(frame: pd.DataFrame):
         ).le(TOP_N)
     )
 
+    # R13日线分只能由结果包中保存的信号日日线快照重算。R9—R12旧包没有
+    # 这些字段时全部保持不可用，绝不以代码顺序伪造研究名次。
+    daily_required = [
+        "Daily_Close_to_MA20_Ratio",
+        "Daily_MA5_Slope_3D_pct",
+        "Daily_MACD_Hist_Delta_pct",
+        "Daily_RS_5D_Pct",
+        "Daily_Higher_Low_5D_pct",
+    ]
+    daily_available = pd.Series(True, index=result.index, dtype=bool)
+    for column in daily_required:
+        if column not in result.columns:
+            result[column] = np.nan
+        daily_available &= pd.to_numeric(result[column], errors="coerce").notna()
+    result["Daily_Restart_Data_Available"] = daily_available
+    result["R13_Daily_Restart_Rank"] = np.nan
+    for column in (
+        "R13_Daily_Price_Repair_20",
+        "R13_Daily_MA5_Slope_20",
+        "R13_Daily_MACD_Accel_20",
+        "R13_Daily_RS5_20",
+        "R13_Daily_Higher_Low_20",
+        "R13_Daily_Restart_100",
+    ):
+        result[column] = np.nan
+    r13_eligible = recovery_eligible & daily_available
+    for _, week_rows in result.loc[r13_eligible].groupby(
+        "Signal_Date", sort=False
+    ):
+        scored = _score_daily_restart_quality(week_rows)
+        score_columns = [
+            "R13_Daily_Price_Repair_20",
+            "R13_Daily_MA5_Slope_20",
+            "R13_Daily_MACD_Accel_20",
+            "R13_Daily_RS5_20",
+            "R13_Daily_Higher_Low_20",
+            "R13_Daily_Restart_100",
+        ]
+        for column in score_columns:
+            result.loc[scored.index, column] = scored[column]
+        ordered = scored.sort_values(
+            [
+                "R13_Daily_Restart_100",
+                "Daily_Close_to_MA20_Ratio",
+                "ts_code",
+            ],
+            ascending=[False, False, True],
+            kind="mergesort",
+        )
+        result.loc[ordered.index, "R13_Daily_Restart_Rank"] = np.arange(
+            1, len(ordered) + 1, dtype=float
+        )
+    r13_count_by_week = (
+        result.loc[r13_eligible].groupby("Signal_Date", sort=False).size()
+    )
+    enough_r13 = result["Signal_Date"].map(r13_count_by_week).fillna(0).ge(
+        MIN_VALID_SELECTION_SIZE
+    )
+    r13_rank = pd.to_numeric(result["R13_Daily_Restart_Rank"], errors="coerce")
+    result["R13_Daily_Restart_Top1"] = (
+        r13_eligible & enough_r13 & r13_rank.eq(1)
+    )
+    result["R13_Daily_Restart_Top2"] = (
+        r13_eligible & enough_r13 & r13_rank.le(TOP_N)
+    )
+
     if "Selected_Top2" not in result.columns:
         result["Selected_Top2"] = False
     if "Selection_Valid" not in result.columns:
@@ -4983,7 +5650,7 @@ def _apply_r12_selection_policy(frame: pd.DataFrame):
     return result
 
 
-def import_r12_results_zip(zip_bytes: bytes, config_id: str):
+def import_r13_results_zip(zip_bytes: bytes, config_id: str):
     """先完整验证、后事务提交；失败时不允许留下候选或账本半成品。"""
     if not zip_bytes:
         raise ValueError("结果包为空。")
@@ -5005,11 +5672,12 @@ def import_r12_results_zip(zip_bytes: bytes, config_id: str):
                 or name.startswith("01_all_r10")
                 or name.startswith("01_all_r11")
                 or name.startswith("01_all_r12")
+                or name.startswith("01_all_r13")
             )
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R9/R10/R11/R12候选明细。")
+            raise ValueError("结果包中未找到唯一的R9/R10/R11/R12/R13候选明细。")
         candidate_info = infos[candidate_names[0]]
         if candidate_info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -5026,7 +5694,10 @@ def import_r12_results_zip(zip_bytes: bytes, config_id: str):
             raise ValueError("候选明细为空。")
         if candidates.duplicated(["Signal_Date", "ts_code"]).any():
             raise ValueError("候选明细存在重复的日期与股票代码。")
-        candidates = _apply_r12_selection_policy(candidates)
+        candidates = _apply_r13_selection_policy(candidates)
+        legacy_missing_r13 = not _bool_series(
+            candidates, "Daily_Restart_Data_Available"
+        ).any()
         candidates["Config_ID"] = str(config_id)
 
         opportunity_name = next(
@@ -5057,8 +5728,8 @@ def import_r12_results_zip(zip_bytes: bytes, config_id: str):
             ).copy()
             if opportunities.duplicated(["Signal_Date", "ts_code"]).any():
                 raise ValueError("大牛股机会明细存在重复的日期与股票代码。")
-            opportunities = _apply_r12_selection_policy(opportunities)
-            # 机会表只是全池子集，R11/R12名次必须从完整候选表回填。
+            opportunities = _apply_r13_selection_policy(opportunities)
+            # 机会表只是全池子集，R11/R12/R13名次必须从完整候选表回填。
             research_map_columns = [
                 "Signal_Date",
                 "ts_code",
@@ -5067,6 +5738,9 @@ def import_r12_results_zip(zip_bytes: bytes, config_id: str):
                 "R11_Strong_Research_Top1",
                 "R12_Recovery_Repair_Rank",
                 "R12_Recovery_Repair_Top2",
+                "R13_Daily_Restart_Rank",
+                "R13_Daily_Restart_Top1",
+                "R13_Daily_Restart_Top2",
             ]
             research_map = candidates[research_map_columns].drop_duplicates(
                 ["Signal_Date", "ts_code"], keep="last"
@@ -5084,6 +5758,12 @@ def import_r12_results_zip(zip_bytes: bytes, config_id: str):
             )
             opportunities["R12_Recovery_Repair_Top2"] = _bool_series(
                 opportunities, "R12_Recovery_Repair_Top2"
+            )
+            opportunities["R13_Daily_Restart_Top1"] = _bool_series(
+                opportunities, "R13_Daily_Restart_Top1"
+            )
+            opportunities["R13_Daily_Restart_Top2"] = _bool_series(
+                opportunities, "R13_Daily_Restart_Top2"
             )
             strong_opportunities = opportunities.get(
                 "Market_Regime", pd.Series("", index=opportunities.index)
@@ -5140,6 +5820,12 @@ def import_r12_results_zip(zip_bytes: bytes, config_id: str):
             imported_ledger["Config_ID"] = str(config_id)
             imported_ledger["Updated_At"] = datetime.now().isoformat(
                 timespec="seconds"
+            )
+
+        if legacy_missing_r13:
+            imported_ledger["Scan_Status"] = "PENDING_R13_DAILY"
+            imported_ledger["Selection_Block_Reason"] = (
+                "旧结果包已恢复；缺少R13信号日日线快照，等待R13逐周重扫"
             )
 
         candidate_rows_by_week = candidates.groupby("Signal_Date").size().to_dict()
@@ -5303,6 +5989,9 @@ def import_r12_results_zip(zip_bytes: bytes, config_id: str):
     return {
         "candidate_rows": len(candidates),
         "known_weeks": candidates["Signal_Date"].nunique(),
+        "r13_daily_rows": int(
+            _bool_series(candidates, "Daily_Restart_Data_Available").sum()
+        ),
         "opportunity_rows": opportunity_count,
         "ledger_rows": len(imported_ledger),
         "ledger_inferred": ledger_name is None,
@@ -5346,10 +6035,14 @@ def build_export_zip(
     r12_gates: pd.DataFrame,
     r12_diagnostics: dict[str, Any],
     r12_factor_comparison: pd.DataFrame,
+    r13_audit: pd.DataFrame,
+    r13_gates: pd.DataFrame,
+    r13_diagnostics: dict[str, Any],
+    r13_factor_comparison: pd.DataFrame,
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r12_weak_repair_rank_candidates.csv": history,
+        "01_all_r13_daily_restart_rank_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -5393,6 +6086,12 @@ def build_export_zip(
             [{"指标": key, "数值": value} for key, value in r12_diagnostics.items()]
         ),
         "36_r12_weak_repair_factor_comparison.csv": r12_factor_comparison,
+        "37_r13_daily_restart_candidate_audit.csv": r13_audit,
+        "38_r13_daily_restart_acceptance_gates.csv": r13_gates,
+        "39_r13_daily_restart_ranking_diagnostics.csv": pd.DataFrame(
+            [{"指标": key, "数值": value} for key, value in r13_diagnostics.items()]
+        ),
+        "40_r13_daily_restart_factor_comparison.csv": r13_factor_comparison,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -5417,14 +6116,14 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R12保持R11.1实际组合不变：R3中性Top2与R6弱势Top2仅作历史基线；"
-        "R11强势Top1和R12弱势修复Top2全部只研究，不进入组合。"
+        "R13保持R11.1实际组合不变：R3中性Top2与R6弱势Top2仅作历史基线；"
+        "R11强势Top1、R12弱势修复Top2和R13日线重启Top2全部只研究。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R12是跨年度诊断版本，不是实盘版本；R3、R6已经在旧年度出现结构性失败。"
+        "R13是跨年度诊断版本，不是实盘版本；任何研究排名均禁止进入实际组合。"
     )
-    with st.expander("查看R12交易与研究边界"):
+    with st.expander("查看R13交易与研究边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
@@ -5434,13 +6133,15 @@ def main():
 - **R11固定接受带**：只检查排名第一的股票；ATR3/ATR13位于0.70至0.90才记为研究信号。第一名不合格时不用第二名补位。
 - **R12弱势研究排名**：只在R6-N6合格池中，先按既有Score_Pullback_15从低到高，再按价格/MA10从高到低打破并列，观察Top2。
 - **R12不增加硬门**：没有新的阈值、市场门或候选数量扩容；新名次不覆盖R6原名次。
+- **R13日线挑战排名**：仍在同一个R6-N6合格池内，把信号日已知的价格/MA20、MA5三日斜率、MACD柱加速度、全池五日相对强度、五日低点抬升五项做同周等权排名。
+- **R13无个股特判**：不使用股票名称、行业故事或买入后涨跌；缺少完整日线快照的旧结果包不会伪造R13名次。
 - **R7/R9对照**：旧触发和旧排名仅保留在报告中用于比较，不下单、不影响R11。
 - **指标口径**：SKDJ固定N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
 - **删除硬门**：不再要求价格达到MA10的75%，不再用1周中位涨幅和55%上涨家数整周归零；市场只做分层审计。
 - **实际排名**：两周涨幅、价格/MA10、K6、8周相对强度、MACD冲量五项均按越早越优等权；R5旧100分只保留对照。
 - **防追高**：单周涨幅超过25%或收盘距离本周低点超过40%时只进入过热观察，不参与排名。
 - **实际组合**：中性期只运行R3 Top2；弱势期只运行R6-N6 Top2；所有强势周持有现金。
-- **研究隔离**：R11强势Top1、R12弱势修复Top2、R7与R9对照均使用独立标记，永远不能进入实际收益或持股统计。
+- **研究隔离**：R11、R12、R13以及R7/R9对照均使用独立标记，永远不能进入实际收益或持股统计。
 - **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
             """
@@ -5452,11 +6153,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R12跨年度研究验证", "最新选股预览"],
+            ["历史R13日线挑战排名验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R12跨年度研究验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R13日线挑战排名验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -5470,7 +6171,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R3/R6实际基线、R11与R12研究样本的W1—W8固定周收益都会扣除该成本。",
+            help="R3/R6实际基线与R11/R12/R13研究样本的W1—W8固定周收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -5482,9 +6183,9 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R12历史结果")
+        clear_history_clicked = st.button("清除R13历史结果")
         imported_results = st.file_uploader(
-            "导入已下载的R9/R10/R11/R12结果包",
+            "导入已下载的R9/R10/R11/R12/R13结果包",
             type=["zip"],
             help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
         )
@@ -5496,7 +6197,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R12跨年度研究验证":
+    if start_input > end_input and mode == "历史R13日线挑战排名验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -5516,14 +6217,14 @@ def main():
             ):
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
-        st.session_state.pop("r12_preview", None)
-        st.success("R12历史结果和断点任务已清除。")
+        st.session_state.pop("r13_preview", None)
+        st.success("R13历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     if import_results_clicked and imported_results is not None:
         try:
-            import_stats = import_r12_results_zip(
+            import_stats = import_r13_results_zip(
                 imported_results.getvalue(), config_id
             )
             inferred_note = (
@@ -5531,17 +6232,22 @@ def main():
                 if import_stats["ledger_inferred"]
                 else ""
             )
+            r13_note = (
+                "。已包含R13日线快照，可直接查看R13报告"
+                if import_stats.get("r13_daily_rows", 0) > 0
+                else "。旧结果包不含R13日线快照；R11/R12可直接查看，R13需重新扫描"
+            )
             st.success(
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个已知候选周"
-                f"{inferred_note}。R11与R12研究名次已重算，无需重新下载行情。"
+                f"{inferred_note}{r13_note}。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
-    if "r12_worker_id" not in st.session_state:
-        st.session_state["r12_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r12_worker_id"])
+    if "r13_worker_id" not in st.session_state:
+        st.session_state["r13_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r13_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -5565,7 +6271,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R12跨年度研究验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R13日线挑战排名验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -5722,7 +6428,7 @@ def main():
 
                     loaded_date_set = set(loaded_dates)
                     batch_gap_dates = sorted(set(failed_dates))
-                    progress = st.progress(0, text="开始扫描R12实际基线与双研究排名候选……")
+                    progress = st.progress(0, text="开始扫描R13实际基线与三项研究排名候选……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -5806,7 +6512,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r12_preview"] = candidates
+                            st.session_state["r13_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -5852,7 +6558,7 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：R12结构与研究候选{raw_count}只，"
+                                f"{signal_date}：R13结构与研究候选{raw_count}只，"
                                 f"当前分支合格{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -5872,7 +6578,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R12跨年度研究扫描完成。")
+                            st.success("历史R13日线挑战排名扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -5899,12 +6605,12 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r12_preview")
+    preview = st.session_state.get("r13_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R12结构或研究观察候选。")
+            st.info("最新交易日没有R13结构或研究观察候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -5991,6 +6697,38 @@ def main():
                     width="stretch",
                     hide_index=True,
                 )
+            r13_preview = preview[
+                _bool_series(preview, "R13_Daily_Restart_Top2")
+            ].copy()
+            if not r13_preview.empty:
+                st.caption(
+                    "以下是R13五项日线重启质量Top2，只作挑战排名研究，"
+                    "不属于实际买入名单。"
+                )
+                r13_columns = [
+                    "Signal_Date",
+                    "R13_Daily_Restart_Rank",
+                    "name",
+                    "ts_code",
+                    "Industry",
+                    "R13_Daily_Restart_100",
+                    "Daily_Close_to_MA20_Ratio",
+                    "Daily_MA5_Slope_3D_pct",
+                    "Daily_MACD_Hist_Delta_pct",
+                    "Daily_Return_5D_pct",
+                    "Daily_RS_5D_Pct",
+                    "Daily_Higher_Low_5D_pct",
+                    "Daily_Close_to_Prior_10D_High_Ratio",
+                    "R13_Daily_Restart_Top1",
+                    "R13_Daily_Restart_Top2",
+                ]
+                st.dataframe(
+                    r13_preview[
+                        [column for column in r13_columns if column in r13_preview.columns]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
             with st.expander("查看全部实际候选、研究观察及未入选原因"):
                 st.dataframe(preview, width="stretch")
 
@@ -6062,13 +6800,21 @@ def main():
                 ledger["Config_ID"].astype(str) == report_config_id
             ].copy()
         data_gap_rows = market_data_gap_audit(ledger)
+        pending_r13_rows = data_gap_rows[
+            data_gap_rows.get(
+                "Scan_Status", pd.Series("", index=data_gap_rows.index)
+            ).astype(str).eq("PENDING_R13_DAILY")
+        ].copy()
+        actual_data_gap_rows = data_gap_rows[
+            ~data_gap_rows.index.isin(pending_r13_rows.index)
+        ].copy()
         state_consistency_rows = result_state_consistency_audit(history, ledger)
         if not state_consistency_rows.empty:
             st.markdown("---")
             st.error(
                 f"发现{len(state_consistency_rows)}周账本与候选明细不一致。"
                 "当前结果禁止判定策略优劣，也不提供正式下载。"
-                "点击“启动历史R12跨年度研究验证”后，程序会只补扫这些日期。"
+                "点击“启动历史R13日线挑战排名验证”后，程序会只补扫这些日期。"
             )
             st.dataframe(
                 state_consistency_rows, width="stretch", hide_index=True
@@ -6099,8 +6845,8 @@ def main():
                     [
                         {
                             "验收项目": "行情缺失或跳过周数必须为0",
-                            "结果": "通过" if data_gap_rows.empty else "未通过",
-                            "当前值": f"当前{len(data_gap_rows)}周",
+                            "结果": "通过" if actual_data_gap_rows.empty else "未通过",
+                            "当前值": f"当前{len(actual_data_gap_rows)}周",
                         },
                         {
                             "验收项目": "扫描账本与候选明细必须完全一致",
@@ -6131,12 +6877,16 @@ def main():
         r12_diagnostics = r12_recovery_repair_ranking_diagnostics(history)
         r12_gates = r12_recovery_repair_gates(history)
         r12_factor_comparison = r12_recovery_factor_comparison_audit(history)
+        r13_audit = r13_daily_restart_candidate_audit(history)
+        r13_diagnostics = r13_daily_restart_ranking_diagnostics(history)
+        r13_gates = r13_daily_restart_gates(history)
+        r13_factor_comparison = r13_daily_restart_factor_comparison_audit(history)
 
         st.markdown("---")
-        st.header("R12跨年度弱势修复排名验证报告")
+        st.header("R13日线重启质量挑战排名验证报告")
         st.caption(
-            "主报告仍只统计R3/R6原实际基线。R11强势Top1、R12弱势修复Top2、"
-            "R7与R9对照均不进入组合；"
+            "主报告仍只统计R3/R6原实际基线。R11、R12、R13及R7/R9对照"
+            "均不进入组合；"
             "W3为主验收周期，W4—W8只统计已经走满相应天数的记录。"
         )
 
@@ -6144,7 +6894,10 @@ def main():
         ledger_status = ledger.get(
             "Scan_Status", pd.Series("COMPLETED", index=ledger.index)
         ).astype(str)
-        data_gap_weeks = int(ledger_status.ne("COMPLETED").sum())
+        pending_r13_weeks = int(ledger_status.eq("PENDING_R13_DAILY").sum())
+        data_gap_weeks = int(
+            (ledger_status.ne("COMPLETED") & ~ledger_status.eq("PENDING_R13_DAILY")).sum()
+        )
         skipped_data_weeks = int(ledger_status.eq("SKIPPED_DATA_GAP").sum())
         invalid_selection_weeks = (
             int(
@@ -6160,28 +6913,34 @@ def main():
         )
         selected = completed[_actual_selected_mask(completed)]
         selected_returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
-        metric_columns = st.columns(7)
-        metric_columns[0].metric("已扫描周数", scanned_weeks)
-        metric_columns[1].metric("数据缺口周", data_gap_weeks)
-        metric_columns[2].metric("跳过扫描周", skipped_data_weeks)
-        metric_columns[3].metric("无有效入选周", invalid_selection_weeks)
-        metric_columns[4].metric("W3完整入选交易", len(selected))
-        metric_columns[5].metric(
+        metric_columns = st.columns(8)
+        metric_columns[0].metric("账本已知周数", scanned_weeks)
+        metric_columns[1].metric("待补R13日线周", pending_r13_weeks)
+        metric_columns[2].metric("数据缺口周", data_gap_weeks)
+        metric_columns[3].metric("跳过扫描周", skipped_data_weeks)
+        metric_columns[4].metric("无有效入选周", invalid_selection_weeks)
+        metric_columns[5].metric("W3完整入选交易", len(selected))
+        metric_columns[6].metric(
             "实际入选胜率",
             f"{((selected_returns > 0).mean() * 100.0 if len(selected_returns) else np.nan):.1f}%",
         )
-        metric_columns[6].metric(
+        metric_columns[7].metric(
             "W3实际入选中位收益",
             f"{(selected_returns.median() if len(selected_returns) else np.nan):.2f}%",
         )
 
-        if not data_gap_rows.empty:
+        if not pending_r13_rows.empty:
+            st.info(
+                f"已恢复旧结果中的{len(pending_r13_rows)}周R3/R6、R11/R12数据；"
+                "这些周缺少R13日线快照，启动R13后会逐周替换，不会被当作已完成。"
+            )
+        if not actual_data_gap_rows.empty:
             st.error(
                 "回测已继续完成，但存在行情缺失或跳过周；这些周不会被伪装成完整样本，"
                 "当前结果不能进入实盘判断。"
             )
             with st.expander("查看行情缺失与跳过明细", expanded=True):
-                st.dataframe(data_gap_rows, width="stretch", hide_index=True)
+                st.dataframe(actual_data_gap_rows, width="stretch", hide_index=True)
 
         st.subheader("R11.1原实际组合总体验收（仅R3/R6基线）")
         st.dataframe(gates, width="stretch", hide_index=True)
@@ -6195,6 +6954,14 @@ def main():
             "从高到低。没有阈值、没有第二套引擎，也不替换R6原实际名次。"
         )
         st.dataframe(r12_gates, width="stretch", hide_index=True)
+        st.subheader("R13日线重启质量挑战排名验收（只研究）")
+        st.caption(
+            "固定五项等权：价格/MA20、MA5三日斜率、MACD柱加速度、"
+            "全池五日相对强度、五日低点抬升。没有硬门，不覆盖R6或R12名次。"
+        )
+        if _bool_series(history, "Daily_Restart_Data_Available").sum() == 0:
+            st.info("当前导入的是R12或更早结果包，不含信号日日线快照；需运行R13扫描后才能验收。")
+        st.dataframe(r13_gates, width="stretch", hide_index=True)
         st.subheader("R11强势温和ATR收缩Top1验收（只研究）")
         st.caption(
             "固定顺序是：先按ATR3/ATR13排名，再检查第一名是否位于0.70—0.90；"
@@ -6221,7 +6988,7 @@ def main():
                 "R3/R6实际分支与总体门槛均通过；强势仍保持空仓，可进入跨年度样本外验证。"
             )
         else:
-            st.error("R3、R6或总体门槛尚未全部通过；R12所有研究信号仍禁止进入实盘。")
+            st.error("R3、R6或总体门槛尚未全部通过；R11—R13研究信号均禁止进入实盘。")
 
         st.subheader("R3与R6实际分支分别表现")
         st.dataframe(_format_report_frame(branches), width="stretch", hide_index=True)
@@ -6307,6 +7074,27 @@ def main():
             hide_index=True,
         )
 
+        st.subheader("R13日线挑战Top1、第二名与R6/R12同周对照")
+        st.dataframe(_format_report_frame(r13_audit), width="stretch", hide_index=True)
+
+        st.subheader("R13日线挑战排名是否真的有效")
+        if r13_diagnostics:
+            st.dataframe(
+                pd.DataFrame(
+                    [{"指标": key, "数值": value} for key, value in r13_diagnostics.items()]
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.subheader("R13预先声明的日线单因子与组合排名对照")
+        st.caption("所有方案使用完全相同的R6合格周，完整展示失败项，不事后挑选赢家。")
+        st.dataframe(
+            _format_report_frame(r13_factor_comparison),
+            width="stretch",
+            hide_index=True,
+        )
+
         st.subheader("R5旧触发与R6首次事件同场对照")
         st.dataframe(
             _format_report_frame(trigger_comparison), width="stretch", hide_index=True
@@ -6388,6 +7176,11 @@ def main():
                 "Strong_Score_ATR20", "Strong_Score_NonChase20",
                 "Strong_Score_Industry20", "Strong_Score_Position20",
                 "Recovery_Early_Stage_100", "Recovery_Score_100",
+                "R13_Daily_Restart_Rank", "R13_Daily_Restart_100",
+                "Daily_Close_to_MA20_Ratio", "Daily_MA5_Slope_3D_pct",
+                "Daily_MACD_Hist_Delta_pct", "Daily_Return_5D_pct",
+                "Daily_RS_5D_Pct", "Daily_Higher_Low_5D_pct",
+                "Daily_Close_to_Prior_10D_High_Ratio",
                 "Weekly_SKDJ_K6", "Weekly_SKDJ_D6",
                 "Drawdown_26W_pct", "Price_to_MA10_Ratio", "Return_1W_pct",
                 "Rebound_From_Week_Low_pct",
@@ -6445,11 +7238,15 @@ def main():
             r12_gates,
             r12_diagnostics,
             r12_factor_comparison,
+            r13_audit,
+            r13_gates,
+            r13_diagnostics,
+            r13_factor_comparison,
         )
         st.download_button(
-            "下载R12跨年度弱势修复排名完整研究结果",
+            "下载R13日线重启质量挑战排名完整研究结果",
             data=export_bytes,
-            file_name="r12_cross_year_weak_repair_rank_w3_audit_results.zip",
+            file_name="r13_daily_restart_quality_w3_audit_results.zip",
             mime="application/zip",
         )
 
