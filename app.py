@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-R13 日线重启质量挑战排名研究版。
+R14 高弹性持仓生命周期研究版。
 
-R3、R6与R11.1实际组合逐行保持不变；R11强势Top1、R12弱势修复Top2继续
-冻结为研究对照。R13只在弱势市场既有R6-N6合格池中，使用信号日收盘前已经
-可见的五项日线信息进行等权横截面排名：价格/MA20、MA5三日斜率、MACD柱
-加速度、全池五日相对强度、五日低点抬升。R13不增加硬门、不扩充候选、不读取买入后
-结果，并独立记录Top1/Top2的W1—W8路径；任何R13标记均不得进入实际组合。
+R3、R6与R11.1实际组合逐行保持不变；R11—R13继续冻结为研究对照。R14只把
+R13已经预先声明并完成三年检验的“日线MACD柱加速度”单因子Top2单独标记为
+高弹性观察组，不增加候选、硬门或选股参数。买入仍为信号后下一交易日开盘，
+退出只比较三个事先固定的收盘规则，并在触发后的下一可交易日开盘成交：W1收盘
+亏损、W1/W2连续收盘亏损、W2收盘不高于-5%。所有R14结果均为研究审计，绝不
+覆盖R3/R6实际入选，也不使用买入后的路径反向修改排名。
 """
 
 from __future__ import annotations
@@ -38,15 +39,15 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R13-DAILY-RESTART-QUALITY-RANK-RESEARCH"
-APP_TITLE = "R13日线重启质量挑战排名验证器"
-ENGINE_PATCH = "R13-DAILY-RESTART-FIVE-FACTOR-RESEARCH"
+APP_VERSION = "R14-MACD-ELASTIC-LIFECYCLE-RESEARCH"
+APP_TITLE = "R14高弹性持仓生命周期验证器"
+ENGINE_PATCH = "R14-MACD-ELASTIC-NEXT-OPEN-EXIT-AUDIT"
 
-CHECKPOINT_FILE = "r13_daily_restart_rank_candidates.csv"
-SCAN_LEDGER_FILE = "r13_daily_restart_rank_scanned_dates.csv"
-OPPORTUNITY_FILE = "r13_daily_restart_rank_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r13_daily_restart_rank_running_task.json"
-RESULT_STATE_GUARD_FILE = "r13_daily_restart_rank_result_state.guard"
+CHECKPOINT_FILE = "r14_macd_elastic_lifecycle_candidates.csv"
+SCAN_LEDGER_FILE = "r14_macd_elastic_lifecycle_scanned_dates.csv"
+OPPORTUNITY_FILE = "r14_macd_elastic_lifecycle_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r14_macd_elastic_lifecycle_running_task.json"
+RESULT_STATE_GUARD_FILE = "r14_macd_elastic_lifecycle_result_state.guard"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -95,6 +96,22 @@ MAJOR_WINNER_W3_PCT = 20.0
 TASK_LEASE_SECONDS = 45
 DATA_READY_HOUR_SHANGHAI = 18
 PRIMARY_RETURN_COLUMN = f"Fixed_Return_W{PRIMARY_HOLD_WEEKS}_Net_pct"
+R14_LIFECYCLE_HORIZONS = (3, 4, 6, 8)
+R14_PRIMARY_EXIT_RULE = "W1/W2连续收盘亏损"
+R14_EXIT_RULES = (
+    ("固定持有", None, None),
+    ("W1收盘亏损", "R14_Trigger_W1_Close_Loss", "R14_W1_Next_Open_Return_Net_pct"),
+    (
+        "W1/W2连续收盘亏损",
+        "R14_Trigger_W1_W2_Both_Loss",
+        "R14_W2_Next_Open_Return_Net_pct",
+    ),
+    (
+        "W2收盘不高于-5%",
+        "R14_Trigger_W2_Close_Minus5",
+        "R14_W2_Next_Open_Return_Net_pct",
+    ),
+)
 
 
 # -----------------------------------------------------------------------------
@@ -1813,7 +1830,7 @@ def _market_state_metrics(pool: pd.DataFrame):
 
 
 def score_r13_candidates(pool_snapshots: pd.DataFrame):
-    """R3/R6保持原实际基线；R11、R12、R13全部只研究。"""
+    """R3/R6保持原实际基线；R11—R14全部只研究。"""
     if pool_snapshots.empty:
         return pd.DataFrame(), 0, 0
     pool = pool_snapshots.copy()
@@ -1886,6 +1903,7 @@ def score_r13_candidates(pool_snapshots: pd.DataFrame):
     candidates["Recovery_Rank"] = np.nan
     candidates["R12_Recovery_Repair_Rank"] = np.nan
     candidates["R13_Daily_Restart_Rank"] = np.nan
+    candidates["R14_MACD_Elastic_Rank"] = np.nan
     for column in (
         "Recovery_Early_Return2W_20",
         "Recovery_Early_MA10_Distance_20",
@@ -1933,6 +1951,8 @@ def score_r13_candidates(pool_snapshots: pd.DataFrame):
     candidates["R12_Recovery_Repair_Top2"] = False
     candidates["R13_Daily_Restart_Top1"] = False
     candidates["R13_Daily_Restart_Top2"] = False
+    candidates["R14_MACD_Elastic_Top1"] = False
+    candidates["R14_MACD_Elastic_Top2"] = False
     r3_eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
     strong_eligible = candidates[_bool_series(candidates, "Strong_Eligible")].copy()
     reacceleration_eligible = candidates[
@@ -2120,6 +2140,23 @@ def score_r13_candidates(pool_snapshots: pd.DataFrame):
                 daily_rank_map.index, "R13_Daily_Restart_Rank"
             ] = daily_rank_map.astype(float)
 
+            # R14不再组合五项日线分，只把R13预先声明的MACD柱加速度单因子
+            # 单独排序为高弹性观察组。股票代码只负责完全同值时的稳定并列，
+            # 此名次永远不能覆盖R6原实际排名。
+            elastic_ordered = daily_rows.sort_values(
+                ["Daily_MACD_Hist_Delta_pct", "ts_code"],
+                ascending=[False, True],
+                na_position="last",
+                kind="mergesort",
+            )
+            elastic_rank_map = pd.Series(
+                np.arange(1, len(elastic_ordered) + 1, dtype=int),
+                index=elastic_ordered.index,
+            )
+            candidates.loc[
+                elastic_rank_map.index, "R14_MACD_Elastic_Rank"
+            ] = elastic_rank_map.astype(float)
+
     market_median = _safe_float(market_state.get("Market_13W_Median_pct"), 0.0)
     previous_market_13w = _safe_float(
         market_state.get("Previous_Market_13W_Median_pct"), 0.0
@@ -2241,6 +2278,11 @@ def score_r13_candidates(pool_snapshots: pd.DataFrame):
     candidates["R13_Daily_Restart_Top2"] = r13_research_context & r13_rank.le(
         TOP_N
     )
+    r14_rank = pd.to_numeric(candidates["R14_MACD_Elastic_Rank"], errors="coerce")
+    candidates["R14_MACD_Elastic_Top1"] = r13_research_context & r14_rank.eq(1)
+    candidates["R14_MACD_Elastic_Top2"] = r13_research_context & r14_rank.le(
+        TOP_N
+    )
     if selection_valid:
         selected = (
             _bool_series(candidates, "Entry_Eligible")
@@ -2269,6 +2311,7 @@ def score_r13_candidates(pool_snapshots: pd.DataFrame):
     )
     candidates["Recovery_Eligible_Count"] = recovery_eligible_count
     candidates["R13_Daily_Available_Count"] = r13_available_count
+    candidates["R14_MACD_Elastic_Count"] = r13_available_count
     candidates["R5_Baseline_Recovery_Eligible_Count"] = r5_baseline_eligible_count
     candidates["Active_Eligible_Count"] = active_eligible_count
     candidates["Strong_Required_Count"] = MIN_VALID_SELECTION_SIZE
@@ -2342,6 +2385,18 @@ def track_fixed_future_path(
         "Path_10_vs_Minus5": "PENDING",
         "Early_Failure_2W": np.nan,
         "Outcome_Grade": "待完成",
+        "R14_W1_Close_Gross_pct": np.nan,
+        "R14_W2_Close_Gross_pct": np.nan,
+        "R14_Trigger_W1_Close_Loss": np.nan,
+        "R14_Trigger_W1_W2_Both_Loss": np.nan,
+        "R14_Trigger_W2_Close_Minus5": np.nan,
+        "R14_W1_Next_Open_Exit_Date": None,
+        "R14_W2_Next_Open_Exit_Date": None,
+        "R14_W1_Next_Open_Return_Net_pct": np.nan,
+        "R14_W2_Next_Open_Return_Net_pct": np.nan,
+        "R14_W1_Exit_Delay_Days": np.nan,
+        "R14_W2_Exit_Delay_Days": np.nan,
+        "R14_Lifecycle_Data_Available": False,
     }
     for week in range(1, HOLD_WEEKS + 1):
         result[f"Fixed_Return_W{week}_Net_pct"] = np.nan
@@ -2402,15 +2457,93 @@ def track_fixed_future_path(
 
     result["Entry_Tradable"] = True
     result["Entry_Status"] = "可成交"
+    marked_close = pd.to_numeric(future["close"], errors="coerce").ffill()
     for week in range(1, HOLD_WEEKS + 1):
         day_index = week * MARKET_DAYS_PER_WEEK - 1
         if len(future) > day_index:
-            marked_close = pd.to_numeric(future["close"], errors="coerce").ffill()
             exit_close = _safe_float(marked_close.iloc[day_index])
             if math.isfinite(exit_close):
                 result[f"Fixed_Return_W{week}_Net_pct"] = (
                     (exit_close / buy_price - 1.0) * 100.0 - roundtrip_cost_pct
                 )
+
+    # R14退出只在周末收盘确认后，于下一可交易日开盘成交。停牌和一字跌停
+    # 不假设能够卖出，而是顺延到第一天真实可交易的开盘价。
+    def _next_tradable_exit(decision_day_index: int):
+        previous_raw_close = signal_raw_close
+        for position, (_, exit_row) in enumerate(future.iterrows()):
+            raw_close = _safe_float(
+                exit_row.get("raw_close"), _safe_float(exit_row.get("close"))
+            )
+            if position <= decision_day_index:
+                if math.isfinite(raw_close) and raw_close > 0:
+                    previous_raw_close = raw_close
+                continue
+            exit_open = _safe_float(exit_row.get("open"))
+            raw_open = _safe_float(exit_row.get("raw_open"), exit_open)
+            raw_high = _safe_float(
+                exit_row.get("raw_high"), _safe_float(exit_row.get("high"))
+            )
+            raw_low = _safe_float(
+                exit_row.get("raw_low"), _safe_float(exit_row.get("low"))
+            )
+            one_price_limit_down = (
+                math.isfinite(previous_raw_close)
+                and previous_raw_close > 0
+                and all(
+                    math.isfinite(item)
+                    for item in (raw_open, raw_high, raw_low, raw_close)
+                )
+                and np.isclose(
+                    raw_high,
+                    raw_low,
+                    rtol=0,
+                    atol=max(0.001, raw_open * 1e-5),
+                )
+                and (raw_close / previous_raw_close - 1.0) <= -limit_threshold
+            )
+            if math.isfinite(exit_open) and exit_open > 0 and not one_price_limit_down:
+                return (
+                    str(future.index[position]),
+                    (exit_open / buy_price - 1.0) * 100.0 - roundtrip_cost_pct,
+                    position - decision_day_index - 1,
+                )
+            if math.isfinite(raw_close) and raw_close > 0:
+                previous_raw_close = raw_close
+        return None, np.nan, np.nan
+
+    if len(future) >= MARKET_DAYS_PER_WEEK:
+        w1_close = _safe_float(marked_close.iloc[MARKET_DAYS_PER_WEEK - 1])
+        if math.isfinite(w1_close):
+            w1_gross = (w1_close / buy_price - 1.0) * 100.0
+            result["R14_W1_Close_Gross_pct"] = w1_gross
+            result["R14_Trigger_W1_Close_Loss"] = bool(w1_gross < 0.0)
+            exit_date, exit_return, delay_days = _next_tradable_exit(
+                MARKET_DAYS_PER_WEEK - 1
+            )
+            result["R14_W1_Next_Open_Exit_Date"] = exit_date
+            result["R14_W1_Next_Open_Return_Net_pct"] = exit_return
+            result["R14_W1_Exit_Delay_Days"] = delay_days
+    if len(future) >= 2 * MARKET_DAYS_PER_WEEK:
+        w2_close = _safe_float(marked_close.iloc[2 * MARKET_DAYS_PER_WEEK - 1])
+        w1_gross = _safe_float(result.get("R14_W1_Close_Gross_pct"))
+        if math.isfinite(w2_close):
+            w2_gross = (w2_close / buy_price - 1.0) * 100.0
+            result["R14_W2_Close_Gross_pct"] = w2_gross
+            result["R14_Trigger_W1_W2_Both_Loss"] = bool(
+                math.isfinite(w1_gross) and w1_gross < 0.0 and w2_gross < 0.0
+            )
+            result["R14_Trigger_W2_Close_Minus5"] = bool(w2_gross <= -5.0)
+            exit_date, exit_return, delay_days = _next_tradable_exit(
+                2 * MARKET_DAYS_PER_WEEK - 1
+            )
+            result["R14_W2_Next_Open_Exit_Date"] = exit_date
+            result["R14_W2_Next_Open_Return_Net_pct"] = exit_return
+            result["R14_W2_Exit_Delay_Days"] = delay_days
+            result["R14_Lifecycle_Data_Available"] = bool(
+                math.isfinite(_safe_float(exit_return))
+                and math.isfinite(w1_gross)
+            )
     result["Fixed_W8_Return_Net_pct"] = _safe_float(
         result.get("Fixed_Return_W8_Net_pct")
     )
@@ -2749,6 +2882,25 @@ def build_major_winner_audit(
                     and _bool_series(
                         pd.DataFrame([candidate_row]),
                         "R13_Daily_Restart_Top2",
+                    ).iloc[0]
+                ),
+                "R14_MACD_Elastic_Rank": (
+                    candidate_row.get("R14_MACD_Elastic_Rank")
+                    if candidate_row is not None
+                    else np.nan
+                ),
+                "R14_MACD_Elastic_Top1": bool(
+                    candidate_row is not None
+                    and _bool_series(
+                        pd.DataFrame([candidate_row]),
+                        "R14_MACD_Elastic_Top1",
+                    ).iloc[0]
+                ),
+                "R14_MACD_Elastic_Top2": bool(
+                    candidate_row is not None
+                    and _bool_series(
+                        pd.DataFrame([candidate_row]),
+                        "R14_MACD_Elastic_Top2",
                     ).iloc[0]
                 ),
                 "Miss_Reason": miss_reason,
@@ -5249,6 +5401,385 @@ def r13_daily_restart_gates(history: pd.DataFrame):
     )
 
 
+# -----------------------------------------------------------------------------
+# R14 MACD高弹性组与下一开盘退出审计
+# -----------------------------------------------------------------------------
+def _r14_selected(history: pd.DataFrame, require_lifecycle: bool = False):
+    if history.empty:
+        return history.iloc[0:0].copy()
+    mask = (
+        _bool_series(history, "R14_MACD_Elastic_Top2")
+        & _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+    )
+    if require_lifecycle:
+        mask &= _bool_series(history, "R14_Lifecycle_Data_Available")
+    return history[mask].copy()
+
+
+def _r14_performance_row(label: str, group: pd.DataFrame):
+    returns = pd.to_numeric(
+        group.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    valid = group.loc[returns.index].copy() if len(returns) else group.iloc[0:0].copy()
+    grades = valid.get(
+        "Outcome_Grade", pd.Series("", index=valid.index)
+    ).astype(str)
+    without_best = (
+        returns.drop(index=returns.idxmax())
+        if len(returns) > 1
+        else pd.Series(dtype=float)
+    )
+    positive_total = returns[returns > 0.0].sum()
+    best_contribution = (
+        returns.max() / positive_total * 100.0
+        if len(returns) and positive_total > 0.0
+        else np.nan
+    )
+    mfe = pd.to_numeric(
+        valid.get("MFE_W3_Net_pct", pd.Series(dtype=float)), errors="coerce"
+    )
+    mae = pd.to_numeric(
+        valid.get("MAE_W3_Raw_pct", pd.Series(dtype=float)), errors="coerce"
+    )
+    return {
+        "R14高弹性研究组": label,
+        "样本数": len(returns),
+        "信号周": valid["Signal_Date"].nunique() if len(valid) else 0,
+        "胜率%": (returns > 0.0).mean() * 100.0 if len(returns) else np.nan,
+        "S级比例%": grades.eq("S").mean() * 100.0 if len(grades) else np.nan,
+        "A级比例%": grades.eq("A").mean() * 100.0 if len(grades) else np.nan,
+        "S/A比例%": grades.isin({"S", "A"}).mean() * 100.0 if len(grades) else np.nan,
+        "F级比例%": grades.eq("F").mean() * 100.0 if len(grades) else np.nan,
+        "中位收益%": returns.median() if len(returns) else np.nan,
+        "平均收益%": returns.mean() if len(returns) else np.nan,
+        "Profit_Factor": _profit_factor(returns),
+        "去最佳一只平均收益%": without_best.mean() if len(without_best) else np.nan,
+        "去最佳一只PF": _profit_factor(without_best),
+        "最佳一只占正利润%": best_contribution,
+        "W3最大浮盈中位数%": mfe.median() if len(mfe.dropna()) else np.nan,
+        "W3最大回撤中位数%": mae.median() if len(mae.dropna()) else np.nan,
+    }
+
+
+def r14_macd_elastic_candidate_audit(history: pd.DataFrame):
+    columns = [
+        "R14高弹性研究组", "样本数", "信号周", "胜率%", "S级比例%",
+        "A级比例%", "S/A比例%", "F级比例%", "中位收益%", "平均收益%",
+        "Profit_Factor", "去最佳一只平均收益%", "去最佳一只PF",
+        "最佳一只占正利润%", "W3最大浮盈中位数%", "W3最大回撤中位数%",
+    ]
+    selected = _r14_selected(history)
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+    selected_dates = set(selected["Signal_Date"].astype(str))
+    same_week_r6 = history[
+        _bool_series(history, "Selected_Top2")
+        & _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & history.get(
+            "Strategy_Branch", pd.Series("", index=history.index)
+        ).astype(str).eq("R6弱势首次转折-N6")
+        & history.get(
+            "Signal_Date", pd.Series("", index=history.index)
+        ).astype(str).isin(selected_dates)
+    ].copy()
+    rank = pd.to_numeric(
+        selected.get("R14_MACD_Elastic_Rank"), errors="coerce"
+    )
+    groups = [
+        ("R14日线MACD柱加速度Top2（只研究）", selected),
+        ("R14高弹性Top1", selected[rank.eq(1)]),
+        ("R14高弹性第二名", selected[rank.eq(2)]),
+        ("同周R6原排名Top2（实际基线）", same_week_r6),
+    ]
+    return pd.DataFrame(
+        [_r14_performance_row(label, group) for label, group in groups],
+        columns=columns,
+    )
+
+
+def r14_exit_classification_audit(history: pd.DataFrame):
+    columns = [
+        "R14退出规则", "完整样本", "触发退出数", "触发退出比例%",
+        "F级样本", "F级捕获率%", "非F误退率%", "S/A样本",
+        "S/A误杀率%", "正常次日开盘退出比例%", "平均顺延交易日",
+    ]
+    selected = _r14_selected(history, require_lifecycle=True)
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+    grades = selected.get(
+        "Outcome_Grade", pd.Series("", index=selected.index)
+    ).astype(str)
+    f_mask = grades.eq("F")
+    sa_mask = grades.isin({"S", "A"})
+    rows = []
+    for label, trigger_column, exit_column in R14_EXIT_RULES[1:]:
+        trigger = _bool_series(selected, trigger_column)
+        delay_column = (
+            "R14_W1_Exit_Delay_Days"
+            if exit_column == "R14_W1_Next_Open_Return_Net_pct"
+            else "R14_W2_Exit_Delay_Days"
+        )
+        delays = pd.to_numeric(
+            selected.loc[trigger].get(
+                delay_column, pd.Series(dtype=float)
+            ),
+            errors="coerce",
+        ).dropna()
+        rows.append(
+            {
+                "R14退出规则": label,
+                "完整样本": len(selected),
+                "触发退出数": int(trigger.sum()),
+                "触发退出比例%": trigger.mean() * 100.0,
+                "F级样本": int(f_mask.sum()),
+                "F级捕获率%": trigger[f_mask].mean() * 100.0 if f_mask.any() else np.nan,
+                "非F误退率%": trigger[~f_mask].mean() * 100.0 if (~f_mask).any() else np.nan,
+                "S/A样本": int(sa_mask.sum()),
+                "S/A误杀率%": trigger[sa_mask].mean() * 100.0 if sa_mask.any() else np.nan,
+                "正常次日开盘退出比例%": (
+                    delays.eq(0).mean() * 100.0 if len(delays) else np.nan
+                ),
+                "平均顺延交易日": delays.mean() if len(delays) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _r14_lifecycle_returns(
+    selected: pd.DataFrame,
+    horizon: int,
+    trigger_column: str | None,
+    exit_column: str | None,
+):
+    fixed_column = f"Fixed_Return_W{horizon}_Net_pct"
+    fixed = pd.to_numeric(
+        selected.get(fixed_column, pd.Series(np.nan, index=selected.index)),
+        errors="coerce",
+    )
+    matured = fixed.notna()
+    cohort = selected.loc[matured].copy()
+    fixed = fixed.loc[matured]
+    if trigger_column is None or exit_column is None:
+        return cohort, fixed, pd.Series(False, index=cohort.index, dtype=bool)
+    trigger = _bool_series(cohort, trigger_column)
+    exit_returns = pd.to_numeric(
+        cohort.get(exit_column, pd.Series(np.nan, index=cohort.index)),
+        errors="coerce",
+    )
+    valid = ~trigger | exit_returns.notna()
+    cohort = cohort.loc[valid].copy()
+    trigger = trigger.loc[valid]
+    fixed = fixed.loc[valid]
+    exit_returns = exit_returns.loc[valid]
+    realized = fixed.copy()
+    realized.loc[trigger] = exit_returns.loc[trigger]
+    return cohort, realized, trigger
+
+
+def r14_lifecycle_return_audit(history: pd.DataFrame):
+    columns = [
+        "持有上限", "R14退出规则", "可比样本", "信号周", "退出交易数",
+        "胜率%", "中位收益%", "平均收益%", "5%截尾均益%",
+        "Profit_Factor", "最大单笔亏损%", "相对固定平均改善百分点",
+        "F级退出率%", "S/A保留率%",
+    ]
+    selected = _r14_selected(history, require_lifecycle=True)
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for horizon in R14_LIFECYCLE_HORIZONS:
+        baseline = pd.to_numeric(
+            selected.get(
+                f"Fixed_Return_W{horizon}_Net_pct",
+                pd.Series(np.nan, index=selected.index),
+            ),
+            errors="coerce",
+        )
+        for label, trigger_column, exit_column in R14_EXIT_RULES:
+            cohort, realized, trigger = _r14_lifecycle_returns(
+                selected, horizon, trigger_column, exit_column
+            )
+            realized = pd.to_numeric(realized, errors="coerce").dropna()
+            cohort = cohort.loc[realized.index]
+            trigger = trigger.loc[realized.index]
+            fixed_same = baseline.loc[realized.index]
+            grades = cohort.get(
+                "Outcome_Grade", pd.Series("", index=cohort.index)
+            ).astype(str)
+            f_mask = grades.eq("F")
+            sa_mask = grades.isin({"S", "A"})
+            rows.append(
+                {
+                    "持有上限": f"W{horizon}",
+                    "R14退出规则": label,
+                    "可比样本": len(realized),
+                    "信号周": cohort["Signal_Date"].nunique() if len(cohort) else 0,
+                    "退出交易数": int(trigger.sum()),
+                    "胜率%": (realized > 0.0).mean() * 100.0 if len(realized) else np.nan,
+                    "中位收益%": realized.median() if len(realized) else np.nan,
+                    "平均收益%": realized.mean() if len(realized) else np.nan,
+                    "5%截尾均益%": _trimmed_mean(realized),
+                    "Profit_Factor": _profit_factor(realized),
+                    "最大单笔亏损%": realized.min() if len(realized) else np.nan,
+                    "相对固定平均改善百分点": (
+                        (realized - fixed_same).mean() if len(realized) else np.nan
+                    ),
+                    "F级退出率%": trigger[f_mask].mean() * 100.0 if f_mask.any() else np.nan,
+                    "S/A保留率%": (~trigger[sa_mask]).mean() * 100.0 if sa_mask.any() else np.nan,
+                }
+            )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r14_yearly_lifecycle_audit(history: pd.DataFrame):
+    columns = [
+        "年份", "持有上限", "R14退出规则", "样本数", "胜率%",
+        "中位收益%", "平均收益%", "Profit_Factor", "最大单笔亏损%",
+    ]
+    selected = _r14_selected(history, require_lifecycle=True)
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+    selected["_year"] = selected["Signal_Date"].astype(str).str[:4]
+    rows = []
+    for year in sorted(selected["_year"].dropna().unique()):
+        year_group = selected[selected["_year"].eq(year)]
+        for horizon in R14_LIFECYCLE_HORIZONS:
+            for label, trigger_column, exit_column in R14_EXIT_RULES:
+                _, realized, _ = _r14_lifecycle_returns(
+                    year_group, horizon, trigger_column, exit_column
+                )
+                realized = pd.to_numeric(realized, errors="coerce").dropna()
+                rows.append(
+                    {
+                        "年份": year,
+                        "持有上限": f"W{horizon}",
+                        "R14退出规则": label,
+                        "样本数": len(realized),
+                        "胜率%": (realized > 0.0).mean() * 100.0 if len(realized) else np.nan,
+                        "中位收益%": realized.median() if len(realized) else np.nan,
+                        "平均收益%": realized.mean() if len(realized) else np.nan,
+                        "Profit_Factor": _profit_factor(realized),
+                        "最大单笔亏损%": realized.min() if len(realized) else np.nan,
+                    }
+                )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r14_lifecycle_acceptance_gates(history: pd.DataFrame):
+    selected = _r14_selected(history)
+    returns = pd.to_numeric(
+        selected.get(PRIMARY_RETURN_COLUMN, pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    selected = selected.loc[returns.index] if len(returns) else selected.iloc[0:0]
+    dates = set(selected["Signal_Date"].astype(str)) if len(selected) else set()
+    r6 = history[
+        _bool_series(history, "Selected_Top2")
+        & _bool_series(history, "Outcome_Complete")
+        & _bool_series(history, "Entry_Tradable")
+        & history.get(
+            "Strategy_Branch", pd.Series("", index=history.index)
+        ).astype(str).eq("R6弱势首次转折-N6")
+        & history.get(
+            "Signal_Date", pd.Series("", index=history.index)
+        ).astype(str).isin(dates)
+    ].copy()
+    selected_grades = selected.get(
+        "Outcome_Grade", pd.Series("", index=selected.index)
+    ).astype(str)
+    r6_grades = r6.get("Outcome_Grade", pd.Series("", index=r6.index)).astype(str)
+    sa_rate = selected_grades.isin({"S", "A"}).mean() * 100.0 if len(selected) else np.nan
+    r6_sa_rate = r6_grades.isin({"S", "A"}).mean() * 100.0 if len(r6) else np.nan
+    f_rate = selected_grades.eq("F").mean() * 100.0 if len(selected) else np.nan
+    r6_f_rate = r6_grades.eq("F").mean() * 100.0 if len(r6) else np.nan
+    without_best = returns.drop(index=returns.idxmax()) if len(returns) > 1 else pd.Series(dtype=float)
+    positive_total = returns[returns > 0.0].sum()
+    best_contribution = (
+        returns.max() / positive_total * 100.0
+        if len(returns) and positive_total > 0.0
+        else np.nan
+    )
+    selected_week_return = (
+        selected.groupby("Signal_Date")[PRIMARY_RETURN_COLUMN].mean()
+        if len(selected)
+        else pd.Series(dtype=float)
+    )
+    r6_week_return = (
+        r6.groupby("Signal_Date")[PRIMARY_RETURN_COLUMN].mean()
+        if len(r6)
+        else pd.Series(dtype=float)
+    )
+    weekly_comparison = pd.concat(
+        [
+            selected_week_return.rename("R14"),
+            r6_week_return.rename("R6"),
+        ],
+        axis=1,
+    ).dropna()
+    weekly_difference = weekly_comparison["R14"] - weekly_comparison["R6"]
+    weekly_wins = int(weekly_difference.gt(1e-9).sum())
+    weekly_losses = int(weekly_difference.lt(-1e-9).sum())
+    weekly_ties = int(weekly_difference.abs().le(1e-9).sum())
+    weekly_win_rate = (
+        weekly_wins / len(weekly_comparison) * 100.0
+        if len(weekly_comparison)
+        else np.nan
+    )
+
+    classification = r14_exit_classification_audit(history)
+    primary_class = classification[
+        classification.get(
+            "R14退出规则", pd.Series("", index=classification.index)
+        ).astype(str).eq(R14_PRIMARY_EXIT_RULE)
+    ]
+    f_capture = _safe_float(
+        primary_class["F级捕获率%"].iloc[0] if not primary_class.empty else np.nan
+    )
+    sa_false = _safe_float(
+        primary_class["S/A误杀率%"].iloc[0] if not primary_class.empty else np.nan
+    )
+    lifecycle = r14_lifecycle_return_audit(history)
+    base_w3 = lifecycle[
+        lifecycle["持有上限"].astype(str).eq("W3")
+        & lifecycle["R14退出规则"].astype(str).eq("固定持有")
+    ] if not lifecycle.empty else pd.DataFrame()
+    primary_w3 = lifecycle[
+        lifecycle["持有上限"].astype(str).eq("W3")
+        & lifecycle["R14退出规则"].astype(str).eq(R14_PRIMARY_EXIT_RULE)
+    ] if not lifecycle.empty else pd.DataFrame()
+    base_pf = _safe_float(base_w3["Profit_Factor"].iloc[0] if not base_w3.empty else np.nan)
+    primary_pf = _safe_float(primary_w3["Profit_Factor"].iloc[0] if not primary_w3.empty else np.nan)
+    base_min = _safe_float(base_w3["最大单笔亏损%"].iloc[0] if not base_w3.empty else np.nan)
+    primary_min = _safe_float(primary_w3["最大单笔亏损%"].iloc[0] if not primary_w3.empty else np.nan)
+    gates = [
+        ("冻结入场8项", "R14高弹性组至少12个完整信号周", selected["Signal_Date"].nunique() >= 12 if len(selected) else False, f"当前{selected['Signal_Date'].nunique() if len(selected) else 0}周"),
+        ("冻结入场8项", "R14高弹性组至少24笔完整交易", len(returns) >= 24, f"当前{len(returns)}笔"),
+        ("冻结入场8项", "R14 S/A比例至少高于同周R6十个百分点", math.isfinite(sa_rate) and math.isfinite(r6_sa_rate) and sa_rate >= r6_sa_rate + 10.0, f"R14 {sa_rate:.1f}% / R6 {r6_sa_rate:.1f}%"),
+        ("冻结入场8项", "R14 F级比例至少低于同周R6十个百分点", math.isfinite(f_rate) and math.isfinite(r6_f_rate) and f_rate <= r6_f_rate - 10.0, f"R14 {f_rate:.1f}% / R6 {r6_f_rate:.1f}%"),
+        ("冻结入场8项", "R14固定W3中位收益大于0", len(returns) > 0 and returns.median() > 0.0, f"当前{returns.median() if len(returns) else np.nan:.2f}%"),
+        ("冻结入场8项", "R14去最佳一只后PF至少1.2", pd.notna(_profit_factor(without_best)) and _profit_factor(without_best) >= 1.2, f"当前{_profit_factor(without_best):.2f}"),
+        ("冻结入场8项", "R14最佳一只占正利润不超过40%", math.isfinite(best_contribution) and best_contribution <= 40.0, f"当前{best_contribution:.1f}%"),
+        ("冻结入场8项", "R14逐周战胜同周R6至少55%", math.isfinite(weekly_win_rate) and weekly_win_rate >= 55.0, f"胜{weekly_wins}周 / 负{weekly_losses}周 / 平{weekly_ties}周；{weekly_win_rate:.1f}%"),
+        ("新增退出4项", "主退出规则捕获至少65%的F级", math.isfinite(f_capture) and f_capture >= 65.0, f"当前{f_capture:.1f}%"),
+        ("新增退出4项", "主退出规则误杀S/A不超过10%", math.isfinite(sa_false) and sa_false <= 10.0, f"当前{sa_false:.1f}%"),
+        ("新增退出4项", "主退出规则W3 Profit Factor不低于固定持有", math.isfinite(primary_pf) and math.isfinite(base_pf) and primary_pf >= base_pf, f"退出{primary_pf:.2f} / 固定{base_pf:.2f}"),
+        ("新增退出4项", "主退出规则改善W3最大单笔亏损", math.isfinite(primary_min) and math.isfinite(base_min) and primary_min > base_min, f"退出{primary_min:.2f}% / 固定{base_min:.2f}%"),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "验收阶段": phase,
+                "R14验收项目": name,
+                "结果": "通过" if passed else "未通过",
+                "当前值": value,
+            }
+            for phase, name, passed, value in gates
+        ]
+    )
+
+
 def market_data_gap_audit(ledger: pd.DataFrame):
     columns = [
         "Signal_Date",
@@ -5320,9 +5851,12 @@ def result_state_consistency_audit(history: pd.DataFrame, ledger: pd.DataFrame):
         "Scan_Status", pd.Series("COMPLETED", index=ledger_frame.index)
     ).astype(str)
     completed = ledger_frame[ledger_status.isin(completed_statuses)].copy()
-    pending_r13_dates = set(
+    pending_research_dates = set(
         ledger_frame.loc[
-            ledger_status.eq("PENDING_R13_DAILY"), "Signal_Date"
+            ledger_status.isin(
+                {"PENDING_R13_DAILY", "PENDING_R14_LIFECYCLE"}
+            ),
+            "Signal_Date",
         ].astype(str)
     )
 
@@ -5379,7 +5913,7 @@ def result_state_consistency_audit(history: pd.DataFrame, ledger: pd.DataFrame):
             )
 
     for signal_date in sorted(
-        candidate_dates - completed_dates - pending_r13_dates
+        candidate_dates - completed_dates - pending_research_dates
     ):
         group = history_frame[
             history_frame["Signal_Date"].astype(str).eq(signal_date)
@@ -5444,8 +5978,8 @@ def repair_inconsistent_completed_ledger(config_id: str):
     return bad_dates
 
 
-def _apply_r13_selection_policy(frame: pd.DataFrame):
-    """兼容导入R9—R13：实际组合不变，重算可复原的研究标记。"""
+def _apply_r14_selection_policy(frame: pd.DataFrame):
+    """兼容导入R9—R14：实际组合不变，重算可复原的研究标记。"""
     result = frame.copy()
     market_regime = result.get(
         "Market_Regime", pd.Series("", index=result.index)
@@ -5626,6 +6160,54 @@ def _apply_r13_selection_policy(frame: pd.DataFrame):
         r13_eligible & enough_r13 & r13_rank.le(TOP_N)
     )
 
+    # R14只需要信号日MACD柱加速度；从完整的同周R6合格池恢复名次，
+    # 不允许利用结果包中的未来收益或保存的旧名次。
+    elastic_available = pd.to_numeric(
+        result.get(
+            "Daily_MACD_Hist_Delta_pct",
+            pd.Series(np.nan, index=result.index),
+        ),
+        errors="coerce",
+    ).notna()
+    r14_eligible = recovery_eligible & elastic_available
+    result["R14_MACD_Elastic_Rank"] = np.nan
+    elastic_rows = result.loc[r14_eligible].copy()
+    if not elastic_rows.empty:
+        elastic_rows["_macd_accel"] = pd.to_numeric(
+            elastic_rows["Daily_MACD_Hist_Delta_pct"], errors="coerce"
+        )
+        elastic_rows["_code"] = elastic_rows.get(
+            "ts_code", pd.Series("", index=elastic_rows.index)
+        ).astype(str)
+        elastic_rows = elastic_rows.sort_values(
+            ["Signal_Date", "_macd_accel", "_code"],
+            ascending=[True, False, True],
+            na_position="last",
+            kind="mergesort",
+        )
+        elastic_rows["_rank"] = (
+            elastic_rows.groupby("Signal_Date", sort=False).cumcount() + 1
+        )
+        result.loc[
+            elastic_rows.index, "R14_MACD_Elastic_Rank"
+        ] = elastic_rows["_rank"]
+    r14_count_by_week = (
+        result.loc[r14_eligible].groupby("Signal_Date", sort=False).size()
+    )
+    enough_r14 = result["Signal_Date"].map(r14_count_by_week).fillna(0).ge(
+        MIN_VALID_SELECTION_SIZE
+    )
+    r14_rank = pd.to_numeric(result["R14_MACD_Elastic_Rank"], errors="coerce")
+    result["R14_MACD_Elastic_Top1"] = (
+        r14_eligible & enough_r14 & r14_rank.eq(1)
+    )
+    result["R14_MACD_Elastic_Top2"] = (
+        r14_eligible & enough_r14 & r14_rank.le(TOP_N)
+    )
+    result["R14_MACD_Elastic_Count"] = (
+        result["Signal_Date"].map(r14_count_by_week).fillna(0).astype(int)
+    )
+
     if "Selected_Top2" not in result.columns:
         result["Selected_Top2"] = False
     if "Selection_Valid" not in result.columns:
@@ -5650,7 +6232,7 @@ def _apply_r13_selection_policy(frame: pd.DataFrame):
     return result
 
 
-def import_r13_results_zip(zip_bytes: bytes, config_id: str):
+def import_r14_results_zip(zip_bytes: bytes, config_id: str):
     """先完整验证、后事务提交；失败时不允许留下候选或账本半成品。"""
     if not zip_bytes:
         raise ValueError("结果包为空。")
@@ -5673,11 +6255,12 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
                 or name.startswith("01_all_r11")
                 or name.startswith("01_all_r12")
                 or name.startswith("01_all_r13")
+                or name.startswith("01_all_r14")
             )
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R9/R10/R11/R12/R13候选明细。")
+            raise ValueError("结果包中未找到唯一的R9/R10/R11/R12/R13/R14候选明细。")
         candidate_info = infos[candidate_names[0]]
         if candidate_info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -5694,10 +6277,26 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
             raise ValueError("候选明细为空。")
         if candidates.duplicated(["Signal_Date", "ts_code"]).any():
             raise ValueError("候选明细存在重复的日期与股票代码。")
-        candidates = _apply_r13_selection_policy(candidates)
+        candidates = _apply_r14_selection_policy(candidates)
         legacy_missing_r13 = not _bool_series(
             candidates, "Daily_Restart_Data_Available"
         ).any()
+        r14_lifecycle_required = {
+            "R14_W1_Close_Gross_pct",
+            "R14_W2_Close_Gross_pct",
+            "R14_W1_Next_Open_Return_Net_pct",
+            "R14_W2_Next_Open_Return_Net_pct",
+            "R14_Lifecycle_Data_Available",
+        }
+        legacy_missing_r14 = not r14_lifecycle_required.issubset(
+            candidates.columns
+        )
+        pending_r14_dates = set(
+            candidates.loc[
+                _bool_series(candidates, "R14_MACD_Elastic_Top2"),
+                "Signal_Date",
+            ].astype(str)
+        ) if legacy_missing_r14 else set()
         candidates["Config_ID"] = str(config_id)
 
         opportunity_name = next(
@@ -5728,7 +6327,7 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
             ).copy()
             if opportunities.duplicated(["Signal_Date", "ts_code"]).any():
                 raise ValueError("大牛股机会明细存在重复的日期与股票代码。")
-            opportunities = _apply_r13_selection_policy(opportunities)
+            opportunities = _apply_r14_selection_policy(opportunities)
             # 机会表只是全池子集，R11/R12/R13名次必须从完整候选表回填。
             research_map_columns = [
                 "Signal_Date",
@@ -5741,6 +6340,9 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
                 "R13_Daily_Restart_Rank",
                 "R13_Daily_Restart_Top1",
                 "R13_Daily_Restart_Top2",
+                "R14_MACD_Elastic_Rank",
+                "R14_MACD_Elastic_Top1",
+                "R14_MACD_Elastic_Top2",
             ]
             research_map = candidates[research_map_columns].drop_duplicates(
                 ["Signal_Date", "ts_code"], keep="last"
@@ -5764,6 +6366,12 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
             )
             opportunities["R13_Daily_Restart_Top2"] = _bool_series(
                 opportunities, "R13_Daily_Restart_Top2"
+            )
+            opportunities["R14_MACD_Elastic_Top1"] = _bool_series(
+                opportunities, "R14_MACD_Elastic_Top1"
+            )
+            opportunities["R14_MACD_Elastic_Top2"] = _bool_series(
+                opportunities, "R14_MACD_Elastic_Top2"
             )
             strong_opportunities = opportunities.get(
                 "Market_Regime", pd.Series("", index=opportunities.index)
@@ -5827,6 +6435,16 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
             imported_ledger["Selection_Block_Reason"] = (
                 "旧结果包已恢复；缺少R13信号日日线快照，等待R13逐周重扫"
             )
+        elif pending_r14_dates:
+            pending_mask = imported_ledger["Signal_Date"].astype(str).isin(
+                pending_r14_dates
+            )
+            imported_ledger.loc[
+                pending_mask, "Scan_Status"
+            ] = "PENDING_R14_LIFECYCLE"
+            imported_ledger.loc[
+                pending_mask, "Selection_Block_Reason"
+            ] = "R13结果已恢复；等待补算R14下一可交易日开盘退出路径"
 
         candidate_rows_by_week = candidates.groupby("Signal_Date").size().to_dict()
         mapped_candidate_rows = imported_ledger["Signal_Date"].map(
@@ -5882,9 +6500,15 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
         mapped_reasons = imported_ledger["Signal_Date"].map(block_reason_by_week)
         if "Selection_Block_Reason" not in imported_ledger.columns:
             imported_ledger["Selection_Block_Reason"] = ""
+        preserve_pending_reason = imported_ledger.get(
+            "Scan_Status", pd.Series("", index=imported_ledger.index)
+        ).astype(str).isin({"PENDING_R13_DAILY", "PENDING_R14_LIFECYCLE"})
         imported_ledger.loc[
-            mapped_reasons.fillna("").ne(""), "Selection_Block_Reason"
-        ] = mapped_reasons[mapped_reasons.fillna("").ne("")]
+            mapped_reasons.fillna("").ne("") & ~preserve_pending_reason,
+            "Selection_Block_Reason",
+        ] = mapped_reasons[
+            mapped_reasons.fillna("").ne("") & ~preserve_pending_reason
+        ]
 
         # 任何“账本说有候选、明细却没有”的压缩包必须在写盘前拒绝。
         imported_issues = result_state_consistency_audit(
@@ -5992,6 +6616,7 @@ def import_r13_results_zip(zip_bytes: bytes, config_id: str):
         "r13_daily_rows": int(
             _bool_series(candidates, "Daily_Restart_Data_Available").sum()
         ),
+        "pending_r14_weeks": len(pending_r14_dates),
         "opportunity_rows": opportunity_count,
         "ledger_rows": len(imported_ledger),
         "ledger_inferred": ledger_name is None,
@@ -6039,10 +6664,15 @@ def build_export_zip(
     r13_gates: pd.DataFrame,
     r13_diagnostics: dict[str, Any],
     r13_factor_comparison: pd.DataFrame,
+    r14_candidate_audit: pd.DataFrame,
+    r14_exit_audit: pd.DataFrame,
+    r14_lifecycle_audit: pd.DataFrame,
+    r14_yearly_audit: pd.DataFrame,
+    r14_gates: pd.DataFrame,
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r13_daily_restart_rank_candidates.csv": history,
+        "01_all_r14_macd_elastic_lifecycle_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -6092,6 +6722,11 @@ def build_export_zip(
             [{"指标": key, "数值": value} for key, value in r13_diagnostics.items()]
         ),
         "40_r13_daily_restart_factor_comparison.csv": r13_factor_comparison,
+        "41_r14_macd_elastic_candidate_audit.csv": r14_candidate_audit,
+        "42_r14_exit_classification_audit.csv": r14_exit_audit,
+        "43_r14_lifecycle_return_audit.csv": r14_lifecycle_audit,
+        "44_r14_yearly_lifecycle_audit.csv": r14_yearly_audit,
+        "45_r14_lifecycle_acceptance_gates.csv": r14_gates,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -6116,14 +6751,14 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R13保持R11.1实际组合不变：R3中性Top2与R6弱势Top2仅作历史基线；"
-        "R11强势Top1、R12弱势修复Top2和R13日线重启Top2全部只研究。"
+        "R14保持R11.1实际组合逐行不变：R3中性Top2与R6弱势Top2仍是历史基线；"
+        "R14只研究已经预先声明的MACD高弹性Top2及三种退出规则。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R13是跨年度诊断版本，不是实盘版本；任何研究排名均禁止进入实际组合。"
+        "R14仍是研究验证版本，不是实盘版本；高弹性排名和退出规则均不进入原实际组合。"
     )
-    with st.expander("查看R13交易与研究边界"):
+    with st.expander("查看R14交易与研究边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
@@ -6135,13 +6770,17 @@ def main():
 - **R12不增加硬门**：没有新的阈值、市场门或候选数量扩容；新名次不覆盖R6原名次。
 - **R13日线挑战排名**：仍在同一个R6-N6合格池内，把信号日已知的价格/MA20、MA5三日斜率、MACD柱加速度、全池五日相对强度、五日低点抬升五项做同周等权排名。
 - **R13无个股特判**：不使用股票名称、行业故事或买入后涨跌；缺少完整日线快照的旧结果包不会伪造R13名次。
+- **R14高弹性排名**：严格使用R13已经预先声明的单因子——信号日日线MACD柱加速度；仍只在同周R6-N6合格池中从高到低取Top2，不增加新入场条件。
+- **R14退出成交**：W1或W2周末收盘后才判断，最早下一交易日开盘卖出；停牌和一字跌停顺延，不用当周收盘价虚构成交。
+- **R14三种退出**：分别检验W1收盘亏损、W1/W2连续收盘亏损、W2收盘不高于-5%；主规则预先指定为“W1/W2连续收盘亏损”。
+- **R14持有上限**：同时报告W3、W4、W6、W8固定上限；退出规则只允许提前离场，不延长相应持有上限。
 - **R7/R9对照**：旧触发和旧排名仅保留在报告中用于比较，不下单、不影响R11。
 - **指标口径**：SKDJ固定N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
 - **删除硬门**：不再要求价格达到MA10的75%，不再用1周中位涨幅和55%上涨家数整周归零；市场只做分层审计。
 - **实际排名**：两周涨幅、价格/MA10、K6、8周相对强度、MACD冲量五项均按越早越优等权；R5旧100分只保留对照。
 - **防追高**：单周涨幅超过25%或收盘距离本周低点超过40%时只进入过热观察，不参与排名。
 - **实际组合**：中性期只运行R3 Top2；弱势期只运行R6-N6 Top2；所有强势周持有现金。
-- **研究隔离**：R11、R12、R13以及R7/R9对照均使用独立标记，永远不能进入实际收益或持股统计。
+- **研究隔离**：R11、R12、R13、R14以及R7/R9对照均使用独立标记，永远不能进入R3/R6实际收益或持股统计。
 - **历史执行**：下一交易日开盘买入；W3为主目标，同时固定观察W1—W8并扣除往返成本。
 - **明确排除**：买入后的走势、止损、止盈、移动保护、S/A/B/F结果均不参与入场评分。
             """
@@ -6153,11 +6792,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R13日线挑战排名验证", "最新选股预览"],
+            ["历史R14高弹性持仓生命周期验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R13日线挑战排名验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R14高弹性持仓生命周期验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -6171,7 +6810,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R3/R6实际基线与R11/R12/R13研究样本的W1—W8固定周收益都会扣除该成本。",
+            help="R3/R6实际基线与R11—R14研究样本的W1—W8固定周收益及下一开盘退出收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -6183,9 +6822,9 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R13历史结果")
+        clear_history_clicked = st.button("清除R14历史结果")
         imported_results = st.file_uploader(
-            "导入已下载的R9/R10/R11/R12/R13结果包",
+            "导入已下载的R9/R10/R11/R12/R13/R14结果包",
             type=["zip"],
             help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
         )
@@ -6197,7 +6836,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R13日线挑战排名验证":
+    if start_input > end_input and mode == "历史R14高弹性持仓生命周期验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -6217,14 +6856,14 @@ def main():
             ):
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
-        st.session_state.pop("r13_preview", None)
-        st.success("R13历史结果和断点任务已清除。")
+        st.session_state.pop("r14_preview", None)
+        st.success("R14历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     if import_results_clicked and imported_results is not None:
         try:
-            import_stats = import_r13_results_zip(
+            import_stats = import_r14_results_zip(
                 imported_results.getvalue(), config_id
             )
             inferred_note = (
@@ -6237,17 +6876,22 @@ def main():
                 if import_stats.get("r13_daily_rows", 0) > 0
                 else "。旧结果包不含R13日线快照；R11/R12可直接查看，R13需重新扫描"
             )
+            r14_note = (
+                f"；其中{import_stats.get('pending_r14_weeks', 0)}周需补算R14下一开盘退出路径"
+                if import_stats.get("pending_r14_weeks", 0) > 0
+                else "；已包含R14持仓生命周期数据"
+            )
             st.success(
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个已知候选周"
-                f"{inferred_note}{r13_note}。"
+                f"{inferred_note}{r13_note}{r14_note}。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
-    if "r13_worker_id" not in st.session_state:
-        st.session_state["r13_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r13_worker_id"])
+    if "r14_worker_id" not in st.session_state:
+        st.session_state["r14_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r14_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -6271,7 +6915,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R13日线挑战排名验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R14高弹性持仓生命周期验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -6428,7 +7072,7 @@ def main():
 
                     loaded_date_set = set(loaded_dates)
                     batch_gap_dates = sorted(set(failed_dates))
-                    progress = st.progress(0, text="开始扫描R13实际基线与三项研究排名候选……")
+                    progress = st.progress(0, text="开始扫描R14实际基线、高弹性排名与退出路径……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -6512,7 +7156,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r13_preview"] = candidates
+                            st.session_state["r14_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -6558,7 +7202,7 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：R13结构与研究候选{raw_count}只，"
+                                f"{signal_date}：R14结构与研究候选{raw_count}只，"
                                 f"当前分支合格{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -6578,7 +7222,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R13日线挑战排名扫描完成。")
+                            st.success("历史R14高弹性持仓生命周期扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -6605,12 +7249,12 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r13_preview")
+    preview = st.session_state.get("r14_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R13结构或研究观察候选。")
+            st.info("最新交易日没有R14结构或研究观察候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -6729,6 +7373,34 @@ def main():
                     width="stretch",
                     hide_index=True,
                 )
+            r14_preview = preview[
+                _bool_series(preview, "R14_MACD_Elastic_Top2")
+            ].copy()
+            if not r14_preview.empty:
+                st.caption(
+                    "以下是R14日线MACD柱加速度高弹性Top2，只作持仓生命周期研究，"
+                    "不属于R3/R6实际买入名单。"
+                )
+                r14_columns = [
+                    "Signal_Date",
+                    "R14_MACD_Elastic_Rank",
+                    "name",
+                    "ts_code",
+                    "Industry",
+                    "Daily_MACD_Hist_Delta_pct",
+                    "Daily_Return_5D_pct",
+                    "Daily_Close_to_MA20_Ratio",
+                    "Weekly_SKDJ_K6",
+                    "R14_MACD_Elastic_Top1",
+                    "R14_MACD_Elastic_Top2",
+                ]
+                st.dataframe(
+                    r14_preview[
+                        [column for column in r14_columns if column in r14_preview.columns]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
             with st.expander("查看全部实际候选、研究观察及未入选原因"):
                 st.dataframe(preview, width="stretch")
 
@@ -6805,8 +7477,15 @@ def main():
                 "Scan_Status", pd.Series("", index=data_gap_rows.index)
             ).astype(str).eq("PENDING_R13_DAILY")
         ].copy()
+        pending_r14_rows = data_gap_rows[
+            data_gap_rows.get(
+                "Scan_Status", pd.Series("", index=data_gap_rows.index)
+            ).astype(str).eq("PENDING_R14_LIFECYCLE")
+        ].copy()
         actual_data_gap_rows = data_gap_rows[
-            ~data_gap_rows.index.isin(pending_r13_rows.index)
+            ~data_gap_rows.index.isin(
+                pending_r13_rows.index.union(pending_r14_rows.index)
+            )
         ].copy()
         state_consistency_rows = result_state_consistency_audit(history, ledger)
         if not state_consistency_rows.empty:
@@ -6814,7 +7493,7 @@ def main():
             st.error(
                 f"发现{len(state_consistency_rows)}周账本与候选明细不一致。"
                 "当前结果禁止判定策略优劣，也不提供正式下载。"
-                "点击“启动历史R13日线挑战排名验证”后，程序会只补扫这些日期。"
+                "点击“启动历史R14高弹性持仓生命周期验证”后，程序会只补扫这些日期。"
             )
             st.dataframe(
                 state_consistency_rows, width="stretch", hide_index=True
@@ -6881,13 +7560,18 @@ def main():
         r13_diagnostics = r13_daily_restart_ranking_diagnostics(history)
         r13_gates = r13_daily_restart_gates(history)
         r13_factor_comparison = r13_daily_restart_factor_comparison_audit(history)
+        r14_candidate_audit = r14_macd_elastic_candidate_audit(history)
+        r14_exit_audit = r14_exit_classification_audit(history)
+        r14_lifecycle_audit = r14_lifecycle_return_audit(history)
+        r14_yearly_audit = r14_yearly_lifecycle_audit(history)
+        r14_gates = r14_lifecycle_acceptance_gates(history)
 
         st.markdown("---")
-        st.header("R13日线重启质量挑战排名验证报告")
+        st.header("R14 MACD高弹性持仓生命周期验证报告")
         st.caption(
-            "主报告仍只统计R3/R6原实际基线。R11、R12、R13及R7/R9对照"
-            "均不进入组合；"
-            "W3为主验收周期，W4—W8只统计已经走满相应天数的记录。"
+            "R14入场严格复用R13已经预先声明的MACD柱加速度单因子，"
+            "不改R3/R6实际组合。退出在W1/W2周末确认，按下一可交易日开盘成交；"
+            "W3、W4、W6、W8只统计已经走满相应期限的同批可比样本。"
         )
 
         scanned_weeks = len(ledger)
@@ -6895,8 +7579,14 @@ def main():
             "Scan_Status", pd.Series("COMPLETED", index=ledger.index)
         ).astype(str)
         pending_r13_weeks = int(ledger_status.eq("PENDING_R13_DAILY").sum())
+        pending_r14_weeks = int(ledger_status.eq("PENDING_R14_LIFECYCLE").sum())
         data_gap_weeks = int(
-            (ledger_status.ne("COMPLETED") & ~ledger_status.eq("PENDING_R13_DAILY")).sum()
+            (
+                ledger_status.ne("COMPLETED")
+                & ~ledger_status.isin(
+                    {"PENDING_R13_DAILY", "PENDING_R14_LIFECYCLE"}
+                )
+            ).sum()
         )
         skipped_data_weeks = int(ledger_status.eq("SKIPPED_DATA_GAP").sum())
         invalid_selection_weeks = (
@@ -6913,18 +7603,19 @@ def main():
         )
         selected = completed[_actual_selected_mask(completed)]
         selected_returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
-        metric_columns = st.columns(8)
+        metric_columns = st.columns(9)
         metric_columns[0].metric("账本已知周数", scanned_weeks)
         metric_columns[1].metric("待补R13日线周", pending_r13_weeks)
-        metric_columns[2].metric("数据缺口周", data_gap_weeks)
-        metric_columns[3].metric("跳过扫描周", skipped_data_weeks)
-        metric_columns[4].metric("无有效入选周", invalid_selection_weeks)
-        metric_columns[5].metric("W3完整入选交易", len(selected))
-        metric_columns[6].metric(
+        metric_columns[2].metric("待补R14退出周", pending_r14_weeks)
+        metric_columns[3].metric("数据缺口周", data_gap_weeks)
+        metric_columns[4].metric("跳过扫描周", skipped_data_weeks)
+        metric_columns[5].metric("无有效入选周", invalid_selection_weeks)
+        metric_columns[6].metric("W3完整入选交易", len(selected))
+        metric_columns[7].metric(
             "实际入选胜率",
             f"{((selected_returns > 0).mean() * 100.0 if len(selected_returns) else np.nan):.1f}%",
         )
-        metric_columns[7].metric(
+        metric_columns[8].metric(
             "W3实际入选中位收益",
             f"{(selected_returns.median() if len(selected_returns) else np.nan):.2f}%",
         )
@@ -6933,6 +7624,11 @@ def main():
             st.info(
                 f"已恢复旧结果中的{len(pending_r13_rows)}周R3/R6、R11/R12数据；"
                 "这些周缺少R13日线快照，启动R13后会逐周替换，不会被当作已完成。"
+            )
+        if not pending_r14_rows.empty:
+            st.info(
+                f"已恢复R13结果中的{len(pending_r14_rows)}个R14信号周；"
+                "这些周尚缺W1/W2确认后的下一可交易日开盘退出路径，启动R14后只补扫相关日期。"
             )
         if not actual_data_gap_rows.empty:
             st.error(
@@ -6948,6 +7644,17 @@ def main():
         st.dataframe(neutral_gates, width="stretch", hide_index=True)
         st.subheader("R6弱势首次转折分支独立验收")
         st.dataframe(recovery_gates, width="stretch", hide_index=True)
+        st.subheader("R14高弹性与持仓生命周期验收（只研究）")
+        st.caption(
+            "前8项检验高弹性入场是否稳定；后4项检验主退出规则“W1/W2连续收盘亏损”。"
+            "任何一项失败都只说明继续研究，不会回头修改R3/R6或按结果挑股票。"
+        )
+        if _bool_series(history, "R14_Lifecycle_Data_Available").sum() == 0:
+            st.info(
+                "当前结果尚无R14下一开盘退出路径；高弹性入场前8项可以先查看，"
+                "退出相关项目需启动R14补算后判断。"
+            )
+        st.dataframe(r14_gates, width="stretch", hide_index=True)
         st.subheader("R12弱势深跌结构+价格修复排名验收（只研究）")
         st.caption(
             "固定顺序：Score_Pullback_15从低到高；同分时Price_to_MA10_Ratio"
@@ -6988,7 +7695,7 @@ def main():
                 "R3/R6实际分支与总体门槛均通过；强势仍保持空仓，可进入跨年度样本外验证。"
             )
         else:
-            st.error("R3、R6或总体门槛尚未全部通过；R11—R13研究信号均禁止进入实盘。")
+            st.error("R3、R6或总体门槛尚未全部通过；R11—R14研究信号均禁止进入实盘。")
 
         st.subheader("R3与R6实际分支分别表现")
         st.dataframe(_format_report_frame(branches), width="stretch", hide_index=True)
@@ -7091,6 +7798,42 @@ def main():
         st.caption("所有方案使用完全相同的R6合格周，完整展示失败项，不事后挑选赢家。")
         st.dataframe(
             _format_report_frame(r13_factor_comparison),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("R14 MACD高弹性Top2与同周R6对照")
+        st.caption(
+            "R14仅把R13对照表中已经预先声明的日线MACD柱加速度单因子独立冻结，"
+            "仍限于同周R6合格池，不读取未来收益。"
+        )
+        st.dataframe(
+            _format_report_frame(r14_candidate_audit),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("R14三种退出规则对F级与S/A级的识别")
+        st.caption(
+            "判断使用W1或W2周末收盘；执行使用下一可交易日开盘。"
+            "F级捕获率越高越好，S/A误杀率越低越好。"
+        )
+        st.dataframe(
+            _format_report_frame(r14_exit_audit),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("R14 W3/W4/W6/W8持有上限与提前退出")
+        st.dataframe(
+            _format_report_frame(r14_lifecycle_audit),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("R14分年持仓生命周期稳定性")
+        st.dataframe(
+            _format_report_frame(r14_yearly_audit),
             width="stretch",
             hide_index=True,
         )
@@ -7201,6 +7944,42 @@ def main():
                 width="stretch",
             )
 
+        with st.expander("查看R14高弹性入场与下一开盘退出明细"):
+            r14_detail_columns = [
+                "Signal_Date", "Entry_Date", "R14_MACD_Elastic_Rank",
+                "name", "ts_code", "Industry", "Daily_MACD_Hist_Delta_pct",
+                "Daily_Return_5D_pct", "Daily_Close_to_MA20_Ratio",
+                "Weekly_SKDJ_K6", "Weekly_SKDJ_D6", "Entry_Open",
+                "R14_W1_Close_Gross_pct", "R14_W2_Close_Gross_pct",
+                "R14_Trigger_W1_Close_Loss", "R14_W1_Next_Open_Exit_Date",
+                "R14_W1_Next_Open_Return_Net_pct", "R14_W1_Exit_Delay_Days",
+                "R14_Trigger_W1_W2_Both_Loss", "R14_Trigger_W2_Close_Minus5",
+                "R14_W2_Next_Open_Exit_Date", "R14_W2_Next_Open_Return_Net_pct",
+                "R14_W2_Exit_Delay_Days", "Fixed_Return_W3_Net_pct",
+                "Fixed_Return_W4_Net_pct", "Fixed_Return_W6_Net_pct",
+                "Fixed_Return_W8_Net_pct", "MFE_W3_Net_pct",
+                "MAE_W3_Raw_pct", "Outcome_Grade",
+            ]
+            r14_detail = history[
+                _bool_series(history, "R14_MACD_Elastic_Top2")
+            ].copy()
+            r14_detail = r14_detail.sort_values(
+                ["Signal_Date", "R14_MACD_Elastic_Rank"],
+                ascending=[False, True],
+                kind="mergesort",
+            )
+            st.dataframe(
+                r14_detail[
+                    [
+                        column
+                        for column in r14_detail_columns
+                        if column in r14_detail.columns
+                    ]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+
         export_bytes = build_export_zip(
             history.drop(columns=["Config_ID"], errors="ignore"),
             cohort,
@@ -7242,11 +8021,16 @@ def main():
             r13_gates,
             r13_diagnostics,
             r13_factor_comparison,
+            r14_candidate_audit,
+            r14_exit_audit,
+            r14_lifecycle_audit,
+            r14_yearly_audit,
+            r14_gates,
         )
         st.download_button(
-            "下载R13日线重启质量挑战排名完整研究结果",
+            "下载R14高弹性持仓生命周期完整研究结果",
             data=export_bytes,
-            file_name="r13_daily_restart_quality_w3_audit_results.zip",
+            file_name="r14_macd_elastic_lifecycle_audit_results.zip",
             mime="application/zip",
         )
 
