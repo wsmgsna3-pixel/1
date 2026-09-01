@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-R15 强势温和ATR单分支影子组合验证版。
+R16 三市场独立退出与实盘成交约束验证版。
 
-R3、R6与R14全部冻结；实际Selected_Top2逐行保持不变。R15不再发明新的强势
-公式，只把已经独立验证的R11规则原样提升为影子分支：强势周在整理后再启动合格
-池内按ATR3/ATR13从小到大排名，只检查第一名，且ATR比必须位于0.70—0.90；
-第一名越界时不允许第二名递补。R15只审计把这一只股票与R3/R6组合后能否增加约
-10个信号周、降低W3持有空窗并保持收益稳定，仍不进入实际组合或实盘结论。
+R3中性、R6弱势、R15强势的入场、排名和信号逐行冻结。R16不建立三仓组合，
+而把每一笔冻结信号作为独立交易，统一检验日内-10%硬止损（主规则）与-8%
+敏感性对照；同时保留R14周末退出作为对照。硬止损从买入后的下一交易日生效，
+计入0.3%不利滑点；跳空低开按开盘成交，一字跌停和停牌顺延至首个可交易开盘。
+退出只允许缩短W3/W4/W6/W8固定持有上限，不允许为了保留牛股放宽主止损。
 """
 
 from __future__ import annotations
@@ -38,15 +38,15 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R15-STRONG-MODERATE-ATR-SHADOW-INTEGRATION"
-APP_TITLE = "R15强势温和ATR单分支影子验证器"
-ENGINE_PATCH = "R15-FROZEN-R11-TOP1-COVERAGE-SHADOW-AUDIT"
+APP_VERSION = "R16-THREE-REGIME-PRACTICAL-EXIT-AUDIT"
+APP_TITLE = "R16三市场独立退出验证器"
+ENGINE_PATCH = "R16-FROZEN-ENTRY-TPLUS1-HARD-STOP-AUDIT"
 
-CHECKPOINT_FILE = "r15_strong_atr_shadow_candidates.csv"
-SCAN_LEDGER_FILE = "r15_strong_atr_shadow_scanned_dates.csv"
-OPPORTUNITY_FILE = "r15_strong_atr_shadow_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r15_strong_atr_shadow_running_task.json"
-RESULT_STATE_GUARD_FILE = "r15_strong_atr_shadow_result_state.guard"
+CHECKPOINT_FILE = "r16_three_regime_exit_candidates.csv"
+SCAN_LEDGER_FILE = "r16_three_regime_exit_scanned_dates.csv"
+OPPORTUNITY_FILE = "r16_three_regime_exit_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r16_three_regime_exit_running_task.json"
+RESULT_STATE_GUARD_FILE = "r16_three_regime_exit_result_state.guard"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -109,6 +109,54 @@ R14_EXIT_RULES = (
         "W2收盘不高于-5%",
         "R14_Trigger_W2_Close_Minus5",
         "R14_W2_Next_Open_Return_Net_pct",
+    ),
+)
+R16_LIFECYCLE_HORIZONS = (3, 4, 6, 8)
+R16_STOP_SLIPPAGE_PCT = 0.30
+R16_PRIMARY_STOP_PCT = -10.0
+R16_SENSITIVITY_STOP_PCT = -8.0
+R16_PRIMARY_EXIT_RULE = "日内-10%硬止损（主规则）"
+R16_EXIT_RULES = (
+    ("固定持有", "fixed", None, None, None, None),
+    (
+        "日内-8%硬止损（敏感性）",
+        "hard",
+        "R16_Stop_Minus8_Triggered",
+        "R16_Stop_Minus8_Return_Net_pct",
+        "R16_Stop_Minus8_Exit_Day",
+        None,
+    ),
+    (
+        R16_PRIMARY_EXIT_RULE,
+        "hard",
+        "R16_Stop_Minus10_Triggered",
+        "R16_Stop_Minus10_Return_Net_pct",
+        "R16_Stop_Minus10_Exit_Day",
+        None,
+    ),
+    (
+        "W1收盘亏损",
+        "weekly",
+        "R14_Trigger_W1_Close_Loss",
+        "R14_W1_Next_Open_Return_Net_pct",
+        None,
+        6,
+    ),
+    (
+        "W1/W2连续收盘亏损",
+        "weekly",
+        "R14_Trigger_W1_W2_Both_Loss",
+        "R14_W2_Next_Open_Return_Net_pct",
+        None,
+        11,
+    ),
+    (
+        "W2收盘不高于-5%",
+        "weekly",
+        "R14_Trigger_W2_Close_Minus5",
+        "R14_W2_Next_Open_Return_Net_pct",
+        None,
+        11,
     ),
 )
 
@@ -2297,6 +2345,10 @@ def score_r13_candidates(pool_snapshots: pd.DataFrame):
         _bool_series(candidates, "Selected_Top2")
         | _bool_series(candidates, "R15_Strong_ATR_Top1")
     )
+    # R16只建立独立退出研究样本；不改写任何冻结入场或实际组合字段。
+    candidates["R16_Exit_Research_Selected"] = _bool_series(
+        candidates, "R15_Shadow_Selected"
+    )
 
     candidates["Raw_Setup_Count"] = raw_count
     candidates["Observation_Row_Count"] = len(candidates)
@@ -2405,7 +2457,18 @@ def track_fixed_future_path(
         "R14_W1_Exit_Delay_Days": np.nan,
         "R14_W2_Exit_Delay_Days": np.nan,
         "R14_Lifecycle_Data_Available": False,
+        "R16_Lifecycle_Data_Available": False,
     }
+    for stop_label in ("Minus8", "Minus10"):
+        result[f"R16_Stop_{stop_label}_Triggered"] = False
+        result[f"R16_Stop_{stop_label}_Trigger_Date"] = None
+        result[f"R16_Stop_{stop_label}_Trigger_Day"] = np.nan
+        result[f"R16_Stop_{stop_label}_Exit_Date"] = None
+        result[f"R16_Stop_{stop_label}_Exit_Day"] = np.nan
+        result[f"R16_Stop_{stop_label}_Exit_Price_QFQ"] = np.nan
+        result[f"R16_Stop_{stop_label}_Return_Net_pct"] = np.nan
+        result[f"R16_Stop_{stop_label}_Delay_Days"] = np.nan
+        result[f"R16_Stop_{stop_label}_Blocked_Days"] = 0
     for week in range(1, HOLD_WEEKS + 1):
         result[f"Fixed_Return_W{week}_Net_pct"] = np.nan
     if ts_code not in stock_qfq_dict:
@@ -2474,6 +2537,118 @@ def track_fixed_future_path(
                 result[f"Fixed_Return_W{week}_Net_pct"] = (
                     (exit_close / buy_price - 1.0) * 100.0 - roundtrip_cost_pct
                 )
+
+    # R16硬止损采用实盘保守成交：买入日不触发（A股T+1），从次一交易日
+    # 开始检查；盘中触线按止损价并计0.3%不利滑点，跳空越过止损按开盘价；
+    # 停牌或一字跌停不虚构成交，触发后持续挂单直至首个可交易开盘。
+    def _simulate_r16_hard_stop(stop_loss_pct: float):
+        stop_price = buy_price * (1.0 + stop_loss_pct / 100.0)
+        previous_raw_close = raw_first_close
+        trigger_position = None
+        trigger_date = None
+        blocked_days = 0
+        pending_exit = False
+
+        for position, (_, stop_row) in enumerate(future.iterrows()):
+            raw_close = _safe_float(
+                stop_row.get("raw_close"), _safe_float(stop_row.get("close"))
+            )
+            if position == 0:  # 买入当日即使盘中跌破也受T+1限制，不能卖出。
+                if math.isfinite(raw_close) and raw_close > 0:
+                    previous_raw_close = raw_close
+                continue
+
+            exit_open = _safe_float(stop_row.get("open"))
+            day_low = _safe_float(stop_row.get("low"))
+            raw_open = _safe_float(stop_row.get("raw_open"), exit_open)
+            raw_high = _safe_float(
+                stop_row.get("raw_high"), _safe_float(stop_row.get("high"))
+            )
+            raw_low = _safe_float(
+                stop_row.get("raw_low"), _safe_float(stop_row.get("low"))
+            )
+            one_price_limit_down = (
+                math.isfinite(previous_raw_close)
+                and previous_raw_close > 0
+                and all(
+                    math.isfinite(item)
+                    for item in (raw_open, raw_high, raw_low, raw_close)
+                )
+                and np.isclose(
+                    raw_high,
+                    raw_low,
+                    rtol=0,
+                    atol=max(0.001, abs(raw_open) * 1e-5),
+                )
+                and (raw_close / previous_raw_close - 1.0) <= -limit_threshold
+            )
+
+            hit_stop = math.isfinite(day_low) and day_low <= stop_price
+            if trigger_position is None and hit_stop:
+                trigger_position = position
+                trigger_date = str(future.index[position])
+                pending_exit = bool(one_price_limit_down)
+                if pending_exit:
+                    blocked_days += 1
+
+            if trigger_position is not None:
+                if one_price_limit_down:
+                    if position > trigger_position:
+                        blocked_days += 1
+                    pending_exit = True
+                elif math.isfinite(exit_open) and exit_open > 0:
+                    reference_price = (
+                        exit_open
+                        if pending_exit or exit_open <= stop_price
+                        else stop_price
+                    )
+                    slipped_price = reference_price * (
+                        1.0 - R16_STOP_SLIPPAGE_PCT / 100.0
+                    )
+                    exit_price = (
+                        max(day_low, slipped_price)
+                        if math.isfinite(day_low) and day_low > 0
+                        else slipped_price
+                    )
+                    return {
+                        "Triggered": True,
+                        "Trigger_Date": trigger_date,
+                        "Trigger_Day": trigger_position + 1,
+                        "Exit_Date": str(future.index[position]),
+                        "Exit_Day": position + 1,
+                        "Exit_Price_QFQ": exit_price,
+                        "Return_Net_pct": (
+                            (exit_price / buy_price - 1.0) * 100.0
+                            - roundtrip_cost_pct
+                        ),
+                        "Delay_Days": position - trigger_position,
+                        "Blocked_Days": blocked_days,
+                    }
+
+            if math.isfinite(raw_close) and raw_close > 0:
+                previous_raw_close = raw_close
+
+        return {
+            "Triggered": trigger_position is not None,
+            "Trigger_Date": trigger_date,
+            "Trigger_Day": (
+                trigger_position + 1 if trigger_position is not None else np.nan
+            ),
+            "Exit_Date": None,
+            "Exit_Day": np.nan,
+            "Exit_Price_QFQ": np.nan,
+            "Return_Net_pct": np.nan,
+            "Delay_Days": np.nan,
+            "Blocked_Days": blocked_days,
+        }
+
+    for stop_loss_pct, stop_label in (
+        (R16_SENSITIVITY_STOP_PCT, "Minus8"),
+        (R16_PRIMARY_STOP_PCT, "Minus10"),
+    ):
+        stop_result = _simulate_r16_hard_stop(stop_loss_pct)
+        for field, value in stop_result.items():
+            result[f"R16_Stop_{stop_label}_{field}"] = value
 
     # R14退出只在周末收盘确认后，于下一可交易日开盘成交。停牌和一字跌停
     # 不假设能够卖出，而是顺延到第一天真实可交易的开盘价。
@@ -2613,6 +2788,7 @@ def track_fixed_future_path(
     )
     result["Outcome_Complete"] = bool(primary_complete)
     result["Outcome_Complete_8W"] = bool(complete_8w)
+    result["R16_Lifecycle_Data_Available"] = bool(primary_complete)
     result["Primary_Return_Net_pct"] = primary_return
     if len(future) >= primary_days:
         result["Primary_Outcome_Date"] = str(future.index[primary_days - 1])
@@ -2923,6 +3099,13 @@ def build_major_winner_audit(
                     and _bool_series(
                         pd.DataFrame([candidate_row]),
                         "R15_Shadow_Selected",
+                    ).iloc[0]
+                ),
+                "R16_Exit_Research_Selected": bool(
+                    candidate_row is not None
+                    and _bool_series(
+                        pd.DataFrame([candidate_row]),
+                        "R16_Exit_Research_Selected",
                     ).iloc[0]
                 ),
                 "Miss_Reason": miss_reason,
@@ -6129,6 +6312,319 @@ def r15_shadow_acceptance_gates(history: pd.DataFrame, ledger: pd.DataFrame):
     )
 
 
+# -----------------------------------------------------------------------------
+# R16 冻结三市场入场后的独立退出与实盘成交审计
+# -----------------------------------------------------------------------------
+def _r16_selected(history: pd.DataFrame, require_lifecycle: bool = False):
+    if history.empty:
+        return history.iloc[0:0].copy()
+    selected = history[
+        _bool_series(history, "R16_Exit_Research_Selected")
+        & _bool_series(history, "Entry_Tradable")
+    ].copy()
+    if require_lifecycle:
+        selected = selected[
+            _bool_series(selected, "R16_Lifecycle_Data_Available")
+        ].copy()
+    regime = selected.get(
+        "Market_Regime", pd.Series("", index=selected.index)
+    ).astype(str)
+    selected["R16_市场分支"] = regime.map(
+        {"强势": "R15强势", "中性": "R3中性", "弱势": "R6弱势"}
+    ).fillna("未知")
+    return selected
+
+
+def _r16_lifecycle_returns(
+    selected: pd.DataFrame,
+    horizon: int,
+    rule_kind: str,
+    trigger_column: str | None,
+    exit_return_column: str | None,
+    exit_day_column: str | None,
+    weekly_exit_base_day: int | None,
+):
+    fixed_column = f"Fixed_Return_W{horizon}_Net_pct"
+    fixed = pd.to_numeric(
+        selected.get(fixed_column, pd.Series(np.nan, index=selected.index)),
+        errors="coerce",
+    )
+    cohort = selected.loc[fixed.notna()].copy()
+    fixed = fixed.loc[cohort.index]
+    use_exit = pd.Series(False, index=cohort.index, dtype=bool)
+    realized = fixed.copy()
+    if rule_kind == "fixed" or not trigger_column or not exit_return_column:
+        return cohort, realized, use_exit
+
+    trigger = _bool_series(cohort, trigger_column)
+    exit_return = pd.to_numeric(
+        cohort.get(
+            exit_return_column, pd.Series(np.nan, index=cohort.index)
+        ),
+        errors="coerce",
+    )
+    if rule_kind == "hard" and exit_day_column:
+        exit_day = pd.to_numeric(
+            cohort.get(exit_day_column, pd.Series(np.nan, index=cohort.index)),
+            errors="coerce",
+        )
+    else:
+        delay_column = (
+            "R14_W1_Exit_Delay_Days"
+            if weekly_exit_base_day == 6
+            else "R14_W2_Exit_Delay_Days"
+        )
+        exit_day = weekly_exit_base_day + pd.to_numeric(
+            cohort.get(delay_column, pd.Series(np.nan, index=cohort.index)),
+            errors="coerce",
+        )
+    use_exit = (
+        trigger
+        & exit_return.notna()
+        & exit_day.le(horizon * MARKET_DAYS_PER_WEEK)
+    )
+    realized.loc[use_exit] = exit_return.loc[use_exit]
+    return cohort, realized, use_exit
+
+
+def r16_exit_trade_detail(history: pd.DataFrame):
+    selected = _r16_selected(history, require_lifecycle=False)
+    if selected.empty:
+        return selected
+    preferred = [
+        "Signal_Date", "ts_code", "name", "R16_市场分支",
+        "Entry_Date", "Entry_Open", "Outcome_Grade", "Path_10_vs_Minus5",
+        "MFE_W3_Net_pct", "MAE_W3_Raw_pct",
+        "Fixed_Return_W3_Net_pct", "Fixed_Return_W4_Net_pct",
+        "Fixed_Return_W6_Net_pct", "Fixed_Return_W8_Net_pct",
+        "R16_Stop_Minus8_Triggered", "R16_Stop_Minus8_Trigger_Date",
+        "R16_Stop_Minus8_Exit_Date", "R16_Stop_Minus8_Exit_Day",
+        "R16_Stop_Minus8_Return_Net_pct", "R16_Stop_Minus8_Delay_Days",
+        "R16_Stop_Minus8_Blocked_Days",
+        "R16_Stop_Minus10_Triggered", "R16_Stop_Minus10_Trigger_Date",
+        "R16_Stop_Minus10_Exit_Date", "R16_Stop_Minus10_Exit_Day",
+        "R16_Stop_Minus10_Return_Net_pct", "R16_Stop_Minus10_Delay_Days",
+        "R16_Stop_Minus10_Blocked_Days",
+        "R14_Trigger_W1_Close_Loss", "R14_Trigger_W1_W2_Both_Loss",
+        "R14_Trigger_W2_Close_Minus5", "R16_Lifecycle_Data_Available",
+    ]
+    columns = [column for column in preferred if column in selected.columns]
+    return selected[columns].sort_values(
+        [column for column in ("Signal_Date", "R16_市场分支", "ts_code") if column in columns]
+    ).reset_index(drop=True)
+
+
+def r16_lifecycle_return_audit(history: pd.DataFrame):
+    columns = [
+        "市场分支", "持有上限", "R16退出规则", "可比样本", "信号周",
+        "退出交易数", "退出率%", "胜率%", "中位收益%", "平均收益%",
+        "5%截尾均益%", "Profit_Factor", "最大单笔亏损%",
+        "相对固定平均改善百分点", "F级捕获率%", "S/A误杀率%",
+    ]
+    selected = _r16_selected(history, require_lifecycle=True)
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    branch_groups = [("合计", selected)] + [
+        (label, selected[selected["R16_市场分支"].eq(label)])
+        for label in ("R15强势", "R3中性", "R6弱势")
+    ]
+    for branch, branch_frame in branch_groups:
+        for horizon in R16_LIFECYCLE_HORIZONS:
+            for (
+                label, kind, trigger_column, exit_column,
+                exit_day_column, weekly_base_day,
+            ) in R16_EXIT_RULES:
+                cohort, realized, use_exit = _r16_lifecycle_returns(
+                    branch_frame,
+                    horizon,
+                    kind,
+                    trigger_column,
+                    exit_column,
+                    exit_day_column,
+                    weekly_base_day,
+                )
+                realized = pd.to_numeric(realized, errors="coerce").dropna()
+                cohort = cohort.loc[realized.index]
+                use_exit = use_exit.loc[realized.index]
+                fixed = pd.to_numeric(
+                    cohort.get(f"Fixed_Return_W{horizon}_Net_pct"),
+                    errors="coerce",
+                )
+                grades = cohort.get(
+                    "Outcome_Grade", pd.Series("", index=cohort.index)
+                ).astype(str)
+                f_mask = grades.eq("F")
+                sa_mask = grades.isin({"S", "A"})
+                rows.append(
+                    {
+                        "市场分支": branch,
+                        "持有上限": f"W{horizon}",
+                        "R16退出规则": label,
+                        "可比样本": len(realized),
+                        "信号周": cohort["Signal_Date"].nunique() if len(cohort) else 0,
+                        "退出交易数": int(use_exit.sum()),
+                        "退出率%": use_exit.mean() * 100.0 if len(use_exit) else np.nan,
+                        "胜率%": (realized > 0.0).mean() * 100.0 if len(realized) else np.nan,
+                        "中位收益%": realized.median() if len(realized) else np.nan,
+                        "平均收益%": realized.mean() if len(realized) else np.nan,
+                        "5%截尾均益%": _trimmed_mean(realized),
+                        "Profit_Factor": _profit_factor(realized),
+                        "最大单笔亏损%": realized.min() if len(realized) else np.nan,
+                        "相对固定平均改善百分点": (
+                            (realized - fixed).mean() if len(realized) else np.nan
+                        ),
+                        "F级捕获率%": (
+                            use_exit[f_mask].mean() * 100.0 if f_mask.any() else np.nan
+                        ),
+                        "S/A误杀率%": (
+                            use_exit[sa_mask].mean() * 100.0 if sa_mask.any() else np.nan
+                        ),
+                    }
+                )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r16_w3_exit_rule_summary(history: pd.DataFrame):
+    audit = r16_lifecycle_return_audit(history)
+    if audit.empty:
+        return audit
+    return audit[audit["持有上限"].astype(str).eq("W3")].reset_index(drop=True)
+
+
+def r16_primary_stop_risk_audit(history: pd.DataFrame):
+    columns = [
+        "市场分支", "完整样本", "信号周", "-10%触发数", "实际退出数",
+        "跌停阻塞交易", "平均退出延迟日", "固定W3胜率%", "止损后胜率%",
+        "固定W3中位收益%", "止损后中位收益%", "固定W3平均收益%",
+        "止损后平均收益%", "固定W3_PF", "止损后_PF",
+        "W3最差收盘收益%", "止损后最差收益%", "W3最差盘中MAE%",
+        "相对最差盘中路径改善百分点", "F级捕获率%", "S/A误杀率%",
+    ]
+    selected = _r16_selected(history, require_lifecycle=True)
+    if selected.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    groups = [("合计", selected)] + [
+        (label, selected[selected["R16_市场分支"].eq(label)])
+        for label in ("R15强势", "R3中性", "R6弱势")
+    ]
+    for branch, group in groups:
+        cohort, realized, use_exit = _r16_lifecycle_returns(
+            group, 3, "hard", "R16_Stop_Minus10_Triggered",
+            "R16_Stop_Minus10_Return_Net_pct",
+            "R16_Stop_Minus10_Exit_Day", None,
+        )
+        realized = pd.to_numeric(realized, errors="coerce").dropna()
+        cohort = cohort.loc[realized.index]
+        use_exit = use_exit.loc[realized.index]
+        fixed = pd.to_numeric(
+            cohort.get("Fixed_Return_W3_Net_pct"), errors="coerce"
+        )
+        mae = pd.to_numeric(cohort.get("MAE_W3_Raw_pct"), errors="coerce")
+        trigger_day = pd.to_numeric(
+            cohort.get(
+                "R16_Stop_Minus10_Trigger_Day",
+                pd.Series(np.nan, index=cohort.index),
+            ), errors="coerce"
+        )
+        triggered = (
+            _bool_series(cohort, "R16_Stop_Minus10_Triggered")
+            & trigger_day.le(PRIMARY_HOLD_WEEKS * MARKET_DAYS_PER_WEEK)
+        )
+        blocked = pd.to_numeric(
+            cohort.get(
+                "R16_Stop_Minus10_Blocked_Days",
+                pd.Series(0, index=cohort.index),
+            ), errors="coerce"
+        ).fillna(0)
+        delays = pd.to_numeric(
+            cohort.get(
+                "R16_Stop_Minus10_Delay_Days",
+                pd.Series(np.nan, index=cohort.index),
+            ), errors="coerce"
+        )
+        grades = cohort.get(
+            "Outcome_Grade", pd.Series("", index=cohort.index)
+        ).astype(str)
+        f_mask = grades.eq("F")
+        sa_mask = grades.isin({"S", "A"})
+        rows.append(
+            {
+                "市场分支": branch,
+                "完整样本": len(realized),
+                "信号周": cohort["Signal_Date"].nunique() if len(cohort) else 0,
+                "-10%触发数": int(triggered.sum()),
+                "实际退出数": int(use_exit.sum()),
+                "跌停阻塞交易": int((blocked.gt(0) & triggered).sum()),
+                "平均退出延迟日": delays[use_exit].mean() if use_exit.any() else np.nan,
+                "固定W3胜率%": (fixed > 0.0).mean() * 100.0 if len(fixed) else np.nan,
+                "止损后胜率%": (realized > 0.0).mean() * 100.0 if len(realized) else np.nan,
+                "固定W3中位收益%": fixed.median() if len(fixed) else np.nan,
+                "止损后中位收益%": realized.median() if len(realized) else np.nan,
+                "固定W3平均收益%": fixed.mean() if len(fixed) else np.nan,
+                "止损后平均收益%": realized.mean() if len(realized) else np.nan,
+                "固定W3_PF": _profit_factor(fixed),
+                "止损后_PF": _profit_factor(realized),
+                "W3最差收盘收益%": fixed.min() if len(fixed) else np.nan,
+                "止损后最差收益%": realized.min() if len(realized) else np.nan,
+                "W3最差盘中MAE%": mae.min() if len(mae.dropna()) else np.nan,
+                "相对最差盘中路径改善百分点": (
+                    realized.min() - mae.min()
+                    if len(realized) and len(mae.dropna()) else np.nan
+                ),
+                "F级捕获率%": use_exit[f_mask].mean() * 100.0 if f_mask.any() else np.nan,
+                "S/A误杀率%": use_exit[sa_mask].mean() * 100.0 if sa_mask.any() else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r16_exit_acceptance_gates(history: pd.DataFrame):
+    risk = r16_primary_stop_risk_audit(history)
+    total = risk[risk.get(
+        "市场分支", pd.Series("", index=risk.index)
+    ).astype(str).eq("合计")]
+    total_row = total.iloc[0] if not total.empty else pd.Series(dtype=object)
+    selected = _r16_selected(history, require_lifecycle=True)
+    branch_counts = (
+        selected.groupby("R16_市场分支").size().to_dict()
+        if len(selected) else {}
+    )
+    median_return = _safe_float(total_row.get("止损后中位收益%"))
+    primary_pf = _safe_float(total_row.get("止损后_PF"))
+    worst_return = _safe_float(total_row.get("止损后最差收益%"))
+    path_improvement = _safe_float(
+        total_row.get("相对最差盘中路径改善百分点")
+    )
+    f_capture = _safe_float(total_row.get("F级捕获率%"))
+    gates = [
+        ("实现约束", "主止损严格固定为-10%", R16_PRIMARY_STOP_PCT == -10.0, f"当前{R16_PRIMARY_STOP_PCT:.1f}%"),
+        ("实现约束", "止损仅从买入次日生效（T+1）", True, "已锁定"),
+        ("实现约束", "止损成交计0.3%不利滑点", np.isclose(R16_STOP_SLIPPAGE_PCT, 0.30), f"当前{R16_STOP_SLIPPAGE_PCT:.2f}%"),
+        ("实现约束", "停牌与一字跌停顺延，不虚构成交", True, "已锁定"),
+        ("样本门槛", "R3中性至少24笔完整交易", branch_counts.get("R3中性", 0) >= 24, f"当前{branch_counts.get('R3中性', 0)}笔"),
+        ("样本门槛", "R6弱势至少12笔完整交易", branch_counts.get("R6弱势", 0) >= 12, f"当前{branch_counts.get('R6弱势', 0)}笔"),
+        ("样本门槛", "R15强势至少8笔完整交易", branch_counts.get("R15强势", 0) >= 8, f"当前{branch_counts.get('R15强势', 0)}笔"),
+        ("风险效果", "主止损W3中位收益仍大于0", math.isfinite(median_return) and median_return > 0.0, f"当前{median_return:.2f}%"),
+        ("风险效果", "主止损W3 Profit Factor至少1.2", math.isfinite(primary_pf) and primary_pf >= 1.2, f"当前{primary_pf:.2f}"),
+        ("风险效果", "主止损最差实际收益不低于-15%", math.isfinite(worst_return) and worst_return >= -15.0, f"当前{worst_return:.2f}%"),
+        ("风险效果", "相对最差盘中路径至少改善3个百分点", math.isfinite(path_improvement) and path_improvement >= 3.0, f"当前{path_improvement:.2f}个百分点"),
+        ("风险效果", "主止损捕获至少50%的F级", math.isfinite(f_capture) and f_capture >= 50.0, f"当前{f_capture:.1f}%"),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "验收阶段": phase,
+                "R16验收项目": name,
+                "结果": "通过" if passed else "未通过",
+                "当前值": value,
+            }
+            for phase, name, passed, value in gates
+        ]
+    )
+
+
 def market_data_gap_audit(ledger: pd.DataFrame):
     columns = [
         "Signal_Date",
@@ -6203,7 +6699,11 @@ def result_state_consistency_audit(history: pd.DataFrame, ledger: pd.DataFrame):
     pending_research_dates = set(
         ledger_frame.loc[
             ledger_status.isin(
-                {"PENDING_R13_DAILY", "PENDING_R14_LIFECYCLE"}
+                {
+                    "PENDING_R13_DAILY",
+                    "PENDING_R14_LIFECYCLE",
+                    "PENDING_R16_EXIT",
+                }
             ),
             "Signal_Date",
         ].astype(str)
@@ -6327,8 +6827,8 @@ def repair_inconsistent_completed_ledger(config_id: str):
     return bad_dates
 
 
-def _apply_r15_selection_policy(frame: pd.DataFrame):
-    """兼容导入R9—R15：实际组合不变，重算可复原的研究标记。"""
+def _apply_r16_selection_policy(frame: pd.DataFrame):
+    """兼容导入R9—R16：冻结入场不变，只恢复研究标记。"""
     result = frame.copy()
     market_regime = result.get(
         "Market_Regime", pd.Series("", index=result.index)
@@ -6585,10 +7085,13 @@ def _apply_r15_selection_policy(frame: pd.DataFrame):
         _bool_series(result, "Selected_Top2")
         | _bool_series(result, "R15_Strong_ATR_Top1")
     )
+    result["R16_Exit_Research_Selected"] = _bool_series(
+        result, "R15_Shadow_Selected"
+    )
     return result
 
 
-def import_r15_results_zip(zip_bytes: bytes, config_id: str):
+def import_r16_results_zip(zip_bytes: bytes, config_id: str):
     """先完整验证、后事务提交；失败时不允许留下候选或账本半成品。"""
     if not zip_bytes:
         raise ValueError("结果包为空。")
@@ -6613,11 +7116,12 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
                 or name.startswith("01_all_r13")
                 or name.startswith("01_all_r14")
                 or name.startswith("01_all_r15")
+                or name.startswith("01_all_r16")
             )
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R9/R10/R11/R12/R13/R14/R15候选明细。")
+            raise ValueError("结果包中未找到唯一的R9—R16候选明细。")
         candidate_info = infos[candidate_names[0]]
         if candidate_info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -6634,7 +7138,7 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
             raise ValueError("候选明细为空。")
         if candidates.duplicated(["Signal_Date", "ts_code"]).any():
             raise ValueError("候选明细存在重复的日期与股票代码。")
-        candidates = _apply_r15_selection_policy(candidates)
+        candidates = _apply_r16_selection_policy(candidates)
         legacy_missing_r13 = not _bool_series(
             candidates, "Daily_Restart_Data_Available"
         ).any()
@@ -6654,6 +7158,30 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
                 "Signal_Date",
             ].astype(str)
         ) if legacy_missing_r14 else set()
+        r16_lifecycle_required = {
+            "R16_Stop_Minus8_Triggered",
+            "R16_Stop_Minus8_Trigger_Day",
+            "R16_Stop_Minus8_Return_Net_pct",
+            "R16_Stop_Minus8_Exit_Day",
+            "R16_Stop_Minus8_Delay_Days",
+            "R16_Stop_Minus8_Blocked_Days",
+            "R16_Stop_Minus10_Triggered",
+            "R16_Stop_Minus10_Trigger_Day",
+            "R16_Stop_Minus10_Return_Net_pct",
+            "R16_Stop_Minus10_Exit_Day",
+            "R16_Stop_Minus10_Delay_Days",
+            "R16_Stop_Minus10_Blocked_Days",
+            "R16_Lifecycle_Data_Available",
+        }
+        legacy_missing_r16 = not r16_lifecycle_required.issubset(
+            candidates.columns
+        )
+        pending_r16_dates = set(
+            candidates.loc[
+                _bool_series(candidates, "R16_Exit_Research_Selected"),
+                "Signal_Date",
+            ].astype(str)
+        ) if legacy_missing_r16 else set()
         candidates["Config_ID"] = str(config_id)
 
         opportunity_name = next(
@@ -6684,7 +7212,7 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
             ).copy()
             if opportunities.duplicated(["Signal_Date", "ts_code"]).any():
                 raise ValueError("大牛股机会明细存在重复的日期与股票代码。")
-            opportunities = _apply_r15_selection_policy(opportunities)
+            opportunities = _apply_r16_selection_policy(opportunities)
             # 机会表只是全池子集，R11/R12/R13名次必须从完整候选表回填。
             research_map_columns = [
                 "Signal_Date",
@@ -6702,6 +7230,7 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
                 "R14_MACD_Elastic_Top2",
                 "R15_Strong_ATR_Top1",
                 "R15_Shadow_Selected",
+                "R16_Exit_Research_Selected",
             ]
             research_map = candidates[research_map_columns].drop_duplicates(
                 ["Signal_Date", "ts_code"], keep="last"
@@ -6737,6 +7266,9 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
             )
             opportunities["R15_Shadow_Selected"] = _bool_series(
                 opportunities, "R15_Shadow_Selected"
+            )
+            opportunities["R16_Exit_Research_Selected"] = _bool_series(
+                opportunities, "R16_Exit_Research_Selected"
             )
             strong_opportunities = opportunities.get(
                 "Market_Regime", pd.Series("", index=opportunities.index)
@@ -6810,6 +7342,21 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
             imported_ledger.loc[
                 pending_mask, "Selection_Block_Reason"
             ] = "R13结果已恢复；等待补算R14下一可交易日开盘退出路径"
+        if not legacy_missing_r13 and pending_r16_dates:
+            r16_pending_mask = (
+                imported_ledger["Signal_Date"].astype(str).isin(
+                    pending_r16_dates
+                )
+                & ~imported_ledger.get(
+                    "Scan_Status", pd.Series("", index=imported_ledger.index)
+                ).astype(str).eq("PENDING_R14_LIFECYCLE")
+            )
+            imported_ledger.loc[
+                r16_pending_mask, "Scan_Status"
+            ] = "PENDING_R16_EXIT"
+            imported_ledger.loc[
+                r16_pending_mask, "Selection_Block_Reason"
+            ] = "冻结入场已恢复；等待补算R16 T+1日内硬止损成交路径"
 
         candidate_rows_by_week = candidates.groupby("Signal_Date").size().to_dict()
         mapped_candidate_rows = imported_ledger["Signal_Date"].map(
@@ -6867,7 +7414,13 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
             imported_ledger["Selection_Block_Reason"] = ""
         preserve_pending_reason = imported_ledger.get(
             "Scan_Status", pd.Series("", index=imported_ledger.index)
-        ).astype(str).isin({"PENDING_R13_DAILY", "PENDING_R14_LIFECYCLE"})
+        ).astype(str).isin(
+            {
+                "PENDING_R13_DAILY",
+                "PENDING_R14_LIFECYCLE",
+                "PENDING_R16_EXIT",
+            }
+        )
         imported_ledger.loc[
             mapped_reasons.fillna("").ne("") & ~preserve_pending_reason,
             "Selection_Block_Reason",
@@ -6982,6 +7535,7 @@ def import_r15_results_zip(zip_bytes: bytes, config_id: str):
             _bool_series(candidates, "Daily_Restart_Data_Available").sum()
         ),
         "pending_r14_weeks": len(pending_r14_dates),
+        "pending_r16_weeks": len(pending_r16_dates),
         "r15_strong_weeks": int(
             candidates.loc[
                 _bool_series(candidates, "R15_Strong_ATR_Top1"),
@@ -7046,10 +7600,15 @@ def build_export_zip(
     r15_holding_coverage: pd.DataFrame,
     r15_yearly_audit: pd.DataFrame,
     r15_gates: pd.DataFrame,
+    r16_trade_detail: pd.DataFrame,
+    r16_w3_exit_summary: pd.DataFrame,
+    r16_lifecycle_audit: pd.DataFrame,
+    r16_primary_risk: pd.DataFrame,
+    r16_gates: pd.DataFrame,
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r15_strong_atr_shadow_candidates.csv": history,
+        "01_all_r16_three_regime_exit_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -7110,6 +7669,11 @@ def build_export_zip(
         "49_r15_fixed_holding_coverage_audit.csv": r15_holding_coverage,
         "50_r15_calendar_year_strong_audit.csv": r15_yearly_audit,
         "51_r15_shadow_acceptance_gates.csv": r15_gates,
+        "52_r16_exit_trade_detail.csv": r16_trade_detail,
+        "53_r16_w3_exit_rule_summary.csv": r16_w3_exit_summary,
+        "54_r16_w3_w8_lifecycle_audit.csv": r16_lifecycle_audit,
+        "55_r16_primary_stop_risk_audit.csv": r16_primary_risk,
+        "56_r16_exit_acceptance_gates.csv": r16_gates,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -7134,14 +7698,14 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R15保持R3/R6实际组合与R14高弹性研究逐行不变；只把冻结的R11温和ATR Top1"
-        "加入强势影子组合，验证能否稳定增加约10个信号周。"
+        "R16冻结R3中性、R6弱势与R15强势的所有入场和排名；不建立三仓组合，"
+        "先逐笔验证统一的实盘退出机制。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "R15仍是影子验证版本，不是实盘版本；强势Top1不会写入原Selected_Top2。"
+        "R16主止损固定为日内-10%，不会为了保留反弹牛股而放宽；-8%仅作敏感性对照。"
     )
-    with st.expander("查看R15交易与研究边界"):
+    with st.expander("查看R16交易与研究边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
@@ -7161,6 +7725,11 @@ def main():
 - **R15禁止递补**：第一名不在接受带时直接空仓，绝不改用第二名；R7、R9失败方案不得拼接补周。
 - **R15影子组合**：中性仍用R3 Top2、弱势仍用R6 Top2；强势只加入R15 Top1，独立报告新信号覆盖、固定W3理论空窗与W3收益。
 - **R15实际隔离**：影子标记不覆盖Selected_Top2，不参与原R3/R6实际组合统计；通过后仍需样本外确认。
+- **R16冻结入场**：R3中性Top2、R6弱势Top2、R15强势Top1逐行不变；每笔交易独立评价，暂不建立三仓组合。
+- **R16主止损**：买入后从下一交易日起检查日内-10%；-8%只作敏感性对照，不加入更宽松的-12%方案。
+- **R16实盘成交**：盘中触线计0.3%不利滑点，跳空低开按开盘价；停牌与一字跌停顺延到首个可交易开盘。
+- **R16持有上限**：固定W3/W4/W6/W8仍是基线；止损和R14周末规则只允许提前退出，不得延长持有时间。
+- **R16评价顺序**：先看最差路径、F级捕获和三市场稳定性；S/A被止损只记录代价，不据此放宽主止损。
 - **R7/R9对照**：旧触发和旧排名仅保留在报告中用于比较，不下单、不影响R11。
 - **指标口径**：SKDJ固定N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
 - **删除硬门**：不再要求价格达到MA10的75%，不再用1周中位涨幅和55%上涨家数整周归零；市场只做分层审计。
@@ -7179,11 +7748,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R15强势单分支影子验证", "最新选股预览"],
+            ["历史R16三市场独立退出验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R15强势单分支影子验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R16三市场独立退出验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -7197,7 +7766,7 @@ def main():
             min_value=0.0,
             max_value=2.0,
             step=0.05,
-            help="R3/R6实际基线与R11—R14研究样本的W1—W8固定周收益及下一开盘退出收益都会扣除该成本。",
+            help="所有冻结入场的固定持有、周末退出与R16硬止损收益都会扣除该成本。",
         )
 
         st.markdown("---")
@@ -7209,9 +7778,9 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R15历史结果")
+        clear_history_clicked = st.button("清除R16历史结果")
         imported_results = st.file_uploader(
-            "导入已下载的R9/R10/R11/R12/R13/R14/R15结果包",
+            "导入已下载的R9—R16结果包",
             type=["zip"],
             help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
         )
@@ -7223,7 +7792,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R15强势单分支影子验证":
+    if start_input > end_input and mode == "历史R16三市场独立退出验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -7243,14 +7812,14 @@ def main():
             ):
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
-        st.session_state.pop("r15_preview", None)
-        st.success("R15历史结果和断点任务已清除。")
+        st.session_state.pop("r16_preview", None)
+        st.success("R16历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
     if import_results_clicked and imported_results is not None:
         try:
-            import_stats = import_r15_results_zip(
+            import_stats = import_r16_results_zip(
                 imported_results.getvalue(), config_id
             )
             inferred_note = (
@@ -7271,17 +7840,22 @@ def main():
             r15_note = (
                 f"；已恢复R15强势影子信号{import_stats.get('r15_strong_weeks', 0)}周"
             )
+            r16_note = (
+                f"；其中{import_stats.get('pending_r16_weeks', 0)}个冻结信号周需补算R16硬止损路径"
+                if import_stats.get("pending_r16_weeks", 0) > 0
+                else "；已包含R16退出生命周期数据"
+            )
             st.success(
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个已知候选周"
-                f"{inferred_note}{r13_note}{r14_note}{r15_note}。"
+                f"{inferred_note}{r13_note}{r14_note}{r15_note}{r16_note}。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
-    if "r15_worker_id" not in st.session_state:
-        st.session_state["r15_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r15_worker_id"])
+    if "r16_worker_id" not in st.session_state:
+        st.session_state["r16_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r16_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -7305,7 +7879,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R15强势单分支影子验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R16三市场独立退出验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -7462,7 +8036,7 @@ def main():
 
                     loaded_date_set = set(loaded_dates)
                     batch_gap_dates = sorted(set(failed_dates))
-                    progress = st.progress(0, text="开始扫描R15实际基线、冻结强势Top1与影子覆盖……")
+                    progress = st.progress(0, text="开始扫描R16冻结入场与实盘退出路径……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -7546,7 +8120,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r15_preview"] = candidates
+                            st.session_state["r16_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -7592,7 +8166,7 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：R15结构与研究候选{raw_count}只，"
+                                f"{signal_date}：R16冻结结构与研究候选{raw_count}只，"
                                 f"当前分支合格{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -7612,7 +8186,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R15强势单分支影子扫描完成。")
+                            st.success("历史R16三市场独立退出扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -7639,12 +8213,12 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r15_preview")
+    preview = st.session_state.get("r16_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R15结构或研究观察候选。")
+            st.info("最新交易日没有R16冻结结构或研究观察候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -7894,9 +8468,16 @@ def main():
                 "Scan_Status", pd.Series("", index=data_gap_rows.index)
             ).astype(str).eq("PENDING_R14_LIFECYCLE")
         ].copy()
+        pending_r16_rows = data_gap_rows[
+            data_gap_rows.get(
+                "Scan_Status", pd.Series("", index=data_gap_rows.index)
+            ).astype(str).eq("PENDING_R16_EXIT")
+        ].copy()
         actual_data_gap_rows = data_gap_rows[
             ~data_gap_rows.index.isin(
-                pending_r13_rows.index.union(pending_r14_rows.index)
+                pending_r13_rows.index.union(pending_r14_rows.index).union(
+                    pending_r16_rows.index
+                )
             )
         ].copy()
         state_consistency_rows = result_state_consistency_audit(history, ledger)
@@ -7905,7 +8486,7 @@ def main():
             st.error(
                 f"发现{len(state_consistency_rows)}周账本与候选明细不一致。"
                 "当前结果禁止判定策略优劣，也不提供正式下载。"
-                "点击“启动历史R15强势单分支影子验证”后，程序会只补扫这些日期。"
+                "点击“启动历史R16三市场独立退出验证”后，程序会只补扫这些日期。"
             )
             st.dataframe(
                 state_consistency_rows, width="stretch", hide_index=True
@@ -7983,13 +8564,17 @@ def main():
         r15_holding_coverage = r15_holding_coverage_audit(history, ledger)
         r15_yearly_audit = r15_calendar_year_audit(history)
         r15_gates = r15_shadow_acceptance_gates(history, ledger)
+        r16_trade_detail = r16_exit_trade_detail(history)
+        r16_w3_exit_summary = r16_w3_exit_rule_summary(history)
+        r16_lifecycle_audit = r16_lifecycle_return_audit(history)
+        r16_primary_risk = r16_primary_stop_risk_audit(history)
+        r16_gates = r16_exit_acceptance_gates(history)
 
         st.markdown("---")
-        st.header("R15强势温和ATR单分支影子组合验证报告")
+        st.header("R16三市场独立退出验证报告")
         st.caption(
-            "R15只复用冻结的R11强势温和ATR Top1：先在强势再启动合格池按"
-            "ATR3/ATR13由低到高取第一名，再要求比值位于0.70—0.90；第一名失败"
-            "不递补第二名。R3/R6实际Selected_Top2与R14研究结果均保持不变。"
+            "R3中性、R6弱势、R15强势信号完全冻结。每笔交易独立比较固定持有、"
+            "日内-10%主止损、-8%敏感性与R14周末退出；本版不模拟三仓资金占用。"
         )
 
         scanned_weeks = len(ledger)
@@ -7998,11 +8583,16 @@ def main():
         ).astype(str)
         pending_r13_weeks = int(ledger_status.eq("PENDING_R13_DAILY").sum())
         pending_r14_weeks = int(ledger_status.eq("PENDING_R14_LIFECYCLE").sum())
+        pending_r16_weeks = int(ledger_status.eq("PENDING_R16_EXIT").sum())
         data_gap_weeks = int(
             (
                 ledger_status.ne("COMPLETED")
                 & ~ledger_status.isin(
-                    {"PENDING_R13_DAILY", "PENDING_R14_LIFECYCLE"}
+                    {
+                        "PENDING_R13_DAILY",
+                        "PENDING_R14_LIFECYCLE",
+                        "PENDING_R16_EXIT",
+                    }
                 )
             ).sum()
         )
@@ -8021,19 +8611,20 @@ def main():
         )
         selected = completed[_actual_selected_mask(completed)]
         selected_returns = selected[PRIMARY_RETURN_COLUMN] if not selected.empty else pd.Series(dtype=float)
-        metric_columns = st.columns(9)
+        metric_columns = st.columns(10)
         metric_columns[0].metric("账本已知周数", scanned_weeks)
         metric_columns[1].metric("待补R13日线周", pending_r13_weeks)
         metric_columns[2].metric("待补R14退出周", pending_r14_weeks)
-        metric_columns[3].metric("数据缺口周", data_gap_weeks)
-        metric_columns[4].metric("跳过扫描周", skipped_data_weeks)
-        metric_columns[5].metric("无有效入选周", invalid_selection_weeks)
-        metric_columns[6].metric("W3完整入选交易", len(selected))
-        metric_columns[7].metric(
+        metric_columns[3].metric("待补R16止损周", pending_r16_weeks)
+        metric_columns[4].metric("数据缺口周", data_gap_weeks)
+        metric_columns[5].metric("跳过扫描周", skipped_data_weeks)
+        metric_columns[6].metric("无有效入选周", invalid_selection_weeks)
+        metric_columns[7].metric("W3完整入选交易", len(selected))
+        metric_columns[8].metric(
             "实际入选胜率",
             f"{((selected_returns > 0).mean() * 100.0 if len(selected_returns) else np.nan):.1f}%",
         )
-        metric_columns[8].metric(
+        metric_columns[9].metric(
             "W3实际入选中位收益",
             f"{(selected_returns.median() if len(selected_returns) else np.nan):.2f}%",
         )
@@ -8083,6 +8674,11 @@ def main():
                 f"已恢复R13结果中的{len(pending_r14_rows)}个R14信号周；"
                 "这些周尚缺W1/W2确认后的下一可交易日开盘退出路径，启动R14后只补扫相关日期。"
             )
+        if not pending_r16_rows.empty:
+            st.info(
+                f"已恢复冻结入场结果，其中{len(pending_r16_rows)}个信号周尚缺R16硬止损路径；"
+                "启动R16后只补扫这些日期，不会重做其他已完成周。"
+            )
         if not actual_data_gap_rows.empty:
             st.error(
                 "回测已继续完成，但存在行情缺失或跳过周；这些周不会被伪装成完整样本，"
@@ -8090,6 +8686,46 @@ def main():
             )
             with st.expander("查看行情缺失与跳过明细", expanded=True):
                 st.dataframe(actual_data_gap_rows, width="stretch", hide_index=True)
+
+        st.subheader("R16实盘退出验收")
+        st.caption(
+            "主规则始终是日内-10%硬止损；S/A误杀率只揭示代价，不作为放宽止损的门槛。"
+        )
+        if _bool_series(history, "R16_Lifecycle_Data_Available").sum() == 0:
+            st.info(
+                "当前结果包尚无R16日内路径。导入后启动历史验证，程序只补算冻结信号周。"
+            )
+        st.dataframe(r16_gates, width="stretch", hide_index=True)
+
+        st.subheader("R16三市场-10%主止损风险效果")
+        st.caption(
+            "最差盘中MAE是实际持有过程风险；止损后最差收益包含跳空、0.3%滑点和跌停延迟。"
+        )
+        st.dataframe(
+            _format_report_frame(r16_primary_risk),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("R16 W3固定持有、硬止损与周末退出对照")
+        st.dataframe(
+            _format_report_frame(r16_w3_exit_summary),
+            width="stretch",
+            hide_index=True,
+        )
+
+        with st.expander("查看R16 W3/W4/W6/W8全部退出生命周期"):
+            st.dataframe(
+                _format_report_frame(r16_lifecycle_audit),
+                width="stretch",
+                hide_index=True,
+            )
+        with st.expander("查看R16逐笔止损成交路径"):
+            st.dataframe(
+                _format_report_frame(r16_trade_detail),
+                width="stretch",
+                hide_index=True,
+            )
 
         st.subheader("R11.1原实际组合总体验收（仅R3/R6基线）")
         st.dataframe(gates, width="stretch", hide_index=True)
@@ -8561,11 +9197,16 @@ def main():
             r15_holding_coverage,
             r15_yearly_audit,
             r15_gates,
+            r16_trade_detail,
+            r16_w3_exit_summary,
+            r16_lifecycle_audit,
+            r16_primary_risk,
+            r16_gates,
         )
         st.download_button(
-            "下载R15强势ATR影子组合完整研究结果",
+            "下载R16三市场独立退出完整研究结果",
             data=export_bytes,
-            file_name="r15_strong_atr_shadow_audit_results.zip",
+            file_name="r16_three_regime_exit_audit_results.zip",
             mime="application/zip",
         )
 
