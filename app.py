@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-R17 W3续持判定与两仓/三仓资金占用验证版。
+R18 三仓W3主方案与盈利尾仓验证版。
 
 R3中性、R6弱势、R15强势的入场、排名和信号逐行冻结，R16的T+1日内-10%
-灾难止损也保持不变。R17只研究两个后置问题：一是在W3当时仅使用冻结市场分支
-和是否已经止损，决定是否把仍在持有的中性/强势交易延长至W4；二是按真实买入、
-止损、W3/W4退出日期，比较同一本金拆成两仓与三仓后能买到、错过和复投的交易。
+灾难止损也保持不变。R17已经证明整仓延长W4会占用资金、错过后续第一名。
+R18因此固定三仓W3为主方案，只研究一个不阻挡新信号的盈利尾仓：W3按原计划
+收回每个仓位的初始仓额；中性/强势且W3盈利的交易，只把已经形成的W3利润继续
+留到W4。弱势、止损或W3未盈利交易全部在W3前退出。
 
-主续持规则预先固定为：弱势始终W3退出；中性/强势未触发主止损的存活交易延长
-至W4。W3盈利且第三周不回落只保留为对照。两者均不读取W4结果，不修改任何入场。
+盈利尾仓不改变三仓W3买入集合，不占用下一笔初始仓额；额外卖出成本按尾仓金额
+0.10%扣除。该规则只做影子判卷，不读取W4结果决定是否保留尾仓，也不修改入场。
 """
 
 from __future__ import annotations
@@ -40,15 +41,15 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R17-W3-W4-EXTENSION-TWO-THREE-SLOT-AUDIT"
-APP_TITLE = "R17续持判定与两仓三仓验证器"
-ENGINE_PATCH = "R17-FROZEN-ENTRY-W3-EXTENSION-PORTFOLIO-AUDIT"
+APP_VERSION = "R18-THREE-SLOT-W3-PROFIT-RUNNER-AUDIT"
+APP_TITLE = "R18三仓W3与盈利尾仓验证器"
+ENGINE_PATCH = "R18-FROZEN-ENTRY-THREE-SLOT-W3-PROFIT-RUNNER-AUDIT"
 
-CHECKPOINT_FILE = "r17_w3_extension_portfolio_candidates.csv"
-SCAN_LEDGER_FILE = "r17_w3_extension_portfolio_scanned_dates.csv"
-OPPORTUNITY_FILE = "r17_w3_extension_portfolio_w3_major_winner_opportunities.csv"
-RUN_TASK_FILE = "r17_w3_extension_portfolio_running_task.json"
-RESULT_STATE_GUARD_FILE = "r17_w3_extension_portfolio_result_state.guard"
+CHECKPOINT_FILE = "r18_three_slot_profit_runner_candidates.csv"
+SCAN_LEDGER_FILE = "r18_three_slot_profit_runner_scanned_dates.csv"
+OPPORTUNITY_FILE = "r18_three_slot_profit_runner_w3_major_winner_opportunities.csv"
+RUN_TASK_FILE = "r18_three_slot_profit_runner_running_task.json"
+RESULT_STATE_GUARD_FILE = "r18_three_slot_profit_runner_result_state.guard"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -122,6 +123,9 @@ R17_PORTFOLIO_CAPITAL_DEFAULT = 200000.0
 R17_PORTFOLIO_SLOT_COUNTS = (2, 3)
 R17_EXTENSION_RULE = "弱势W3；中性/强势未止损存活单延长W4"
 R17_MOMENTUM_EXTENSION_COMPARISON = "动量续持对照：W3盈利且第三周未回落才延长W4"
+R18_PRIMARY_SLOT_COUNT = 3
+R18_TAIL_EXTRA_COST_PCT = 0.10
+R18_PROFIT_RUNNER_RULE = "三仓W3收回初始仓额；中性/强势W3利润作为W4尾仓"
 R16_EXIT_RULES = (
     ("固定持有", "fixed", None, None, None, None),
     (
@@ -7179,6 +7183,419 @@ def r17_extension_acceptance_gates(
     )
 
 
+# -----------------------------------------------------------------------------
+# R18 三仓W3本金回收与盈利尾仓审计
+# -----------------------------------------------------------------------------
+def _r18_normalize_signal_keys(frame: pd.DataFrame):
+    result = frame.copy()
+    result["Signal_Date"] = result.get(
+        "Signal_Date", pd.Series("", index=result.index)
+    ).map(parse_yyyymmdd)
+    result["ts_code"] = result.get(
+        "ts_code", pd.Series("", index=result.index)
+    ).astype(str)
+    return result
+
+
+def r18_profit_runner_trade_detail(
+    history: pd.DataFrame,
+    total_capital: float = R17_PORTFOLIO_CAPITAL_DEFAULT,
+):
+    _, portfolio_ledger = r17_two_three_slot_portfolio_audit(
+        history, total_capital=total_capital
+    )
+    if portfolio_ledger.empty:
+        return pd.DataFrame()
+    base = portfolio_ledger[
+        portfolio_ledger.get(
+            "退出方案", pd.Series("", index=portfolio_ledger.index)
+        ).astype(str).eq("W3主规则")
+        & pd.to_numeric(
+            portfolio_ledger.get("仓位数"), errors="coerce"
+        ).eq(R18_PRIMARY_SLOT_COUNT)
+        & portfolio_ledger.get(
+            "执行状态", pd.Series("", index=portfolio_ledger.index)
+        ).astype(str).eq("买入")
+    ].copy()
+    if base.empty:
+        return pd.DataFrame()
+    base = _r18_normalize_signal_keys(base)
+    base["R18_W3主方案收益_pct"] = pd.to_numeric(
+        base.get("交易净收益%"), errors="coerce"
+    )
+
+    selected = _r16_selected(history, require_lifecycle=True)
+    if selected.empty:
+        return pd.DataFrame()
+    cohort3, realized3, stop3 = _r16_lifecycle_returns(
+        selected, 3, "hard", "R16_Stop_Minus10_Triggered",
+        "R16_Stop_Minus10_Return_Net_pct", "R16_Stop_Minus10_Exit_Day", None,
+    )
+    cohort4, realized4, stop4 = _r16_lifecycle_returns(
+        selected, 4, "hard", "R16_Stop_Minus10_Triggered",
+        "R16_Stop_Minus10_Return_Net_pct", "R16_Stop_Minus10_Exit_Day", None,
+    )
+    common = cohort3.index.intersection(cohort4.index)
+    research = selected.loc[common].copy()
+    research = _r18_normalize_signal_keys(research)
+    research["R18_W3止损实际收益_pct"] = realized3.reindex(common).to_numpy()
+    research["R18_W4止损实际收益_pct"] = realized4.reindex(common).to_numpy()
+    research["R18_W3已止损"] = stop3.reindex(common).fillna(False).to_numpy()
+    research["R18_W4前已止损"] = stop4.reindex(common).fillna(False).to_numpy()
+    research["R18_W3退出日期"] = research.get(
+        "Fixed_Exit_W3_Date", pd.Series(None, index=research.index)
+    )
+    fixed_w4_date = research.get(
+        "Fixed_Exit_W4_Date", pd.Series(None, index=research.index)
+    ).copy()
+    stop_exit_date = research.get(
+        "R16_Stop_Minus10_Exit_Date", pd.Series(None, index=research.index)
+    )
+    extension_stop = (
+        research["R18_W4前已止损"].astype(bool)
+        & ~research["R18_W3已止损"].astype(bool)
+    )
+    research["R18_尾仓退出日期"] = fixed_w4_date
+    research.loc[extension_stop, "R18_尾仓退出日期"] = stop_exit_date.loc[
+        extension_stop
+    ]
+    research["R18_尾仓退出原因"] = np.where(
+        extension_stop, "延长期-10%灾难止损", "W4到期"
+    )
+    research_columns = [
+        "Signal_Date", "ts_code", "R18_W3止损实际收益_pct",
+        "R18_W4止损实际收益_pct", "R18_W3已止损", "R18_W4前已止损",
+        "R18_W3退出日期", "R18_尾仓退出日期", "R18_尾仓退出原因",
+    ]
+    research = research[research_columns].drop_duplicates(
+        ["Signal_Date", "ts_code"], keep="last"
+    )
+    detail = base.merge(
+        research,
+        on=["Signal_Date", "ts_code"],
+        how="left",
+        sort=False,
+    )
+    branch = detail.get(
+        "市场分支", pd.Series("", index=detail.index)
+    ).astype(str)
+    w3_return = pd.to_numeric(
+        detail.get("R18_W3止损实际收益_pct"), errors="coerce"
+    )
+    w4_return = pd.to_numeric(
+        detail.get("R18_W4止损实际收益_pct"), errors="coerce"
+    )
+    stop_w3 = _bool_series(detail, "R18_W3已止损")
+    factor3 = 1.0 + w3_return / 100.0
+    factor4 = 1.0 + w4_return / 100.0
+    eligible = (
+        branch.isin({"R15强势", "R3中性"})
+        & ~stop_w3
+        & w3_return.gt(0.0)
+        & w4_return.notna()
+        & factor3.gt(0.0)
+        & factor4.gt(0.0)
+    )
+    stake = float(total_capital) / float(R18_PRIMARY_SLOT_COUNT)
+    runner_initial = pd.Series(0.0, index=detail.index)
+    runner_initial.loc[eligible] = (
+        stake * w3_return.loc[eligible] / 100.0
+    )
+    runner_final = pd.Series(0.0, index=detail.index)
+    runner_final.loc[eligible] = (
+        runner_initial.loc[eligible]
+        * factor4.loc[eligible]
+        / factor3.loc[eligible]
+        * (1.0 - R18_TAIL_EXTRA_COST_PCT / 100.0)
+    )
+    runner_increment = runner_final - runner_initial
+    runner_increment_return = runner_increment / stake * 100.0
+    detail["R18_盈利尾仓资格"] = eligible
+    detail["R18_初始仓额"] = stake
+    detail["R18_W3收回初始仓额"] = np.where(eligible, stake, 0.0)
+    detail["R18_W3尾仓初始金额"] = runner_initial
+    detail["R18_W4尾仓最终金额"] = runner_final
+    detail["R18_尾仓增量盈亏"] = runner_increment
+    detail["R18_尾仓增量折算原仓收益_pct"] = runner_increment_return
+    detail["R18_主方案加尾仓收益_pct"] = (
+        detail["R18_W3主方案收益_pct"] + runner_increment_return
+    )
+    detail["R18_尾仓结果"] = np.select(
+        [
+            ~eligible,
+            runner_increment.gt(0.0),
+            runner_increment.lt(0.0),
+        ],
+        ["不保留", "增加利润", "回吐部分利润"],
+        default="持平",
+    )
+    preferred = [
+        "Signal_Date", "Entry_Date", "Exit_Date", "Rank", "ts_code", "name",
+        "市场分支", "Outcome_Grade", "R18_W3主方案收益_pct",
+        "R18_W3止损实际收益_pct", "R18_W4止损实际收益_pct",
+        "R18_盈利尾仓资格", "R18_W3退出日期", "R18_尾仓退出日期",
+        "R18_尾仓退出原因", "R18_初始仓额", "R18_W3收回初始仓额",
+        "R18_W3尾仓初始金额", "R18_W4尾仓最终金额", "R18_尾仓增量盈亏",
+        "R18_尾仓增量折算原仓收益_pct", "R18_主方案加尾仓收益_pct",
+        "R18_尾仓结果",
+    ]
+    result = detail[[column for column in preferred if column in detail.columns]]
+    return result.sort_values(
+        [column for column in ("Signal_Date", "Rank", "ts_code") if column in result.columns],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+
+def r18_profit_runner_exposure_audit(detail: pd.DataFrame):
+    columns = [
+        "观察日期", "同时尾仓数", "尾仓初始金额合计",
+        "尾仓起止较大值合计", "占初始本金比例%",
+    ]
+    if detail.empty:
+        return pd.DataFrame(columns=columns)
+    runners = detail[_bool_series(detail, "R18_盈利尾仓资格")].copy()
+    if runners.empty:
+        return pd.DataFrame(columns=columns)
+    runners["_start"] = _r17_date_series(runners, "R18_W3退出日期")
+    runners["_exit"] = _r17_date_series(runners, "R18_尾仓退出日期")
+    runners["_initial"] = pd.to_numeric(
+        runners.get("R18_W3尾仓初始金额"), errors="coerce"
+    )
+    runners["_final"] = pd.to_numeric(
+        runners.get("R18_W4尾仓最终金额"), errors="coerce"
+    )
+    runners = runners.dropna(subset=["_start", "_exit", "_initial"])
+    if runners.empty:
+        return pd.DataFrame(columns=columns)
+    total_capital = _safe_float(
+        pd.to_numeric(runners.get("R18_初始仓额"), errors="coerce").dropna().iloc[0]
+        if pd.to_numeric(runners.get("R18_初始仓额"), errors="coerce").notna().any()
+        else np.nan
+    ) * R18_PRIMARY_SLOT_COUNT
+    dates = sorted(set(runners["_start"]).union(set(runners["_exit"])))
+    rows = []
+    for observation_date in dates:
+        active = runners[
+            runners["_start"].le(observation_date)
+            & runners["_exit"].ge(observation_date)
+        ]
+        initial_sum = active["_initial"].sum()
+        conservative_sum = pd.concat(
+            [active["_initial"], active["_final"]], axis=1
+        ).max(axis=1).sum()
+        rows.append(
+            {
+                "观察日期": observation_date.strftime("%Y%m%d"),
+                "同时尾仓数": len(active),
+                "尾仓初始金额合计": initial_sum,
+                "尾仓起止较大值合计": conservative_sum,
+                "占初始本金比例%": (
+                    conservative_sum / total_capital * 100.0
+                    if total_capital > 0 else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r18_profit_runner_summary(
+    history: pd.DataFrame,
+    detail: pd.DataFrame,
+    exposure: pd.DataFrame,
+    total_capital: float = R17_PORTFOLIO_CAPITAL_DEFAULT,
+):
+    columns = [
+        "方案", "仓位数", "初始资金", "单仓初始金额", "实际买入",
+        "错过第一名", "尾仓交易", "尾仓正增量", "尾仓负增量",
+        "实际胜率%", "平均单笔收益%", "中位单笔收益%",
+        "固定仓额期末资金", "固定仓额总收益率%", "前五笔占净利润%",
+        "剔除前五笔后固定仓额收益率%", "尾仓增量合计",
+        "尾仓增量折合总收益率%", "去最佳尾仓后增量",
+        "最大尾仓暴露占本金%", "最大单笔亏损%",
+    ]
+    if detail.empty:
+        return pd.DataFrame(columns=columns)
+    _, portfolio_ledger = r17_two_three_slot_portfolio_audit(
+        history, total_capital=total_capital
+    )
+    w3_three = portfolio_ledger[
+        portfolio_ledger.get(
+            "退出方案", pd.Series("", index=portfolio_ledger.index)
+        ).astype(str).eq("W3主规则")
+        & pd.to_numeric(
+            portfolio_ledger.get("仓位数"), errors="coerce"
+        ).eq(R18_PRIMARY_SLOT_COUNT)
+    ]
+    skipped_rank1 = int(
+        (
+            w3_three.get(
+                "执行状态", pd.Series("", index=w3_three.index)
+            ).astype(str).eq("跳过")
+            & pd.to_numeric(w3_three.get("Rank"), errors="coerce").eq(1.0)
+        ).sum()
+    )
+    stake = float(total_capital) / float(R18_PRIMARY_SLOT_COUNT)
+    runner_mask = _bool_series(detail, "R18_盈利尾仓资格")
+    increment = pd.to_numeric(
+        detail.get("R18_尾仓增量盈亏"), errors="coerce"
+    ).fillna(0.0)
+    runner_increment = increment.loc[runner_mask]
+    no_best_increment = (
+        runner_increment.drop(runner_increment.idxmax()).sum()
+        if len(runner_increment) > 1 else np.nan
+    )
+    max_exposure_pct = pd.to_numeric(
+        exposure.get("占初始本金比例%"), errors="coerce"
+    ).max() if not exposure.empty else np.nan
+    plans = [
+        ("三仓W3主方案", "R18_W3主方案收益_pct", False),
+        (R18_PROFIT_RUNNER_RULE, "R18_主方案加尾仓收益_pct", True),
+    ]
+    rows = []
+    for label, return_column, with_runner in plans:
+        returns = pd.to_numeric(detail.get(return_column), errors="coerce").dropna()
+        top5 = returns.nlargest(min(5, len(returns))).sum() if len(returns) else np.nan
+        fixed_profit = stake * returns.sum() / 100.0
+        final_capital = float(total_capital) + fixed_profit
+        rows.append(
+            {
+                "方案": label,
+                "仓位数": R18_PRIMARY_SLOT_COUNT,
+                "初始资金": float(total_capital),
+                "单仓初始金额": stake,
+                "实际买入": len(returns),
+                "错过第一名": skipped_rank1,
+                "尾仓交易": int(runner_mask.sum()) if with_runner else 0,
+                "尾仓正增量": int((runner_increment > 0.0).sum()) if with_runner else 0,
+                "尾仓负增量": int((runner_increment < 0.0).sum()) if with_runner else 0,
+                "实际胜率%": (returns > 0.0).mean() * 100.0 if len(returns) else np.nan,
+                "平均单笔收益%": returns.mean() if len(returns) else np.nan,
+                "中位单笔收益%": returns.median() if len(returns) else np.nan,
+                "固定仓额期末资金": final_capital,
+                "固定仓额总收益率%": (
+                    final_capital / float(total_capital) - 1.0
+                ) * 100.0,
+                "前五笔占净利润%": (
+                    top5 / returns.sum() * 100.0
+                    if len(returns) and not np.isclose(returns.sum(), 0.0)
+                    else np.nan
+                ),
+                "剔除前五笔后固定仓额收益率%": (
+                    (returns.sum() - top5) / float(R18_PRIMARY_SLOT_COUNT)
+                    if len(returns) else np.nan
+                ),
+                "尾仓增量合计": runner_increment.sum() if with_runner else 0.0,
+                "尾仓增量折合总收益率%": (
+                    runner_increment.sum() / float(total_capital) * 100.0
+                    if with_runner else 0.0
+                ),
+                "去最佳尾仓后增量": no_best_increment if with_runner else np.nan,
+                "最大尾仓暴露占本金%": max_exposure_pct if with_runner else 0.0,
+                "最大单笔亏损%": returns.min() if len(returns) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r18_profit_runner_acceptance_gates(
+    detail: pd.DataFrame,
+    summary: pd.DataFrame,
+):
+    base_rows = summary[
+        summary.get("方案", pd.Series("", index=summary.index)).astype(str).eq(
+            "三仓W3主方案"
+        )
+    ]
+    test_rows = summary[
+        summary.get("方案", pd.Series("", index=summary.index)).astype(str).eq(
+            R18_PROFIT_RUNNER_RULE
+        )
+    ]
+    base = base_rows.iloc[0] if not base_rows.empty else pd.Series(dtype=object)
+    test = test_rows.iloc[0] if not test_rows.empty else pd.Series(dtype=object)
+    runner = detail[_bool_series(detail, "R18_盈利尾仓资格")].copy()
+    recovered = pd.to_numeric(
+        runner.get(
+            "R18_W3收回初始仓额", pd.Series(dtype=float)
+        ), errors="coerce"
+    )
+    stake = pd.to_numeric(
+        runner.get("R18_初始仓额", pd.Series(dtype=float)), errors="coerce"
+    )
+    worst_increment_return = pd.to_numeric(
+        runner.get(
+            "R18_尾仓增量折算原仓收益_pct", pd.Series(dtype=float)
+        ), errors="coerce"
+    ).min()
+    tests = [
+        (
+            "实现约束", "固定使用三仓W3主买入集合",
+            _safe_float(test.get("仓位数")) == R18_PRIMARY_SLOT_COUNT,
+            f"当前{int(_safe_float(test.get('仓位数'), 0.0))}仓",
+        ),
+        (
+            "实现约束", "尾仓不减少实际买入或增加错过第一名",
+            _safe_float(test.get("实际买入")) == _safe_float(base.get("实际买入"))
+            and _safe_float(test.get("错过第一名")) == _safe_float(base.get("错过第一名")),
+            f"买入{int(_safe_float(test.get('实际买入'), 0.0))}笔；错过第一名{int(_safe_float(test.get('错过第一名'), 0.0))}笔",
+        ),
+        (
+            "实现约束", "每笔尾仓在W3完整收回初始仓额",
+            len(runner) > 0 and np.allclose(recovered, stake, equal_nan=False),
+            f"当前{len(runner)}笔尾仓",
+        ),
+        (
+            "样本门槛", "至少12笔完整盈利尾仓",
+            _safe_float(test.get("尾仓交易")) >= 12.0,
+            f"当前{int(_safe_float(test.get('尾仓交易'), 0.0))}笔",
+        ),
+        (
+            "资金效果", "盈利尾仓固定仓额总收益不低于W3",
+            _safe_float(test.get("固定仓额总收益率%"))
+            >= _safe_float(base.get("固定仓额总收益率%")),
+            f"尾仓{_safe_float(test.get('固定仓额总收益率%')):.2f}% / W3 {_safe_float(base.get('固定仓额总收益率%')):.2f}%",
+        ),
+        (
+            "稳健性", "去掉最佳尾仓后增量仍不为负",
+            _safe_float(test.get("去最佳尾仓后增量"), -math.inf) >= 0.0,
+            f"当前{_safe_float(test.get('去最佳尾仓后增量')):.0f}元",
+        ),
+        (
+            "稳健性", "前五笔利润依赖较W3增加不超过5个百分点",
+            _safe_float(test.get("前五笔占净利润%"), math.inf)
+            <= _safe_float(base.get("前五笔占净利润%"), -math.inf) + 5.0,
+            f"尾仓{_safe_float(test.get('前五笔占净利润%')):.1f}% / W3 {_safe_float(base.get('前五笔占净利润%')):.1f}%",
+        ),
+        (
+            "稳健性", "剔除前五笔后固定仓额收益率仍大于50%",
+            _safe_float(test.get("剔除前五笔后固定仓额收益率%")) > 50.0,
+            f"当前{_safe_float(test.get('剔除前五笔后固定仓额收益率%')):.2f}%",
+        ),
+        (
+            "风险约束", "尾仓最大同时暴露不超过一个初始仓位",
+            _safe_float(test.get("最大尾仓暴露占本金%"), math.inf)
+            <= 100.0 / R18_PRIMARY_SLOT_COUNT,
+            f"当前{_safe_float(test.get('最大尾仓暴露占本金%')):.1f}%",
+        ),
+        (
+            "风险约束", "单笔尾仓回吐不超过原仓额10%",
+            _safe_float(worst_increment_return, -math.inf) >= -10.0,
+            f"当前最差{_safe_float(worst_increment_return):.2f}%",
+        ),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "验收阶段": phase,
+                "R18验收项目": name,
+                "结果": "通过" if passed else "未通过",
+                "当前值": value,
+            }
+            for phase, name, passed, value in tests
+        ]
+    )
+
+
 def market_data_gap_audit(ledger: pd.DataFrame):
     columns = [
         "Signal_Date",
@@ -7382,7 +7799,7 @@ def repair_inconsistent_completed_ledger(config_id: str):
 
 
 def _apply_r16_selection_policy(frame: pd.DataFrame):
-    """兼容导入R9—R17：冻结入场不变，只恢复研究标记。"""
+    """兼容导入R9—R18：冻结入场不变，只恢复研究标记。"""
     result = frame.copy()
     market_regime = result.get(
         "Market_Regime", pd.Series("", index=result.index)
@@ -7646,7 +8063,7 @@ def _apply_r16_selection_policy(frame: pd.DataFrame):
 
 
 def import_r16_results_zip(zip_bytes: bytes, config_id: str):
-    """先完整验证、后事务提交；失败时不允许留下候选或账本半成品。"""
+    """兼容导入R9—R18；先完整验证、后事务提交。"""
     if not zip_bytes:
         raise ValueError("结果包为空。")
     task = read_json_safe(RUN_TASK_FILE)
@@ -7672,11 +8089,12 @@ def import_r16_results_zip(zip_bytes: bytes, config_id: str):
                 or name.startswith("01_all_r15")
                 or name.startswith("01_all_r16")
                 or name.startswith("01_all_r17")
+                or name.startswith("01_all_r18")
             )
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R9—R17候选明细。")
+            raise ValueError("结果包中未找到唯一的R9—R18候选明细。")
         candidate_info = infos[candidate_names[0]]
         if candidate_info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -8097,6 +8515,9 @@ def import_r16_results_zip(zip_bytes: bytes, config_id: str):
                 "Signal_Date",
             ].nunique()
         ),
+        "w4_exit_date_rows": int(
+            _r17_date_series(candidates, "Fixed_Exit_W4_Date").notna().sum()
+        ),
         "opportunity_rows": opportunity_count,
         "ledger_rows": len(imported_ledger),
         "ledger_inferred": ledger_name is None,
@@ -8165,10 +8586,14 @@ def build_export_zip(
     r17_portfolio_summary: pd.DataFrame,
     r17_portfolio_ledger: pd.DataFrame,
     r17_gates: pd.DataFrame,
+    r18_runner_detail: pd.DataFrame,
+    r18_runner_summary: pd.DataFrame,
+    r18_runner_exposure: pd.DataFrame,
+    r18_gates: pd.DataFrame,
 ):
     buffer = io.BytesIO()
     files = {
-        "01_all_r17_w3_extension_portfolio_candidates.csv": history,
+        "01_all_r18_three_slot_profit_runner_candidates.csv": history,
         "02_rank_cohort_summary.csv": cohort,
         "03_outlier_dependency_audit.csv": outlier,
         "04_year_summary.csv": yearly,
@@ -8239,6 +8664,10 @@ def build_export_zip(
         "59_r17_two_three_slot_summary.csv": r17_portfolio_summary,
         "60_r17_two_three_slot_trade_ledger.csv": r17_portfolio_ledger,
         "61_r17_extension_portfolio_acceptance_gates.csv": r17_gates,
+        "62_r18_profit_runner_trade_detail.csv": r18_runner_detail,
+        "63_r18_three_slot_profit_runner_summary.csv": r18_runner_summary,
+        "64_r18_profit_runner_exposure_audit.csv": r18_runner_exposure,
+        "65_r18_profit_runner_acceptance_gates.csv": r18_gates,
     }
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for filename, frame in files.items():
@@ -8263,14 +8692,14 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R17继续冻结R3中性、R6弱势与R15强势的所有入场和排名；"
-        "只验证W3续持W4以及两仓/三仓资金占用。"
+        "R18继续冻结R3中性、R6弱势与R15强势的所有入场和排名；"
+        "三仓W3是主方案，只验证不阻挡新信号的W4盈利尾仓。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
         "R16主止损固定为日内-10%，不会为了保留反弹牛股而放宽；-8%仅作敏感性对照。"
     )
-    with st.expander("查看R17交易与研究边界"):
+    with st.expander("查看R18交易与研究边界"):
         st.markdown(
             """
 - **R3中性趋势**：原MACD首红、MA20资格和趋势/风险/总分词典序完全保留。
@@ -8299,6 +8728,10 @@ def main():
 - **R17动量筛选对照**：W3盈利且第三周不回落才延长W4只作为反证对照，不因结果好坏转为实盘规则。
 - **R17资金模拟**：同一本金分别拆成两仓、三仓；仓位满时按当周冻结名次跳过，退出当日收盘前的资金不能用于当日开盘买入。
 - **R17禁止追旧信号**：仓位释放后只买下一次新信号；已经错过买入日的旧信号不会补买。
+- **R18主组合**：固定三仓并以W3退出为主；R17整仓W4只保留失败对照，不进入主组合。
+- **R18盈利尾仓**：中性/强势且W3仍盈利时，W3收回完整初始仓额，仅把已经形成的利润留到W4；弱势、止损和未盈利交易不保留。
+- **R18新信号优先**：尾仓不占用三仓初始本金，因此实际买入和错过第一名必须与三仓W3完全一致，否则直接否决。
+- **R18稳健性否决**：去掉最佳尾仓后增量必须非负，前五笔利润依赖增幅不得超过5个百分点，尾仓暴露不得超过一个初始仓位。
 - **R7/R9对照**：旧触发和旧排名仅保留在报告中用于比较，不下单、不影响R11。
 - **指标口径**：SKDJ固定N=6、M=3；Raw RSV两次EMA(span=3)得到K，D为K的3周简单均线。
 - **删除硬门**：不再要求价格达到MA10的75%，不再用1周中位涨幅和55%上涨家数整周归零；市场只做分层审计。
@@ -8317,11 +8750,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R17续持与资金占用验证", "最新选股预览"],
+            ["历史R18三仓与盈利尾仓验证", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R17续持与资金占用验证")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R18三仓与盈利尾仓验证")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -8338,7 +8771,7 @@ def main():
             help="所有冻结入场的固定持有、周末退出与R16硬止损收益都会扣除该成本。",
         )
         portfolio_capital_wan = st.number_input(
-            "两仓/三仓模拟本金（万元）",
+            "三仓本金与尾仓审计本金（万元）",
             value=20.0,
             min_value=1.0,
             max_value=10000.0,
@@ -8355,9 +8788,9 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R17历史结果")
+        clear_history_clicked = st.button("清除R18历史结果")
         imported_results = st.file_uploader(
-            "导入已下载的R9—R17结果包",
+            "导入已下载的R9—R18结果包",
             type=["zip"],
             help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
         )
@@ -8369,7 +8802,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R17续持与资金占用验证":
+    if start_input > end_input and mode == "历史R18三仓与盈利尾仓验证":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -8390,7 +8823,7 @@ def main():
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
         st.session_state.pop("r16_preview", None)
-        st.success("R17历史结果和断点任务已清除。")
+        st.success("R18历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
@@ -8422,10 +8855,15 @@ def main():
                 if import_stats.get("pending_r16_weeks", 0) > 0
                 else "；已包含R16退出生命周期数据"
             )
+            r18_note = (
+                "；已包含W4真实退出日期，可直接查看R18尾仓报告"
+                if import_stats.get("w4_exit_date_rows", 0) > 0
+                else "；旧包缺少W4真实退出日期，R18尾仓时间线需重新扫描"
+            )
             st.success(
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个已知候选周"
-                f"{inferred_note}{r13_note}{r14_note}{r15_note}{r16_note}。"
+                f"{inferred_note}{r13_note}{r14_note}{r15_note}{r16_note}{r18_note}。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
@@ -8456,7 +8894,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R17续持与资金占用验证"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R18三仓与盈利尾仓验证"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -8613,7 +9051,7 @@ def main():
 
                     loaded_date_set = set(loaded_dates)
                     batch_gap_dates = sorted(set(failed_dates))
-                    progress = st.progress(0, text="开始扫描R17冻结入场、续持与资金路径……")
+                    progress = st.progress(0, text="开始扫描R18冻结入场、三仓与盈利尾仓路径……")
                     stopped_during_batch = False
                     for idx, signal_date in enumerate(batch_dates):
                         if run_history and not refresh_task_lease(
@@ -8743,7 +9181,7 @@ def main():
                         progress.progress(
                             (idx + 1) / len(batch_dates),
                             text=(
-                                f"{signal_date}：R17冻结结构与研究候选{raw_count}只，"
+                                f"{signal_date}：R18冻结结构与研究候选{raw_count}只，"
                                 f"当前分支合格{eligible_count}只，入选{selected_count}只"
                             ),
                         )
@@ -8763,7 +9201,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R17续持与资金占用扫描完成。")
+                            st.success("历史R18三仓与盈利尾仓扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -8795,7 +9233,7 @@ def main():
         st.markdown("---")
         st.header("最新选股预览")
         if preview.empty:
-            st.info("最新交易日没有R17冻结结构或研究观察候选。")
+            st.info("最新交易日没有R18冻结结构或研究观察候选。")
         else:
             selected_preview = preview[_bool_series(preview, "Selected_Top2")].copy()
             if selected_preview.empty:
@@ -9063,7 +9501,7 @@ def main():
             st.error(
                 f"发现{len(state_consistency_rows)}周账本与候选明细不一致。"
                 "当前结果禁止判定策略优劣，也不提供正式下载。"
-                "点击“启动历史R17续持与资金占用验证”后，程序会只补扫这些日期。"
+                "点击“启动历史R18三仓与盈利尾仓验证”后，程序会只补扫这些日期。"
             )
             st.dataframe(
                 state_consistency_rows, width="stretch", hide_index=True
@@ -9158,12 +9596,30 @@ def main():
             r17_extension_audit,
             r17_portfolio_summary,
         )
+        r18_runner_detail = r18_profit_runner_trade_detail(
+            history,
+            total_capital=float(portfolio_capital_wan) * 10000.0,
+        )
+        r18_runner_exposure = r18_profit_runner_exposure_audit(
+            r18_runner_detail
+        )
+        r18_runner_summary = r18_profit_runner_summary(
+            history,
+            r18_runner_detail,
+            r18_runner_exposure,
+            total_capital=float(portfolio_capital_wan) * 10000.0,
+        )
+        r18_gates = r18_profit_runner_acceptance_gates(
+            r18_runner_detail,
+            r18_runner_summary,
+        )
 
         st.markdown("---")
-        st.header("R17 W3续持与两仓/三仓资金验证报告")
+        st.header("R18 三仓W3与盈利尾仓验证报告")
         st.caption(
             "R3中性、R6弱势、R15强势信号以及R16日内-10%主止损完全冻结。"
-            "R17不改入口，只比较W3续持W4与同一本金的两仓/三仓真实信号冲突。"
+            "R18固定三仓W3买入集合，只检查盈利尾仓是否能在不阻挡新信号的前提下"
+            "增加收益并保持分散度。"
         )
 
         scanned_weeks = len(ledger)
@@ -9276,7 +9732,55 @@ def main():
             with st.expander("查看行情缺失与跳过明细", expanded=True):
                 st.dataframe(actual_data_gap_rows, width="stretch", hide_index=True)
 
-        st.subheader("R17续持与资金模拟验收")
+        st.subheader("R18三仓W3与盈利尾仓验收")
+        st.caption(
+            f"影子规则：{R18_PROFIT_RUNNER_RULE}。尾仓额外卖出成本按尾仓金额"
+            f"{R18_TAIL_EXTRA_COST_PCT:.2f}%扣除；W3初始仓额必须完整回到本金池。"
+        )
+        if not r18_gates.empty and r18_gates.get(
+            "结果", pd.Series("", index=r18_gates.index)
+        ).astype(str).eq("未通过").any():
+            st.warning(
+                "盈利尾仓仍有验收项未通过，因此三仓W3继续作为唯一主方案；"
+                "尾仓结果只作研究，不进入实盘。"
+            )
+        st.dataframe(r18_gates, width="stretch", hide_index=True)
+
+        st.subheader(
+            f"R18三仓固定仓额资金对照（本金{float(portfolio_capital_wan):.0f}万元）"
+        )
+        st.caption(
+            "主方案与尾仓方案使用完全相同的三仓W3买入集合。尾仓只使用W3利润，"
+            "因此实际买入数和错过第一名必须保持不变；本表不使用利润复投放大。"
+        )
+        runner_summary_display = r18_runner_summary.copy()
+        for money_column in (
+            "初始资金", "单仓初始金额", "固定仓额期末资金", "尾仓增量合计",
+            "去最佳尾仓后增量",
+        ):
+            if money_column in runner_summary_display.columns:
+                runner_summary_display[money_column] = pd.to_numeric(
+                    runner_summary_display[money_column], errors="coerce"
+                ).round(0)
+        st.dataframe(
+            _format_report_frame(runner_summary_display),
+            width="stretch",
+            hide_index=True,
+        )
+        with st.expander("查看R18逐笔盈利尾仓与利润回吐"):
+            st.dataframe(
+                _format_report_frame(r18_runner_detail),
+                width="stretch",
+                hide_index=True,
+            )
+        with st.expander("查看R18尾仓同时暴露时间线"):
+            st.dataframe(
+                _format_report_frame(r18_runner_exposure),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.subheader("R17整仓W4失败对照与资金模拟验收")
         st.caption(
             "主续持决策只读取冻结市场分支和截至W3是否已经止损；"
             "两仓/三仓均按冻结名次、真实买卖日期和仓位冲突执行。"
@@ -9328,7 +9832,7 @@ def main():
             ).astype(str).eq("R17续持W4影子").any():
                 st.info(
                     "导入的R16旧结果没有保存W4真实退出日期，因此本页只生成W3资金曲线；"
-                    "如需W4资金曲线，请先清除R17历史结果再重新扫描；程序会优先复用"
+                    "如需W4资金曲线，请先清除R18历史结果再重新扫描；程序会优先复用"
                     "现有行情缓存、只补缺失数据，不会用自然日近似退出日期。"
                 )
         with st.expander("查看两仓/三仓逐笔买入、跳过与复投明细"):
@@ -9858,11 +10362,15 @@ def main():
             r17_portfolio_summary,
             r17_portfolio_ledger,
             r17_gates,
+            r18_runner_detail,
+            r18_runner_summary,
+            r18_runner_exposure,
+            r18_gates,
         )
         st.download_button(
-            "下载R17续持与两仓三仓完整研究结果",
+            "下载R18三仓W3与盈利尾仓完整研究结果",
             data=export_bytes,
-            file_name="r17_w3_extension_two_three_slot_audit_results.zip",
+            file_name="r18_three_slot_profit_runner_audit_results.zip",
             mime="application/zip",
         )
 
