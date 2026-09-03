@@ -93,6 +93,13 @@ FALLBACK_MIN_SELECTION_SIZE = 1
 RECOVERY_STRICT_MIN_STARTUP_VOLUME_RATIO = 1.0
 RECOVERY_STRICT_MAX_MA10_GAP_PCT = -8.0
 RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT = 0.25
+# --- R21 新增：R15强势分支的"见顶背离"二次确认 ---------------------------
+# 2020H2-2021H1回测显示R15在题材股加速见顶阶段(如2021年初)整体净亏损
+# (PF仅0.58)，问题不是数值算错，而是13周中位数天然滞后，见顶前最后加速期
+# 该指标依然显示"强势"。用当周4周节奏 vs 13周节奏、当周上涨家数占比两项
+# 做背离确认，任一转弱就不再把R15当第一顺位（瀑布会自动降级去试R3/R6）。
+MOMENTUM_DECEL_RATIO = 0.5
+MARKET_BREADTH_MIN_FOR_STRONG = 0.45
 TASK_LEASE_SECONDS = 45
 DATA_READY_HOUR_SHANGHAI = 18
 PRIMARY_RETURN_COLUMN = f"Fixed_Return_W{PRIMARY_HOLD_WEEKS}_Net_pct"
@@ -1379,8 +1386,10 @@ def _market_state_metrics(pool: pd.DataFrame):
     R20：先做坏数据过滤，样本不足时回退中性，并暴露诊断字段方便审计。"""
     raw_13w = _numeric_series(pool, "Return_13W_pct")
     raw_1w = _numeric_series(pool, "Return_1W_pct")
+    raw_4w = _numeric_series(pool, "Return_4W_pct")
     sane_13w = _sane_pct_series(raw_13w)
     sane_1w = _sane_pct_series(raw_1w)
+    sane_4w = _sane_pct_series(raw_4w)
     valid_count = int(sane_13w.notna().sum())
     dropped_count = int(raw_13w.notna().sum() - valid_count)
     degraded = valid_count < MARKET_STATE_MIN_VALID_SAMPLES
@@ -1397,15 +1406,36 @@ def _market_state_metrics(pool: pd.DataFrame):
             else "中性"
         )
     market_1w = _safe_float(sane_1w.median(), 0.0)
+    market_4w = _safe_float(sane_4w.median(), 0.0)
     positive_breadth = float((sane_1w > 0.0).mean()) if sane_1w.notna().any() else 0.0
+    # R21：R20.2用——单周截面即可算出的"动量方向"代理指标，不需要跨周状态。
+    # 13周中位数是滞后的（把过去一整段涨幅都算在内），题材股见顶前最后加速
+    # 阶段13周中位数往往仍然很高，但最近4周的涨幅节奏和当周上涨家数占比
+    # 已经开始转弱——这正是2020H2-2021H1"茅指数"见顶阶段R15分支大幅亏损
+    # 的典型特征。用"4周中位数是否明显低于13周节奏"和"当周上涨家数占比是
+    # 否偏低"两项，给R15加一道广度背离确认，而不是只看13周绝对水平。
+    quarterly_pace = market_13w / 3.25 if math.isfinite(market_13w) else 0.0
+    momentum_decelerating = bool(
+        (not degraded)
+        and regime == "强势"
+        and market_4w < quarterly_pace * MOMENTUM_DECEL_RATIO
+    )
+    breadth_thinning = bool(
+        (not degraded)
+        and regime == "强势"
+        and positive_breadth < MARKET_BREADTH_MIN_FOR_STRONG
+    )
     return {
         "Market_13W_Median_pct": market_13w,
+        "Market_4W_Median_pct": market_4w,
         "Market_1W_Median_pct": market_1w,
         "Market_1W_Positive_Breadth": positive_breadth,
         "Market_Regime": regime,
         "Market_State_Valid_Sample_Count": valid_count,
         "Market_State_Dropped_Bad_Count": dropped_count,
         "Market_State_Degraded": bool(degraded),
+        "Market_Momentum_Decelerating": momentum_decelerating,
+        "Market_Breadth_Thinning": breadth_thinning,
     }
 
 def score_frozen_candidates(pool_snapshots: pd.DataFrame):
@@ -1547,6 +1577,13 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
         )
     )
     r15_eligible_mask = strong_eligible_mask & r15_quality_mask
+    # R21：见顶背离二次确认——当周动量减速或广度转弱时，即使13周中位数仍
+    # 显示"强势"、个股自身ATR压缩也达标，也不再把这些股票算作R15合格候选，
+    # 让瀑布自动降级去试R3/R6，而不是继续把追涨型策略往见顶行情里送。
+    if market_state.get("Market_Momentum_Decelerating") or market_state.get(
+        "Market_Breadth_Thinning"
+    ):
+        r15_eligible_mask = pd.Series(False, index=candidates.index)
 
     market_regime = str(market_state.get("Market_Regime", "中性"))
     r3_count = len(r3_eligible)
