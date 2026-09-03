@@ -71,6 +71,28 @@ RECOVERY_DEEP_DRAWDOWN_PCT = -20.0
 RECOVERY_MAX_WEEKLY_RETURN_PCT = 25.0
 RECOVERY_MAX_LOW_REBOUND_PCT = 40.0
 RECOVERY_STRONG_CLOSE_LOCATION = 0.70
+# --- R20 新增：市场状态数据健全性过滤 -----------------------------------
+# 单只股票的周度收益率在数学上不可能低于-100%（跌到0以下），凡是出现
+# 这种数值，必然是复权因子/停牌缺口导致的坏数据，一律从"市场状态"统计
+# 样本中剔除，不再参与强势/中性/弱势的中位数判定。
+RETURN_PCT_SANE_MIN = -99.0
+RETURN_PCT_SANE_MAX = 500.0
+# 剔除坏数据后，如果当周有效样本数过少，中位数不可信，直接回退为"中性"，
+# 并打上Market_State_Degraded标记，方便日后复核。
+MARKET_STATE_MIN_VALID_SAMPLES = 30
+# --- R20 新增：跨分支回退选股，避免连续空窗 ------------------------------
+# 任一分支只要有>=1只合格候选，就允许用它来补齐当周空缺，而不必凑够2只，
+# 但仍然只从"分支自身门槛"内选股，不降低单只个股的入选标准。
+FALLBACK_MIN_SELECTION_SIZE = 1
+# --- R20 新增：R6弱势(抄底/首次转折)分支的额外确认条件 --------------------
+# 四年回测显示R6弱势分支实际执行胜率仅42%、中位数收益为负，是账户的净拖累。
+# 在不删除该分支（避免弱势市场连续空窗）的前提下，新增"量能确认"和
+# "行业相对强度垫底过滤"两条门槛，只把信号质量更高的一部分保留为
+# "严格版R6"，优先使用；原有宽松版R6降级为最后一道回退，只在R3/R15/
+# 严格R6都没有候选时才启用。
+RECOVERY_STRICT_MIN_STARTUP_VOLUME_RATIO = 1.0
+RECOVERY_STRICT_MAX_MA10_GAP_PCT = -8.0
+RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT = 0.25
 TASK_LEASE_SECONDS = 45
 DATA_READY_HOUR_SHANGHAI = 18
 PRIMARY_RETURN_COLUMN = f"Fixed_Return_W{PRIMARY_HOLD_WEEKS}_Net_pct"
@@ -1343,25 +1365,47 @@ def _score_recovery_early_stage(frame: pd.DataFrame):
     scored["Recovery_Early_Stage_100"] = scored[component_columns].sum(axis=1)
     return scored
 
+def _sane_pct_series(series: pd.Series):
+    """剔除数学上不可能出现的收益率坏值（如<=-100%），只做过滤不做压缩，
+    避免脏数据（复权因子/停牌缺口错误）把全市场中位数拖到几百甚至上千个
+    百分点——这类值曾在实测数据里出现过（例如单周中位数错误地显示为
+    -1400%或+4000%），会直接污染强势/中性/弱势的判定。"""
+    numeric = pd.to_numeric(series, errors="coerce")
+    sane = numeric.where(numeric.between(RETURN_PCT_SANE_MIN, RETURN_PCT_SANE_MAX))
+    return sane
+
 def _market_state_metrics(pool: pd.DataFrame):
-    """仅保留三分支真正使用的市场状态，全部字段在信号日已知。"""
-    current_13w = _numeric_series(pool, "Return_13W_pct")
-    current_1w = _numeric_series(pool, "Return_1W_pct")
-    market_13w = _safe_float(current_13w.median(), 0.0)
-    market_1w = _safe_float(current_1w.median(), 0.0)
-    positive_breadth = float((current_1w > 0.0).mean()) if len(pool) else 0.0
-    regime = (
-        "强势"
-        if market_13w >= MARKET_NEUTRAL_UPPER_PCT
-        else "弱势"
-        if market_13w <= MARKET_NEUTRAL_LOWER_PCT
-        else "中性"
-    )
+    """仅保留三分支真正使用的市场状态，全部字段在信号日已知。
+    R20：先做坏数据过滤，样本不足时回退中性，并暴露诊断字段方便审计。"""
+    raw_13w = _numeric_series(pool, "Return_13W_pct")
+    raw_1w = _numeric_series(pool, "Return_1W_pct")
+    sane_13w = _sane_pct_series(raw_13w)
+    sane_1w = _sane_pct_series(raw_1w)
+    valid_count = int(sane_13w.notna().sum())
+    dropped_count = int(raw_13w.notna().sum() - valid_count)
+    degraded = valid_count < MARKET_STATE_MIN_VALID_SAMPLES
+    if degraded:
+        market_13w = 0.0
+        regime = "中性"
+    else:
+        market_13w = _safe_float(sane_13w.median(), 0.0)
+        regime = (
+            "强势"
+            if market_13w >= MARKET_NEUTRAL_UPPER_PCT
+            else "弱势"
+            if market_13w <= MARKET_NEUTRAL_LOWER_PCT
+            else "中性"
+        )
+    market_1w = _safe_float(sane_1w.median(), 0.0)
+    positive_breadth = float((sane_1w > 0.0).mean()) if sane_1w.notna().any() else 0.0
     return {
         "Market_13W_Median_pct": market_13w,
         "Market_1W_Median_pct": market_1w,
         "Market_1W_Positive_Breadth": positive_breadth,
         "Market_Regime": regime,
+        "Market_State_Valid_Sample_Count": valid_count,
+        "Market_State_Dropped_Bad_Count": dropped_count,
+        "Market_State_Degraded": bool(degraded),
     }
 
 def score_frozen_candidates(pool_snapshots: pd.DataFrame):
@@ -1370,15 +1414,20 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
         return pd.DataFrame(), 0, 0
 
     pool = pool_snapshots.copy()
-    return_13w = _numeric_series(pool, "Return_13W_pct")
+    return_13w = _sane_pct_series(_numeric_series(pool, "Return_13W_pct"))
+    pool["Return_13W_pct"] = return_13w
     industry_median = pool.groupby(
         "Industry", dropna=False
     )["Return_13W_pct"].transform("median")
     pool["Industry_13W_Excess_pct"] = return_13w - pd.to_numeric(
         industry_median, errors="coerce"
     )
-    pool["RS_4W_Pct"] = _percentile_rank(_numeric_series(pool, "Return_4W_pct"))
-    pool["RS_8W_Pct"] = _percentile_rank(_numeric_series(pool, "Return_8W_pct"))
+    pool["RS_4W_Pct"] = _percentile_rank(
+        _sane_pct_series(_numeric_series(pool, "Return_4W_pct"))
+    )
+    pool["RS_8W_Pct"] = _percentile_rank(
+        _sane_pct_series(_numeric_series(pool, "Return_8W_pct"))
+    )
     pool["RS_13W_Pct"] = _percentile_rank(return_13w)
     pool["Industry_Excess_Pct"] = _percentile_rank(
         _numeric_series(pool, "Industry_13W_Excess_pct")
@@ -1418,9 +1467,29 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
             1, len(ordered) + 1, dtype=float
         )
 
-    recovery_eligible = candidates[
-        _bool_series(candidates, "Recovery_Eligible")
-    ].copy()
+    recovery_loose_mask = _bool_series(candidates, "Recovery_Eligible")
+    recovery_eligible = candidates[recovery_loose_mask].copy()
+    # R20：严格版R6追加三项确认——首次转折周必须放量（而非缩量假反弹）、
+    # 价格离MA10不能仍然过远（避免在深跌趋势里过早接刀）、行业内相对强度
+    # 不能垫底（避免买在结构性最差的板块里）。三项全部满足才进入严格池。
+    startup_vol = pd.to_numeric(
+        candidates.get("Startup_Volume_Ratio", np.nan), errors="coerce"
+    )
+    ma10_gap_pct = (
+        pd.to_numeric(candidates.get("Price_to_MA10_Ratio", np.nan), errors="coerce")
+        .sub(1.0)
+        .mul(100.0)
+    )
+    industry_excess_rank = pd.to_numeric(
+        candidates.get("Industry_Excess_Pct", np.nan), errors="coerce"
+    )
+    recovery_strict_confirm = (
+        (startup_vol >= RECOVERY_STRICT_MIN_STARTUP_VOLUME_RATIO)
+        & (ma10_gap_pct >= RECOVERY_STRICT_MAX_MA10_GAP_PCT)
+        & (industry_excess_rank >= RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT)
+    )
+    recovery_strict_mask = recovery_loose_mask & recovery_strict_confirm.fillna(False)
+    candidates["Recovery_Eligible_Strict"] = recovery_strict_mask
     if not recovery_eligible.empty:
         early_scored = _score_recovery_early_stage(recovery_eligible)
         early_columns = [
@@ -1464,63 +1533,100 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
         )
 
     r15_atr = pd.to_numeric(candidates["ATR_Contraction"], errors="coerce")
-    r15_top1 = (
-        pd.to_numeric(candidates["R15_Strong_Rank"], errors="coerce").eq(1)
-        & r15_atr.between(
-            STRONG_ATR_CONTRACTION_MIN,
-            STRONG_ATR_CONTRACTION_MAX,
-            inclusive="both",
+    # R20：不再用历史调出来的固定0.70-0.90绝对区间（过拟合风险），改为要求
+    # ATR3/ATR13低于"当周同一强势候选池"自身的中位数——即相对同期其他强势
+    # 股更收缩，阈值随市场自适应，不再依赖一组写死的历史魔数。
+    r15_atr_median_this_week = (
+        r15_atr.loc[strong_eligible_mask].median() if strong_eligible_mask.any() else np.nan
+    )
+    r15_quality_mask = (
+        pd.to_numeric(candidates["R15_Strong_Rank"], errors="coerce").notna()
+        & (
+            r15_atr <= r15_atr_median_this_week
+            if math.isfinite(_safe_float(r15_atr_median_this_week))
+            else True
         )
     )
+    r15_eligible_mask = strong_eligible_mask & r15_quality_mask
 
     market_regime = str(market_state.get("Market_Regime", "中性"))
     r3_count = len(r3_eligible)
     recovery_count = len(recovery_eligible)
-    strong_count = len(strong_eligible)
-    if market_regime == "强势":
-        active_branch = "R15强势温和ATR Top1"
-        active_count = strong_count
-        candidates["Rank"] = candidates["R15_Strong_Rank"]
-        candidates["Entry_Eligible"] = strong_eligible_mask
-        candidates["R15_Strong_ATR_Top1"] = r15_top1
-        candidates["R19_Selected"] = r15_top1
-        selection_valid = bool(r15_top1.any())
-        block_reason = (
-            ""
-            if selection_valid
-            else "R15强势Top1的ATR3/ATR13不在0.70—0.90，保持空仓"
+    recovery_strict_count = int(recovery_strict_mask.sum())
+    strong_count = int(r15_eligible_mask.sum())
+
+    # R20：三分支不再按市场状态互斥，改为"优先级瀑布"——市场状态决定
+    # 第一顺位尝试哪个分支，但只要该分支当周候选为空，就依次尝试下一档，
+    # 而不是直接空仓。严格版R6优先于宽松版R6，宽松版R6是最后一道回退，
+    # 只要有>=1只合格候选就用，用来压缩"连续数周选不出股票"的空窗期。
+    tiers = {
+        "R15强势温和ATR Top1": {
+            "mask": r15_eligible_mask,
+            "rank_col": "R15_Strong_Rank",
+            "top_n": TOP_N,
+        },
+        "R3中性趋势": {
+            "mask": _bool_series(candidates, "Trend_Eligible"),
+            "rank_col": "R3_Rank",
+            "top_n": TOP_N,
+        },
+        "R6弱势首次转折-严格确认": {
+            "mask": recovery_strict_mask,
+            "rank_col": "Recovery_Rank",
+            "top_n": TOP_N,
+        },
+        "R6弱势首次转折-宽松回退": {
+            "mask": recovery_loose_mask,
+            "rank_col": "Recovery_Rank",
+            "top_n": TOP_N,
+        },
+    }
+    tier_order_by_regime = {
+        "强势": ["R15强势温和ATR Top1", "R3中性趋势",
+                 "R6弱势首次转折-严格确认", "R6弱势首次转折-宽松回退"],
+        "中性": ["R3中性趋势", "R15强势温和ATR Top1",
+                 "R6弱势首次转折-严格确认", "R6弱势首次转折-宽松回退"],
+        "弱势": ["R6弱势首次转折-严格确认", "R3中性趋势",
+                 "R15强势温和ATR Top1", "R6弱势首次转折-宽松回退"],
+    }
+    tier_order = tier_order_by_regime.get(market_regime, tier_order_by_regime["中性"])
+    regime_native_branch = tier_order[0]
+
+    active_branch = ""
+    active_count = 0
+    selection_valid = False
+    for tier_name in tier_order:
+        tier = tiers[tier_name]
+        tier_mask = tier["mask"]
+        tier_count = int(tier_mask.sum())
+        if tier_count < FALLBACK_MIN_SELECTION_SIZE:
+            continue
+        active_branch = tier_name
+        active_count = tier_count
+        candidates["Rank"] = candidates[tier["rank_col"]]
+        candidates["Entry_Eligible"] = tier_mask
+        selected = tier_mask & pd.to_numeric(
+            candidates["Rank"], errors="coerce"
+        ).le(tier["top_n"])
+        candidates["R15_Strong_ATR_Top1"] = (
+            selected if tier_name == "R15强势温和ATR Top1" else False
         )
-    elif market_regime == "中性":
-        active_branch = "R3中性趋势"
-        active_count = r3_count
-        candidates["Rank"] = candidates["R3_Rank"]
-        candidates["Entry_Eligible"] = _bool_series(candidates, "Trend_Eligible")
-        selection_valid = r3_count >= MIN_VALID_SELECTION_SIZE
-        block_reason = "" if selection_valid else "R3中性候选不足2只"
-        if selection_valid:
-            selected = (
-                _bool_series(candidates, "Entry_Eligible")
-                & pd.to_numeric(candidates["Rank"], errors="coerce").le(TOP_N)
-            )
-            candidates.loc[selected, ["Selected_Top2", "R19_Selected"]] = True
+        candidates.loc[selected, ["Selected_Top2", "R19_Selected"]] = True
+        selection_valid = True
+        break
+
+    if not selection_valid:
+        active_branch = regime_native_branch
+        block_reason = "R3/R15/R6严格/R6宽松四档候选均为空，保持空仓"
     else:
-        active_branch = "R6弱势首次转折-N6"
-        active_count = recovery_count
-        candidates["Rank"] = candidates["Recovery_Rank"]
-        candidates["Entry_Eligible"] = _bool_series(
-            candidates, "Recovery_Eligible"
-        )
-        selection_valid = recovery_count >= MIN_VALID_SELECTION_SIZE
-        block_reason = "" if selection_valid else "R6弱势候选不足2只"
-        if selection_valid:
-            selected = (
-                _bool_series(candidates, "Entry_Eligible")
-                & pd.to_numeric(candidates["Rank"], errors="coerce").le(TOP_N)
-            )
-            candidates.loc[selected, ["Selected_Top2", "R19_Selected"]] = True
+        block_reason = ""
 
     candidates["Selection_Valid"] = bool(selection_valid)
     candidates["Selection_Block_Reason"] = block_reason
+    candidates["Regime_Native_Branch"] = regime_native_branch
+    candidates["Fallback_Applied"] = bool(
+        selection_valid and active_branch != regime_native_branch
+    )
     candidates["Strategy_Branch"] = active_branch
     candidates["Raw_Setup_Count"] = raw_count
     candidates["Observation_Row_Count"] = len(candidates)
@@ -1532,6 +1638,7 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     candidates["Eligible_Trend_Count"] = r3_count
     candidates["Strong_Reacceleration_Eligible_Count"] = strong_count
     candidates["Recovery_Eligible_Count"] = recovery_count
+    candidates["Recovery_Eligible_Strict_Count"] = recovery_strict_count
     candidates["Active_Eligible_Count"] = active_count
     for key, value in market_state.items():
         column = (
@@ -3024,6 +3131,7 @@ def _apply_r19_selection_policy(frame: pd.DataFrame):
         errors="coerce",
     )
     rows = result.loc[strong_eligible].copy()
+    atr_week_median = pd.Series(np.nan, index=result.index, dtype=float)
     if not rows.empty:
         rows["_atr"] = atr.loc[rows.index]
         rows["_code"] = rows.get(
@@ -3037,15 +3145,16 @@ def _apply_r19_selection_policy(frame: pd.DataFrame):
         )
         rows["_rank"] = rows.groupby("Signal_Date", sort=False).cumcount() + 1
         result.loc[rows.index, "R15_Strong_Rank"] = rows["_rank"].astype(float)
+        # R20：与实时扫描口径保持一致——用"当周同池中位数"代替写死的
+        # 0.70-0.90历史区间，避免重建口径落后于实时扫描口径。
+        week_median = rows.groupby("Signal_Date")["_atr"].transform("median")
+        atr_week_median.loc[rows.index] = week_median.values
 
+    r15_rank = pd.to_numeric(result["R15_Strong_Rank"], errors="coerce")
     result["R15_Strong_ATR_Top1"] = (
         strong_market
-        & pd.to_numeric(result["R15_Strong_Rank"], errors="coerce").eq(1)
-        & atr.between(
-            STRONG_ATR_CONTRACTION_MIN,
-            STRONG_ATR_CONTRACTION_MAX,
-            inclusive="both",
-        )
+        & r15_rank.le(TOP_N)
+        & (atr <= atr_week_median).where(atr_week_median.notna(), True)
     )
     if "Selected_Top2" not in result.columns:
         result["Selected_Top2"] = False
@@ -4146,6 +4255,8 @@ def main():
             detail_columns = [
                 "Signal_Date", "Entry_Date", "Rank", "name", "ts_code",
                 "Industry", "Market_Regime", "Strategy_Branch",
+                "Regime_Native_Branch", "Fallback_Applied",
+                "Market_State_Degraded",
                 "R15_Strong_Rank", "ATR_Contraction",
                 "Recovery_Early_Stage_100", "Weekly_SKDJ_K6",
                 "Weekly_SKDJ_D6", "Drawdown_26W_pct",
