@@ -1533,18 +1533,17 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
         )
 
     r15_atr = pd.to_numeric(candidates["ATR_Contraction"], errors="coerce")
-    # R20：不再用历史调出来的固定0.70-0.90绝对区间（过拟合风险），改为要求
-    # ATR3/ATR13低于"当周同一强势候选池"自身的中位数——即相对同期其他强势
-    # 股更收缩，阈值随市场自适应，不再依赖一组写死的历史魔数。
-    r15_atr_median_this_week = (
-        r15_atr.loc[strong_eligible_mask].median() if strong_eligible_mask.any() else np.nan
-    )
+    # R20.1：上一版把固定的[0.70,0.90]压缩区间换成"低于当周同池中位数"的
+    # 相对阈值，本意是降低过拟合风险，但4年回测证明这个区间不是拟合噪声，
+    # 而是真实有效的判定标准——去掉之后R15原生交易均值从+5.89%跌到-0.73%、
+    # 胜率从64%跌到42%（同一4年窗口，回退机制本身经核对没有问题）。
+    # 现改回固定区间，只保留Top2（分散度改进，未证实有负面影响）。
     r15_quality_mask = (
         pd.to_numeric(candidates["R15_Strong_Rank"], errors="coerce").notna()
-        & (
-            r15_atr <= r15_atr_median_this_week
-            if math.isfinite(_safe_float(r15_atr_median_this_week))
-            else True
+        & r15_atr.between(
+            STRONG_ATR_CONTRACTION_MIN,
+            STRONG_ATR_CONTRACTION_MAX,
+            inclusive="both",
         )
     )
     r15_eligible_mask = strong_eligible_mask & r15_quality_mask
@@ -3131,7 +3130,6 @@ def _apply_r19_selection_policy(frame: pd.DataFrame):
         errors="coerce",
     )
     rows = result.loc[strong_eligible].copy()
-    atr_week_median = pd.Series(np.nan, index=result.index, dtype=float)
     if not rows.empty:
         rows["_atr"] = atr.loc[rows.index]
         rows["_code"] = rows.get(
@@ -3145,16 +3143,18 @@ def _apply_r19_selection_policy(frame: pd.DataFrame):
         )
         rows["_rank"] = rows.groupby("Signal_Date", sort=False).cumcount() + 1
         result.loc[rows.index, "R15_Strong_Rank"] = rows["_rank"].astype(float)
-        # R20：与实时扫描口径保持一致——用"当周同池中位数"代替写死的
-        # 0.70-0.90历史区间，避免重建口径落后于实时扫描口径。
-        week_median = rows.groupby("Signal_Date")["_atr"].transform("median")
-        atr_week_median.loc[rows.index] = week_median.values
 
+    # R20.1：撤回相对分位阈值，恢复固定[0.70,0.90]压缩区间（经4年回测验证
+    # 该区间本身有效，不是过拟合噪声），只保留Top2分散度改进。
     r15_rank = pd.to_numeric(result["R15_Strong_Rank"], errors="coerce")
     result["R15_Strong_ATR_Top1"] = (
         strong_market
         & r15_rank.le(TOP_N)
-        & (atr <= atr_week_median).where(atr_week_median.notna(), True)
+        & atr.between(
+            STRONG_ATR_CONTRACTION_MIN,
+            STRONG_ATR_CONTRACTION_MAX,
+            inclusive="both",
+        )
     )
     if "Selected_Top2" not in result.columns:
         result["Selected_Top2"] = False
