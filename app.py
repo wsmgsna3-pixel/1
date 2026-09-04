@@ -100,6 +100,33 @@ RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT = 0.25
 # 做背离确认，任一转弱就不再把R15当第一顺位（瀑布会自动降级去试R3/R6）。
 MOMENTUM_DECEL_RATIO = 0.5
 MARKET_BREADTH_MIN_FOR_STRONG = 0.45
+# --- R23 新增：R3中性分支追加"不过度延伸+行业相对强度"门槛 ---------------
+# Position_Risk_OK此前只参与打分不参与准入，导致部分离MA20已经很远、周
+# 振幅偏大的追高单也能入选；Industry_Excess_Pct此前只是排名权重，没有
+# 硬性下限，导致在自己所在行业里明显跑输同行的"伪首红"也能入选。两条都
+# 改成硬性准入门槛，牺牲一部分数量换胜率。
+R3_MIN_INDUSTRY_EXCESS_PCT = 0.40
+# --- R23 新增：R6严格版追加"更深超卖"确认 --------------------------------
+# 基础Recovery_Eligible用的是35分的温和超卖线；严格版在此基础上进一步要求
+# 转折前必须触及更深的超卖区（<=25分），只信真正杀透之后的首次转折，
+# 而不是刚跌破35分附近的轻度超卖就转。行业相对强度门槛同步从0.25提到0.40。
+RECOVERY_STRICT_MAX_OVERSOLD_LEVEL = 25.0
+RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT_V2 = 0.40
+# --- R23 新增：R15强势分支结构性改造（不是再调阈值，是换确认逻辑）--------
+# 复盘发现R15的"整理后再加速"形态本质是无量能/无板块背景确认的纯价格
+# 突破，胜率始终不稳定。三处结构性改动：
+# 1) 突破当周必须放量确认，否则视为无效突破（无量突破更容易是假突破）。
+# 2) 必须身处相对强势的行业（行业超额分位>=0.5），呼应4-6月的验证——
+#    真正兑现的大票几乎都出现在板块性普涨里，孤立个股的技术突破不可信。
+# 3) 只取Top1（不再Top2）——R15定位是"稀缺高确信度信号"，宁缺毋滥；
+#    Top2容易把矮子里拔出来的次优标的也买入，拉低整体质量。
+# 4) 止损收紧到-6%（不与R3/R6共用-10%）——突破失败通常几天内就会显形，
+#    放任跌到-10%才止损，对于"低胜率、博高赔率"的突破策略是不必要的
+#    额外亏损，及早止损能显著改善这个分支的赔率结构。
+R15_STRICT_MIN_STARTUP_VOLUME_RATIO = 1.2
+R15_STRICT_MIN_INDUSTRY_EXCESS_PCT = 0.50
+R15_TOP_N = 1
+R15_STRONG_STOP_PCT = -6.0
 TASK_LEASE_SECONDS = 45
 DATA_READY_HOUR_SHANGHAI = 18
 PRIMARY_RETURN_COLUMN = f"Fixed_Return_W{PRIMARY_HOLD_WEEKS}_Net_pct"
@@ -1489,7 +1516,20 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     candidates["R19_Selected"] = False
     candidates["Entry_Eligible"] = False
 
-    r3_eligible = candidates[_bool_series(candidates, "Trend_Eligible")].copy()
+    # R23：R3中性追加两条硬性准入门槛（此前只是打分权重，不卡准入）——
+    # 不能离MA20/振幅过度延伸，且行业相对强度不能低于同池40分位，
+    # 排除"技术形态对但躺在弱势板块里"的伪首红。
+    r3_quality_confirm = (
+        _bool_series(candidates, "Position_Risk_OK")
+        & (
+            pd.to_numeric(
+                candidates.get("Industry_Excess_Pct", np.nan), errors="coerce"
+            )
+            >= R3_MIN_INDUSTRY_EXCESS_PCT
+        )
+    )
+    r3_eligible_mask = _bool_series(candidates, "Trend_Eligible") & r3_quality_confirm
+    r3_eligible = candidates[r3_eligible_mask].copy()
     if not r3_eligible.empty:
         ordered = r3_eligible.sort_values(
             ["Score_Trend_20", "Score_Risk_10", "Entry_Score_100", "ts_code"],
@@ -1505,6 +1545,8 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     # R20：严格版R6追加三项确认——首次转折周必须放量（而非缩量假反弹）、
     # 价格离MA10不能仍然过远（避免在深跌趋势里过早接刀）、行业内相对强度
     # 不能垫底（避免买在结构性最差的板块里）。三项全部满足才进入严格池。
+    # R23：行业相对强度门槛从0.25提到0.40，并追加"更深超卖"确认——只信
+    # 真正杀透到SKDJ<=25分之后的首次转折，排除刚跌破35分附近的轻度回踩。
     startup_vol = pd.to_numeric(
         candidates.get("Startup_Volume_Ratio", np.nan), errors="coerce"
     )
@@ -1516,10 +1558,14 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     industry_excess_rank = pd.to_numeric(
         candidates.get("Industry_Excess_Pct", np.nan), errors="coerce"
     )
+    skdj_recent_min = pd.to_numeric(
+        candidates.get("SKDJ_Recent_Min", np.nan), errors="coerce"
+    )
     recovery_strict_confirm = (
         (startup_vol >= RECOVERY_STRICT_MIN_STARTUP_VOLUME_RATIO)
         & (ma10_gap_pct >= RECOVERY_STRICT_MAX_MA10_GAP_PCT)
-        & (industry_excess_rank >= RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT)
+        & (industry_excess_rank >= RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT_V2)
+        & (skdj_recent_min <= RECOVERY_STRICT_MAX_OVERSOLD_LEVEL)
     )
     recovery_strict_mask = recovery_loose_mask & recovery_strict_confirm.fillna(False)
     candidates["Recovery_Eligible_Strict"] = recovery_strict_mask
@@ -1570,7 +1616,19 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     # 相对阈值，本意是降低过拟合风险，但4年回测证明这个区间不是拟合噪声，
     # 而是真实有效的判定标准——去掉之后R15原生交易均值从+5.89%跌到-0.73%、
     # 胜率从64%跌到42%（同一4年窗口，回退机制本身经核对没有问题）。
-    # 现改回固定区间，只保留Top2（分散度改进，未证实有负面影响）。
+    # 现改回固定区间。
+    # R23：在ATR压缩区间之外，追加两条此前完全缺失的确认——原有形态只看
+    # 个股自身价格结构，没有放量确认也没有板块背景确认，是胜率反复不稳定
+    # 的根本原因（复盘2026年4-6月最大的几笔赢家几乎都发生在板块性普涨
+    # 里，而R15自己的信号在同一窗口是2赢2输，没有体现优势）：
+    # 1) 突破当周必须放量（Startup_Volume_Ratio>=1.2），无量突破视为无效；
+    # 2) 必须身处行业相对强度前50%，孤立个股的技术突破不再单独采信。
+    r15_startup_vol = pd.to_numeric(
+        candidates.get("Startup_Volume_Ratio", np.nan), errors="coerce"
+    )
+    r15_industry_excess = pd.to_numeric(
+        candidates.get("Industry_Excess_Pct", np.nan), errors="coerce"
+    )
     r15_quality_mask = (
         pd.to_numeric(candidates["R15_Strong_Rank"], errors="coerce").notna()
         & r15_atr.between(
@@ -1578,6 +1636,8 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
             STRONG_ATR_CONTRACTION_MAX,
             inclusive="both",
         )
+        & (r15_startup_vol >= R15_STRICT_MIN_STARTUP_VOLUME_RATIO)
+        & (r15_industry_excess >= R15_STRICT_MIN_INDUSTRY_EXCESS_PCT)
     )
     r15_eligible_mask = strong_eligible_mask & r15_quality_mask
     # R21：见顶背离二次确认——当周动量减速或广度转弱时，即使13周中位数仍
@@ -1602,10 +1662,10 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
         "R15强势温和ATR Top1": {
             "mask": r15_eligible_mask,
             "rank_col": "R15_Strong_Rank",
-            "top_n": TOP_N,
+            "top_n": R15_TOP_N,
         },
         "R3中性趋势": {
-            "mask": _bool_series(candidates, "Trend_Eligible"),
+            "mask": r3_eligible_mask,
             "rank_col": "R3_Rank",
             "top_n": TOP_N,
         },
@@ -1720,8 +1780,10 @@ def track_w3_future_path(
     stock_qfq_dict: dict[str, pd.DataFrame],
     roundtrip_cost_pct: float,
     market_dates=None,
+    stop_pct: float = R16_PRIMARY_STOP_PCT,
 ):
-    """固定下一交易日开盘、T+1 -10%止损和W3退出，并保存净值所需日线。"""
+    """固定下一交易日开盘、T+1止损（默认-10%，R15分支传入更紧的-6%）和
+    W3退出，并保存净值所需日线。"""
     result: dict[str, Any] = {
         "Entry_Tradable": False,
         "Entry_Date": None,
@@ -1748,6 +1810,7 @@ def track_w3_future_path(
         "R16_Stop_Minus10_Return_Net_pct": np.nan,
         "R16_Stop_Minus10_Delay_Days": np.nan,
         "R16_Stop_Minus10_Blocked_Days": 0,
+        "R16_Stop_Pct_Applied": float(stop_pct),
         "R19_Daily_Path_JSON": "",
         "R19_Daily_Path_Available": False,
         "R19_Roundtrip_Cost_pct": float(roundtrip_cost_pct),
@@ -1843,7 +1906,7 @@ def track_w3_future_path(
                 (exit_close / buy_price - 1.0) * 100.0 - roundtrip_cost_pct
             )
 
-    stop_price = buy_price * (1.0 + R16_PRIMARY_STOP_PCT / 100.0)
+    stop_price = buy_price * (1.0 + stop_pct / 100.0)
     previous_raw_close = raw_first_close
     trigger_position = None
     trigger_date = None
@@ -2331,6 +2394,14 @@ def scan_one_date(
             outcome_rows = []
             for _, row in candidates.iterrows():
                 if bool(row.get("R19_Selected", False)):
+                    # R23：R15强势分支单独收紧止损到-6%——突破失败通常几天
+                    # 内就会显形，不需要放任跌到-10%才止损。R3/R6仍用-10%。
+                    branch_name = str(row.get("Strategy_Branch", ""))
+                    trade_stop_pct = (
+                        R15_STRONG_STOP_PCT
+                        if branch_name.startswith("R15强势")
+                        else R16_PRIMARY_STOP_PCT
+                    )
                     outcome_rows.append(
                         track_w3_future_path(
                             str(row["ts_code"]),
@@ -2339,6 +2410,7 @@ def scan_one_date(
                             stock_qfq_dict,
                             roundtrip_cost_pct,
                             market_dates,
+                            stop_pct=trade_stop_pct,
                         )
                     )
                 else:
@@ -2519,8 +2591,17 @@ def r19_trade_universe(history: pd.DataFrame):
         selected, "Fixed_Exit_W3_Date"
     )
     selected.loc[use_stop, "R19_Exit_Date"] = stop_exit.loc[use_stop]
+    stop_pct_applied = pd.to_numeric(
+        selected.get(
+            "R16_Stop_Pct_Applied",
+            pd.Series(R16_PRIMARY_STOP_PCT, index=selected.index),
+        ),
+        errors="coerce",
+    ).fillna(R16_PRIMARY_STOP_PCT)
     selected["R19_Exit_Reason"] = np.where(
-        use_stop, "T+1日内-10%灾难止损", "W3到期"
+        use_stop,
+        "T+1日内" + stop_pct_applied.round(0).astype(int).astype(str) + "%灾难止损",
+        "W3到期",
     )
     rank = pd.to_numeric(
         selected.get("Rank", pd.Series(np.nan, index=selected.index)),
@@ -2948,7 +3029,8 @@ def r19_integrity_gates(
     gates = [
         ("冻结规则", "仓位数严格为3", PORTFOLIO_SLOT_COUNT == 3, f"当前{PORTFOLIO_SLOT_COUNT}仓"),
         ("冻结规则", "最长持有严格为W3", PRIMARY_HOLD_WEEKS == 3, f"当前W{PRIMARY_HOLD_WEEKS}"),
-        ("冻结规则", "灾难止损严格为T+1日内-10%", R16_PRIMARY_STOP_PCT == -10.0, f"当前{R16_PRIMARY_STOP_PCT:.1f}%"),
+        ("冻结规则", "R3/R6灾难止损严格为T+1日内-10%", R16_PRIMARY_STOP_PCT == -10.0, f"当前{R16_PRIMARY_STOP_PCT:.1f}%"),
+        ("冻结规则", "R15灾难止损严格为T+1日内-6%（R23单独收紧）", R15_STRONG_STOP_PCT == -6.0, f"当前{R15_STRONG_STOP_PCT:.1f}%"),
         ("冻结规则", "止损计0.3%不利滑点", np.isclose(R16_STOP_SLIPPAGE_PCT, 0.30), f"当前{R16_STOP_SLIPPAGE_PCT:.2f}%"),
         ("数据完整", "全部扫描周无缺口且已完成", data_complete, f"完成{int(completed_status.eq('COMPLETED').sum())}/{len(ledger)}周"),
         ("数据完整", "扫描账本与候选明细一致", result_state_consistency_audit(history, ledger).empty, "已核对"),
@@ -3490,11 +3572,12 @@ def main():
     with st.expander("查看冻结交易规则"):
         st.markdown(
             """
-- **R3中性**：MACD首红趋势池按原词典序取Top2；不足2只则空仓。
-- **R6弱势**：26周深跌、SKDJ固定N=6的首次转折池按原五项早期阶段排名取Top2；不足2只则空仓。
-- **R15强势**：整理后首次再启动候选仅按ATR3/ATR13从小到大取Top1；第一名必须位于0.70—0.90，不递补。
+- **R3中性**：MACD首红趋势池，追加"不过度延伸(Position_Risk_OK)+行业相对强度≥40分位"两条硬性准入门槛，按六因子评分取Top2；不足2只则试下一档。
+- **R6弱势**：26周深跌+SKDJ首次转折，严格版追加"放量确认+MA10距离+行业相对强度≥40分位+更深超卖(≤25分)"四项确认，按五项早期阶段排名取Top2；不足则降级到宽松版，宽松版仍不足才试下一档。
+- **R15强势**：整理后首次再启动候选，ATR3/ATR13须在0.70—0.90区间，追加"放量确认(≥1.2)+行业相对强度≥50分位"两项确认（不再是纯价格形态），叠加动量减速/广度转弱二次过滤；只取Top1（R23改回，不递补）。
+- **三分支瀑布**：市场状态决定第一顺位，但任一档当周候选为空就自动试下一档，避免长期空仓；四档全空才真正空仓。
 - **买入**：下一交易日开盘；一字涨停不虚构成交。
-- **止损**：买入日不可卖，从下一交易日起执行日内-10%；计0.3%不利滑点，停牌或一字跌停顺延。
+- **止损**：R3/R6从下一交易日起执行日内-10%；**R15单独收紧为-6%**（R23新增，突破失败通常几天内显形，不放任跌到-10%才止损）；均计0.3%不利滑点，停牌或一字跌停顺延。
 - **退出**：未触发止损的交易固定W3收盘卖出；卖出日资金不能用于当日开盘新信号。
 - **资金**：本金等分三仓，每个仓位卖出后连同盈亏投入下一次新信号；仓位满时不追买旧信号。
 - **已删除**：R7/R9、R12/R13、R14周末退出、R17整仓W4、R18盈利尾仓及全池大牛机会反查。
