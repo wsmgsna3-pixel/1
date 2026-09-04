@@ -1465,7 +1465,10 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     pool["MACD_Impulse_Pct"] = _percentile_rank(
         _numeric_series(pool, "MACD_Impulse_pct")
     )
-    market_state = _market_state_metrics(pool)
+    # R22修复：这里必须传原始pool_snapshots而不是上面已经就地净化过的pool——
+    # 否则_market_state_metrics内部再统计"剔除了多少条坏数据"时，坏数据早
+    # 已经被清成NaN、数不到了，Market_State_Dropped_Bad_Count会一直显示0。
+    market_state = _market_state_metrics(pool_snapshots)
 
     r3_trigger = _bool_series(pool, "R3_Setup_Candidate")
     strong_trigger = _bool_series(pool, "Strong_Reacceleration_Trigger")
@@ -1676,7 +1679,22 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     candidates["Recovery_Eligible_Count"] = recovery_count
     candidates["Recovery_Eligible_Strict_Count"] = recovery_strict_count
     candidates["Active_Eligible_Count"] = active_count
+    # R22修复：老代码对市场状态字典里所有以"_pct"结尾的键统一乘100导出，
+    # 这个规则只对Market_1W_Positive_Breadth（内部是0~1的比例）是对的；
+    # Market_13W_Median_pct/Market_4W_Median_pct/Market_1W_Median_pct在
+    # _market_state_metrics内部算出来时已经是百分比单位了（例如真实13周
+    # 涨幅40.29%就存成40.29），blanket乘100会把它错误放大成4029——这正是
+    # 前几轮回测里导出的市场状态数值看起来极不合理的真正原因，判断逻辑
+    # 本身用的是乘100之前的正确数值，没有被这个bug影响。
+    ALREADY_PERCENT_KEYS = {
+        "Market_13W_Median_pct",
+        "Market_4W_Median_pct",
+        "Market_1W_Median_pct",
+    }
     for key, value in market_state.items():
+        if key in ALREADY_PERCENT_KEYS:
+            candidates[key] = value
+            continue
         column = (
             f"{key}_pct"
             if key == "Market_1W_Positive_Breadth"
