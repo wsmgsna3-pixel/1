@@ -1,27 +1,22 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ信号有效性验证器（单文件独立版，直接覆盖 app.py 运行即可）。
+"""周线SKDJ最简策略回测器（单文件独立版，直接覆盖 app.py 运行）。
 
-这个版本不做选股、不做组合、不做资金管理、不做回测收益曲线。
-它只回答一个问题：
+选股只用一个信号，不含任何其他条件：
+    周线SKDJ  K <= 阈值  且  K >= 上周K（低位拐头）  且  K > D
 
-    "周线SKDJ的K上穿25之后，股价表现真的比同期随便买一只科技股更好吗？"
+该信号已由信号验证器在4年、24万个「个股-周」观测上验证：
+    N=4, K<=20, 要求K>D, 持有3周
+    -> 平均收益2.07%、胜率56.2%、相对全池超额+1.63%、t=9.25
 
-核心方法是超额收益（edge），而不是绝对收益：
-    edge = 信号样本未来N周平均收益 - 同期全池所有股票未来N周平均收益
+本回测把策略拆成三层，用来分辨「策略好」与「运气好」：
+    1. 信号层：无资金约束，每周买入当周全部信号 -> 策略本身的优势上限
+    2. 三仓层：真实资金约束，每周最多N只      -> 实际能拿到多少
+    3. 蒙特卡洛：把"选哪只"随机化重复数百次   -> 运气区间与排序规则的真实贡献
 
-牛市里随便买什么都涨，只看绝对收益会把大盘的功劳误认成信号的功劳。
-只有信号组相对同期全池基准仍然领先，才说明信号本身携带择股信息。
+三仓存在路径依赖：某只股票占住仓位会挡掉后面的信号，这纯属时间巧合。
+只看三仓的单次收益无法分辨优势来源，因此必须配合蒙特卡洛分布一起看。
 
-买卖口径：信号周收盘产生信号 -> 下一周开盘买入 -> 持有N周后按当周收盘卖出。
-不计交易成本（验证信号阶段，成本留到策略层再算）。
-
-SKDJ 严格按通达信公式实现：
-    LOWV := LLV(LOW, N);  HIGHV := HHV(HIGH, N);
-    RSV  := EMA((CLOSE-LOWV)/(HIGHV-LOWV)*100, M);
-    K : EMA(RSV, M);   D : MA(K, M);
-其中通达信 EMA(X,M) 对应 pandas ewm(span=M)，MA(X,M) 对应 rolling(M).mean()。
-
-行情缓存目录与主程序一致，之前下载过的数据不会重复下载。
+行情缓存目录与之前一致，已下载的数据不会重复下载。
 """
 
 from __future__ import annotations
@@ -51,15 +46,14 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "周线SKDJ信号有效性验证器"
-# 与主程序共用同一个缓存目录，避免重复下载行情
+APP_TITLE = "周线SKDJ最简策略回测（三层分离验证）"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
 DATA_READY_HOUR_SHANGHAI = 18
 
 # -----------------------------------------------------------------------------
-# 数据层（与主程序完全一致：复权处理、缓存分片、股票池口径）
+# 数据层（与之前完全一致：复权、缓存分片、股票池口径）
 # -----------------------------------------------------------------------------
 def clean_token_str(raw_token: str) -> str:
     if not raw_token:
@@ -641,22 +635,10 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
     return weekly
 
 
-def add_skdj_suffixed(
-    weekly: pd.DataFrame, n_period: int, m_period: int, suffix: str
-) -> pd.DataFrame:
-    """同一份周线上算多组N参数，列名加后缀，用于N参数扫描。"""
-    low = pd.to_numeric(weekly["low"], errors="coerce")
-    high = pd.to_numeric(weekly["high"], errors="coerce")
-    close = pd.to_numeric(weekly["close"], errors="coerce")
-    low_n = low.rolling(n_period).min()
-    high_n = high.rolling(n_period).max()
-    raw_rsv = (close - low_n) / (high_n - low_n).replace(0, np.nan) * 100.0
-    rsv = raw_rsv.ewm(span=m_period, adjust=False).mean()
-    weekly[f"K{suffix}"] = rsv.ewm(span=m_period, adjust=False).mean()
-    weekly[f"D{suffix}"] = weekly[f"K{suffix}"].rolling(m_period).mean()
-    return weekly
 
-
+# -----------------------------------------------------------------------------
+# SKDJ 与信号构造
+# -----------------------------------------------------------------------------
 def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame:
     """严格按通达信公式：
         LOWV := LLV(LOW,N); HIGHV := HHV(HIGH,N);
@@ -666,7 +648,6 @@ def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame
     low = pd.to_numeric(weekly["low"], errors="coerce")
     high = pd.to_numeric(weekly["high"], errors="coerce")
     close = pd.to_numeric(weekly["close"], errors="coerce")
-
     low_n = low.rolling(n_period).min()
     high_n = high.rolling(n_period).max()
     raw_rsv = (close - low_n) / (high_n - low_n).replace(0, np.nan) * 100.0
@@ -676,115 +657,257 @@ def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame
     return weekly
 
 
-def add_forward_returns(weekly: pd.DataFrame, horizons) -> pd.DataFrame:
-    """对信号周 i：买入价 = 第 i+1 周开盘价，卖出价 = 第 i+N 周收盘价。"""
-    open_next = pd.to_numeric(weekly["open"], errors="coerce").shift(-1)
-    close = pd.to_numeric(weekly["close"], errors="coerce")
-    weekly["Entry_Open_Next_Week"] = open_next
-    for n_weeks in horizons:
-        exit_close = close.shift(-n_weeks)
-        weekly[f"Fwd_{n_weeks}W_pct"] = (
-            exit_close / open_next.replace(0, np.nan) - 1.0
-        ) * 100.0
-    return weekly
+def build_stock_signals(
+    weekly: pd.DataFrame,
+    ts_code: str,
+    level: float,
+    hold_weeks: int,
+    require_k_above_d: bool,
+) -> pd.DataFrame:
+    """信号定义（经四年24万观测验证的最优口径）：
+        K <= 阈值   且   K >= 上周K（低位拐头）   且   K > D（可选确认）
+
+    买卖口径：信号周收盘出信号 -> 下一周开盘买入 -> 持有hold_weeks周后按当周收盘卖出。
+    与信号验证器完全一致，保证两边结果可直接对照。
+    """
+    k_now = pd.to_numeric(weekly["K"], errors="coerce")
+    k_prev = k_now.shift(1)
+    d_now = pd.to_numeric(weekly["D"], errors="coerce")
+
+    signal = (k_prev <= k_now) & (k_now <= level)
+    if require_k_above_d:
+        signal = signal & (k_now > d_now)
+    signal = signal.fillna(False)
+
+    open_price = pd.to_numeric(weekly["open"], errors="coerce")
+    close_price = pd.to_numeric(weekly["close"], errors="coerce")
+    dates = weekly["trade_date_str"].astype(str)
+
+    entry_open = open_price.shift(-1)
+    exit_close = close_price.shift(-hold_weeks)
+
+    frame = pd.DataFrame(
+        {
+            "ts_code": ts_code,
+            "Signal_Week": dates,
+            "Entry_Week": dates.shift(-1),
+            "Exit_Week": dates.shift(-hold_weeks),
+            "K": k_now,
+            "D": d_now,
+            "Entry_Open": entry_open,
+            "Exit_Close": exit_close,
+        }
+    )
+    # 持仓期内每周收盘，用于组合按周盯市
+    for step in range(1, hold_weeks + 1):
+        frame[f"Path_{step}"] = close_price.shift(-step)
+
+    frame["Return_pct"] = (
+        exit_close / entry_open.replace(0, np.nan) - 1.0
+    ) * 100.0
+    frame = frame[signal]
+    frame = frame.dropna(subset=["Entry_Week", "Exit_Week", "Return_pct"])
+    return frame
 
 
 # -----------------------------------------------------------------------------
-# 统计对比
+# 回测层一：信号层（无资金约束）——衡量策略本身的纯粹优势
 # -----------------------------------------------------------------------------
-def describe_group(values: pd.Series) -> dict:
-    numeric = pd.to_numeric(values, errors="coerce").dropna()
-    if numeric.empty:
-        return {"样本数": 0, "平均收益%": np.nan, "中位收益%": np.nan, "胜率%": np.nan}
-    return {
-        "样本数": int(len(numeric)),
-        "平均收益%": float(numeric.mean()),
-        "中位收益%": float(numeric.median()),
-        "胜率%": float((numeric > 0).mean() * 100.0),
+def backtest_signal_layer(
+    signals: pd.DataFrame, week_index: dict, hold_weeks: int, cost_pct: float
+):
+    """把资金分成hold_weeks份阶梯（每周投一份），每份等权买入当周全部信号。
+
+    与三仓层使用完全相同的资金投放节奏，唯一区别是每份资金买入当周所有信号
+    而不是只买1只。因此两者之差 = 集中持股（只买1只）带来的影响。
+    """
+    if signals.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    cohort = (
+        signals.groupby("Entry_Week")["Return_pct"]
+        .agg(["mean", "count"])
+        .reset_index()
+        .rename(columns={"mean": "Cohort_Return_pct", "count": "Signal_Count"})
+    )
+    cohort["Entry_Index"] = cohort["Entry_Week"].map(week_index)
+    cohort = cohort.dropna(subset=["Entry_Index"]).sort_values("Entry_Index")
+    cohort["Entry_Index"] = cohort["Entry_Index"].astype(int)
+    cohort["Net_Return_pct"] = cohort["Cohort_Return_pct"] - cost_pct
+
+    # hold_weeks条阶梯，各自独立复利
+    tranche_values = {j: 1.0 for j in range(hold_weeks)}
+    rows = []
+    for _, row in cohort.iterrows():
+        tranche = int(row["Entry_Index"]) % hold_weeks
+        tranche_values[tranche] *= 1.0 + row["Net_Return_pct"] / 100.0
+        rows.append(
+            {
+                "Entry_Week": row["Entry_Week"],
+                "阶梯": tranche + 1,
+                "当周信号数": int(row["Signal_Count"]),
+                "当周等权收益%": row["Net_Return_pct"],
+                "组合净值": sum(tranche_values.values()) / hold_weeks,
+            }
+        )
+    curve = pd.DataFrame(rows)
+    total_return = (sum(tranche_values.values()) / hold_weeks - 1.0) * 100.0
+    returns = cohort["Net_Return_pct"]
+    summary = pd.DataFrame(
+        [
+            {
+                "层级": "信号层（无资金约束，每周买入全部信号）",
+                "交易笔数": int(len(signals)),
+                "调仓周数": int(len(cohort)),
+                "每周平均信号数": float(cohort["Signal_Count"].mean()),
+                "单笔平均收益%": float(
+                    signals["Return_pct"].mean() - cost_pct
+                ),
+                "单笔胜率%": float(
+                    (signals["Return_pct"] - cost_pct > 0).mean() * 100.0
+                ),
+                "周期等权平均收益%": float(returns.mean()),
+                "周期胜率%": float((returns > 0).mean() * 100.0),
+                "总收益率%": total_return,
+            }
+        ]
+    )
+    return summary, curve
+
+
+# -----------------------------------------------------------------------------
+# 回测层二：三仓组合（有资金约束）
+# -----------------------------------------------------------------------------
+def backtest_three_slot(
+    signals: pd.DataFrame,
+    week_index: dict,
+    hold_weeks: int,
+    cost_pct: float,
+    slot_count: int,
+    order_mode: str = "K",
+    seed: int = 0,
+):
+    """三仓逐仓复投。order_mode='K' 按K值升序优选；'random' 随机顺序。
+
+    随机顺序用于蒙特卡洛：它保持了完全相同的资金约束和路径依赖结构，
+    只把"选哪只"变成随机，从而分离出「排序规则的贡献」与「运气的贡献」。
+    """
+    if signals.empty:
+        return pd.DataFrame(), pd.DataFrame(), 0.0
+
+    work = signals.copy()
+    work["Entry_Index"] = work["Entry_Week"].map(week_index)
+    work["Exit_Index"] = work["Exit_Week"].map(week_index)
+    work = work.dropna(subset=["Entry_Index", "Exit_Index"])
+    work["Entry_Index"] = work["Entry_Index"].astype(int)
+    work["Exit_Index"] = work["Exit_Index"].astype(int)
+
+    rng = np.random.default_rng(seed)
+    if order_mode == "random":
+        work["_order"] = rng.random(len(work))
+    else:
+        work["_order"] = pd.to_numeric(work["K"], errors="coerce").fillna(999.0)
+
+    by_entry = {
+        idx: group.sort_values(["_order", "ts_code"], kind="mergesort")
+        for idx, group in work.groupby("Entry_Index", sort=True)
     }
 
+    slot_value = [1.0 / slot_count] * slot_count
+    slot_free_at = [0] * slot_count
+    slot_holding = [None] * slot_count
+    trades = []
+    taken_codes_by_slot = {}
 
-def compare_signal_vs_baseline(
-    panel: pd.DataFrame, signal_mask: pd.Series, horizons, label: str
-) -> pd.DataFrame:
-    """信号组 vs 全池基准组，核心输出是超额收益。"""
-    rows = []
-    for n_weeks in horizons:
-        column = f"Fwd_{n_weeks}W_pct"
-        signal_values = pd.to_numeric(
-            panel.loc[signal_mask, column], errors="coerce"
-        ).dropna()
-        base_values = pd.to_numeric(panel[column], errors="coerce").dropna()
-        signal_stats = describe_group(signal_values)
-        base_stats = describe_group(base_values)
-
-        # 粗略显著性参考：同一周内个股涨跌高度相关，真实显著性低于该值，
-        # 因此它只用来排除"明显是噪声"，不能当作严格统计检验。
-        if len(signal_values) > 1 and signal_values.std(ddof=1) > 0:
-            std_error = signal_values.std(ddof=1) / math.sqrt(len(signal_values))
-            t_stat = (
-                (signal_stats["平均收益%"] - base_stats["平均收益%"]) / std_error
-                if std_error > 0
-                else np.nan
+    for entry_index in sorted(by_entry.keys()):
+        group = by_entry[entry_index]
+        for _, row in group.iterrows():
+            free_slots = [
+                i for i in range(slot_count) if slot_free_at[i] <= entry_index
+            ]
+            held_now = {
+                taken_codes_by_slot[i]
+                for i in range(slot_count)
+                if slot_free_at[i] > entry_index and i in taken_codes_by_slot
+            }
+            if str(row["ts_code"]) in held_now:
+                trades.append({**row.to_dict(), "执行": "跳过", "原因": "已持有同股"})
+                continue
+            if not free_slots:
+                trades.append({**row.to_dict(), "执行": "跳过", "原因": "三仓已满"})
+                continue
+            slot = free_slots[0]
+            net_return = float(row["Return_pct"]) - cost_pct
+            before = slot_value[slot]
+            slot_value[slot] = before * (1.0 + net_return / 100.0)
+            slot_free_at[slot] = int(row["Exit_Index"]) + 1
+            taken_codes_by_slot[slot] = str(row["ts_code"])
+            trades.append(
+                {
+                    **row.to_dict(),
+                    "执行": "买入",
+                    "原因": "",
+                    "仓位": slot + 1,
+                    "净收益%": net_return,
+                    "仓位买入前": before,
+                    "仓位卖出后": slot_value[slot],
+                }
             )
-        else:
-            t_stat = np.nan
 
-        rows.append(
+    ledger = pd.DataFrame(trades)
+    total_return = (sum(slot_value) - 1.0) * 100.0
+    bought = (
+        ledger[ledger["执行"].eq("买入")]
+        if not ledger.empty and "执行" in ledger.columns
+        else pd.DataFrame()
+    )
+    net = (
+        pd.to_numeric(bought["净收益%"], errors="coerce").dropna()
+        if not bought.empty
+        else pd.Series(dtype=float)
+    )
+    summary = pd.DataFrame(
+        [
             {
-                "信号定义": label,
-                "持有周数": n_weeks,
-                "信号样本数": signal_stats["样本数"],
-                "信号平均收益%": signal_stats["平均收益%"],
-                "基准平均收益%": base_stats["平均收益%"],
-                "超额收益%(核心)": signal_stats["平均收益%"] - base_stats["平均收益%"],
-                "信号中位收益%": signal_stats["中位收益%"],
-                "基准中位收益%": base_stats["中位收益%"],
-                "超额中位收益%": signal_stats["中位收益%"] - base_stats["中位收益%"],
-                "信号胜率%": signal_stats["胜率%"],
-                "基准胜率%": base_stats["胜率%"],
-                "胜率差%": signal_stats["胜率%"] - base_stats["胜率%"],
-                "粗略t值": t_stat,
+                "层级": f"{slot_count}仓组合（{'按K值优选' if order_mode == 'K' else '随机选取'}）",
+                "完整信号": int(len(work)),
+                "实际买入": int(len(bought)),
+                "仓位冲突跳过": int(len(ledger) - len(bought)) if not ledger.empty else 0,
+                "单笔平均收益%": float(net.mean()) if len(net) else np.nan,
+                "单笔中位收益%": float(net.median()) if len(net) else np.nan,
+                "单笔胜率%": float((net > 0).mean() * 100.0) if len(net) else np.nan,
+                "总收益率%": total_return,
             }
-        )
-    return pd.DataFrame(rows)
+        ]
+    )
+    return summary, ledger, total_return
 
 
-def yearly_breakdown(
-    panel: pd.DataFrame, signal_mask: pd.Series, hold_weeks: int
-) -> pd.DataFrame:
-    """按年度拆分——判断优势是长期稳定，还是只集中在某一两年。"""
-    column = f"Fwd_{hold_weeks}W_pct"
-    work = panel.copy()
-    work["_year"] = work["Signal_Date"].astype(str).str[:4]
-    work["_is_signal"] = np.asarray(signal_mask)
-    rows = []
-    for year, group in work.groupby("_year", sort=True):
-        signal_values = pd.to_numeric(
-            group.loc[group["_is_signal"], column], errors="coerce"
-        ).dropna()
-        base_values = pd.to_numeric(group[column], errors="coerce").dropna()
-        if base_values.empty:
-            continue
-        signal_mean = signal_values.mean() if len(signal_values) else np.nan
-        rows.append(
-            {
-                "年份": year,
-                "信号样本数": int(len(signal_values)),
-                "信号平均收益%": signal_mean,
-                "基准平均收益%": float(base_values.mean()),
-                "超额收益%": (
-                    signal_mean - base_values.mean() if len(signal_values) else np.nan
-                ),
-                "信号胜率%": (
-                    float((signal_values > 0).mean() * 100.0)
-                    if len(signal_values)
-                    else np.nan
-                ),
-                "基准胜率%": float((base_values > 0).mean() * 100.0),
-            }
+def monte_carlo_slots(
+    signals: pd.DataFrame,
+    week_index: dict,
+    hold_weeks: int,
+    cost_pct: float,
+    slot_count: int,
+    runs: int,
+    progress_callback=None,
+):
+    """重复N次随机选取的三仓回测，得到"纯运气"情况下的收益分布。
+
+    把按K值优选的真实结果放到这个分布里比较：
+      - 落在分布中间 -> 排序规则没有贡献，结果主要由运气决定
+      - 落在分布右尾 -> 排序规则确实带来了额外价值
+    分布本身的宽度，就是三仓路径依赖引入的运气成分大小。
+    """
+    outcomes = []
+    for run in range(runs):
+        _, _, total = backtest_three_slot(
+            signals, week_index, hold_weeks, cost_pct, slot_count,
+            order_mode="random", seed=run + 1,
         )
-    return pd.DataFrame(rows)
+        outcomes.append(total)
+        if progress_callback and (run % 10 == 0 or run == runs - 1):
+            progress_callback((run + 1) / runs)
+    return np.array(outcomes, dtype=float)
 
 
 # -----------------------------------------------------------------------------
@@ -792,18 +915,21 @@ def yearly_breakdown(
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"🔍 {APP_TITLE}")
+    st.title(f"🧪 {APP_TITLE}")
     st.caption(
-        "本工具不做选股、不做组合、不做资金管理，只回答一个问题："
-        "周线SKDJ信号之后的表现，是否真的优于同期随便买一只科技股。"
+        "只用一个信号：周线SKDJ低位拐头。不加MACD、不加ATR、不加六因子、不加市场状态分支。"
     )
     st.info(
-        "**为什么必须看超额收益**：牛市里随便买什么都涨，只看绝对收益会把大盘的功劳"
-        "误认成信号的功劳。只有信号组相对同期全池基准仍然领先，才说明信号本身携带择股信息。"
+        "**本工具把策略拆成三层分别测量**，用来回答"
+        "「三仓买入法是否引入了运气成分」：\n\n"
+        "1. **信号层**：不受资金约束，每周买入当周全部信号 → 策略本身的纯粹优势\n"
+        "2. **三仓层**：真实资金约束，每周最多3只 → 实际能拿到多少\n"
+        "3. **蒙特卡洛**：把「选哪只」改成随机，重复数百次 → 运气区间有多宽、"
+        "按K值排序到底有没有用"
     )
 
     with st.sidebar:
-        st.header("验证配置")
+        st.header("策略配置")
         try:
             secret_token = st.secrets.get("TUSHARE_TOKEN", "")
         except Exception:
@@ -815,44 +941,42 @@ def main():
         end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.subheader("SKDJ 参数")
-        n_period = st.number_input(
-            "N（LLV/HHV周期）", value=4, min_value=2, max_value=60, step=1,
-            help="N扫描显示：低位拐头口径下超额收益随N单调下降，N=4最优。",
+        st.subheader("信号参数（已由信号验证器确定）")
+        n_period = st.number_input("N（LLV/HHV周期）", value=4, min_value=2, max_value=60, step=1)
+        m_period = st.number_input("M（EMA/MA周期）", value=3, min_value=2, max_value=30, step=1)
+        level = st.number_input(
+            "K值阈值（低位判定）", value=20.0, min_value=1.0, max_value=90.0, step=5.0,
+            help="验证结果：15最强但信号偏少，20是收益与信号密度的平衡点。",
         )
-        m_period = st.number_input(
-            "M（EMA/MA周期）", value=3, min_value=2, max_value=30, step=1
+        require_kd = st.checkbox(
+            "要求 K > D（确认）", value=True,
+            help="验证显示加此确认后平均收益从1.79%升到2.07%、胜率升到56.2%。",
         )
-        cross_level = st.number_input(
-            "判定线（阈值）",
-            value=25.0,
-            min_value=1.0,
-            max_value=90.0,
-            step=5.0,
-            help="脚本会同时测试附近几个阈值，检验结论是否只在这一个值上成立。",
+        hold_weeks = st.number_input(
+            "持有周数", value=3, min_value=1, max_value=8, step=1,
+            help="验证显示3-4周最优；1周几乎无效。",
         )
-        signal_mode = st.radio(
-            "信号口径",
-            ["K在阈值下方拐头", "K上穿阈值"],
-            index=0,
-            help=(
-                "「低位拐头」= K还在阈值下方、但已开始向上（K>=上周K）；"
-                "「上穿」= K从阈值下方穿到上方。实测在所有N下拐头都明显更强，"
-                "因为等K穿过阈值时一部分涨幅已经走完。"
-            ),
+
+        st.markdown("---")
+        st.subheader("资金与成本")
+        slot_count = st.number_input("仓位数", value=3, min_value=1, max_value=10, step=1)
+        cost_pct = st.number_input(
+            "往返交易成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05
+        )
+        mc_runs = st.number_input(
+            "蒙特卡洛次数", value=200, min_value=20, max_value=1000, step=20,
+            help="次数越多分布越稳定，200次通常足够。",
         )
 
         st.markdown("---")
         st.subheader("股票池硬条件")
         min_price = st.number_input("最低股价（元）", value=10.0, min_value=0.0, step=1.0)
         min_mv = st.number_input("最低流通市值（亿元）", value=100.0, min_value=0.0, step=10.0)
-        max_mv = st.number_input(
-            "最高流通市值（亿元）", value=1000.0, min_value=100.0, step=100.0
-        )
+        max_mv = st.number_input("最高流通市值（亿元）", value=1000.0, min_value=100.0, step=100.0)
 
         st.markdown("---")
         clear_cache_clicked = st.button("清空行情缓存")
-        run_clicked = st.button("开始验证", type="primary")
+        run_clicked = st.button("开始回测", type="primary")
 
     if clear_cache_clicked:
         if os.path.isdir(MARKET_CACHE_ROOT):
@@ -862,24 +986,24 @@ def main():
     if not run_clicked:
         st.markdown(
             """
-### 这个工具会给你三张表
+### 为什么要这样拆开测
 
-**表1 · 信号 vs 基准**  
-最重要的是 **超额收益%** 这一列：
-- 明显为正（且样本足够多）→ 信号确实有效，值得在它上面搭策略、加日线择时
-- 接近 0 → 信号只是跟着大盘走，没有独立价值，再精妙的买点也救不回来
-- 为负 → 信号方向是反的
+三仓买入法有一个内在问题：**哪只股票在哪天占住了仓位，会影响后面能不能买到别的信号**。
+这是纯粹的时间巧合，和信号质量无关。在之前的四年回测里已经出现过实证——
+因"三仓已满"被跳过的交易胜率56%，实际买入的胜率80%，差了24个百分点，
+而跳过与否完全取决于运气。
 
-**表2 · 分年度拆解**  
-判断优势是长期稳定，还是只靠某一两年撑起来。如果只有一年为正、其余年份为负，
-那和之前四年回测遇到的问题是同一个——收益集中在极少数窗口，不可复制。
+所以直接看三仓的最终收益，是**分不清"策略好"和"运气好"**的。
 
-**表3 · 参数敏感性**  
-同时测试上穿 15/20/25/30/35 各条线，以及"上穿且K>D"等变体。
-如果只有25有效、旁边的20和30都失效，那这个25大概率是数据里的巧合而非规律。
+这个工具的做法：
+- **信号层**给出策略的天花板（如果资金无限）
+- **三仓层**给出真实约束下的结果
+- **蒙特卡洛**把"选哪只"随机化重复数百次，画出运气的分布区间
+
+三个数字放在一起，就能明确回答：三仓损失了多少、排序规则值多少、运气占多大比重。
 
 ---
-填好左侧配置后点击「开始验证」。行情缓存与你原来的主程序共用，之前下载过的不会重复下载。
+默认参数已是信号验证器确定的最优配置（N=4、K≤20、要求K>D、持有3周）。
             """
         )
         return
@@ -892,16 +1016,11 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input >= end_input:
-        st.error("开始日期必须早于结束日期。")
-        return
 
-    horizons = [1, 2, 3, 4]
     start_date = start_input.strftime("%Y%m%d")
     end_date = end_input.strftime("%Y%m%d")
-    # 预留周线指标预热窗口 + 未来收益观察窗口
     fetch_start = (pd.Timestamp(start_input) - timedelta(days=400)).strftime("%Y%m%d")
-    fetch_end = (pd.Timestamp(end_input) + timedelta(days=60)).strftime("%Y%m%d")
+    fetch_end = (pd.Timestamp(end_input) + timedelta(days=90)).strftime("%Y%m%d")
 
     with st.spinner("构建科技股研究池……"):
         whitelist_set, name_map, industry_map = load_custom_tech_whitelist(token_clean)
@@ -911,14 +1030,7 @@ def main():
     st.success(f"科技股研究池：{len(whitelist_set)}只")
 
     with st.spinner("加载行情（复用已有缓存）……"):
-        (
-            stocks,
-            basic_indexed,
-            _,
-            _,
-            failed_dates,
-            sync_stats,
-        ) = load_optimized_market_data(
+        stocks, basic_indexed, _, _, failed_dates, sync_stats = load_optimized_market_data(
             fetch_start, fetch_end, token_clean, tuple(sorted(whitelist_set))
         )
     if not stocks:
@@ -928,250 +1040,210 @@ def main():
         f"行情：复用{sync_stats.get('cached_days', 0)}天，"
         f"本次下载{sync_stats.get('downloaded_days', 0)}天。"
     )
-    if failed_dates:
-        st.warning(f"{len(failed_dates)}个交易日未取得，结果可能有少量缺口。")
 
-    # N参数扫描范围：用来检验你选定的N是不是一个"幸运的尖峰"。
-    # 如果超额收益随N平滑变化，说明是真实规律；如果只有某个N突出、
-    # 相邻的N都很差，那这个N大概率是数据里的巧合。
-    sweep_n_values = sorted({4, 5, 6, 7, 8, 9, 10, 12, int(n_period)})
-    max_warmup = max(sweep_n_values) + int(m_period) + 12
-
-    progress = st.progress(0.0, text="计算周线SKDJ与未来收益……")
-    panel_parts = []
+    progress = st.progress(0.0, text="计算信号……")
+    signal_parts = []
+    all_weeks = set()
     codes = sorted(stocks.keys())
     for idx, ts_code in enumerate(codes):
         weekly = build_weekly_bars(stocks[ts_code])
-        if weekly.empty or len(weekly) < max_warmup:
+        if weekly.empty or len(weekly) < int(n_period) + int(m_period) + int(hold_weeks) + 8:
             continue
         weekly = add_skdj(weekly, int(n_period), int(m_period))
-        for sweep_n in sweep_n_values:
-            weekly = add_skdj_suffixed(
-                weekly, sweep_n, int(m_period), f"_N{sweep_n}"
-            )
-        weekly = add_forward_returns(weekly, horizons)
-        weekly["ts_code"] = ts_code
-        weekly["Signal_Date"] = weekly["trade_date_str"].astype(str)
-        keep = ["ts_code", "Signal_Date", "close", "K", "D", "Entry_Open_Next_Week"]
-        if "raw_close" in weekly.columns:
-            keep.insert(3, "raw_close")
-        keep += [f"Fwd_{n}W_pct" for n in horizons]
-        keep += [f"K_N{sweep_n}" for sweep_n in sweep_n_values]
-        panel_parts.append(weekly[keep])
+        all_weeks.update(weekly["trade_date_str"].astype(str).tolist())
+        rows = build_stock_signals(
+            weekly, ts_code, float(level), int(hold_weeks), bool(require_kd)
+        )
+        if not rows.empty:
+            # 只保留信号周落在回测区间内的
+            rows = rows[
+                (rows["Signal_Week"] >= start_date) & (rows["Signal_Week"] <= end_date)
+            ]
+            if not rows.empty:
+                signal_parts.append(rows)
         if idx % 50 == 0:
             progress.progress(
                 min((idx + 1) / len(codes), 1.0),
-                text=f"计算周线SKDJ与未来收益……{idx + 1}/{len(codes)}",
+                text=f"计算信号……{idx + 1}/{len(codes)}",
             )
     progress.empty()
-
     del stocks
     gc.collect()
 
-    if not panel_parts:
-        st.error("没有足够长的周线数据。")
+    if not signal_parts:
+        st.error("回测区间内没有产生任何信号，请放宽阈值或时间范围。")
         return
-    panel = pd.concat(panel_parts, ignore_index=True)
-    del panel_parts
+    signals = pd.concat(signal_parts, ignore_index=True)
+    del signal_parts
     gc.collect()
 
-    # 应用股票池硬条件
-    panel = panel[
-        (panel["Signal_Date"] >= start_date) & (panel["Signal_Date"] <= end_date)
-    ].copy()
-    price_column = "raw_close" if "raw_close" in panel.columns else "close"
-    panel = panel[pd.to_numeric(panel[price_column], errors="coerce") >= min_price]
-
+    # 股票池硬条件（按信号周的市值与股价）
     if not basic_indexed.empty:
-        basic_reset = basic_indexed.reset_index()
-        basic_reset = basic_reset.rename(columns={"trade_date_str": "Signal_Date"})
-        keep_columns = [
-            column
-            for column in ("Signal_Date", "ts_code", "circ_mv")
-            if column in basic_reset.columns
-        ]
-        if len(keep_columns) == 3:
-            panel = panel.merge(
-                basic_reset[keep_columns].drop_duplicates(["Signal_Date", "ts_code"]),
-                on=["Signal_Date", "ts_code"],
-                how="left",
+        basic_reset = basic_indexed.reset_index().rename(
+            columns={"trade_date_str": "Signal_Week"}
+        )
+        keep = [c for c in ("Signal_Week", "ts_code", "circ_mv") if c in basic_reset.columns]
+        if len(keep) == 3:
+            signals = signals.merge(
+                basic_reset[keep].drop_duplicates(["Signal_Week", "ts_code"]),
+                on=["Signal_Week", "ts_code"], how="left",
             )
-            circ_mv_billion = pd.to_numeric(panel["circ_mv"], errors="coerce") / 10000.0
-            panel = panel[circ_mv_billion.between(min_mv, max_mv) | circ_mv_billion.isna()]
-
-    panel = panel.dropna(subset=["K", f"Fwd_{horizons[0]}W_pct"]).reset_index(drop=True)
-    if panel.empty:
-        st.error("过滤后没有可用样本，请放宽股票池条件或时间范围。")
+            mv_billion = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
+            signals = signals[mv_billion.between(min_mv, max_mv) | mv_billion.isna()]
+    signals = signals[
+        pd.to_numeric(signals["Entry_Open"], errors="coerce") >= min_price
+    ]
+    signals = signals.reset_index(drop=True)
+    if signals.empty:
+        st.error("过滤后没有信号，请放宽股票池条件。")
         return
 
+    week_list = sorted(all_weeks)
+    week_index = {week: i for i, week in enumerate(week_list)}
+
+    signals["name"] = signals["ts_code"].map(name_map)
+    signals["Industry"] = signals["ts_code"].map(industry_map)
+
     st.markdown("---")
-    st.header("验证结果")
+    st.header("回测结果")
     st.caption(
-        f"全池基准样本：{len(panel):,} 个「个股-周」观测，"
-        f"覆盖 {panel['Signal_Date'].min()} — {panel['Signal_Date'].max()}。"
-        "每个信号都与同一批基准对比。"
+        f"信号总数 {len(signals):,} 笔，覆盖 "
+        f"{signals['Signal_Week'].min()} — {signals['Signal_Week'].max()}"
     )
 
-    k_now = pd.to_numeric(panel["K"], errors="coerce")
-    k_prev = k_now.groupby(panel["ts_code"]).shift(1)
-    d_now = pd.to_numeric(panel["D"], errors="coerce")
+    # 三层结果
+    sig_summary, sig_curve = backtest_signal_layer(
+        signals, week_index, int(hold_weeks), float(cost_pct)
+    )
+    slot_summary, slot_ledger, slot_total = backtest_three_slot(
+        signals, week_index, int(hold_weeks), float(cost_pct), int(slot_count),
+        order_mode="K",
+    )
 
-    def build_mask(k_series, k_prev_series, level, mode):
-        """按选定口径构造信号掩码。两种口径的区别：
-        上穿 = 从下方穿越到上方（一次性事件）
-        低位拐头 = 仍在阈值下方但已开始向上（可连续多周成立）
-        """
-        if mode == "K上穿阈值":
-            return ((k_prev_series <= level) & (k_series > level)).fillna(False)
-        return ((k_prev_series <= k_series) & (k_series <= level)).fillna(False)
-
-    def mode_label(level, mode):
-        return (
-            f"K上穿{level:.0f}"
-            if mode == "K上穿阈值"
-            else f"K在{level:.0f}下方拐头"
-        )
-
-    # 表1：主假设
-    main_label = mode_label(cross_level, signal_mode)
-    main_mask = build_mask(k_now, k_prev, cross_level, signal_mode)
-    main_table = compare_signal_vs_baseline(panel, main_mask, horizons, main_label)
-    st.subheader(f"表1 · 当前口径：{main_label}")
-    st.dataframe(main_table.round(3), width="stretch", hide_index=True)
+    st.subheader("表1 · 信号层 vs 三仓层")
+    combined = pd.concat(
+        [
+            sig_summary[["层级", "交易笔数", "单笔平均收益%", "单笔胜率%", "总收益率%"]]
+            .rename(columns={"交易笔数": "实际买入"}),
+            slot_summary[["层级", "实际买入", "单笔平均收益%", "单笔胜率%", "总收益率%"]],
+        ],
+        ignore_index=True,
+    )
+    st.dataframe(combined.round(2), width="stretch", hide_index=True)
     st.caption(
-        "**看「超额收益%(核心)」这一列**：明显为正=信号有效；接近0=只是跟随大盘；为负=方向相反。"
-        "粗略t值仅用于排除明显噪声（同周个股涨跌高度相关，真实显著性低于该值），"
-        "|t|<2 基本可认为没有说服力。"
+        "两层使用完全相同的资金投放节奏，区别只在于：信号层每份资金买入当周全部信号，"
+        "三仓层每份资金只买1只。**两者之差就是资金约束+集中持股的代价。**"
     )
 
-    # 表2：分年度（当前口径 + 另一口径对照）
-    st.subheader("表2 · 分年度拆解（优势稳定吗？）")
-    year_table = yearly_breakdown(panel, main_mask, 3)
-    year_table.insert(0, "口径", main_label)
-    other_mode = (
-        "K上穿阈值" if signal_mode == "K在阈值下方拐头" else "K在阈值下方拐头"
-    )
-    other_mask = build_mask(k_now, k_prev, cross_level, other_mode)
-    other_year = yearly_breakdown(panel, other_mask, 3)
-    other_year.insert(0, "口径", mode_label(cross_level, other_mode))
-    year_table = pd.concat([year_table, other_year], ignore_index=True)
-    st.dataframe(year_table.round(3), width="stretch", hide_index=True)
-    st.caption(
-        "以持有3周为例，两种口径并排对照。**关键看每一年的超额收益是否大多为正**："
-        "如果只有一两年为正、其余年份为负，说明优势不可复制——"
-        "这正是之前四年回测暴露的问题。"
+    st.dataframe(
+        sig_summary[
+            ["调仓周数", "每周平均信号数", "周期等权平均收益%", "周期胜率%"]
+        ].round(2),
+        width="stretch", hide_index=True,
     )
 
-    # 表3：阈值敏感性（跟随当前口径）
-    st.subheader("表3 · 阈值敏感性（这条线是规律还是巧合？）")
-    variant_tables = []
-    for level in (15.0, 20.0, 25.0, 30.0, 35.0):
-        mask = build_mask(k_now, k_prev, level, signal_mode)
-        variant_tables.append(
-            compare_signal_vs_baseline(
-                panel, mask, [3], mode_label(level, signal_mode)
-            )
-        )
-    # 两种口径在同一阈值下的直接对比
-    variant_tables.append(
-        compare_signal_vs_baseline(
-            panel, other_mask, [3],
-            f"【对照口径】{mode_label(cross_level, other_mode)}",
-        )
+    # 蒙特卡洛
+    st.subheader("表2 · 蒙特卡洛：运气占多大比重？")
+    mc_progress = st.progress(0.0, text="随机重排选股顺序，重复回测……")
+    outcomes = monte_carlo_slots(
+        signals, week_index, int(hold_weeks), float(cost_pct), int(slot_count),
+        int(mc_runs), progress_callback=lambda p: mc_progress.progress(p),
     )
-    kd_confirm = (main_mask & (k_now > d_now)).fillna(False)
-    variant_tables.append(
-        compare_signal_vs_baseline(
-            panel, kd_confirm, [3], f"{main_label} 且 K>D"
-        )
+    mc_progress.empty()
+
+    percentile_of_real = float((outcomes < slot_total).mean() * 100.0)
+    mc_table = pd.DataFrame(
+        [
+            {
+                "指标": "随机选股 最差5%",
+                "总收益率%": float(np.percentile(outcomes, 5)),
+            },
+            {"指标": "随机选股 中位数", "总收益率%": float(np.median(outcomes))},
+            {"指标": "随机选股 平均", "总收益率%": float(outcomes.mean())},
+            {
+                "指标": "随机选股 最好5%",
+                "总收益率%": float(np.percentile(outcomes, 95)),
+            },
+            {"指标": "▶ 按K值优选（真实规则）", "总收益率%": slot_total},
+            {"指标": "▶ 信号层（无资金约束）",
+             "总收益率%": float(sig_summary["总收益率%"].iloc[0])},
+        ]
     )
-    variant_table = pd.concat(variant_tables, ignore_index=True)
-    st.dataframe(variant_table.round(3), width="stretch", hide_index=True)
-    st.caption(
-        "全部按持有3周计算。**如果只有某一个阈值有效、相邻阈值都失效，那它大概率是巧合**——"
-        "真实的市场规律不会对阈值这么敏感。倒数第二行是另一种信号口径的对照，"
-        "最后一行测试加上K>D确认是否还能提升。"
+    st.dataframe(mc_table.round(2), width="stretch", hide_index=True)
+
+    spread = float(np.percentile(outcomes, 95) - np.percentile(outcomes, 5))
+    st.markdown(
+        f"""
+**怎么读这张表：**
+
+- 随机选股{int(mc_runs)}次，总收益率的90%区间宽度是 **{spread:.1f}个百分点**
+  —— 这就是三仓路径依赖带来的**纯运气区间**。区间越宽，单次回测结果越不可信。
+- 按K值优选的真实结果落在随机分布的 **{percentile_of_real:.0f}%分位**。
+  - 接近50% → 排序规则基本没贡献，结果主要靠运气
+  - 高于90% → 排序规则确实有效
+- 信号层收益与三仓层之差 = 资金约束的代价。
+"""
     )
 
-    # 表4：N参数扫描
-    st.subheader("表4 · N参数扫描（你选的N是真规律还是幸运尖峰？）")
-    sweep_rows = []
-    for sweep_n in sweep_n_values:
-        column = f"K_N{sweep_n}"
-        if column not in panel.columns:
-            continue
-        k_sweep = pd.to_numeric(panel[column], errors="coerce")
-        k_sweep_prev = k_sweep.groupby(panel["ts_code"]).shift(1)
-        cross_mask = (
-            (k_sweep_prev <= cross_level) & (k_sweep > cross_level)
-        ).fillna(False)
-        turn_mask = (
-            (k_sweep_prev <= k_sweep) & (k_sweep <= cross_level)
-        ).fillna(False)
-        for mask, definition in (
-            (cross_mask, f"K上穿{cross_level:.0f}"),
-            (turn_mask, f"K在{cross_level:.0f}下方拐头"),
-        ):
-            one = compare_signal_vs_baseline(panel, mask, [3], definition)
-            one.insert(0, "N", sweep_n)
-            sweep_rows.append(one)
-    sweep_table = pd.concat(sweep_rows, ignore_index=True) if sweep_rows else pd.DataFrame()
-    if not sweep_table.empty:
-        for definition in sweep_table["信号定义"].unique():
-            subset = sweep_table[sweep_table["信号定义"] == definition]
-            st.markdown(f"**{definition}**")
-            st.dataframe(
-                subset[
-                    ["N", "信号样本数", "超额收益%(核心)", "超额中位收益%",
-                     "胜率差%", "粗略t值"]
-                ].round(3),
-                width="stretch",
-                hide_index=True,
-            )
-    st.caption(
-        "全部按持有3周计算，M保持不变。**看超额收益随N的变化是否平滑**："
-        "如果是单调或平缓的曲线（例如N越小越好），说明背后有真实逻辑（N越短指标越灵敏、"
-        "越早捕捉拐点）；如果你选的那个N特别突出、相邻的N却明显更差，"
-        "那这个N大概率是在历史数据上试出来的巧合，换一段行情就会失效。"
+    chart_frame = pd.DataFrame({"随机选股总收益率%": outcomes})
+    st.bar_chart(
+        chart_frame["随机选股总收益率%"].value_counts(bins=30, sort=False).rename("次数")
     )
+
+    # 分年度
+    st.subheader("表3 · 分年度（信号层）")
+    year_frame = signals.copy()
+    year_frame["年份"] = year_frame["Signal_Week"].astype(str).str[:4]
+    year_frame["净收益%"] = pd.to_numeric(
+        year_frame["Return_pct"], errors="coerce"
+    ) - float(cost_pct)
+    year_table = (
+        year_frame.groupby("年份")["净收益%"]
+        .agg(["count", "mean", "median", lambda s: (s > 0).mean() * 100.0])
+        .reset_index()
+    )
+    year_table.columns = ["年份", "信号数", "平均收益%", "中位收益%", "胜率%"]
+    st.dataframe(year_table.round(2), width="stretch", hide_index=True)
 
     # 导出
     st.markdown("---")
-    signal_rows = panel.loc[main_mask].copy()
-    signal_rows["name"] = signal_rows["ts_code"].map(name_map)
-    signal_rows["Industry"] = signal_rows["ts_code"].map(industry_map)
-
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_signal_vs_baseline.csv",
-            main_table.to_csv(index=False, encoding="utf-8-sig"),
+            "01_layer_comparison.csv", combined.to_csv(index=False, encoding="utf-8-sig")
         )
         archive.writestr(
-            "02_yearly_breakdown.csv",
-            year_table.to_csv(index=False, encoding="utf-8-sig"),
+            "02_monte_carlo.csv", mc_table.to_csv(index=False, encoding="utf-8-sig")
         )
         archive.writestr(
-            "03_parameter_sensitivity.csv",
-            variant_table.to_csv(index=False, encoding="utf-8-sig"),
+            "03_monte_carlo_raw.csv",
+            pd.DataFrame({"total_return_pct": outcomes}).to_csv(
+                index=False, encoding="utf-8-sig"
+            ),
         )
         archive.writestr(
-            "05_n_period_sweep.csv",
-            sweep_table.to_csv(index=False, encoding="utf-8-sig"),
+            "04_yearly.csv", year_table.to_csv(index=False, encoding="utf-8-sig")
         )
         archive.writestr(
-            "04_all_signal_rows.csv",
-            signal_rows.to_csv(index=False, encoding="utf-8-sig"),
+            "05_all_signals.csv", signals.to_csv(index=False, encoding="utf-8-sig")
+        )
+        archive.writestr(
+            "06_three_slot_ledger.csv",
+            slot_ledger.to_csv(index=False, encoding="utf-8-sig"),
+        )
+        archive.writestr(
+            "07_signal_layer_curve.csv",
+            sig_curve.to_csv(index=False, encoding="utf-8-sig"),
         )
     st.download_button(
-        "下载完整验证结果",
+        "下载完整回测结果",
         data=output.getvalue(),
-        file_name="skdj_signal_edge_validation.zip",
+        file_name="skdj_strategy_backtest.zip",
         mime="application/zip",
     )
 
-    with st.expander("查看全部信号明细"):
-        st.dataframe(signal_rows, width="stretch", hide_index=True)
+    with st.expander("查看三仓逐笔台账"):
+        st.dataframe(slot_ledger, width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
