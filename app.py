@@ -785,6 +785,7 @@ def backtest_three_slot(
     slot_count: int,
     order_mode: str = "K",
     seed: int = 0,
+    keep_ledger: bool = True,
 ):
     """三仓逐仓复投。order_mode='K' 按K值升序优选；'random' 随机顺序。
 
@@ -807,43 +808,45 @@ def backtest_three_slot(
     else:
         work["_order"] = pd.to_numeric(work["K"], errors="coerce").fillna(999.0)
 
-    by_entry = {
-        idx: group.sort_values(["_order", "ts_code"], kind="mergesort")
-        for idx, group in work.groupby("Entry_Index", sort=True)
-    }
+    work = work.sort_values(
+        ["Entry_Index", "_order", "ts_code"], kind="mergesort"
+    )
+    # 用 records 替代 iterrows：蒙特卡洛要重复跑数百次，iterrows 会慢一个数量级
+    records = work.to_dict("records")
 
     slot_value = [1.0 / slot_count] * slot_count
     slot_free_at = [0] * slot_count
-    slot_holding = [None] * slot_count
+    slot_code = [None] * slot_count
     trades = []
-    taken_codes_by_slot = {}
 
-    for entry_index in sorted(by_entry.keys()):
-        group = by_entry[entry_index]
-        for _, row in group.iterrows():
-            free_slots = [
-                i for i in range(slot_count) if slot_free_at[i] <= entry_index
-            ]
-            held_now = {
-                taken_codes_by_slot[i]
-                for i in range(slot_count)
-                if slot_free_at[i] > entry_index and i in taken_codes_by_slot
-            }
-            if str(row["ts_code"]) in held_now:
-                trades.append({**row.to_dict(), "执行": "跳过", "原因": "已持有同股"})
-                continue
-            if not free_slots:
-                trades.append({**row.to_dict(), "执行": "跳过", "原因": "三仓已满"})
-                continue
-            slot = free_slots[0]
-            net_return = float(row["Return_pct"]) - cost_pct
-            before = slot_value[slot]
-            slot_value[slot] = before * (1.0 + net_return / 100.0)
-            slot_free_at[slot] = int(row["Exit_Index"]) + 1
-            taken_codes_by_slot[slot] = str(row["ts_code"])
+    for row in records:
+        entry_index = int(row["Entry_Index"])
+        free_slots = [
+            i for i in range(slot_count) if slot_free_at[i] <= entry_index
+        ]
+        held_now = {
+            slot_code[i]
+            for i in range(slot_count)
+            if slot_free_at[i] > entry_index and slot_code[i] is not None
+        }
+        if str(row["ts_code"]) in held_now:
+            if keep_ledger:
+                trades.append({**row, "执行": "跳过", "原因": "已持有同股"})
+            continue
+        if not free_slots:
+            if keep_ledger:
+                trades.append({**row, "执行": "跳过", "原因": "仓位已满"})
+            continue
+        slot = free_slots[0]
+        net_return = float(row["Return_pct"]) - cost_pct
+        before = slot_value[slot]
+        slot_value[slot] = before * (1.0 + net_return / 100.0)
+        slot_free_at[slot] = int(row["Exit_Index"]) + 1
+        slot_code[slot] = str(row["ts_code"])
+        if keep_ledger:
             trades.append(
                 {
-                    **row.to_dict(),
+                    **row,
                     "执行": "买入",
                     "原因": "",
                     "仓位": slot + 1,
@@ -852,6 +855,8 @@ def backtest_three_slot(
                     "仓位卖出后": slot_value[slot],
                 }
             )
+        else:
+            trades.append({"执行": "买入", "净收益%": net_return})
 
     ledger = pd.DataFrame(trades)
     total_return = (sum(slot_value) - 1.0) * 100.0
@@ -902,12 +907,67 @@ def monte_carlo_slots(
     for run in range(runs):
         _, _, total = backtest_three_slot(
             signals, week_index, hold_weeks, cost_pct, slot_count,
-            order_mode="random", seed=run + 1,
+            order_mode="random", seed=run + 1, keep_ledger=False,
         )
         outcomes.append(total)
         if progress_callback and (run % 10 == 0 or run == runs - 1):
             progress_callback((run + 1) / runs)
     return np.array(outcomes, dtype=float)
+
+
+def apply_density_filter(signals: pd.DataFrame, min_signals_per_week: int):
+    """信号密度门槛：当周全市场触发数少于阈值时整周不出手（空仓等待）。
+
+    依据：实测显示信号稀疏的周平均收益为负（-0.57%），信号爆发的周收益最高
+    （+2.96%）。SKDJ低位拐头会在市场底部成群出现，那才是该动用有限仓位的时候。
+    该门槛在信号周收盘时即可计算（数当周有多少只票触发），不含未来函数。
+    """
+    if signals.empty or min_signals_per_week <= 1:
+        return signals
+    counts = signals.groupby("Entry_Week")["ts_code"].transform("size")
+    return signals[counts >= min_signals_per_week].copy()
+
+
+def sweep_slot_counts(
+    signals: pd.DataFrame,
+    week_index: dict,
+    hold_weeks: int,
+    cost_pct: float,
+    slot_values,
+    mc_runs: int,
+    progress_callback=None,
+):
+    """扫描不同仓位数：真实收益 + 运气区间 + 排序规则贡献分位。
+
+    用来在"实盘能拿几只"的现实约束下，找到统计上还能站得住的最小仓位数。
+    """
+    rows = []
+    total_steps = max(len(slot_values), 1)
+    for step, slots in enumerate(slot_values):
+        summary, _, real_total = backtest_three_slot(
+            signals, week_index, hold_weeks, cost_pct, int(slots),
+            order_mode="K", keep_ledger=False,
+        )
+        outcomes = monte_carlo_slots(
+            signals, week_index, hold_weeks, cost_pct, int(slots), int(mc_runs)
+        )
+        low = float(np.percentile(outcomes, 5))
+        high = float(np.percentile(outcomes, 95))
+        rows.append(
+            {
+                "仓位数": int(slots),
+                "实际买入": int(summary["实际买入"].iloc[0]),
+                "单笔平均收益%": float(summary["单笔平均收益%"].iloc[0]),
+                "单笔胜率%": float(summary["单笔胜率%"].iloc[0]),
+                "按K优选总收益%": real_total,
+                "随机中位数%": float(np.median(outcomes)),
+                "运气区间宽度pp": high - low,
+                "K优选所处分位%": float((outcomes < real_total).mean() * 100.0),
+            }
+        )
+        if progress_callback:
+            progress_callback((step + 1) / total_steps)
+    return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
@@ -960,11 +1020,15 @@ def main():
         st.markdown("---")
         st.subheader("资金与成本")
         slot_count = st.number_input(
-            "仓位数", value=10, min_value=1, max_value=50, step=1,
+            "仓位数（同时最多持有几只）", value=3, min_value=1, max_value=50, step=1,
+        )
+        min_week_signals = st.number_input(
+            "信号密度门槛：当周至少N只触发才出手",
+            value=1, min_value=1, max_value=200, step=1,
             help=(
-                "3仓实测只能买到8.5%的信号，且蒙特卡洛显示运气区间宽达80个百分点、"
-                "排序规则贡献为零。建议先试10-20仓，看运气区间是否收窄、"
-                "信号密集期是否能吃到。改成3可复现之前的结果做对比。"
+                "填1=不过滤。实测信号稀疏的周平均收益为负(-0.57%)，"
+                "信号爆发的周最高(+2.96%)。仓位有限时，与其被平庸信号占满，"
+                "不如空仓等信号成群出现。建议试10、20、30。"
             ),
         )
         cost_pct = st.number_input(
@@ -973,6 +1037,10 @@ def main():
         mc_runs = st.number_input(
             "蒙特卡洛次数", value=200, min_value=20, max_value=1000, step=20,
             help="次数越多分布越稳定，200次通常足够。",
+        )
+        do_sweep = st.checkbox(
+            "同时扫描 1-10 仓（较慢）", value=True,
+            help="对比不同仓位数的收益与运气区间，找出实盘可接受的最小仓位数。",
         )
 
         st.markdown("---")
@@ -1118,6 +1186,15 @@ def main():
     signals["name"] = signals["ts_code"].map(name_map)
     signals["Industry"] = signals["ts_code"].map(industry_map)
 
+    signals_raw_count = len(signals)
+    weeks_raw_count = signals["Entry_Week"].nunique()
+    signals = apply_density_filter(signals, int(min_week_signals))
+    if signals.empty:
+        st.error(
+            f"信号密度门槛设为{int(min_week_signals)}只后没有任何周达标，请调低。"
+        )
+        return
+
     # 三层结果
     sig_summary, sig_curve = backtest_signal_layer(
         signals, week_index, int(hold_weeks), float(cost_pct)
@@ -1133,6 +1210,17 @@ def main():
         int(mc_runs), progress_callback=lambda p: mc_progress.progress(p),
     )
     mc_progress.empty()
+
+    sweep_table = pd.DataFrame()
+    if do_sweep:
+        sweep_progress = st.progress(0.0, text="扫描不同仓位数……")
+        sweep_table = sweep_slot_counts(
+            signals, week_index, int(hold_weeks), float(cost_pct),
+            [1, 2, 3, 4, 5, 6, 8, 10],
+            max(30, int(mc_runs) // 4),
+            progress_callback=lambda p: sweep_progress.progress(p),
+        )
+        sweep_progress.empty()
 
     year_frame = signals.copy()
     year_frame["年份"] = year_frame["Signal_Week"].astype(str).str[:4]
@@ -1158,7 +1246,15 @@ def main():
         "slot_total": slot_total,
         "outcomes": outcomes,
         "year_table": year_table,
+        "sweep_table": sweep_table,
         "mc_runs": int(mc_runs),
+        "density": {
+            "门槛": int(min_week_signals),
+            "过滤前信号": int(signals_raw_count),
+            "过滤后信号": int(len(signals)),
+            "过滤前周数": int(weeks_raw_count),
+            "过滤后周数": int(signals["Entry_Week"].nunique()),
+        },
         "params": {
             "N": int(n_period), "M": int(m_period), "阈值": float(level),
             "要求K>D": bool(require_kd), "持有周数": int(hold_weeks),
@@ -1182,6 +1278,8 @@ def render_results():
     slot_total = result["slot_total"]
     outcomes = result["outcomes"]
     year_table = result["year_table"]
+    sweep_table = result.get("sweep_table", pd.DataFrame())
+    density = result.get("density", {})
     mc_runs = result["mc_runs"]
     params = result["params"]
 
@@ -1194,6 +1292,13 @@ def render_results():
         f"{'且K>D ' if params['要求K>D'] else ''}持有{params['持有周数']}周 "
         f"{params['仓位数']}仓 成本{params['成本%']:.2f}%"
     )
+    if density and density.get("门槛", 1) > 1:
+        st.info(
+            f"**信号密度门槛：当周至少{density['门槛']}只触发才出手。**　"
+            f"信号 {density['过滤前信号']:,} → {density['过滤后信号']:,} 笔，"
+            f"可交易周 {density['过滤前周数']} → {density['过滤后周数']} 周"
+            f"（其余时间空仓等待）。"
+        )
 
     st.subheader("表1 · 信号层 vs 组合层")
     combined = pd.concat(
@@ -1285,7 +1390,17 @@ def render_results():
             "而那正是最该重仓的时刻）。"
         )
 
-    st.subheader("表4 · 分年度（信号层）")
+    if not sweep_table.empty:
+        st.subheader("表4 · 仓位数扫描：实盘能拿几只才站得住？")
+        st.dataframe(sweep_table.round(2), width="stretch", hide_index=True)
+        st.caption(
+            "**这是选仓位数的依据。**「运气区间宽度」越小，回测结论越可信；"
+            "「K优选所处分位」越高（>70%）说明排序规则真正起了作用，接近50%则等于随机。"
+            "实盘拿不了太多只时，就在你能接受的仓位数里，选运气区间已经收敛的那个。"
+            "如果3-5仓的区间仍然很宽，说明必须靠信号密度门槛来集中火力，而不是靠加仓位。"
+        )
+
+    st.subheader("表5 · 分年度（信号层）")
     st.dataframe(year_table.round(2), width="stretch", hide_index=True)
 
     st.markdown("---")
@@ -1305,6 +1420,10 @@ def render_results():
         )
         archive.writestr(
             "04_yearly.csv", year_table.to_csv(index=False, encoding="utf-8-sig")
+        )
+        archive.writestr(
+            "08_slot_count_sweep.csv",
+            sweep_table.to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
             "05_all_signals.csv", signals.to_csv(index=False, encoding="utf-8-sig")
