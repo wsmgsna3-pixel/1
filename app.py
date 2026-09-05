@@ -641,6 +641,22 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
     return weekly
 
 
+def add_skdj_suffixed(
+    weekly: pd.DataFrame, n_period: int, m_period: int, suffix: str
+) -> pd.DataFrame:
+    """同一份周线上算多组N参数，列名加后缀，用于N参数扫描。"""
+    low = pd.to_numeric(weekly["low"], errors="coerce")
+    high = pd.to_numeric(weekly["high"], errors="coerce")
+    close = pd.to_numeric(weekly["close"], errors="coerce")
+    low_n = low.rolling(n_period).min()
+    high_n = high.rolling(n_period).max()
+    raw_rsv = (close - low_n) / (high_n - low_n).replace(0, np.nan) * 100.0
+    rsv = raw_rsv.ewm(span=m_period, adjust=False).mean()
+    weekly[f"K{suffix}"] = rsv.ewm(span=m_period, adjust=False).mean()
+    weekly[f"D{suffix}"] = weekly[f"K{suffix}"].rolling(m_period).mean()
+    return weekly
+
+
 def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame:
     """严格按通达信公式：
         LOWV := LLV(LOW,N); HIGHV := HHV(HIGH,N);
@@ -904,14 +920,24 @@ def main():
     if failed_dates:
         st.warning(f"{len(failed_dates)}个交易日未取得，结果可能有少量缺口。")
 
+    # N参数扫描范围：用来检验你选定的N是不是一个"幸运的尖峰"。
+    # 如果超额收益随N平滑变化，说明是真实规律；如果只有某个N突出、
+    # 相邻的N都很差，那这个N大概率是数据里的巧合。
+    sweep_n_values = sorted({4, 5, 6, 7, 8, 9, 10, 12, int(n_period)})
+    max_warmup = max(sweep_n_values) + int(m_period) + 12
+
     progress = st.progress(0.0, text="计算周线SKDJ与未来收益……")
     panel_parts = []
     codes = sorted(stocks.keys())
     for idx, ts_code in enumerate(codes):
         weekly = build_weekly_bars(stocks[ts_code])
-        if weekly.empty or len(weekly) < int(n_period) + int(m_period) + 12:
+        if weekly.empty or len(weekly) < max_warmup:
             continue
         weekly = add_skdj(weekly, int(n_period), int(m_period))
+        for sweep_n in sweep_n_values:
+            weekly = add_skdj_suffixed(
+                weekly, sweep_n, int(m_period), f"_N{sweep_n}"
+            )
         weekly = add_forward_returns(weekly, horizons)
         weekly["ts_code"] = ts_code
         weekly["Signal_Date"] = weekly["trade_date_str"].astype(str)
@@ -919,6 +945,7 @@ def main():
         if "raw_close" in weekly.columns:
             keep.insert(3, "raw_close")
         keep += [f"Fwd_{n}W_pct" for n in horizons]
+        keep += [f"K_N{sweep_n}" for sweep_n in sweep_n_values]
         panel_parts.append(weekly[keep])
         if idx % 50 == 0:
             progress.progress(
@@ -1030,6 +1057,48 @@ def main():
         "可以直接看出它和你的原始想法差别有多大。"
     )
 
+    # 表4：N参数扫描
+    st.subheader("表4 · N参数扫描（你选的N是真规律还是幸运尖峰？）")
+    sweep_rows = []
+    for sweep_n in sweep_n_values:
+        column = f"K_N{sweep_n}"
+        if column not in panel.columns:
+            continue
+        k_sweep = pd.to_numeric(panel[column], errors="coerce")
+        k_sweep_prev = k_sweep.groupby(panel["ts_code"]).shift(1)
+        cross_mask = (
+            (k_sweep_prev <= cross_level) & (k_sweep > cross_level)
+        ).fillna(False)
+        turn_mask = (
+            (k_sweep_prev <= k_sweep) & (k_sweep <= cross_level)
+        ).fillna(False)
+        for mask, definition in (
+            (cross_mask, f"K上穿{cross_level:.0f}"),
+            (turn_mask, f"K在{cross_level:.0f}下方拐头"),
+        ):
+            one = compare_signal_vs_baseline(panel, mask, [3], definition)
+            one.insert(0, "N", sweep_n)
+            sweep_rows.append(one)
+    sweep_table = pd.concat(sweep_rows, ignore_index=True) if sweep_rows else pd.DataFrame()
+    if not sweep_table.empty:
+        for definition in sweep_table["信号定义"].unique():
+            subset = sweep_table[sweep_table["信号定义"] == definition]
+            st.markdown(f"**{definition}**")
+            st.dataframe(
+                subset[
+                    ["N", "信号样本数", "超额收益%(核心)", "超额中位收益%",
+                     "胜率差%", "粗略t值"]
+                ].round(3),
+                width="stretch",
+                hide_index=True,
+            )
+    st.caption(
+        "全部按持有3周计算，M保持不变。**看超额收益随N的变化是否平滑**："
+        "如果是单调或平缓的曲线（例如N越小越好），说明背后有真实逻辑（N越短指标越灵敏、"
+        "越早捕捉拐点）；如果你选的那个N特别突出、相邻的N却明显更差，"
+        "那这个N大概率是在历史数据上试出来的巧合，换一段行情就会失效。"
+    )
+
     # 导出
     st.markdown("---")
     signal_rows = panel.loc[main_mask].copy()
@@ -1049,6 +1118,10 @@ def main():
         archive.writestr(
             "03_parameter_sensitivity.csv",
             variant_table.to_csv(index=False, encoding="utf-8-sig"),
+        )
+        archive.writestr(
+            "05_n_period_sweep.csv",
+            sweep_table.to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
             "04_all_signal_rows.csv",
