@@ -817,18 +817,29 @@ def main():
         st.markdown("---")
         st.subheader("SKDJ 参数")
         n_period = st.number_input(
-            "N（LLV/HHV周期）", value=6, min_value=2, max_value=60, step=1
+            "N（LLV/HHV周期）", value=4, min_value=2, max_value=60, step=1,
+            help="N扫描显示：低位拐头口径下超额收益随N单调下降，N=4最优。",
         )
         m_period = st.number_input(
             "M（EMA/MA周期）", value=3, min_value=2, max_value=30, step=1
         )
         cross_level = st.number_input(
-            "上穿判定线",
+            "判定线（阈值）",
             value=25.0,
             min_value=1.0,
             max_value=90.0,
             step=5.0,
-            help="你的原始想法是25。脚本会同时测试附近几个值，检验结论是否只在25成立。",
+            help="脚本会同时测试附近几个阈值，检验结论是否只在这一个值上成立。",
+        )
+        signal_mode = st.radio(
+            "信号口径",
+            ["K在阈值下方拐头", "K上穿阈值"],
+            index=0,
+            help=(
+                "「低位拐头」= K还在阈值下方、但已开始向上（K>=上周K）；"
+                "「上穿」= K从阈值下方穿到上方。实测在所有N下拐头都明显更强，"
+                "因为等K穿过阈值时一部分涨幅已经走完。"
+            ),
         )
 
         st.markdown("---")
@@ -1005,12 +1016,27 @@ def main():
     k_prev = k_now.groupby(panel["ts_code"]).shift(1)
     d_now = pd.to_numeric(panel["D"], errors="coerce")
 
+    def build_mask(k_series, k_prev_series, level, mode):
+        """按选定口径构造信号掩码。两种口径的区别：
+        上穿 = 从下方穿越到上方（一次性事件）
+        低位拐头 = 仍在阈值下方但已开始向上（可连续多周成立）
+        """
+        if mode == "K上穿阈值":
+            return ((k_prev_series <= level) & (k_series > level)).fillna(False)
+        return ((k_prev_series <= k_series) & (k_series <= level)).fillna(False)
+
+    def mode_label(level, mode):
+        return (
+            f"K上穿{level:.0f}"
+            if mode == "K上穿阈值"
+            else f"K在{level:.0f}下方拐头"
+        )
+
     # 表1：主假设
-    main_mask = ((k_prev <= cross_level) & (k_now > cross_level)).fillna(False)
-    main_table = compare_signal_vs_baseline(
-        panel, main_mask, horizons, f"K上穿{cross_level:.0f}"
-    )
-    st.subheader(f"表1 · 你的假设：K上穿{cross_level:.0f}")
+    main_label = mode_label(cross_level, signal_mode)
+    main_mask = build_mask(k_now, k_prev, cross_level, signal_mode)
+    main_table = compare_signal_vs_baseline(panel, main_mask, horizons, main_label)
+    st.subheader(f"表1 · 当前口径：{main_label}")
     st.dataframe(main_table.round(3), width="stretch", hide_index=True)
     st.caption(
         "**看「超额收益%(核心)」这一列**：明显为正=信号有效；接近0=只是跟随大盘；为负=方向相反。"
@@ -1018,43 +1044,53 @@ def main():
         "|t|<2 基本可认为没有说服力。"
     )
 
-    # 表2：分年度
+    # 表2：分年度（当前口径 + 另一口径对照）
     st.subheader("表2 · 分年度拆解（优势稳定吗？）")
     year_table = yearly_breakdown(panel, main_mask, 3)
+    year_table.insert(0, "口径", main_label)
+    other_mode = (
+        "K上穿阈值" if signal_mode == "K在阈值下方拐头" else "K在阈值下方拐头"
+    )
+    other_mask = build_mask(k_now, k_prev, cross_level, other_mode)
+    other_year = yearly_breakdown(panel, other_mask, 3)
+    other_year.insert(0, "口径", mode_label(cross_level, other_mode))
+    year_table = pd.concat([year_table, other_year], ignore_index=True)
     st.dataframe(year_table.round(3), width="stretch", hide_index=True)
     st.caption(
-        "以持有3周为例。如果超额收益只有一两年为正、其余年份为负，"
-        "说明优势不可复制——这正是之前四年回测暴露的问题。"
+        "以持有3周为例，两种口径并排对照。**关键看每一年的超额收益是否大多为正**："
+        "如果只有一两年为正、其余年份为负，说明优势不可复制——"
+        "这正是之前四年回测暴露的问题。"
     )
 
-    # 表3：参数敏感性
-    st.subheader("表3 · 参数敏感性（25这条线是规律还是巧合？）")
+    # 表3：阈值敏感性（跟随当前口径）
+    st.subheader("表3 · 阈值敏感性（这条线是规律还是巧合？）")
     variant_tables = []
     for level in (15.0, 20.0, 25.0, 30.0, 35.0):
-        mask = ((k_prev <= level) & (k_now > level)).fillna(False)
+        mask = build_mask(k_now, k_prev, level, signal_mode)
         variant_tables.append(
-            compare_signal_vs_baseline(panel, mask, [3], f"K上穿{level:.0f}")
+            compare_signal_vs_baseline(
+                panel, mask, [3], mode_label(level, signal_mode)
+            )
         )
-    cross_and_kd = (
-        (k_prev <= cross_level) & (k_now > cross_level) & (k_now > d_now)
-    ).fillna(False)
+    # 两种口径在同一阈值下的直接对比
     variant_tables.append(
         compare_signal_vs_baseline(
-            panel, cross_and_kd, [3], f"K上穿{cross_level:.0f} 且 K>D"
+            panel, other_mask, [3],
+            f"【对照口径】{mode_label(cross_level, other_mode)}",
         )
     )
-    low_zone_turn = ((k_prev <= k_now) & (k_now <= cross_level)).fillna(False)
+    kd_confirm = (main_mask & (k_now > d_now)).fillna(False)
     variant_tables.append(
         compare_signal_vs_baseline(
-            panel, low_zone_turn, [3], f"K在{cross_level:.0f}下方拐头（旧R6近似口径）"
+            panel, kd_confirm, [3], f"{main_label} 且 K>D"
         )
     )
     variant_table = pd.concat(variant_tables, ignore_index=True)
     st.dataframe(variant_table.round(3), width="stretch", hide_index=True)
     st.caption(
-        "全部按持有3周计算。**如果只有25有效、20和30都失效，那25大概率是巧合而非规律**——"
-        "真实的市场规律不会对阈值这么敏感。最后一行是旧R6分支的近似口径，"
-        "可以直接看出它和你的原始想法差别有多大。"
+        "全部按持有3周计算。**如果只有某一个阈值有效、相邻阈值都失效，那它大概率是巧合**——"
+        "真实的市场规律不会对阈值这么敏感。倒数第二行是另一种信号口径的对照，"
+        "最后一行测试加上K>D确认是否还能提升。"
     )
 
     # 表4：N参数扫描
