@@ -108,19 +108,20 @@ MARKET_BREADTH_MIN_FOR_STRONG = 0.45
 R3_MIN_INDUSTRY_EXCESS_PCT = 0.40
 # --- R23 新增：R6严格版追加"更深超卖"确认 --------------------------------
 # 基础Recovery_Eligible用的是35分的温和超卖线；严格版在此基础上进一步要求
-# 转折前必须触及更深的超卖区（<=25分），只信真正杀透之后的首次转折，
-# 而不是刚跌破35分附近的轻度超卖就转。行业相对强度门槛同步从0.25提到0.40。
-RECOVERY_STRICT_MAX_OVERSOLD_LEVEL = 25.0
+# 转折前必须触及更深的超卖区，只信真正杀透之后的首次转折，而不是刚跌破
+# 35分附近的轻度超卖就转。行业相对强度门槛同步从0.25提到0.40。
+# R24修复：清空重扫后发现严格版4年只剩6笔且全部亏损，样本太小不能确认
+# 是真的没用还是运气差，但25分这条线偏严，先放宽到30分观察。
+RECOVERY_STRICT_MAX_OVERSOLD_LEVEL = 30.0
 RECOVERY_STRICT_MIN_INDUSTRY_EXCESS_PCT_V2 = 0.40
 # --- R23 新增：R15强势分支结构性改造（不是再调阈值，是换确认逻辑）--------
 # 复盘发现R15的"整理后再加速"形态本质是无量能/无板块背景确认的纯价格
-# 突破，胜率始终不稳定。三处结构性改动：
-# 1) 突破当周必须放量确认，否则视为无效突破（无量突破更容易是假突破）。
-# 2) 必须身处相对强势的行业（行业超额分位>=0.5），呼应4-6月的验证——
-#    真正兑现的大票几乎都出现在板块性普涨里，孤立个股的技术突破不可信。
-# 3) 只取Top1（不再Top2）——R15定位是"稀缺高确信度信号"，宁缺毋滥；
-#    Top2容易把矮子里拔出来的次优标的也买入，拉低整体质量。
-# 4) 止损收紧到-6%（不与R3/R6共用-10%）——突破失败通常几天内就会显形，
+# 突破，胜率始终不稳定。四处结构性改动：
+# 1) 突破当周须放量或身处强势行业，二选一即可（R24修复：R23原先用AND
+#    同时要求两者，清空重扫后实测4年只成交1笔——不是提高胜率，是几乎
+#    打不出信号，完全背离"避免空窗期"的目标，改成OR）。
+# 2) 只取Top1（不再Top2）——R15定位是"稀缺高确信度信号"，宁缺毋滥。
+# 3) 止损收紧到-6%（不与R3/R6共用-10%）——突破失败通常几天内就会显形，
 #    放任跌到-10%才止损，对于"低胜率、博高赔率"的突破策略是不必要的
 #    额外亏损，及早止损能显著改善这个分支的赔率结构。
 R15_STRICT_MIN_STARTUP_VOLUME_RATIO = 1.2
@@ -1629,6 +1630,11 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     r15_industry_excess = pd.to_numeric(
         candidates.get("Industry_Excess_Pct", np.nan), errors="coerce"
     )
+    # R24修复：R23把"放量确认"和"行业相对强度确认"用AND叠加，实测4年里
+    # 只成交1笔——不是提高了胜率，是几乎打不出信号，完全背离"避免空窗期"
+    # 的目标。改成OR：只要放量或者行业够强，满足其一即可，仍然比R22之前
+    # "完全不看量能和板块"要严格，但不会把两个独立的确认条件相乘到几乎
+    # 不可能同时满足的地步。
     r15_quality_mask = (
         pd.to_numeric(candidates["R15_Strong_Rank"], errors="coerce").notna()
         & r15_atr.between(
@@ -1636,8 +1642,10 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
             STRONG_ATR_CONTRACTION_MAX,
             inclusive="both",
         )
-        & (r15_startup_vol >= R15_STRICT_MIN_STARTUP_VOLUME_RATIO)
-        & (r15_industry_excess >= R15_STRICT_MIN_INDUSTRY_EXCESS_PCT)
+        & (
+            (r15_startup_vol >= R15_STRICT_MIN_STARTUP_VOLUME_RATIO)
+            | (r15_industry_excess >= R15_STRICT_MIN_INDUSTRY_EXCESS_PCT)
+        )
     )
     r15_eligible_mask = strong_eligible_mask & r15_quality_mask
     # R21：见顶背离二次确认——当周动量减速或广度转弱时，即使13周中位数仍
@@ -2534,12 +2542,29 @@ def _r19_selected(history: pd.DataFrame, require_complete: bool = False):
             | _bool_series(history, "R15_Strong_ATR_Top1")
         )
     selected = history.loc[selected_mask].copy()
-    regime = selected.get(
-        "Market_Regime", pd.Series("", index=selected.index)
-    ).astype(str)
-    selected["R19_市场分支"] = regime.map(
-        {"强势": "R15强势", "中性": "R3中性", "弱势": "R6弱势"}
-    ).fillna("未知")
+    # R24修复：此前这里按"当周大盘Market_Regime"重新贴分支标签，R20引入
+    # 跨分支瀑布回退之后这就是错的——一只股票可能是市场判定"强势"的那周
+    # 由R3或R6顶上来的，却被这里强行贴成"R15强势"。改成直接使用真实生效
+    # 的Strategy_Branch（哪个分支的规则真正选中了这只股票），只有在完全
+    # 没有Strategy_Branch字段的很旧的导入数据上才退回原来的市场状态映射。
+    if "Strategy_Branch" in selected.columns:
+        branch_raw = selected["Strategy_Branch"].astype(str)
+        selected["R19_市场分支"] = np.select(
+            [
+                branch_raw.str.startswith("R15强势"),
+                branch_raw.str.startswith("R3中性"),
+                branch_raw.str.startswith("R6弱势"),
+            ],
+            ["R15强势", "R3中性", "R6弱势"],
+            default="未知",
+        )
+    else:
+        regime = selected.get(
+            "Market_Regime", pd.Series("", index=selected.index)
+        ).astype(str)
+        selected["R19_市场分支"] = regime.map(
+            {"强势": "R15强势", "中性": "R3中性", "弱势": "R6弱势"}
+        ).fillna("未知")
     if require_complete:
         complete = (
             _bool_series(selected, "Entry_Tradable")
