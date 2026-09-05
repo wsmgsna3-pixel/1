@@ -959,7 +959,14 @@ def main():
 
         st.markdown("---")
         st.subheader("资金与成本")
-        slot_count = st.number_input("仓位数", value=3, min_value=1, max_value=10, step=1)
+        slot_count = st.number_input(
+            "仓位数", value=10, min_value=1, max_value=50, step=1,
+            help=(
+                "3仓实测只能买到8.5%的信号，且蒙特卡洛显示运气区间宽达80个百分点、"
+                "排序规则贡献为零。建议先试10-20仓，看运气区间是否收窄、"
+                "信号密集期是否能吃到。改成3可复现之前的结果做对比。"
+            ),
+        )
         cost_pct = st.number_input(
             "往返交易成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05
         )
@@ -984,23 +991,30 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
+        # Streamlit 每次点击控件（含下载按钮）都会重跑整个脚本，此时
+        # run_clicked 为 False。已有结果时直接返回，由入口处的
+        # render_results() 统一渲染，避免"点一次下载就退回说明页、
+        # 必须重跑回测才能再下载"。
+        if st.session_state.get("bt_result"):
+            return
         st.markdown(
             """
 ### 为什么要这样拆开测
 
-三仓买入法有一个内在问题：**哪只股票在哪天占住了仓位，会影响后面能不能买到别的信号**。
+固定仓位买入法有一个内在问题：**哪只股票在哪天占住了仓位，会影响后面能不能买到别的信号**。
 这是纯粹的时间巧合，和信号质量无关。在之前的四年回测里已经出现过实证——
-因"三仓已满"被跳过的交易胜率56%，实际买入的胜率80%，差了24个百分点，
+因"仓位已满"被跳过的交易胜率56%，实际买入的胜率80%，差了24个百分点，
 而跳过与否完全取决于运气。
 
-所以直接看三仓的最终收益，是**分不清"策略好"和"运气好"**的。
+所以直接看组合层的最终收益，是**分不清"策略好"和"运气好"**的。
 
 这个工具的做法：
 - **信号层**给出策略的天花板（如果资金无限）
-- **三仓层**给出真实约束下的结果
+- **组合层**给出真实约束下的结果
 - **蒙特卡洛**把"选哪只"随机化重复数百次，画出运气的分布区间
+- **信号密度表**检查仓位数够不够（信号会在市场底部集中爆发）
 
-三个数字放在一起，就能明确回答：三仓损失了多少、排序规则值多少、运气占多大比重。
+几个数字放在一起，就能明确回答：资金约束损失了多少、排序规则值多少、运气占多大比重。
 
 ---
 默认参数已是信号验证器确定的最优配置（N=4、K≤20、要求K>D、持有3周）。
@@ -1104,13 +1118,6 @@ def main():
     signals["name"] = signals["ts_code"].map(name_map)
     signals["Industry"] = signals["ts_code"].map(industry_map)
 
-    st.markdown("---")
-    st.header("回测结果")
-    st.caption(
-        f"信号总数 {len(signals):,} 笔，覆盖 "
-        f"{signals['Signal_Week'].min()} — {signals['Signal_Week'].max()}"
-    )
-
     # 三层结果
     sig_summary, sig_curve = backtest_signal_layer(
         signals, week_index, int(hold_weeks), float(cost_pct)
@@ -1120,7 +1127,75 @@ def main():
         order_mode="K",
     )
 
-    st.subheader("表1 · 信号层 vs 三仓层")
+    mc_progress = st.progress(0.0, text="随机重排选股顺序，重复回测……")
+    outcomes = monte_carlo_slots(
+        signals, week_index, int(hold_weeks), float(cost_pct), int(slot_count),
+        int(mc_runs), progress_callback=lambda p: mc_progress.progress(p),
+    )
+    mc_progress.empty()
+
+    year_frame = signals.copy()
+    year_frame["年份"] = year_frame["Signal_Week"].astype(str).str[:4]
+    year_frame["净收益%"] = pd.to_numeric(
+        year_frame["Return_pct"], errors="coerce"
+    ) - float(cost_pct)
+    year_table = (
+        year_frame.groupby("年份")["净收益%"]
+        .agg(["count", "mean", "median", lambda s: (s > 0).mean() * 100.0])
+        .reset_index()
+    )
+    year_table.columns = ["年份", "信号数", "平均收益%", "中位收益%", "胜率%"]
+
+    # 存入 session_state：Streamlit 每次点击控件（包括下载按钮）都会重跑整个
+    # 脚本，如果结果只存在局部变量里，点下载就会退回初始页面。存到
+    # session_state 后，结果在整个会话内持续可用，可以反复下载。
+    st.session_state["bt_result"] = {
+        "signals": signals,
+        "sig_summary": sig_summary,
+        "sig_curve": sig_curve,
+        "slot_summary": slot_summary,
+        "slot_ledger": slot_ledger,
+        "slot_total": slot_total,
+        "outcomes": outcomes,
+        "year_table": year_table,
+        "mc_runs": int(mc_runs),
+        "params": {
+            "N": int(n_period), "M": int(m_period), "阈值": float(level),
+            "要求K>D": bool(require_kd), "持有周数": int(hold_weeks),
+            "仓位数": int(slot_count), "成本%": float(cost_pct),
+            "区间": f"{start_date}—{end_date}",
+        },
+    }
+
+
+def render_results():
+    """从 session_state 渲染结果，与"是否刚点了运行"解耦。"""
+    result = st.session_state.get("bt_result")
+    if not result:
+        return False
+
+    signals = result["signals"]
+    sig_summary = result["sig_summary"]
+    sig_curve = result["sig_curve"]
+    slot_summary = result["slot_summary"]
+    slot_ledger = result["slot_ledger"]
+    slot_total = result["slot_total"]
+    outcomes = result["outcomes"]
+    year_table = result["year_table"]
+    mc_runs = result["mc_runs"]
+    params = result["params"]
+
+    st.markdown("---")
+    st.header("回测结果")
+    st.caption(
+        f"信号总数 {len(signals):,} 笔，覆盖 "
+        f"{signals['Signal_Week'].min()} — {signals['Signal_Week'].max()}　|　"
+        f"参数：N={params['N']} M={params['M']} K≤{params['阈值']:.0f} "
+        f"{'且K>D ' if params['要求K>D'] else ''}持有{params['持有周数']}周 "
+        f"{params['仓位数']}仓 成本{params['成本%']:.2f}%"
+    )
+
+    st.subheader("表1 · 信号层 vs 组合层")
     combined = pd.concat(
         [
             sig_summary[["层级", "交易笔数", "单笔平均收益%", "单笔胜率%", "总收益率%"]]
@@ -1132,7 +1207,7 @@ def main():
     st.dataframe(combined.round(2), width="stretch", hide_index=True)
     st.caption(
         "两层使用完全相同的资金投放节奏，区别只在于：信号层每份资金买入当周全部信号，"
-        "三仓层每份资金只买1只。**两者之差就是资金约束+集中持股的代价。**"
+        "组合层每份资金只买1只。**两者之差就是资金约束+集中持股的代价。**"
     )
 
     st.dataframe(
@@ -1142,28 +1217,14 @@ def main():
         width="stretch", hide_index=True,
     )
 
-    # 蒙特卡洛
     st.subheader("表2 · 蒙特卡洛：运气占多大比重？")
-    mc_progress = st.progress(0.0, text="随机重排选股顺序，重复回测……")
-    outcomes = monte_carlo_slots(
-        signals, week_index, int(hold_weeks), float(cost_pct), int(slot_count),
-        int(mc_runs), progress_callback=lambda p: mc_progress.progress(p),
-    )
-    mc_progress.empty()
-
     percentile_of_real = float((outcomes < slot_total).mean() * 100.0)
     mc_table = pd.DataFrame(
         [
-            {
-                "指标": "随机选股 最差5%",
-                "总收益率%": float(np.percentile(outcomes, 5)),
-            },
+            {"指标": "随机选股 最差5%", "总收益率%": float(np.percentile(outcomes, 5))},
             {"指标": "随机选股 中位数", "总收益率%": float(np.median(outcomes))},
             {"指标": "随机选股 平均", "总收益率%": float(outcomes.mean())},
-            {
-                "指标": "随机选股 最好5%",
-                "总收益率%": float(np.percentile(outcomes, 95)),
-            },
+            {"指标": "随机选股 最好5%", "总收益率%": float(np.percentile(outcomes, 95))},
             {"指标": "▶ 按K值优选（真实规则）", "总收益率%": slot_total},
             {"指标": "▶ 信号层（无资金约束）",
              "总收益率%": float(sig_summary["总收益率%"].iloc[0])},
@@ -1176,12 +1237,12 @@ def main():
         f"""
 **怎么读这张表：**
 
-- 随机选股{int(mc_runs)}次，总收益率的90%区间宽度是 **{spread:.1f}个百分点**
-  —— 这就是三仓路径依赖带来的**纯运气区间**。区间越宽，单次回测结果越不可信。
+- 随机选股{mc_runs}次，总收益率的90%区间宽度是 **{spread:.1f}个百分点**
+  —— 这就是仓位路径依赖带来的**纯运气区间**。区间越宽，单次回测结果越不可信。
 - 按K值优选的真实结果落在随机分布的 **{percentile_of_real:.0f}%分位**。
   - 接近50% → 排序规则基本没贡献，结果主要靠运气
   - 高于90% → 排序规则确实有效
-- 信号层收益与三仓层之差 = 资金约束的代价。
+- 信号层收益与组合层之差 = 资金约束的代价。
 """
     )
 
@@ -1190,22 +1251,43 @@ def main():
         chart_frame["随机选股总收益率%"].value_counts(bins=30, sort=False).rename("次数")
     )
 
-    # 分年度
-    st.subheader("表3 · 分年度（信号层）")
-    year_frame = signals.copy()
-    year_frame["年份"] = year_frame["Signal_Week"].astype(str).str[:4]
-    year_frame["净收益%"] = pd.to_numeric(
-        year_frame["Return_pct"], errors="coerce"
-    ) - float(cost_pct)
-    year_table = (
-        year_frame.groupby("年份")["净收益%"]
-        .agg(["count", "mean", "median", lambda s: (s > 0).mean() * 100.0])
-        .reset_index()
-    )
-    year_table.columns = ["年份", "信号数", "平均收益%", "中位收益%", "胜率%"]
+    st.subheader("表3 · 信号密度 vs 实际买到比例")
+    ledger = slot_ledger.copy()
+    if not ledger.empty and "Entry_Week" in ledger.columns:
+        counts = ledger.groupby("Entry_Week").size()
+        ledger["当周信号数"] = ledger["Entry_Week"].map(counts)
+        ledger["_组"] = pd.cut(
+            ledger["当周信号数"], [0, 3, 10, 30, 10000],
+            labels=["1-3只", "4-10只", "11-30只", "31只以上"],
+        )
+        density = (
+            ledger.groupby("_组", observed=False)
+            .apply(
+                lambda d: pd.Series(
+                    {
+                        "信号数": len(d),
+                        "买入数": int((d["执行"] == "买入").sum()),
+                        "买入比例%": (d["执行"] == "买入").mean() * 100.0,
+                        "该组信号平均收益%": pd.to_numeric(
+                            d["Return_pct"], errors="coerce"
+                        ).mean(),
+                    }
+                ),
+                include_groups=False,
+            )
+            .reset_index()
+            .rename(columns={"_组": "当周信号数"})
+        )
+        st.dataframe(density.round(2), width="stretch", hide_index=True)
+        st.caption(
+            "**这张表检查仓位数是否够用**：如果信号密集的组收益更高、但买入比例更低，"
+            "说明仓位太少，系统性错过了最好的时段（SKDJ低位信号会在市场底部集中爆发，"
+            "而那正是最该重仓的时刻）。"
+        )
+
+    st.subheader("表4 · 分年度（信号层）")
     st.dataframe(year_table.round(2), width="stretch", hide_index=True)
 
-    # 导出
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -1228,8 +1310,7 @@ def main():
             "05_all_signals.csv", signals.to_csv(index=False, encoding="utf-8-sig")
         )
         archive.writestr(
-            "06_three_slot_ledger.csv",
-            slot_ledger.to_csv(index=False, encoding="utf-8-sig"),
+            "06_slot_ledger.csv", slot_ledger.to_csv(index=False, encoding="utf-8-sig")
         )
         archive.writestr(
             "07_signal_layer_curve.csv",
@@ -1240,11 +1321,16 @@ def main():
         data=output.getvalue(),
         file_name="skdj_strategy_backtest.zip",
         mime="application/zip",
+        key="download_results",
     )
 
-    with st.expander("查看三仓逐笔台账"):
+    with st.expander("查看逐笔台账"):
         st.dataframe(slot_ledger, width="stretch", hide_index=True)
+    return True
 
 
 if __name__ == "__main__":
     main()
+    # main() 里刚跑完的结果已存入 session_state，这里统一渲染。
+    # 这样"刚跑完"和"点了下载后重跑"走的是同一条渲染路径，结果不会丢失。
+    render_results()
