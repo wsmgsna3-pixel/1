@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
-"""SKDJ vs 26周回撤 因子分解验证器（单文件独立版，直接覆盖 app.py 运行）。
+"""周线选股 + 日线买点 验证器（单文件独立版，直接覆盖 app.py 运行）。
 
-回答一个问题：此前找到的选股优势，到底来自SKDJ信号，还是来自"跌得深"？
-如果来自后者，SKDJ就可以扔掉——那样信号更多、逻辑更简单、实操性更好。
+验证一个此前从未测过、但你最初就提出的思路：
+    周线SKDJ出信号后，用日线判断具体买入时机，而不是下周一开盘无脑买入。
 
-背景：
-- SKDJ低位拐头信号本身有横截面超额（+1.34%/3周，t=8.9）
-- 但周内用K值排序选股完全无效（超额-0.05%，t=-0.21）
-- 真正有效的周内排序是26周回撤（超额+0.99%，t=2.51，五分组单调，反向对照为负）
-- 所以必须搞清楚：SKDJ是否贡献了独立于"跌得深"的信息
+已确立的前提（前几轮验证结论）：
+- 周线SKDJ低位拐头信号有真实横截面优势，且是主因子（2x2析因：净贡献+1.06~+2.24%）
+- 26周回撤只在SKDJ信号内部有效（无SKDJ时净贡献-0.15%），是附属排序工具
+- 但整体信噪比偏低，相对随机买入的超额仅约+0.5%/笔
 
-方法：2x2析因设计。把"有无SKDJ信号"与"是否深度回撤"作为两个独立因子，
-在控制另一因子不变的前提下，测量各自的净贡献。这比单独看任一方案的
-总收益更能分辨因果。
+日线择时可能带来两类价值：
+  ① 择价：拿到更好的成交价
+  ② 筛选：周线出信号但日线迟迟不确认的，直接放弃——这层筛选比择价更有意义
 
-对比全部采用横截面口径（每周选N只算平均，再对周求平均），不模拟仓位调度，
-以剔除三仓路径依赖带来的巨大噪声（此前实测运气区间宽达80个百分点）。
+测试口径（严格避免未来函数）：
+- 确认统一为「当日收盘满足条件 -> 次日开盘买入」
+- 回踩买入按限价单模拟：盘中触及目标价才成交，开盘已跳空低于目标价则按开盘价
+- 所有入场方式共用完全相同的退出时点（第N周最后交易日收盘），
+  因此收益差异只反映入场时机，不受持有时间不同影响
+- 与基准的比较采用「同一批能成交的交易」配对比较，避免样本不同造成误判
 
 行情缓存与之前共用，已下载数据不会重复下载。
 """
@@ -47,7 +50,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "SKDJ vs 回撤 因子分解验证"
+APP_TITLE = "周线选股 + 日线买点 验证"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
@@ -644,11 +647,11 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # 指标计算
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# 指标
+# -----------------------------------------------------------------------------
 def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame:
-    """通达信 SKDJ：
-        LOWV:=LLV(LOW,N); HIGHV:=HHV(HIGH,N);
-        RSV:=EMA((CLOSE-LOWV)/(HIGHV-LOWV)*100,M); K:EMA(RSV,M); D:MA(K,M);
-    """
     low = pd.to_numeric(weekly["low"], errors="coerce")
     high = pd.to_numeric(weekly["high"], errors="coerce")
     close = pd.to_numeric(weekly["close"], errors="coerce")
@@ -661,217 +664,334 @@ def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame
     return weekly
 
 
-def build_panel_for_stock(
-    weekly: pd.DataFrame, ts_code: str, n_period: int, m_period: int,
-    level: float, require_kd: bool, hold_weeks: int,
-) -> pd.DataFrame:
-    """构建"全部个股-周"面板：不只是信号周，而是每一周都留下。
+def prepare_daily_indicators(daily: pd.DataFrame) -> pd.DataFrame:
+    """日线指标，只用于入场确认。全部基于当日及之前数据，无未来函数。"""
+    frame = daily.copy()
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    high = pd.to_numeric(frame["high"], errors="coerce")
+    low = pd.to_numeric(frame["low"], errors="coerce")
+    volume = pd.to_numeric(frame.get("vol", np.nan), errors="coerce")
 
-    这样才能做2x2析因：需要知道"有SKDJ信号"和"没有SKDJ信号"两组的表现，
-    只保留信号周是无法做对照的。
+    frame["d_ma5"] = close.rolling(5).mean()
+    frame["d_vol_ma5"] = volume.shift(1).rolling(5).mean()
+    frame["d_vol_ratio"] = volume / frame["d_vol_ma5"].replace(0, np.nan)
+
+    low9 = low.rolling(9).min()
+    high9 = high.rolling(9).max()
+    rsv = (close - low9) / (high9 - low9).replace(0, np.nan) * 100.0
+    k = rsv.ewm(alpha=1 / 3, adjust=False).mean()
+    d = k.ewm(alpha=1 / 3, adjust=False).mean()
+    frame["d_k"] = k
+    frame["d_d"] = d
+    frame["d_k_prev"] = k.shift(1)
+    frame["d_d_prev"] = d.shift(1)
+    frame["d_close_prev"] = close.shift(1)
+    return frame
+
+
+def daily_entry_variants(
+    daily_window: pd.DataFrame, signal_close: float, pullback_pct: float
+):
+    """返回各种日线确认方式下的 (成交日, 成交价)；无法确认则为 (None, nan)。
+
+    统一口径：当日收盘满足条件 -> 次日开盘买入。这样不存在用当日收盘价
+    成交的未来函数问题。窗口内始终无法确认则放弃该笔交易。
+    """
+    results = {}
+    if daily_window.empty:
+        return results
+
+    dates = daily_window.index.tolist()
+    opens = pd.to_numeric(daily_window["open"], errors="coerce")
+    closes = pd.to_numeric(daily_window["close"], errors="coerce")
+    lows = pd.to_numeric(daily_window["low"], errors="coerce")
+
+    # ① 基准：下周第一个交易日开盘直接买入
+    first_open = _safe_float(opens.iloc[0]) if len(opens) else np.nan
+    results["①立即买入（基准）"] = (
+        (dates[0], first_open) if math.isfinite(first_open) else (None, np.nan)
+    )
+
+    def confirm_then_next_open(mask):
+        """当日满足条件，次日开盘买入。"""
+        for position in range(len(dates) - 1):
+            if bool(mask.iloc[position]):
+                price = _safe_float(opens.iloc[position + 1])
+                if math.isfinite(price):
+                    return dates[position + 1], price
+        return None, np.nan
+
+    # ② 收盘站上5日线
+    ma5 = pd.to_numeric(daily_window["d_ma5"], errors="coerce")
+    results["②收盘站上5日线"] = confirm_then_next_open(closes >= ma5)
+
+    # ③ 日线KDJ金叉
+    k = pd.to_numeric(daily_window["d_k"], errors="coerce")
+    d_line = pd.to_numeric(daily_window["d_d"], errors="coerce")
+    k_prev = pd.to_numeric(daily_window["d_k_prev"], errors="coerce")
+    d_prev = pd.to_numeric(daily_window["d_d_prev"], errors="coerce")
+    results["③日线KDJ金叉"] = confirm_then_next_open((k > d_line) & (k_prev <= d_prev))
+
+    # ④ 放量阳线
+    close_prev = pd.to_numeric(daily_window["d_close_prev"], errors="coerce")
+    vol_ratio = pd.to_numeric(daily_window["d_vol_ratio"], errors="coerce")
+    results["④放量阳线"] = confirm_then_next_open(
+        (closes > close_prev) & (vol_ratio >= 1.2)
+    )
+
+    # ⑤ 回踩后买入：盘中触及信号周收盘价下方 pullback_pct，则以该限价成交
+    target = signal_close * (1.0 - pullback_pct / 100.0)
+    for position in range(len(dates)):
+        day_low = _safe_float(lows.iloc[position])
+        day_open = _safe_float(opens.iloc[position])
+        if math.isfinite(day_low) and day_low <= target:
+            # 开盘已低于目标价则按开盘价，否则按目标价成交
+            fill = day_open if math.isfinite(day_open) and day_open < target else target
+            results[f"⑤回踩{pullback_pct:.0f}%买入"] = (dates[position], fill)
+            break
+    else:
+        results[f"⑤回踩{pullback_pct:.0f}%买入"] = (None, np.nan)
+
+    return results
+
+
+def build_signals_with_daily_entry(
+    weekly: pd.DataFrame,
+    daily: pd.DataFrame,
+    ts_code: str,
+    n_period: int,
+    m_period: int,
+    level: float,
+    require_kd: bool,
+    hold_weeks: int,
+    pullback_pct: float,
+) -> pd.DataFrame:
+    """周线出信号，日线定买点；退出统一固定在第 hold_weeks 周最后一个交易日收盘。
+
+    退出时点对所有入场方式完全相同，这样收益差异只反映"入场时机"，
+    不会被"持有时间不同"污染。
     """
     weekly = add_skdj(weekly, n_period, m_period)
-    close = pd.to_numeric(weekly["close"], errors="coerce")
-    high = pd.to_numeric(weekly["high"], errors="coerce")
-    open_price = pd.to_numeric(weekly["open"], errors="coerce")
-    dates = weekly["trade_date_str"].astype(str)
+    if len(weekly) < 30:
+        return pd.DataFrame()
 
     k_now = pd.to_numeric(weekly["K"], errors="coerce")
     k_prev = k_now.shift(1)
     d_now = pd.to_numeric(weekly["D"], errors="coerce")
+    close_w = pd.to_numeric(weekly["close"], errors="coerce")
+    high_w = pd.to_numeric(weekly["high"], errors="coerce")
+    volume_w = pd.to_numeric(weekly.get("vol", np.nan), errors="coerce")
+    turnover_w = pd.to_numeric(weekly.get("turnover_rate", np.nan), errors="coerce")
+    amount_w = pd.to_numeric(weekly.get("amount", np.nan), errors="coerce")
 
-    skdj_signal = (k_prev <= k_now) & (k_now <= level)
+    signal = (k_prev <= k_now) & (k_now <= level)
     if require_kd:
-        skdj_signal = skdj_signal & (k_now > d_now)
+        signal = signal & (k_now > d_now)
+    signal = signal.fillna(False)
 
-    entry_open = open_price.shift(-1)
-    exit_close = close.shift(-hold_weeks)
-
-    frame = pd.DataFrame(
-        {
-            "ts_code": ts_code,
-            "Signal_Week": dates,
-            "Entry_Week": dates.shift(-1),
-            "K": k_now,
-            "D": d_now,
-            "SKDJ_Signal": skdj_signal.fillna(False),
-            "Drawdown_26W_pct": (close / high.rolling(26).max() - 1.0) * 100.0,
-            "Entry_Open": entry_open,
-            "Fwd_Return_pct": (
-                exit_close / entry_open.replace(0, np.nan) - 1.0
-            ) * 100.0,
-        }
+    # 周线附加因子（全部只用信号周及之前数据）
+    drawdown_26 = (close_w / high_w.rolling(26).max() - 1.0) * 100.0
+    vol_surge = volume_w / volume_w.shift(1).rolling(8).mean().replace(0, np.nan)
+    turnover_change = (
+        turnover_w / turnover_w.shift(1).rolling(8).mean().replace(0, np.nan)
     )
-    return frame.dropna(subset=["Entry_Week", "Fwd_Return_pct", "Drawdown_26W_pct"])
+    position_52w = (
+        (close_w - close_w.rolling(52).min())
+        / (close_w.rolling(52).max() - close_w.rolling(52).min()).replace(0, np.nan)
+    )
+    return_13w = (close_w / close_w.shift(13) - 1.0) * 100.0
 
+    daily_ready = prepare_daily_indicators(daily)
+    daily_index = daily_ready.index
 
-# -----------------------------------------------------------------------------
-# 分解分析
-# -----------------------------------------------------------------------------
-def factorial_2x2(panel: pd.DataFrame, deep_quantile: float, cost_pct: float):
-    """2x2析因：把SKDJ信号和深度回撤当作两个独立因子，看各自的净贡献。
-
-    这是判断"SKDJ该不该留"的核心测试。如果在同样是深度回撤的股票里，
-    有没有SKDJ信号的表现差不多，那SKDJ就是多余的。
-    """
-    work = panel.copy()
-    work["_ret"] = pd.to_numeric(work["Fwd_Return_pct"], errors="coerce") - cost_pct
-    work = work.dropna(subset=["_ret"])
-    # 每周横截面上定义"深度回撤"：回撤最深的 deep_quantile 部分
-    work["_dd_rank"] = work.groupby("Entry_Week")["Drawdown_26W_pct"].rank(pct=True)
-    work["深度回撤"] = work["_dd_rank"] <= deep_quantile
-    work["SKDJ信号"] = work["SKDJ_Signal"].astype(bool)
-
+    week_dates = weekly["trade_date_str"].astype(str).tolist()
     rows = []
-    for dd in (True, False):
-        for sk in (True, False):
-            cell = work[(work["深度回撤"] == dd) & (work["SKDJ信号"] == sk)]["_ret"]
-            rows.append(
-                {
-                    "深度回撤": "是" if dd else "否",
-                    "SKDJ信号": "有" if sk else "无",
-                    "样本数": int(len(cell)),
-                    "平均收益%": float(cell.mean()) if len(cell) else np.nan,
-                    "中位收益%": float(cell.median()) if len(cell) else np.nan,
-                    "胜率%": float((cell > 0).mean() * 100.0) if len(cell) else np.nan,
-                }
+    for i in range(len(weekly)):
+        if not bool(signal.iloc[i]):
+            continue
+        if i + hold_weeks >= len(weekly):
+            continue
+        week_end = week_dates[i]
+        next_week_end = week_dates[i + 1]
+        exit_date = week_dates[i + hold_weeks]
+
+        window_mask = (daily_index > week_end) & (daily_index <= next_week_end)
+        window = daily_ready.loc[window_mask]
+        if window.empty:
+            continue
+        exit_price = _safe_float(close_w.iloc[i + hold_weeks])
+        if not math.isfinite(exit_price) or exit_price <= 0:
+            continue
+
+        signal_close = _safe_float(close_w.iloc[i])
+        variants = daily_entry_variants(window, signal_close, pullback_pct)
+
+        base = {
+            "ts_code": ts_code,
+            "Signal_Week": week_end,
+            "Entry_Week": next_week_end,
+            "Exit_Week": exit_date,
+            "K": _safe_float(k_now.iloc[i]),
+            "Drawdown_26W_pct": _safe_float(drawdown_26.iloc[i]),
+            "Vol_Surge": _safe_float(vol_surge.iloc[i]),
+            "Turnover_Change": _safe_float(turnover_change.iloc[i]),
+            "Position_52W": _safe_float(position_52w.iloc[i]),
+            "Return_13W_pct": _safe_float(return_13w.iloc[i]),
+            "Amount_W": _safe_float(amount_w.iloc[i]),
+            "Exit_Close": exit_price,
+        }
+        for label, (entry_date, entry_price) in variants.items():
+            base[f"入场_{label}_日期"] = entry_date
+            base[f"入场_{label}_价格"] = entry_price
+            base[f"收益_{label}"] = (
+                (exit_price / entry_price - 1.0) * 100.0
+                if math.isfinite(_safe_float(entry_price)) and entry_price > 0
+                else np.nan
             )
-    table = pd.DataFrame(rows)
-
-    def cell_mean(dd, sk):
-        row = table[(table["深度回撤"] == dd) & (table["SKDJ信号"] == sk)]
-        return float(row["平均收益%"].iloc[0]) if len(row) else np.nan
-
-    contrib = pd.DataFrame(
-        [
-            {
-                "对比": "SKDJ的独立贡献（在深度回撤股票内部）",
-                "有该因子%": cell_mean("是", "有"),
-                "无该因子%": cell_mean("是", "无"),
-                "净贡献%": cell_mean("是", "有") - cell_mean("是", "无"),
-            },
-            {
-                "对比": "SKDJ的独立贡献（在非深度回撤股票内部）",
-                "有该因子%": cell_mean("否", "有"),
-                "无该因子%": cell_mean("否", "无"),
-                "净贡献%": cell_mean("否", "有") - cell_mean("否", "无"),
-            },
-            {
-                "对比": "深度回撤的独立贡献（在有SKDJ信号内部）",
-                "有该因子%": cell_mean("是", "有"),
-                "无该因子%": cell_mean("否", "有"),
-                "净贡献%": cell_mean("是", "有") - cell_mean("否", "有"),
-            },
-            {
-                "对比": "深度回撤的独立贡献（在无SKDJ信号内部）",
-                "有该因子%": cell_mean("是", "无"),
-                "无该因子%": cell_mean("否", "无"),
-                "净贡献%": cell_mean("是", "无") - cell_mean("否", "无"),
-            },
-        ]
-    )
-    return table, contrib
+        rows.append(base)
+    return pd.DataFrame(rows)
 
 
-def compare_selection_schemes(
-    panel: pd.DataFrame, top_n: int, cost_pct: float, random_draws: int = 50
-):
-    """四种选股方案的正面对比（每周选top_n只，算平均收益，再对周求平均）。
-
-    用横截面方式对比而不是模拟三仓，是为了剔除仓位路径依赖带来的噪声，
-    让"选股方法本身"的差异干净地显现出来。
-    """
-    work = panel.copy()
-    work["_ret"] = pd.to_numeric(work["Fwd_Return_pct"], errors="coerce") - cost_pct
-    work = work.dropna(subset=["_ret"])
-    rng = np.random.default_rng(20240101)
-
-    def weekly_mean_of_top(subset: pd.DataFrame, sort_col: str | None):
-        if subset.empty:
-            return pd.Series(dtype=float)
-        if sort_col is None:
-            picks = []
-            for _, group in subset.groupby("Entry_Week"):
-                take = min(top_n, len(group))
-                vals = group["_ret"].to_numpy()
-                draws = [
-                    rng.choice(vals, size=take, replace=False).mean()
-                    for _ in range(random_draws)
-                ]
-                picks.append((group["Entry_Week"].iloc[0], float(np.mean(draws))))
-            return pd.Series(dict(picks))
-        ranked = subset.groupby("Entry_Week")[sort_col].rank(
-            method="first", ascending=True
-        )
-        return subset[ranked <= top_n].groupby("Entry_Week")["_ret"].mean()
-
-    skdj_only = work[work["SKDJ_Signal"].astype(bool)]
-
-    schemes = [
-        ("① SKDJ信号 + 回撤最深（当前策略）", skdj_only, "Drawdown_26W_pct"),
-        ("② 全池 + 回撤最深（不用SKDJ）", work, "Drawdown_26W_pct"),
-        ("③ SKDJ信号 + 随机取（只靠SKDJ）", skdj_only, None),
-        ("④ 全池随机取（基准）", work, None),
+# -----------------------------------------------------------------------------
+# 分析
+# -----------------------------------------------------------------------------
+def compare_entry_methods(signals: pd.DataFrame, cost_pct: float):
+    """对比各日线入场方式：同样的退出时点，只有入场不同。"""
+    labels = [
+        column[3:] for column in signals.columns if column.startswith("收益_")
     ]
     rows = []
-    for label, subset, sort_col in schemes:
-        weekly_returns = weekly_mean_of_top(subset, sort_col)
-        weekly_returns = weekly_returns.dropna()
-        if weekly_returns.empty:
-            continue
-        if len(weekly_returns) > 1 and weekly_returns.std(ddof=1) > 0:
-            t_stat = weekly_returns.mean() / (
-                weekly_returns.std(ddof=1) / math.sqrt(len(weekly_returns))
+    baseline_label = next((x for x in labels if x.startswith("①")), None)
+    base_returns = (
+        pd.to_numeric(signals[f"收益_{baseline_label}"], errors="coerce")
+        if baseline_label
+        else pd.Series(dtype=float)
+    )
+    for label in labels:
+        returns = pd.to_numeric(signals[f"收益_{label}"], errors="coerce")
+        traded = returns.notna()
+        net = returns[traded] - cost_pct
+        # 与基准在"同一批能成交的交易"上对比，避免样本不同造成误判
+        both = traded & base_returns.notna()
+        paired_diff = (returns[both] - base_returns[both]).dropna()
+        if len(paired_diff) > 1 and paired_diff.std(ddof=1) > 0:
+            t_stat = paired_diff.mean() / (
+                paired_diff.std(ddof=1) / math.sqrt(len(paired_diff))
             )
         else:
             t_stat = np.nan
         rows.append(
             {
-                "选股方案": label,
-                "可交易周数": int(len(weekly_returns)),
-                f"每周Top{top_n}平均收益%": float(weekly_returns.mean()),
-                "周胜率%": float((weekly_returns > 0).mean() * 100.0),
-                "周收益标准差%": float(weekly_returns.std(ddof=1)),
-                "粗略t值": t_stat,
+                "入场方式": label,
+                "成交笔数": int(traded.sum()),
+                "成交率%": float(traded.mean() * 100.0),
+                "平均收益%": float(net.mean()) if len(net) else np.nan,
+                "中位收益%": float(net.median()) if len(net) else np.nan,
+                "胜率%": float((net > 0).mean() * 100.0) if len(net) else np.nan,
+                "标准差%": float(net.std(ddof=1)) if len(net) > 1 else np.nan,
+                "vs基准差值%": float(paired_diff.mean()) if len(paired_diff) else np.nan,
+                "差值t值": t_stat,
             }
         )
     return pd.DataFrame(rows)
 
 
-def yearly_scheme_comparison(panel: pd.DataFrame, top_n: int, cost_pct: float):
-    """两个主要方案的分年度对比：用SKDJ vs 不用SKDJ。"""
-    work = panel.copy()
-    work["_ret"] = pd.to_numeric(work["Fwd_Return_pct"], errors="coerce") - cost_pct
+def test_weekly_factors(signals: pd.DataFrame, top_n: int, cost_pct: float, label: str):
+    """周线附加因子的周内选股能力检验（含反向对照）。"""
+    if signals.empty or f"收益_{label}" not in signals.columns:
+        return pd.DataFrame()
+    work = signals.copy()
+    work["_ret"] = pd.to_numeric(work[f"收益_{label}"], errors="coerce") - cost_pct
     work = work.dropna(subset=["_ret"])
-    work["年份"] = work["Entry_Week"].astype(str).str[:4]
+    if work.empty:
+        return pd.DataFrame()
+    baseline = work.groupby("Entry_Week")["_ret"].mean()
 
-    def top_by_week(subset):
-        ranked = subset.groupby("Entry_Week")["Drawdown_26W_pct"].rank(
-            method="first", ascending=True
-        )
-        return subset[ranked <= top_n]
-
+    candidates = [
+        ("Drawdown_26W_pct", "26周回撤最深优先", True),
+        ("Vol_Surge", "成交量放大优先", False),
+        ("Turnover_Change", "换手率放大优先", False),
+        ("Position_52W", "52周位置最低优先", True),
+        ("Return_13W_pct", "13周涨幅最高优先", False),
+        ("Amount_W", "成交额最大优先", False),
+        ("K", "K值最低优先", True),
+    ]
     rows = []
-    for year, group in work.groupby("年份"):
-        with_skdj = top_by_week(group[group["SKDJ_Signal"].astype(bool)])
-        without_skdj = top_by_week(group)
+    for column, name, ascending in candidates:
+        if column not in work.columns:
+            continue
+        values = pd.to_numeric(work[column], errors="coerce")
+        if values.notna().sum() < len(work) * 0.5:
+            continue
+        subset = work.assign(_v=values).dropna(subset=["_v"])
+        rank_fwd = subset.groupby("Entry_Week")["_v"].rank(
+            method="first", ascending=ascending
+        )
+        rank_rev = subset.groupby("Entry_Week")["_v"].rank(
+            method="first", ascending=not ascending
+        )
+        top = subset[rank_fwd <= top_n].groupby("Entry_Week")["_ret"].mean()
+        bottom = subset[rank_rev <= top_n].groupby("Entry_Week")["_ret"].mean()
+        edge = (top - baseline.reindex(top.index)).dropna()
+        edge_rev = (bottom - baseline.reindex(bottom.index)).dropna()
+        if len(edge) > 1 and edge.std(ddof=1) > 0:
+            t_stat = edge.mean() / (edge.std(ddof=1) / math.sqrt(len(edge)))
+        else:
+            t_stat = np.nan
         rows.append(
             {
-                "年份": year,
-                "①用SKDJ 周数": with_skdj["Entry_Week"].nunique(),
-                "①用SKDJ 收益%": float(
-                    with_skdj.groupby("Entry_Week")["_ret"].mean().mean()
-                ) if not with_skdj.empty else np.nan,
-                "②不用SKDJ 周数": without_skdj["Entry_Week"].nunique(),
-                "②不用SKDJ 收益%": float(
-                    without_skdj.groupby("Entry_Week")["_ret"].mean().mean()
-                ) if not without_skdj.empty else np.nan,
+                "附加因子": name,
+                f"每周Top{top_n}收益%": float(top.mean()),
+                "同周全部信号%": float(baseline.reindex(top.index).mean()),
+                "选股超额%": float(edge.mean()),
+                "反向对照%": float(edge_rev.mean()) if len(edge_rev) else np.nan,
+                "有效周数": int(len(edge)),
+                "粗略t值": t_stat,
             }
         )
     result = pd.DataFrame(rows)
     if not result.empty:
-        result["差值(①-②)%"] = result["①用SKDJ 收益%"] - result["②不用SKDJ 收益%"]
+        result = result.sort_values("选股超额%", ascending=False).reset_index(drop=True)
     return result
+
+
+def combo_test(signals: pd.DataFrame, top_n: int, cost_pct: float, label: str):
+    """把日线确认与周线排序组合起来，看叠加后还剩多少优势。"""
+    labels = [c[3:] for c in signals.columns if c.startswith("收益_")]
+    rows = []
+    for entry_label in labels:
+        work = signals.copy()
+        work["_ret"] = pd.to_numeric(work[f"收益_{entry_label}"], errors="coerce") - cost_pct
+        work = work.dropna(subset=["_ret", "Drawdown_26W_pct"])
+        if work.empty:
+            continue
+        rank = work.groupby("Entry_Week")["Drawdown_26W_pct"].rank(
+            method="first", ascending=True
+        )
+        top = work[rank <= top_n]
+        by_week = top.groupby("Entry_Week")["_ret"].mean()
+        if by_week.empty:
+            continue
+        if len(by_week) > 1 and by_week.std(ddof=1) > 0:
+            t_stat = by_week.mean() / (by_week.std(ddof=1) / math.sqrt(len(by_week)))
+        else:
+            t_stat = np.nan
+        rows.append(
+            {
+                "组合方案": f"{entry_label} + 回撤最深Top{top_n}",
+                "可交易周数": int(len(by_week)),
+                "每周收益%": float(by_week.mean()),
+                "周胜率%": float((by_week > 0).mean() * 100.0),
+                "周标准差%": float(by_week.std(ddof=1)) if len(by_week) > 1 else np.nan,
+                "收益/波动": (
+                    by_week.mean() / by_week.std(ddof=1)
+                    if len(by_week) > 1 and by_week.std(ddof=1) > 0
+                    else np.nan
+                ),
+                "粗略t值": t_stat,
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
@@ -879,16 +999,16 @@ def yearly_scheme_comparison(panel: pd.DataFrame, top_n: int, cost_pct: float):
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"🔬 {APP_TITLE}")
-    st.caption(
-        "回答一个问题：优势到底来自SKDJ，还是来自「跌得深」？SKDJ该不该保留？"
-    )
+    st.title(f"📈 {APP_TITLE}")
+    st.caption("周线SKDJ出信号，日线找买点——你最初的思路，这次正式验证。")
     st.info(
-        "**背景**：此前检验发现，真正稳定有效的是「26周回撤越深越好」"
-        "（同周五分组单调、跨年稳定、反向对照为负），而SKDJ的K值排序完全无效。"
-        "所以必须搞清楚：SKDJ是在贡献独立信息，还是只是个噪声筛子。\n\n"
-        "**方法**：2x2析因设计。把「有无SKDJ信号」和「是否深度回撤」当作两个独立因子，"
-        "看在**控制另一个因子不变**的前提下，各自还能带来多少收益差异。"
+        "**为什么测这个**：此前所有回测都是「周线出信号→下周一开盘无脑买入」，"
+        "从未验证过日线择时。日线确认可能带来两类价值："
+        "①拿到更好的成交价；②过滤掉周线出了信号但日线迟迟不确认的假信号。"
+        "第②类尤其重要——那不只是买便宜点，而是多了一层筛选。\n\n"
+        "**测法**：所有入场方式共用**完全相同的退出时点**，"
+        "因此收益差异只反映入场时机，不会被持有时间不同污染。"
+        "确认口径统一为「当日收盘满足条件→次日开盘买入」，不存在未来函数。"
     )
 
     with st.sidebar:
@@ -898,26 +1018,25 @@ def main():
         except Exception:
             secret_token = ""
         token_input = st.text_input("Tushare Token", value=secret_token, type="password")
-
         today = pd.Timestamp.now().date()
         start_input = st.date_input("开始日期", value=today - timedelta(days=365 * 4))
         end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.subheader("SKDJ 信号定义")
+        st.subheader("周线信号（已验证的最优配置）")
         n_period = st.number_input("N", value=4, min_value=2, max_value=60, step=1)
         m_period = st.number_input("M", value=3, min_value=2, max_value=30, step=1)
         level = st.number_input("K值阈值", value=20.0, min_value=1.0, max_value=90.0, step=5.0)
         require_kd = st.checkbox("要求 K > D", value=True)
+        hold_weeks = st.number_input("持有周数", value=3, min_value=1, max_value=8, step=1)
 
         st.markdown("---")
-        st.subheader("对比设置")
-        hold_weeks = st.number_input("持有周数", value=3, min_value=1, max_value=8, step=1)
-        top_n = st.number_input("每周选几只", value=3, min_value=1, max_value=20, step=1)
-        deep_quantile = st.slider(
-            "「深度回撤」定义：每周回撤最深的百分之几",
-            min_value=0.05, max_value=0.50, value=0.20, step=0.05,
+        st.subheader("日线入场")
+        pullback_pct = st.number_input(
+            "回踩买入：低于信号周收盘价百分之几",
+            value=3.0, min_value=0.5, max_value=15.0, step=0.5,
         )
+        top_n = st.number_input("每周选几只", value=3, min_value=1, max_value=20, step=1)
         cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
 
         st.markdown("---")
@@ -928,7 +1047,7 @@ def main():
 
         st.markdown("---")
         clear_cache_clicked = st.button("清空行情缓存")
-        run_clicked = st.button("开始分解验证", type="primary")
+        run_clicked = st.button("开始验证", type="primary")
 
     if clear_cache_clicked:
         if os.path.isdir(MARKET_CACHE_ROOT):
@@ -936,28 +1055,31 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
-        if st.session_state.get("decomp_result"):
+        if st.session_state.get("entry_result"):
             return
         st.markdown(
             """
-### 三张表会告诉你什么
+### 五种入场方式的对比
 
-**表1 · 2x2析因**  
-四个格子：深回撤×有SKDJ、深回撤×无SKDJ、浅回撤×有SKDJ、浅回撤×无SKDJ。
-关键看**在同样是深度回撤的股票里，有没有SKDJ信号的收益差多少**。
+| 方式 | 说明 |
+|---|---|
+| ①立即买入 | 下周第一个交易日开盘买入（现在的做法，基准） |
+| ②收盘站上5日线 | 等日线收盘站上MA5，次日开盘买 |
+| ③日线KDJ金叉 | 等日线KDJ(9,3,3)金叉，次日开盘买 |
+| ④放量阳线 | 等一根放量上涨的日K，次日开盘买 |
+| ⑤回踩买入 | 挂低于信号周收盘价N%的限价单，触及才成交 |
 
-**表2 · 因子净贡献**  
-把表1换算成"控制另一因子后，每个因子还值多少"。
-- SKDJ净贡献接近0 → **可以扔掉SKDJ**，直接用回撤选股，信号更多、更简单
-- SKDJ净贡献明显为正 → SKDJ有独立价值，保留
+②③④如果在下一周内始终没确认，就**放弃这笔交易**——这是筛选效应，
+会体现在「成交率」那一列。
 
-**表3 · 四种选股方案正面对比**  
-① SKDJ+回撤（当前策略）② 只用回撤 ③ 只用SKDJ ④ 纯随机基准。
-直接比谁的每周Top3收益更高、可交易周数更多。
+### 三张表
 
----
-用横截面方式对比（每周选N只算平均），不模拟仓位调度——
-这样能剔除路径依赖噪声，让选股方法本身的差异干净显现。
+**表1 · 入场方式对比**　同一批交易配对比较，看「vs基准差值」和t值。
+
+**表2 · 周线附加因子**　除回撤外，再测量能、换手、52周位置、成交额等
+是否有周内选股能力（全部带反向对照）。
+
+**表3 · 组合效果**　把日线确认和回撤排序叠加，看最终还剩多少优势。
             """
         )
         return
@@ -973,13 +1095,13 @@ def main():
 
     start_date = start_input.strftime("%Y%m%d")
     end_date = end_input.strftime("%Y%m%d")
-    fetch_start = (pd.Timestamp(start_input) - timedelta(days=400)).strftime("%Y%m%d")
+    fetch_start = (pd.Timestamp(start_input) - timedelta(days=450)).strftime("%Y%m%d")
     fetch_end = (pd.Timestamp(end_input) + timedelta(days=90)).strftime("%Y%m%d")
 
     with st.spinner("构建科技股研究池……"):
         whitelist_set, name_map, industry_map = load_custom_tech_whitelist(token_clean)
     if not whitelist_set:
-        st.error("未取得科技股研究池。")
+        st.error("未取得研究池。")
         return
     st.success(f"科技股研究池：{len(whitelist_set)}只")
 
@@ -995,147 +1117,172 @@ def main():
         f"本次下载{sync_stats.get('downloaded_days', 0)}天。"
     )
 
-    progress = st.progress(0.0, text="构建全池面板……")
+    progress = st.progress(0.0, text="周线出信号 + 日线定买点……")
     parts = []
     codes = sorted(stocks.keys())
     for idx, ts_code in enumerate(codes):
-        weekly = build_weekly_bars(stocks[ts_code])
-        if weekly.empty or len(weekly) < 26 + int(hold_weeks) + 6:
+        daily = stocks[ts_code]
+        weekly = build_weekly_bars(daily)
+        if weekly.empty or len(weekly) < 60:
             continue
-        parts.append(
-            build_panel_for_stock(
-                weekly, ts_code, int(n_period), int(m_period),
-                float(level), bool(require_kd), int(hold_weeks),
-            )
+        rows = build_signals_with_daily_entry(
+            weekly, daily, ts_code, int(n_period), int(m_period),
+            float(level), bool(require_kd), int(hold_weeks), float(pullback_pct),
         )
-        if idx % 50 == 0:
+        if not rows.empty:
+            parts.append(rows)
+        if idx % 40 == 0:
             progress.progress(
                 min((idx + 1) / len(codes), 1.0),
-                text=f"构建全池面板……{idx + 1}/{len(codes)}",
+                text=f"周线出信号 + 日线定买点……{idx + 1}/{len(codes)}",
             )
     progress.empty()
     del stocks
     gc.collect()
 
     if not parts:
-        st.error("没有足够数据。")
+        st.error("没有产生信号。")
         return
-    panel = pd.concat(parts, ignore_index=True)
+    signals = pd.concat(parts, ignore_index=True)
     del parts
     gc.collect()
 
-    panel = panel[
-        (panel["Signal_Week"] >= start_date) & (panel["Signal_Week"] <= end_date)
+    signals = signals[
+        (signals["Signal_Week"] >= start_date) & (signals["Signal_Week"] <= end_date)
     ]
-    panel = panel[pd.to_numeric(panel["Entry_Open"], errors="coerce") >= min_price]
     if not basic_indexed.empty:
         basic_reset = basic_indexed.reset_index().rename(
             columns={"trade_date_str": "Signal_Week"}
         )
         keep = [c for c in ("Signal_Week", "ts_code", "circ_mv") if c in basic_reset.columns]
         if len(keep) == 3:
-            panel = panel.merge(
+            signals = signals.merge(
                 basic_reset[keep].drop_duplicates(["Signal_Week", "ts_code"]),
                 on=["Signal_Week", "ts_code"], how="left",
             )
-            mv = pd.to_numeric(panel["circ_mv"], errors="coerce") / 10000.0
-            panel = panel[mv.between(min_mv, max_mv) | mv.isna()]
-    panel = panel.reset_index(drop=True)
-    if panel.empty:
-        st.error("过滤后无数据。")
+            mv = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
+            signals = signals[mv.between(min_mv, max_mv) | mv.isna()]
+    base_col = next(
+        (c for c in signals.columns if c.startswith("入场_①") and c.endswith("价格")), None
+    )
+    if base_col:
+        signals = signals[pd.to_numeric(signals[base_col], errors="coerce") >= min_price]
+    signals = signals.reset_index(drop=True)
+    if signals.empty:
+        st.error("过滤后无信号。")
         return
 
-    table_2x2, contrib = factorial_2x2(panel, float(deep_quantile), float(cost_pct))
-    schemes = compare_selection_schemes(panel, int(top_n), float(cost_pct))
-    yearly = yearly_scheme_comparison(panel, int(top_n), float(cost_pct))
+    entry_table = compare_entry_methods(signals, float(cost_pct))
+    baseline_label = next(
+        (c[3:] for c in signals.columns if c.startswith("收益_①")), None
+    )
+    factor_table = test_weekly_factors(
+        signals, int(top_n), float(cost_pct), baseline_label
+    )
+    combo_table = combo_test(signals, int(top_n), float(cost_pct), baseline_label)
 
-    st.session_state["decomp_result"] = {
-        "panel_size": len(panel),
-        "weeks": panel["Entry_Week"].nunique(),
-        "skdj_count": int(panel["SKDJ_Signal"].astype(bool).sum()),
-        "table_2x2": table_2x2,
-        "contrib": contrib,
-        "schemes": schemes,
-        "yearly": yearly,
+    signals["年份"] = signals["Signal_Week"].astype(str).str[:4]
+    yearly_rows = []
+    for year, group in signals.groupby("年份"):
+        row = {"年份": year, "信号数": len(group)}
+        for column in group.columns:
+            if column.startswith("收益_"):
+                row[column[3:]] = float(
+                    pd.to_numeric(group[column], errors="coerce").mean() - cost_pct
+                )
+        yearly_rows.append(row)
+    yearly_table = pd.DataFrame(yearly_rows)
+
+    st.session_state["entry_result"] = {
+        "signals": signals,
+        "entry_table": entry_table,
+        "factor_table": factor_table,
+        "combo_table": combo_table,
+        "yearly_table": yearly_table,
         "params": {
             "N": int(n_period), "M": int(m_period), "阈值": float(level),
             "K>D": bool(require_kd), "持有": int(hold_weeks),
-            "每周选": int(top_n), "深度回撤定义": float(deep_quantile),
+            "回踩%": float(pullback_pct), "每周选": int(top_n),
         },
     }
 
 
 def render_results():
-    result = st.session_state.get("decomp_result")
+    result = st.session_state.get("entry_result")
     if not result:
         return False
     params = result["params"]
+    signals = result["signals"]
 
     st.markdown("---")
-    st.header("分解验证结果")
+    st.header("验证结果")
     st.caption(
-        f"全池观测 {result['panel_size']:,} 个「个股-周」，其中SKDJ信号 "
-        f"{result['skdj_count']:,} 个，覆盖 {result['weeks']} 周　|　"
+        f"信号 {len(signals):,} 笔，覆盖 {signals['Signal_Week'].min()} — "
+        f"{signals['Signal_Week'].max()}　|　"
         f"SKDJ: N={params['N']} M={params['M']} K≤{params['阈值']:.0f}"
-        f"{' 且K>D' if params['K>D'] else ''}　持有{params['持有']}周　"
-        f"每周选{params['每周选']}只　深度回撤=最深{params['深度回撤定义']*100:.0f}%"
+        f"{' 且K>D' if params['K>D'] else ''}　持有{params['持有']}周"
     )
 
-    st.subheader("表1 · 2x2析因：四个格子的表现")
-    st.dataframe(result["table_2x2"].round(3), width="stretch", hide_index=True)
+    st.subheader("表1 · 日线入场方式对比")
+    st.dataframe(result["entry_table"].round(3), width="stretch", hide_index=True)
     st.caption(
-        "**重点看前两行**：同样是深度回撤的股票，有SKDJ信号和没有SKDJ信号，收益差多少。"
+        "**重点看两列**：「vs基准差值%」是同一批交易的配对比较（比单纯比平均值更可靠），"
+        "「成交率%」反映筛选强度。\n\n"
+        "- 差值明显为正且 |t|>2 → 日线择时确实有用\n"
+        "- 差值接近0 → 日线择时只是换个价格进场，不创造优势\n"
+        "- 成交率低但收益高 → 价值来自**过滤**而非**择价**，这种更有意义"
     )
 
-    st.subheader("表2 · 因子净贡献（控制另一因子后）")
-    st.dataframe(result["contrib"].round(3), width="stretch", hide_index=True)
-    st.caption(
-        "**这是决策依据。**\n"
-        "- SKDJ净贡献接近0或为负 → 可以放弃SKDJ，直接用回撤选股：信号更多、逻辑更简单\n"
-        "- SKDJ净贡献明显为正（两行都为正）→ SKDJ有独立价值，值得保留\n"
-        "- 只有一行为正、另一行为负 → 不稳定，多半是噪声"
-    )
-
-    st.subheader("表3 · 四种选股方案正面对比")
-    st.dataframe(result["schemes"].round(3), width="stretch", hide_index=True)
-    st.caption(
-        "①是当前策略，②是去掉SKDJ，③是只靠SKDJ不排序，④是纯随机基准。"
-        "**如果②不比①差，那SKDJ就是多余的**——而且②的可交易周数会明显更多，实操性更好。"
-    )
-
-    if not result["yearly"].empty:
-        st.subheader("表4 · 分年度：用SKDJ vs 不用SKDJ")
-        st.dataframe(result["yearly"].round(3), width="stretch", hide_index=True)
+    if not result["factor_table"].empty:
+        st.subheader("表2 · 周线附加因子（周内选股能力）")
+        st.dataframe(result["factor_table"].round(3), width="stretch", hide_index=True)
         st.caption(
-            "看「差值」这一列是否稳定为正。如果各年正负交替、幅度不大，"
-            "说明SKDJ的贡献不可靠。"
+            "同样带反向对照：**正向超额为正、反向为负、|t|>2** 三条都满足才可信。"
+            "只有正向为正而反向也为正的，是噪声。"
         )
+
+    if not result["combo_table"].empty:
+        st.subheader("表3 · 日线确认 + 回撤排序 的组合效果")
+        st.dataframe(result["combo_table"].round(3), width="stretch", hide_index=True)
+        st.caption(
+            "「收益/波动」是风险调整后的比较，比单看收益率更能说明问题。"
+            "可交易周数也要一起看——周数太少同样没有实操性。"
+        )
+
+    if not result["yearly_table"].empty:
+        st.subheader("表4 · 各入场方式分年度表现")
+        st.dataframe(result["yearly_table"].round(2), width="stretch", hide_index=True)
+        st.caption("看某种入场方式是否每年都优于基准，还是只靠某一年。")
 
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_factorial_2x2.csv",
-            result["table_2x2"].to_csv(index=False, encoding="utf-8-sig"),
+            "01_entry_methods.csv",
+            result["entry_table"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "02_factor_contribution.csv",
-            result["contrib"].to_csv(index=False, encoding="utf-8-sig"),
+            "02_weekly_factors.csv",
+            result["factor_table"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "03_scheme_comparison.csv",
-            result["schemes"].to_csv(index=False, encoding="utf-8-sig"),
+            "03_combo.csv",
+            result["combo_table"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "04_yearly_comparison.csv",
-            result["yearly"].to_csv(index=False, encoding="utf-8-sig"),
+            "04_yearly.csv",
+            result["yearly_table"].to_csv(index=False, encoding="utf-8-sig"),
+        )
+        archive.writestr(
+            "05_all_signals.csv",
+            signals.to_csv(index=False, encoding="utf-8-sig"),
         )
     st.download_button(
-        "下载分解验证结果",
+        "下载验证结果",
         data=output.getvalue(),
-        file_name="skdj_vs_drawdown_decomposition.zip",
+        file_name="daily_entry_validation.zip",
         mime="application/zip",
-        key="download_decomp",
+        key="download_entry",
     )
     return True
 
