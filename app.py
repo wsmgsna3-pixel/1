@@ -1054,6 +1054,19 @@ def yearly_entry_table(signals: pd.DataFrame, cost_pct: float):
 # -----------------------------------------------------------------------------
 # Streamlit
 # -----------------------------------------------------------------------------
+def _memory_usage_mb():
+    """当前进程内存占用（MB）。Streamlit Cloud 上限约1GB，超过会被直接杀掉，
+    表现为日志无报错、应用消失、需要重新部署。用它做运行中的预警。"""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as file_obj:
+            for line in file_obj:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return float("nan")
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔍 {APP_TITLE}")
@@ -1190,34 +1203,74 @@ def main():
         f"本次下载{sync_stats.get('downloaded_days', 0)}天。"
     )
 
+    # 内存优化：basic_indexed 含多列且行数庞大，但后续只用到流通市值。
+    # 立即裁成小表并释放原对象，避免它在整个回测过程中一直占内存。
+    if not basic_indexed.empty and "circ_mv" in basic_indexed.columns:
+        mv_lookup = (
+            basic_indexed[["circ_mv"]]
+            .reset_index()
+            .rename(columns={"trade_date_str": "Week"})
+        )
+        mv_lookup["circ_mv"] = pd.to_numeric(
+            mv_lookup["circ_mv"], errors="coerce"
+        ).astype("float32")
+        mv_lookup = mv_lookup.drop_duplicates(["Week", "ts_code"])
+    else:
+        mv_lookup = pd.DataFrame()
+    del basic_indexed
+    gc.collect()
+
     pullback_levels = [8.0, 12.0, 15.0]
     confirm_modes = [(12.0, "站回突破价"), (12.0, "周线收阳")]
 
-    # 先算全池的位置分位数，作为筛选门槛
+    # 内存优化：日线数据体积远大于周线（约1300只×1200行×20列）。
+    # 这里边构建周线边把对应日线从字典中弹出并释放，避免两份完整数据
+    # 同时驻留内存——Streamlit Cloud 内存上限约1GB，同时保留会被OOM杀掉
+    # （表现为日志无报错、应用直接消失、必须重新部署）。
+    needed_columns = ["trade_date_str", "open", "high", "low", "close", "vol"]
     position_samples = []
     weekly_cache = {}
     codes = sorted(stocks.keys())
-    prep = st.progress(0.0, text="计算全池位置分布……")
+    total_codes = len(codes)
+    prep = st.progress(0.0, text="构建周线并计算全池位置分布……")
     for idx, ts_code in enumerate(codes):
-        weekly = build_weekly_bars(stocks[ts_code])
+        daily = stocks.pop(ts_code)  # 弹出：字典中不再持有该股日线
+        weekly = build_weekly_bars(daily)
+        del daily
         if weekly.empty or len(weekly) < int(base_weeks) + 30:
             continue
+        # 只保留后续真正用到的列，并降精度，进一步压缩占用
+        keep = [c for c in needed_columns if c in weekly.columns]
+        weekly = weekly[keep].copy()
+        for column in ("open", "high", "low", "close", "vol"):
+            if column in weekly.columns:
+                weekly[column] = pd.to_numeric(
+                    weekly[column], errors="coerce"
+                ).astype("float32")
         weekly_cache[ts_code] = weekly
         features = compute_features(weekly, int(breakout_weeks), int(base_weeks))
         values = features.loc[features["breakout"].fillna(False), "position_2y"]
-        position_samples.append(values.dropna())
+        position_samples.append(values.dropna().astype("float32"))
+        del features
         if idx % 60 == 0:
-            prep.progress(min((idx + 1) / len(codes), 1.0))
+            prep.progress(min((idx + 1) / total_codes, 1.0))
     prep.empty()
+    del stocks
+    gc.collect()
+
     if not position_samples:
         st.error("数据不足。")
         return
     all_positions = pd.concat(position_samples, ignore_index=True)
+    del position_samples
+    gc.collect()
     position_threshold = (
         float(all_positions.quantile(1.0 - float(position_cut)))
         if float(position_cut) < 1.0
         else float("-inf")
     )
+    del all_positions
+    gc.collect()
     st.caption(
         f"位置门槛：只保留突破时价格 ≥ 两年高点的 "
         f"{position_threshold:.3f} 倍（前{float(position_cut)*100:.0f}%）"
@@ -1225,18 +1278,21 @@ def main():
 
     progress = st.progress(0.0, text="模拟洗盘与各种入场方式……")
     parts = []
-    for idx, (ts_code, weekly) in enumerate(weekly_cache.items()):
+    cached_codes = list(weekly_cache.keys())
+    for idx, ts_code in enumerate(cached_codes):
+        weekly = weekly_cache.pop(ts_code)  # 用完即释放
         rows = build_signals(
             weekly, ts_code, int(breakout_weeks), int(base_weeks),
             int(forward_weeks), float(stop_pct), pullback_levels, confirm_modes,
             position_threshold, bool(use_contraction),
         )
+        del weekly
         if not rows.empty:
             parts.append(rows)
         if idx % 40 == 0:
-            progress.progress(min((idx + 1) / len(weekly_cache), 1.0))
+            progress.progress(min((idx + 1) / len(cached_codes), 1.0))
     progress.empty()
-    del stocks, weekly_cache
+    del weekly_cache
     gc.collect()
 
     if not parts:
@@ -1250,20 +1306,27 @@ def main():
     signals = signals[
         pd.to_numeric(signals["Signal_Close"], errors="coerce") >= min_price
     ]
-    if not basic_indexed.empty:
-        basic_reset = basic_indexed.reset_index().rename(columns={"trade_date_str": "Week"})
-        keep = [c for c in ("Week", "ts_code", "circ_mv") if c in basic_reset.columns]
-        if len(keep) == 3:
-            signals = signals.merge(
-                basic_reset[keep].drop_duplicates(["Week", "ts_code"]),
-                on=["Week", "ts_code"], how="left",
-            )
-            mv = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
-            signals = signals[mv.between(min_mv, max_mv) | mv.isna()]
+    if not mv_lookup.empty:
+        signals = signals.merge(mv_lookup, on=["Week", "ts_code"], how="left")
+        mv = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
+        signals = signals[mv.between(min_mv, max_mv) | mv.isna()]
+        del mv_lookup
+        gc.collect()
     signals = signals.reset_index(drop=True)
     if signals.empty:
         st.error("过滤后无信号。")
         return
+
+    used_mb = _memory_usage_mb()
+    if math.isfinite(used_mb):
+        if used_mb > 750:
+            st.warning(
+                f"当前内存占用 {used_mb:.0f} MB，已接近 Streamlit Cloud 约1GB的上限。"
+                "如果之后出现应用崩溃需重新部署，请缩短回测时间范围"
+                "（例如改成2年）或收紧股票池条件。"
+            )
+        else:
+            st.caption(f"当前内存占用 {used_mb:.0f} MB（上限约1GB）")
 
     st.session_state["wash_result"] = {
         "signals": signals,
