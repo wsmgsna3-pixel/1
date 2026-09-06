@@ -826,7 +826,15 @@ def backtest_three_slot(
     if order_mode == "random":
         work["_order"] = rng.random(len(work))
     else:
-        work["_order"] = pd.to_numeric(work["K"], errors="coerce").fillna(999.0)
+        # order_mode 形如 "Drawdown_26W_pct:asc" 或 "K:asc"
+        column, _, direction = str(order_mode).partition(":")
+        column = column if column in work.columns else "K"
+        values = pd.to_numeric(work[column], errors="coerce")
+        # 缺失值排到最后：升序填+inf，降序填-inf
+        if direction == "desc":
+            work["_order"] = (-values).fillna(np.inf)
+        else:
+            work["_order"] = values.fillna(np.inf)
 
     work = work.sort_values(
         ["Entry_Index", "_order", "ts_code"], kind="mergesort"
@@ -893,7 +901,7 @@ def backtest_three_slot(
     summary = pd.DataFrame(
         [
             {
-                "层级": f"{slot_count}仓组合（{'按K值优选' if order_mode == 'K' else '随机选取'}）",
+                "层级": f"{slot_count}仓组合（{'随机选取' if order_mode == 'random' else '按规则优选'}）",
                 "完整信号": int(len(work)),
                 "实际买入": int(len(bought)),
                 "仓位冲突跳过": int(len(ledger) - len(bought)) if not ledger.empty else 0,
@@ -1031,6 +1039,7 @@ def sweep_slot_counts(
     cost_pct: float,
     slot_values,
     mc_runs: int,
+    order_mode: str = "K:asc",
     progress_callback=None,
 ):
     """扫描不同仓位数：真实收益 + 运气区间 + 排序规则贡献分位。
@@ -1042,7 +1051,7 @@ def sweep_slot_counts(
     for step, slots in enumerate(slot_values):
         summary, _, real_total = backtest_three_slot(
             signals, week_index, hold_weeks, cost_pct, int(slots),
-            order_mode="K", keep_ledger=False,
+            order_mode=order_mode, keep_ledger=False,
         )
         outcomes = monte_carlo_slots(
             signals, week_index, hold_weeks, cost_pct, int(slots), int(mc_runs)
@@ -1055,10 +1064,10 @@ def sweep_slot_counts(
                 "实际买入": int(summary["实际买入"].iloc[0]),
                 "单笔平均收益%": float(summary["单笔平均收益%"].iloc[0]),
                 "单笔胜率%": float(summary["单笔胜率%"].iloc[0]),
-                "按K优选总收益%": real_total,
+                "按规则优选总收益%": real_total,
                 "随机中位数%": float(np.median(outcomes)),
                 "运气区间宽度pp": high - low,
-                "K优选所处分位%": float((outcomes < real_total).mean() * 100.0),
+                "优选所处分位%": float((outcomes < real_total).mean() * 100.0),
             }
         )
         if progress_callback:
@@ -1117,6 +1126,16 @@ def main():
         st.subheader("资金与成本")
         slot_count = st.number_input(
             "仓位数（同时最多持有几只）", value=3, min_value=1, max_value=50, step=1,
+        )
+        rank_choice = st.selectbox(
+            "周内排序规则（决定同一周买哪几只）",
+            [
+                "26周回撤最深优先（检验通过：超额+0.99%，t=2.51，反向对照为负）",
+                "K值最低优先（检验显示无效：超额-0.05%，t=-0.21）",
+                "距MA20最近优先（反向对照也为正，疑似噪声）",
+                "13周涨幅最高优先（反向对照也为正，疑似噪声）",
+            ],
+            index=0,
         )
         min_week_signals = st.number_input(
             "信号密度门槛：当周至少N只触发才出手",
@@ -1194,6 +1213,17 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
+
+    rank_map = {
+        "26周回撤最深优先（检验通过：超额+0.99%，t=2.51，反向对照为负）":
+            ("Drawdown_26W_pct:asc", "26周回撤最深优先"),
+        "K值最低优先（检验显示无效：超额-0.05%，t=-0.21）": ("K:asc", "K值最低优先"),
+        "距MA20最近优先（反向对照也为正，疑似噪声）":
+            ("Dist_MA20_pct:asc", "距MA20最近优先"),
+        "13周涨幅最高优先（反向对照也为正，疑似噪声）":
+            ("Return_13W_pct:desc", "13周涨幅最高优先"),
+    }
+    order_mode, order_label = rank_map[rank_choice]
 
     start_date = start_input.strftime("%Y%m%d")
     end_date = end_input.strftime("%Y%m%d")
@@ -1297,7 +1327,7 @@ def main():
     )
     slot_summary, slot_ledger, slot_total = backtest_three_slot(
         signals, week_index, int(hold_weeks), float(cost_pct), int(slot_count),
-        order_mode="K",
+        order_mode=order_mode,
     )
 
     mc_progress = st.progress(0.0, text="随机重排选股顺序，重复回测……")
@@ -1314,6 +1344,7 @@ def main():
             signals, week_index, int(hold_weeks), float(cost_pct),
             [1, 2, 3, 4, 5, 6, 8, 10],
             max(30, int(mc_runs) // 4),
+            order_mode=order_mode,
             progress_callback=lambda p: sweep_progress.progress(p),
         )
         sweep_progress.empty()
@@ -1360,6 +1391,7 @@ def main():
             "N": int(n_period), "M": int(m_period), "阈值": float(level),
             "要求K>D": bool(require_kd), "持有周数": int(hold_weeks),
             "仓位数": int(slot_count), "成本%": float(cost_pct),
+            "排序规则": order_label,
             "区间": f"{start_date}—{end_date}",
         },
     }
@@ -1392,7 +1424,8 @@ def render_results():
         f"{signals['Signal_Week'].min()} — {signals['Signal_Week'].max()}　|　"
         f"参数：N={params['N']} M={params['M']} K≤{params['阈值']:.0f} "
         f"{'且K>D ' if params['要求K>D'] else ''}持有{params['持有周数']}周 "
-        f"{params['仓位数']}仓 成本{params['成本%']:.2f}%"
+        f"{params['仓位数']}仓 成本{params['成本%']:.2f}%　|　"
+        f"排序：{params.get('排序规则', '—')}"
     )
     if density and density.get("门槛", 1) > 1:
         st.info(
@@ -1432,7 +1465,7 @@ def render_results():
             {"指标": "随机选股 中位数", "总收益率%": float(np.median(outcomes))},
             {"指标": "随机选股 平均", "总收益率%": float(outcomes.mean())},
             {"指标": "随机选股 最好5%", "总收益率%": float(np.percentile(outcomes, 95))},
-            {"指标": "▶ 按K值优选（真实规则）", "总收益率%": slot_total},
+            {"指标": "▶ 按规则优选（真实结果）", "总收益率%": slot_total},
             {"指标": "▶ 信号层（无资金约束）",
              "总收益率%": float(sig_summary["总收益率%"].iloc[0])},
         ]
@@ -1446,7 +1479,7 @@ def render_results():
 
 - 随机选股{mc_runs}次，总收益率的90%区间宽度是 **{spread:.1f}个百分点**
   —— 这就是仓位路径依赖带来的**纯运气区间**。区间越宽，单次回测结果越不可信。
-- 按K值优选的真实结果落在随机分布的 **{percentile_of_real:.0f}%分位**。
+- 按排序规则优选的真实结果落在随机分布的 **{percentile_of_real:.0f}%分位**。
   - 接近50% → 排序规则基本没贡献，结果主要靠运气
   - 高于90% → 排序规则确实有效
 - 信号层收益与组合层之差 = 资金约束的代价。
@@ -1508,7 +1541,7 @@ def render_results():
         st.dataframe(sweep_table.round(2), width="stretch", hide_index=True)
         st.caption(
             "**这是选仓位数的依据。**「运气区间宽度」越小，回测结论越可信；"
-            "「K优选所处分位」越高（>70%）说明排序规则真正起了作用，接近50%则等于随机。"
+            "「优选所处分位」越高（>70%）说明排序规则真正起了作用，接近50%则等于随机。"
             "实盘拿不了太多只时，就在你能接受的仓位数里，选运气区间已经收敛的那个。"
             "如果3-5仓的区间仍然很宽，说明必须靠信号密度门槛来集中火力，而不是靠加仓位。"
         )
