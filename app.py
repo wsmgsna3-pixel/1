@@ -1,28 +1,29 @@
 # -*- coding: utf-8 -*-
-"""洗盘验证器（单文件独立版，直接覆盖 app.py 运行）。
+"""样本外测试器（单文件独立版，直接覆盖 app.py 运行）。
 
-上一轮结论：突破+接近两年高点+波动压缩的组合，涨超100%的概率是全池基准的
-2.37倍——选股确实找对了。但移动止损后的实际收益却只有3.95%，
-且加入"区间宽"特征后收益转负、止损中位数从-7%恶化到-14%、胜率从40%掉到31%。
+背景与目的：
+突破策略在2022-2026期间表现为：翻倍概率15.41%（全池基准7.33%，提升2.10倍），
+移动止损后收益6.47%。但77%的信号（988/1285）集中在2025-2026两年，
+所谓"四年回测"在信息量上其实只有两年。
 
-诊断：不是选错股票，而是固定止损把赢家提前赶走了。
+更值得注意的是：2024年全市场+4.12%而该策略-3.91%；
+2026年全市场-2.29%而该策略+8.16%。说明它不是单纯的牛市beta，
+2025-2026与2022-2024之间存在某种市场结构差异。
 
-本工具验证两个假设：
-  1. 真正的上涨浪起来之前存在洗盘（即使最终大涨的股票，中途也深度回撤）
-  2. 如果洗盘存在，能否等洗盘结束后再介入
+但用同一份数据无法分辨以下两种可能：
+  (a) 过拟合——参数是在这份数据上试出来的，换时期即失效
+  (b) 行情依赖——逻辑真实，但只在特定市场结构下有效
 
-第二点的关键优势：在更低位置进场后，同样15%的止损从更低成本算起，
-被打掉的概率自然更小——不需要把止损放宽到实盘无法承受的25~40%。
+唯一的分辨方法是拿全新的数据做样本外测试。本工具即为此设计：
+策略参数全部锁死为模块级常量，只允许修改测试区间。
 
-必须同时验证的前提：洗盘和失败在事前是否可区分。如果不可区分，
-"等回撤再买"就等于把失败的票也一起买了，这会体现在成交率和大涨比例上。
+使用纪律：绝对不要在新数据上调整这些参数。样本外测试的全部价值就在于
+"规则不动，只换数据"；一旦调参，就等于又做了一轮样本内拟合，测试立即失效。
 
-止损范围限定在5~25%（实盘可承受），不再测更宽的止损。
+内存优化：边构建周线边释放日线，避免两份完整数据共存
+（Streamlit Cloud 上限约1GB，超出会被静默杀死、需重新部署）。
 
-所有判断只用当周及之前数据；限价单按盘中触及成交，确认类按当周收盘确认、
-次周开盘买入，无未来函数。
-
-行情缓存与之前共用，已下载数据不会重复下载。
+行情缓存与之前共用，但测试早期区间需要额外下载历史数据。
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ import time
 import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -52,7 +53,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "洗盘验证：能否等洗盘后再介入"
+APP_TITLE = "样本外测试：规则冻结，只换数据"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
@@ -682,381 +683,203 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # 信号与路径
 # -----------------------------------------------------------------------------
-def compute_features(weekly: pd.DataFrame, breakout_weeks: int, base_weeks: int):
+
+# =============================================================================
+# 冻结的策略规则 —— 这些数值来自 2022-2026 样本内测试，本工具不允许修改。
+# 样本外测试的全部意义就在于"规则不动，只换数据"。
+# 一旦在新数据上调参数，这次测试就失去价值，等于又做了一轮样本内拟合。
+# =============================================================================
+FROZEN_BREAKOUT_WEEKS = 26          # 突破26周新高
+FROZEN_POSITION_QUANTILE = 0.33     # 只取接近两年高点的前33%
+FROZEN_VOL_CONTRACTION_MAX = 0.8    # 波动率压缩 ≤0.8
+FROZEN_FORWARD_WEEKS = 26           # 前瞻26周
+FROZEN_STOP_PCT = 15.0              # 移动止损15%（实盘可承受范围）
+FROZEN_ENTRY = "立即买入"            # 突破次周开盘买入（洗盘验证已证明等回撤更差）
+
+# 2022-2026 样本内基准结果，用于并排对照
+IN_SAMPLE_REFERENCE = {
+    "期间": "2022-2026（样本内，已反复优化）",
+    "信号数": 1285,
+    "翻倍概率%": 15.41,
+    "全池基准翻倍概率%": 7.33,
+    "提升倍数": 2.10,
+    "止损后收益%": 6.47,
+    "止损后胜率%": 38.75,
+    "涨超50%比例": 36.34,
+}
+
+
+def compute_features(weekly: pd.DataFrame):
     close = pd.to_numeric(weekly["close"], errors="coerce")
     high = pd.to_numeric(weekly["high"], errors="coerce")
-    low = pd.to_numeric(weekly["low"], errors="coerce")
-    volume = (
-        pd.to_numeric(weekly["vol"], errors="coerce")
-        if "vol" in weekly.columns
-        else pd.Series(np.nan, index=weekly.index, dtype="float64")
-    )
     return_1w = (close / close.shift(1) - 1.0) * 100.0
-
     features = pd.DataFrame(index=weekly.index)
-    features["breakout"] = close > close.shift(1).rolling(breakout_weeks).max()
+    features["breakout"] = (
+        close > close.shift(1).rolling(FROZEN_BREAKOUT_WEEKS).max()
+    )
     features["position_2y"] = close / high.shift(1).rolling(104).max().replace(0, np.nan)
     vol_recent = return_1w.shift(1).rolling(8).std()
     vol_earlier = return_1w.shift(9).rolling(18).std()
     features["vol_contraction"] = vol_recent / vol_earlier.replace(0, np.nan)
-    features["volume_surge"] = (
-        volume / volume.shift(1).rolling(8).mean().replace(0, np.nan)
-    )
-    # 个股自身的周波动率，用于判断回撤是否属于其正常波动范围
-    features["weekly_vol"] = return_1w.rolling(26).std()
     return features
 
 
-def analyze_signal_path(
-    close_values, high_values, low_values, open_values,
-    signal_index: int, forward_weeks: int, stop_pct: float,
-    pullback_levels, confirm_modes,
-):
-    """对单个突破信号，模拟"立即买入"与各种"等洗盘后买入"的结果。
-
-    统一口径：
-      - 限价单：盘中最低价触及目标价即成交；若开盘已低于目标价则按开盘价
-      - 确认类：当周收盘满足条件 -> 次周开盘买入
-      - 所有方式共用同一个观察截止周，止损幅度也相同
-    """
-    n = len(close_values)
-    stop_index = min(signal_index + forward_weeks, n - 1)
-    if stop_index <= signal_index + 1:
-        return None
-
-    entry_index_immediate = signal_index + 1
-    entry_immediate = open_values[entry_index_immediate]
-    if not math.isfinite(entry_immediate) or entry_immediate <= 0:
-        return None
-    signal_close = close_values[signal_index]
-
-    def outcome_from(entry_idx, entry_price):
-        """给定入场点，算最大涨幅、止损收益、持有到期收益、以及最大逆向波动。"""
-        if entry_idx is None or not math.isfinite(entry_price) or entry_price <= 0:
-            return None
-        if entry_idx > stop_index:
-            return None
-        window_high = high_values[entry_idx : stop_index + 1]
-        window_low = low_values[entry_idx : stop_index + 1]
-        finite_high = window_high[np.isfinite(window_high)]
-        max_gain = (
-            (finite_high.max() / entry_price - 1.0) * 100.0 if finite_high.size else np.nan
-        )
-        # 到达最高点之前的最大跌幅（衡量"要忍多少痛才等到涨"）
-        if finite_high.size:
-            peak_offset = int(np.nanargmax(window_high))
-            pre_peak_low = window_low[: peak_offset + 1]
-            finite_low = pre_peak_low[np.isfinite(pre_peak_low)]
-            max_adverse = (
-                (finite_low.min() / entry_price - 1.0) * 100.0 if finite_low.size else np.nan
-            )
-        else:
-            max_adverse = np.nan
-        # 止损收益
-        peak = entry_price
-        exit_price = None
-        for j in range(entry_idx, stop_index + 1):
-            current = close_values[j]
-            if not math.isfinite(current):
-                continue
-            peak = max(peak, current)
-            if current <= peak * (1.0 - stop_pct / 100.0):
-                exit_price = current
-                break
-        if exit_price is None:
-            exit_price = close_values[stop_index]
-        trail_return = (
-            (exit_price / entry_price - 1.0) * 100.0 if math.isfinite(exit_price) else np.nan
-        )
-        hold_return = (
-            (close_values[stop_index] / entry_price - 1.0) * 100.0
-            if math.isfinite(close_values[stop_index])
-            else np.nan
-        )
-        return {
-            "max_gain": max_gain,
-            "max_adverse": max_adverse,
-            "trail": trail_return,
-            "hold": hold_return,
-            "entry_index": entry_idx,
-        }
-
-    result = {"signal_index": signal_index}
-    immediate = outcome_from(entry_index_immediate, entry_immediate)
-    if immediate is None:
-        return None
-    result["立即买入"] = immediate
-
-    # ---- 等回撤到指定幅度再买（限价单）----
-    for level in pullback_levels:
-        target = signal_close * (1.0 - level / 100.0)
-        filled_index = None
-        fill_price = np.nan
-        for j in range(signal_index + 1, stop_index + 1):
-            day_low = low_values[j]
-            day_open = open_values[j]
-            if math.isfinite(day_low) and day_low <= target:
-                fill_price = (
-                    day_open
-                    if math.isfinite(day_open) and day_open < target
-                    else target
-                )
-                filled_index = j
-                break
-        outcome = outcome_from(filled_index, fill_price) if filled_index else None
-        result[f"回撤{level:.0f}%买入"] = outcome
-
-    # ---- 洗盘后需要回升确认 ----
-    for level, mode in confirm_modes:
-        target = signal_close * (1.0 - level / 100.0)
-        pullback_index = None
-        for j in range(signal_index + 1, stop_index + 1):
-            day_low = low_values[j]
-            if math.isfinite(day_low) and day_low <= target:
-                pullback_index = j
-                break
-        outcome = None
-        if pullback_index is not None:
-            for j in range(pullback_index, stop_index):
-                current = close_values[j]
-                if not math.isfinite(current):
-                    continue
-                confirmed = False
-                if mode == "站回突破价":
-                    confirmed = current >= signal_close
-                elif mode == "周线收阳":
-                    prev = close_values[j - 1] if j > 0 else np.nan
-                    confirmed = math.isfinite(prev) and current > prev
-                if confirmed:
-                    entry_price = open_values[j + 1]
-                    outcome = outcome_from(j + 1, entry_price)
-                    break
-        result[f"回撤{level:.0f}%后{mode}"] = outcome
-
-    return result
-
-
-def build_signals(
-    weekly: pd.DataFrame, ts_code: str, breakout_weeks: int, base_weeks: int,
-    forward_weeks: int, stop_pct: float, pullback_levels, confirm_modes,
-    position_quantile_value: float, use_contraction: bool,
+def evaluate_stock(
+    weekly: pd.DataFrame, ts_code: str, position_threshold: float
 ) -> pd.DataFrame:
-    if len(weekly) < base_weeks + 30:
+    """对单只股票：算出全部周的基准结果 + 符合冻结规则的信号结果。
+
+    基准 = 该股所有周（无条件买入），用于计算"随机买入"的翻倍概率。
+    信号 = 满足 突破+接近高点+波动压缩 的周。
+    两者用完全相同的前瞻与止损口径，可直接比较。
+    """
+    if len(weekly) < 140:
         return pd.DataFrame()
-    features = compute_features(weekly, breakout_weeks, base_weeks)
+    features = compute_features(weekly)
     close_values = pd.to_numeric(weekly["close"], errors="coerce").to_numpy()
     high_values = pd.to_numeric(weekly["high"], errors="coerce").to_numpy()
-    low_values = pd.to_numeric(weekly["low"], errors="coerce").to_numpy()
     open_values = pd.to_numeric(weekly["open"], errors="coerce").to_numpy()
     dates = weekly["trade_date_str"].astype(str).tolist()
+    n = len(weekly)
 
     breakout = features["breakout"].fillna(False).to_numpy()
     position = features["position_2y"].to_numpy()
     contraction = features["vol_contraction"].to_numpy()
-    volume_surge = features["volume_surge"].to_numpy()
-    weekly_vol = features["weekly_vol"].to_numpy()
 
     rows = []
-    for i in range(len(weekly)):
-        if not breakout[i]:
+    for i in range(n - 1):
+        entry_price = open_values[i + 1]
+        if not math.isfinite(entry_price) or entry_price <= 0:
             continue
-        if math.isfinite(position_quantile_value) and not (
-            math.isfinite(position[i]) and position[i] >= position_quantile_value
-        ):
+        stop_index = min(i + FROZEN_FORWARD_WEEKS, n - 1)
+        if stop_index <= i + 1:
             continue
-        if use_contraction and not (
-            math.isfinite(contraction[i]) and contraction[i] <= 0.8
-        ):
+        window_high = high_values[i + 1 : stop_index + 1]
+        finite_high = window_high[np.isfinite(window_high)]
+        if not finite_high.size:
             continue
-        path = analyze_signal_path(
-            close_values, high_values, low_values, open_values,
-            i, forward_weeks, stop_pct, pullback_levels, confirm_modes,
+        max_gain = (finite_high.max() / entry_price - 1.0) * 100.0
+
+        peak = entry_price
+        exit_price = None
+        for j in range(i + 1, stop_index + 1):
+            current = close_values[j]
+            if not math.isfinite(current):
+                continue
+            peak = max(peak, current)
+            if current <= peak * (1.0 - FROZEN_STOP_PCT / 100.0):
+                exit_price = current
+                break
+        if exit_price is None:
+            exit_price = close_values[stop_index]
+        if not math.isfinite(exit_price):
+            continue
+        trail_return = (exit_price / entry_price - 1.0) * 100.0
+
+        is_signal = bool(
+            breakout[i]
+            and math.isfinite(position[i])
+            and position[i] >= position_threshold
+            and math.isfinite(contraction[i])
+            and contraction[i] <= FROZEN_VOL_CONTRACTION_MAX
         )
-        if path is None:
-            continue
-        row = {
-            "ts_code": ts_code,
-            "Week": dates[i],
-            "Signal_Close": close_values[i],
-            "Position_2Y": position[i],
-            "Vol_Contraction": contraction[i],
-            "Volume_Surge": volume_surge[i],
-            "Weekly_Vol": weekly_vol[i],
-        }
-        for key, outcome in path.items():
-            if key == "signal_index":
-                continue
-            if outcome is None:
-                row[f"{key}_成交"] = False
-                continue
-            row[f"{key}_成交"] = True
-            row[f"{key}_最大涨幅"] = outcome["max_gain"]
-            row[f"{key}_最大逆向"] = outcome["max_adverse"]
-            row[f"{key}_止损收益"] = outcome["trail"]
-            row[f"{key}_持有到期"] = outcome["hold"]
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-# -----------------------------------------------------------------------------
-# 分析
-# -----------------------------------------------------------------------------
-def washout_evidence(signals: pd.DataFrame):
-    """洗盘存在性检验：把最终大涨的和没涨的分开，看它们中途各回撤了多少。
-
-    如果连最终大涨的股票，中途也普遍深度回撤，
-    就证明"固定止损把赢家提前赶走"这个诊断成立。
-    """
-    gain = pd.to_numeric(signals.get("立即买入_最大涨幅"), errors="coerce")
-    adverse = pd.to_numeric(signals.get("立即买入_最大逆向"), errors="coerce")
-    work = pd.DataFrame({"gain": gain, "adverse": adverse}).dropna()
-    if work.empty:
-        return pd.DataFrame()
-    buckets = [
-        ("失败（最大涨幅<10%）", work["gain"] < 10),
-        ("一般（10~30%）", (work["gain"] >= 10) & (work["gain"] < 30)),
-        ("良好（30~50%）", (work["gain"] >= 30) & (work["gain"] < 50)),
-        ("大涨（50~100%）", (work["gain"] >= 50) & (work["gain"] < 100)),
-        ("翻倍以上（>100%）", work["gain"] >= 100),
-    ]
-    rows = []
-    for label, mask in buckets:
-        subset = work.loc[mask, "adverse"]
-        if subset.empty:
-            continue
         rows.append(
             {
-                "最终结果分组": label,
-                "样本数": int(len(subset)),
-                "中途最大跌幅 中位数%": float(subset.median()),
-                "中途最大跌幅 平均%": float(subset.mean()),
-                "跌超10%比例": float((subset <= -10).mean() * 100.0),
-                "跌超15%比例": float((subset <= -15).mean() * 100.0),
-                "跌超20%比例": float((subset <= -20).mean() * 100.0),
-                "跌超30%比例": float((subset <= -30).mean() * 100.0),
+                "ts_code": ts_code,
+                "Week": dates[i],
+                "Is_Signal": is_signal,
+                "Entry_Price": entry_price,
+                "Max_Gain_pct": max_gain,
+                "Trail_Return_pct": trail_return,
             }
         )
     return pd.DataFrame(rows)
 
 
-def entry_method_comparison(signals: pd.DataFrame, cost_pct: float):
-    """各入场方式对比：洗盘后介入是否真的更好。"""
-    methods = sorted(
-        {
-            column.rsplit("_", 1)[0]
-            for column in signals.columns
-            if column.endswith("_止损收益")
-        }
-    )
-    total = len(signals)
+# -----------------------------------------------------------------------------
+# 汇总
+# -----------------------------------------------------------------------------
+def summarize(panel: pd.DataFrame, cost_pct: float, label: str):
+    gain = pd.to_numeric(panel["Max_Gain_pct"], errors="coerce")
+    trail = pd.to_numeric(panel["Trail_Return_pct"], errors="coerce") - cost_pct
+    valid = gain.notna() & trail.notna()
+    gain, trail = gain[valid], trail[valid]
+    if gain.empty:
+        return {}
+    return {
+        "组别": label,
+        "样本数": int(len(gain)),
+        "涨超50%比例": float((gain > 50).mean() * 100.0),
+        "翻倍概率%": float((gain > 100).mean() * 100.0),
+        "止损后收益%": float(trail.mean()),
+        "止损后中位%": float(trail.median()),
+        "止损后胜率%": float((trail > 0).mean() * 100.0),
+    }
+
+
+def main_comparison(panel: pd.DataFrame, cost_pct: float):
+    signal = panel[panel["Is_Signal"].astype(bool)]
+    baseline = panel
     rows = []
-    for method in methods:
-        filled = signals.get(f"{method}_成交", pd.Series(False, index=signals.index))
-        filled = filled.fillna(False).astype(bool)
-        trail = (
-            pd.to_numeric(signals.loc[filled, f"{method}_止损收益"], errors="coerce").dropna()
-            - cost_pct
-        )
-        hold = (
-            pd.to_numeric(signals.loc[filled, f"{method}_持有到期"], errors="coerce").dropna()
-            - cost_pct
-        )
-        gain = pd.to_numeric(
-            signals.loc[filled, f"{method}_最大涨幅"], errors="coerce"
-        ).dropna()
-        adverse = pd.to_numeric(
-            signals.loc[filled, f"{method}_最大逆向"], errors="coerce"
-        ).dropna()
-        if trail.empty:
-            continue
-        rows.append(
+    base_stats = summarize(baseline, cost_pct, "全池基准（所有周无条件买入）")
+    signal_stats = summarize(signal, cost_pct, "冻结规则信号")
+    if base_stats:
+        rows.append(base_stats)
+    if signal_stats:
+        rows.append(signal_stats)
+    table = pd.DataFrame(rows)
+    if len(table) == 2:
+        lift = pd.Series(
             {
-                "入场方式": method,
-                "成交数": int(filled.sum()),
-                "成交率%": float(filled.sum() / total * 100.0) if total else np.nan,
-                "止损后收益%": float(trail.mean()),
-                "止损后中位%": float(trail.median()),
-                "止损后胜率%": float((trail > 0).mean() * 100.0),
-                "持有到期收益%": float(hold.mean()) if len(hold) else np.nan,
-                "涨超50%比例": float((gain > 50).mean() * 100.0) if len(gain) else np.nan,
-                "涨超100%比例": float((gain > 100).mean() * 100.0) if len(gain) else np.nan,
-                "中途最大跌幅中位%": float(adverse.median()) if len(adverse) else np.nan,
+                "组别": "提升倍数（信号÷基准）",
+                "样本数": np.nan,
+                "涨超50%比例": table["涨超50%比例"].iloc[1] / table["涨超50%比例"].iloc[0]
+                if table["涨超50%比例"].iloc[0]
+                else np.nan,
+                "翻倍概率%": table["翻倍概率%"].iloc[1] / table["翻倍概率%"].iloc[0]
+                if table["翻倍概率%"].iloc[0]
+                else np.nan,
+                "止损后收益%": np.nan,
+                "止损后中位%": np.nan,
+                "止损后胜率%": np.nan,
             }
         )
-    result = pd.DataFrame(rows)
-    if not result.empty:
-        result = result.sort_values("止损后收益%", ascending=False).reset_index(drop=True)
-    return result
+        table = pd.concat([table, lift.to_frame().T], ignore_index=True)
+    return table
 
 
-def stop_sensitivity(signals: pd.DataFrame, cost_pct: float):
-    """在最优入场方式下，不同止损幅度的效果（只测实盘可承受的范围）。
-
-    注意：这里用"中途最大跌幅"重新推算不同止损的触发情况是近似的，
-    真实结果需要重跑；本表用于判断方向，不作为最终依据。
-    """
-    methods = sorted(
-        {
-            column.rsplit("_", 1)[0]
-            for column in signals.columns
-            if column.endswith("_最大逆向")
-        }
-    )
-    rows = []
-    for method in methods:
-        filled = signals.get(f"{method}_成交", pd.Series(False, index=signals.index))
-        filled = filled.fillna(False).astype(bool)
-        adverse = pd.to_numeric(
-            signals.loc[filled, f"{method}_最大逆向"], errors="coerce"
-        )
-        gain = pd.to_numeric(
-            signals.loc[filled, f"{method}_最大涨幅"], errors="coerce"
-        )
-        work = pd.DataFrame({"adverse": adverse, "gain": gain}).dropna()
-        if work.empty:
-            continue
-        big = work["gain"] >= 50
-        row = {"入场方式": method, "成交数": int(len(work))}
-        for stop in (8, 10, 12, 15, 20):
-            killed = work["adverse"] <= -stop
-            row[f"{stop}%止损误杀大涨比例"] = (
-                float((killed & big).sum() / big.sum() * 100.0) if big.sum() else np.nan
-            )
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def yearly_entry_table(signals: pd.DataFrame, cost_pct: float):
-    work = signals.copy()
+def yearly_table(panel: pd.DataFrame, cost_pct: float):
+    work = panel.copy()
     work["年份"] = work["Week"].astype(str).str[:4]
-    methods = sorted(
-        {
-            column.rsplit("_", 1)[0]
-            for column in signals.columns
-            if column.endswith("_止损收益")
-        }
-    )
     rows = []
     for year, group in work.groupby("年份"):
-        record = {"年份": year, "信号数": len(group)}
-        for method in methods:
-            filled = group.get(f"{method}_成交", pd.Series(False, index=group.index))
-            filled = filled.fillna(False).astype(bool)
-            trail = (
-                pd.to_numeric(group.loc[filled, f"{method}_止损收益"], errors="coerce").dropna()
-                - cost_pct
-            )
-            record[method] = float(trail.mean()) if len(trail) else np.nan
-        rows.append(record)
+        signal = group[group["Is_Signal"].astype(bool)]
+        base_gain = pd.to_numeric(group["Max_Gain_pct"], errors="coerce").dropna()
+        if signal.empty or base_gain.empty:
+            continue
+        gain = pd.to_numeric(signal["Max_Gain_pct"], errors="coerce").dropna()
+        trail = (
+            pd.to_numeric(signal["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
+        )
+        base_double = float((base_gain > 100).mean() * 100.0)
+        signal_double = float((gain > 100).mean() * 100.0) if len(gain) else np.nan
+        rows.append(
+            {
+                "年份": year,
+                "信号数": int(len(signal)),
+                "信号翻倍概率%": signal_double,
+                "基准翻倍概率%": base_double,
+                "提升倍数": (
+                    signal_double / base_double if base_double and base_double > 0 else np.nan
+                ),
+                "止损后收益%": float(trail.mean()) if len(trail) else np.nan,
+                "止损后胜率%": float((trail > 0).mean() * 100.0) if len(trail) else np.nan,
+            }
+        )
     return pd.DataFrame(rows)
 
 
-# -----------------------------------------------------------------------------
-# Streamlit
-# -----------------------------------------------------------------------------
 def _memory_usage_mb():
-    """当前进程内存占用（MB）。Streamlit Cloud 上限约1GB，超过会被直接杀掉，
-    表现为日志无报错、应用消失、需要重新部署。用它做运行中的预警。"""
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as file_obj:
             for line in file_obj:
@@ -1067,21 +890,29 @@ def _memory_usage_mb():
     return float("nan")
 
 
+# -----------------------------------------------------------------------------
+# Streamlit
+# -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"🔍 {APP_TITLE}")
-    st.caption("先证明洗盘存在，再测能不能等洗盘结束后再进场。")
+    st.title(f"🧊 {APP_TITLE}")
+    st.caption("规则完全冻结，只换数据——这是唯一能分辨真规律与过拟合的方法。")
+    st.error(
+        "**使用纪律：这个工具里的策略参数是锁死的，请不要修改代码去调它们。**\n\n"
+        "样本外测试的全部价值就在于「规则不动，只换数据」。"
+        "一旦在新数据上试参数，这次测试立刻失效，等于又做了一轮样本内拟合。"
+        "如果结果不好，那就是不好——那本身就是最有价值的信息。"
+    )
     st.info(
-        "**两步验证：**\n\n"
-        "**第一步 · 洗盘是否真实存在**　把突破后最终大涨的股票和没涨的分开，"
-        "看它们中途各自回撤了多少。如果连最终翻倍的股票中途也普遍跌15%以上，"
-        "就证明固定止损确实在提前赶走赢家。\n\n"
-        "**第二步 · 能否等洗盘后再买**　对比立即买入与几种等回撤后介入的方式。"
-        "**关键优势**：在更低的位置进场，同样15%的止损从更低成本算起，"
-        "被打掉的概率自然更小——不用放宽止损就能解决被洗出的问题。\n\n"
-        "**但有个前提要验证**：洗盘和失败在事前长得一样。"
-        "如果分不出来，等回撤再买就等于把失败的票也一起买了——"
-        "这会体现在成交率和涨超50%比例的变化上。"
+        "**冻结的规则**（来自2022-2026样本内测试）：\n\n"
+        f"- 突破 {FROZEN_BREAKOUT_WEEKS} 周新高\n"
+        f"- 价格接近两年高点（前 {FROZEN_POSITION_QUANTILE*100:.0f}%）\n"
+        f"- 波动率压缩 ≤ {FROZEN_VOL_CONTRACTION_MAX}\n"
+        f"- 突破次周开盘买入（洗盘验证已证明等回撤更差）\n"
+        f"- 移动止损 {FROZEN_STOP_PCT:.0f}%，最长持有 {FROZEN_FORWARD_WEEKS} 周\n\n"
+        "**要检验的问题**：2022-2026期间该规则翻倍概率15.41%，是基准7.33%的2.1倍。"
+        "但77%的信号集中在2025-2026两年——这究竟是真规律，"
+        "还是只在最近两年的市场结构下成立？"
     )
 
     with st.sidebar:
@@ -1091,42 +922,23 @@ def main():
         except Exception:
             secret_token = ""
         token_input = st.text_input("Tushare Token", value=secret_token, type="password")
-        today = pd.Timestamp.now().date()
-        start_input = st.date_input("开始日期", value=today - timedelta(days=365 * 4))
-        end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.subheader("突破信号")
-        breakout_weeks = st.number_input("突破几周新高", value=26, min_value=4, max_value=104, step=2)
-        base_weeks = st.number_input("基底考察周数", value=26, min_value=8, max_value=104, step=2)
-        position_cut = st.slider(
-            "只保留接近两年高点的前百分之几",
-            min_value=0.10, max_value=1.00, value=0.33, step=0.05,
-            help="上轮验证：越接近两年高点，大涨概率越高（5年里4年正向）。设为1.00则不筛选。",
-        )
-        use_contraction = st.checkbox(
-            "同时要求波动率压缩（≤0.8）", value=True,
-            help="上轮F组合的组成部分，涨超100%提升2.37倍。",
-        )
+        st.subheader("测试区间（这是唯一该改的东西）")
+        st.caption("建议先跑 2018-01-01 至 2022-08-31，这段我们从未碰过。")
+        start_input = st.date_input("开始日期", value=date(2018, 1, 1))
+        end_input = st.date_input("结束日期", value=date(2022, 8, 31))
 
         st.markdown("---")
-        st.subheader("洗盘与止损")
-        forward_weeks = st.number_input("前瞻观察周数", value=26, min_value=8, max_value=104, step=2)
-        stop_pct = st.number_input(
-            "移动止损%（实盘可承受范围）", value=15.0, min_value=5.0, max_value=25.0, step=1.0,
-            help="不再测25%以上——单笔亏那么多实盘扛不住。",
-        )
-        cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
-
-        st.markdown("---")
-        st.subheader("股票池硬条件")
+        st.subheader("股票池（与样本内保持一致）")
         min_price = st.number_input("最低股价（元）", value=10.0, min_value=0.0, step=1.0)
         min_mv = st.number_input("最低流通市值（亿元）", value=100.0, min_value=0.0, step=10.0)
         max_mv = st.number_input("最高流通市值（亿元）", value=1000.0, min_value=100.0, step=100.0)
+        cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
 
         st.markdown("---")
         clear_cache_clicked = st.button("清空行情缓存")
-        run_clicked = st.button("开始验证", type="primary")
+        run_clicked = st.button("开始样本外测试", type="primary")
 
     if clear_cache_clicked:
         if os.path.isdir(MARKET_CACHE_ROOT):
@@ -1134,34 +946,36 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
-        if st.session_state.get("wash_result"):
+        if st.session_state.get("oos_result"):
             return
         st.markdown(
             """
-### 对比的入场方式
+### 结果会怎么读
 
-| 方式 | 说明 |
-|---|---|
-| 立即买入 | 突破次周开盘买（基准） |
-| 回撤8/12/15%买入 | 挂低于突破周收盘价N%的限价单 |
-| 回撤12%后站回突破价 | 洗完盘、价格重新站上突破价才买 |
-| 回撤12%后周线收阳 | 洗完盘、出现一根周阳线才买 |
+跑完会得到「新区间」的三个数字，和2022-2026并排对照：
 
-后两种是"等洗盘结束的信号"，比单纯挂限价单更谨慎，
-代价是买得更高、可能错过。
+| 情形 | 含义 | 该怎么办 |
+|---|---|---|
+| 提升倍数 ≈ 2，收益为正 | **真规律**，跨越完全不同的市场环境仍成立 | 可以认真考虑 |
+| 提升倍数 1.2~1.5 | 有效但弱，之前的2.1倍含运气成分 | 降低预期，小仓位试 |
+| 提升倍数 ≈ 1 或收益为负 | **要么过拟合，要么市场结构已变** | 见下方 |
 
-### 四张表
+### 如果最后一种情况发生
 
-**表1 · 洗盘存在性**　按最终涨幅分组，看各组中途跌了多少。
-**这张表决定后面所有讨论有没有意义。**
+那还需要再分辨一次：
 
-**表2 · 入场方式对比**　重点看「止损后收益%」和「中途最大跌幅中位%」——
-后者反映在更低位置进场是否真的减轻了持仓压力。
+- **过拟合**：策略从来就没用过，2025-2026是撞上的
+- **结构变化**：老规律在老市场有效、在新市场失效，或反过来
 
-**表3 · 止损误杀分析**　在各入场方式下，8/10/12/15/20%的止损
-分别会误杀掉多少比例的大涨行情。这直接回答"止损该设多少"。
+区分方法：看2018-2022内部的分年度。如果那几年里也有某一两年特别好、其余年份亏，
+说明这个策略**一直都是靠特定行情吃饭**，只是每个时代的好年份不同——
+那它就是个高波动的行情依赖型策略，而不是坏策略，
+但你必须接受连亏几年的可能。
 
-**表4 · 分年度**　确认结论稳定。
+### 数据量提醒
+
+需要额外下载2016年起的行情（位置特征要104周历史），
+首次运行会比较慢。如果崩溃，把区间缩短到2-3年分次跑。
             """
         )
         return
@@ -1174,15 +988,15 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
+    if start_input >= end_input:
+        st.error("开始日期必须早于结束日期。")
+        return
 
     start_date = start_input.strftime("%Y%m%d")
     end_date = end_input.strftime("%Y%m%d")
-    fetch_start = (
-        pd.Timestamp(start_input) - timedelta(days=int(base_weeks) * 7 + 900)
-    ).strftime("%Y%m%d")
-    fetch_end = (
-        pd.Timestamp(end_input) + timedelta(days=int(forward_weeks) * 7 + 60)
-    ).strftime("%Y%m%d")
+    # 位置特征需104周历史，前瞻需26周
+    fetch_start = (pd.Timestamp(start_input) - timedelta(days=900)).strftime("%Y%m%d")
+    fetch_end = (pd.Timestamp(end_input) + timedelta(days=220)).strftime("%Y%m%d")
 
     with st.spinner("构建科技股研究池……"):
         whitelist_set, name_map, industry_map = load_custom_tech_whitelist(token_clean)
@@ -1191,7 +1005,7 @@ def main():
         return
     st.success(f"科技股研究池：{len(whitelist_set)}只")
 
-    with st.spinner("加载行情（复用缓存）……"):
+    with st.spinner("加载行情（首次跑早期区间需要下载，较慢）……"):
         stocks, basic_indexed, _, _, failed_dates, sync_stats = load_optimized_market_data(
             fetch_start, fetch_end, token_clean, tuple(sorted(whitelist_set))
         )
@@ -1203,13 +1017,11 @@ def main():
         f"本次下载{sync_stats.get('downloaded_days', 0)}天。"
     )
 
-    # 内存优化：basic_indexed 含多列且行数庞大，但后续只用到流通市值。
-    # 立即裁成小表并释放原对象，避免它在整个回测过程中一直占内存。
     if not basic_indexed.empty and "circ_mv" in basic_indexed.columns:
         mv_lookup = (
-            basic_indexed[["circ_mv"]]
-            .reset_index()
-            .rename(columns={"trade_date_str": "Week"})
+            basic_indexed[["circ_mv"]].reset_index().rename(
+                columns={"trade_date_str": "Week"}
+            )
         )
         mv_lookup["circ_mv"] = pd.to_numeric(
             mv_lookup["circ_mv"], errors="coerce"
@@ -1220,40 +1032,32 @@ def main():
     del basic_indexed
     gc.collect()
 
-    pullback_levels = [8.0, 12.0, 15.0]
-    confirm_modes = [(12.0, "站回突破价"), (12.0, "周线收阳")]
-
-    # 内存优化：日线数据体积远大于周线（约1300只×1200行×20列）。
-    # 这里边构建周线边把对应日线从字典中弹出并释放，避免两份完整数据
-    # 同时驻留内存——Streamlit Cloud 内存上限约1GB，同时保留会被OOM杀掉
-    # （表现为日志无报错、应用直接消失、必须重新部署）。
-    needed_columns = ["trade_date_str", "open", "high", "low", "close", "vol"]
-    position_samples = []
+    # 边建周线边释放日线，避免两份数据共存导致内存溢出
+    needed = ["trade_date_str", "open", "high", "low", "close"]
     weekly_cache = {}
+    position_samples = []
     codes = sorted(stocks.keys())
-    total_codes = len(codes)
-    prep = st.progress(0.0, text="构建周线并计算全池位置分布……")
+    prep = st.progress(0.0, text="构建周线并计算位置分布……")
     for idx, ts_code in enumerate(codes):
-        daily = stocks.pop(ts_code)  # 弹出：字典中不再持有该股日线
+        daily = stocks.pop(ts_code)
         weekly = build_weekly_bars(daily)
         del daily
-        if weekly.empty or len(weekly) < int(base_weeks) + 30:
+        if weekly.empty or len(weekly) < 140:
             continue
-        # 只保留后续真正用到的列，并降精度，进一步压缩占用
-        keep = [c for c in needed_columns if c in weekly.columns]
+        keep = [c for c in needed if c in weekly.columns]
         weekly = weekly[keep].copy()
-        for column in ("open", "high", "low", "close", "vol"):
+        for column in ("open", "high", "low", "close"):
             if column in weekly.columns:
                 weekly[column] = pd.to_numeric(
                     weekly[column], errors="coerce"
                 ).astype("float32")
         weekly_cache[ts_code] = weekly
-        features = compute_features(weekly, int(breakout_weeks), int(base_weeks))
+        features = compute_features(weekly)
         values = features.loc[features["breakout"].fillna(False), "position_2y"]
         position_samples.append(values.dropna().astype("float32"))
         del features
         if idx % 60 == 0:
-            prep.progress(min((idx + 1) / total_codes, 1.0))
+            prep.progress(min((idx + 1) / len(codes), 1.0))
     prep.empty()
     del stocks
     gc.collect()
@@ -1264,166 +1068,157 @@ def main():
     all_positions = pd.concat(position_samples, ignore_index=True)
     del position_samples
     gc.collect()
-    position_threshold = (
-        float(all_positions.quantile(1.0 - float(position_cut)))
-        if float(position_cut) < 1.0
-        else float("-inf")
+    position_threshold = float(
+        all_positions.quantile(1.0 - FROZEN_POSITION_QUANTILE)
     )
     del all_positions
     gc.collect()
-    st.caption(
-        f"位置门槛：只保留突破时价格 ≥ 两年高点的 "
-        f"{position_threshold:.3f} 倍（前{float(position_cut)*100:.0f}%）"
-    )
 
-    progress = st.progress(0.0, text="模拟洗盘与各种入场方式……")
+    progress = st.progress(0.0, text="应用冻结规则……")
     parts = []
-    cached_codes = list(weekly_cache.keys())
-    for idx, ts_code in enumerate(cached_codes):
-        weekly = weekly_cache.pop(ts_code)  # 用完即释放
-        rows = build_signals(
-            weekly, ts_code, int(breakout_weeks), int(base_weeks),
-            int(forward_weeks), float(stop_pct), pullback_levels, confirm_modes,
-            position_threshold, bool(use_contraction),
-        )
+    cached = list(weekly_cache.keys())
+    for idx, ts_code in enumerate(cached):
+        weekly = weekly_cache.pop(ts_code)
+        rows = evaluate_stock(weekly, ts_code, position_threshold)
         del weekly
         if not rows.empty:
             parts.append(rows)
         if idx % 40 == 0:
-            progress.progress(min((idx + 1) / len(cached_codes), 1.0))
+            progress.progress(min((idx + 1) / len(cached), 1.0))
     progress.empty()
     del weekly_cache
     gc.collect()
 
     if not parts:
-        st.error("没有产生信号，请放宽筛选条件。")
+        st.error("没有产生数据。")
         return
-    signals = pd.concat(parts, ignore_index=True)
+    panel = pd.concat(parts, ignore_index=True)
     del parts
     gc.collect()
 
-    signals = signals[(signals["Week"] >= start_date) & (signals["Week"] <= end_date)]
-    signals = signals[
-        pd.to_numeric(signals["Signal_Close"], errors="coerce") >= min_price
-    ]
+    panel = panel[(panel["Week"] >= start_date) & (panel["Week"] <= end_date)]
+    panel = panel[pd.to_numeric(panel["Entry_Price"], errors="coerce") >= min_price]
     if not mv_lookup.empty:
-        signals = signals.merge(mv_lookup, on=["Week", "ts_code"], how="left")
-        mv = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
-        signals = signals[mv.between(min_mv, max_mv) | mv.isna()]
+        panel = panel.merge(mv_lookup, on=["Week", "ts_code"], how="left")
+        mv = pd.to_numeric(panel["circ_mv"], errors="coerce") / 10000.0
+        panel = panel[mv.between(min_mv, max_mv) | mv.isna()]
         del mv_lookup
         gc.collect()
-    signals = signals.reset_index(drop=True)
-    if signals.empty:
-        st.error("过滤后无信号。")
+    panel = panel.reset_index(drop=True)
+    if panel.empty:
+        st.error("过滤后无数据。")
         return
 
     used_mb = _memory_usage_mb()
-    if math.isfinite(used_mb):
-        if used_mb > 750:
-            st.warning(
-                f"当前内存占用 {used_mb:.0f} MB，已接近 Streamlit Cloud 约1GB的上限。"
-                "如果之后出现应用崩溃需重新部署，请缩短回测时间范围"
-                "（例如改成2年）或收紧股票池条件。"
-            )
-        else:
-            st.caption(f"当前内存占用 {used_mb:.0f} MB（上限约1GB）")
-
-    st.session_state["wash_result"] = {
-        "signals": signals,
-        "washout": washout_evidence(signals),
-        "entries": entry_method_comparison(signals, float(cost_pct)),
-        "stops": stop_sensitivity(signals, float(cost_pct)),
-        "yearly": yearly_entry_table(signals, float(cost_pct)),
-        "params": {
-            "突破周数": int(breakout_weeks), "前瞻": int(forward_weeks),
-            "止损": float(stop_pct), "位置前": float(position_cut),
-            "要求压缩": bool(use_contraction),
-        },
+    st.session_state["oos_result"] = {
+        "panel_rows": len(panel),
+        "signal_count": int(panel["Is_Signal"].astype(bool).sum()),
+        "comparison": main_comparison(panel, float(cost_pct)),
+        "yearly": yearly_table(panel, float(cost_pct)),
+        "period": f"{start_date} — {end_date}",
+        "memory_mb": used_mb,
     }
 
 
 def render_results():
-    result = st.session_state.get("wash_result")
+    result = st.session_state.get("oos_result")
     if not result:
         return False
-    params = result["params"]
-    signals = result["signals"]
 
     st.markdown("---")
-    st.header("洗盘验证结果")
+    st.header("样本外测试结果")
     st.caption(
-        f"突破信号 {len(signals):,} 个，覆盖 {signals['Week'].min()} — "
-        f"{signals['Week'].max()}　|　突破{params['突破周数']}周新高　"
-        f"前瞻{params['前瞻']}周　移动止损{params['止损']:.0f}%　"
-        f"位置前{params['位置前']*100:.0f}%"
-        f"{'　含波动压缩' if params['要求压缩'] else ''}"
-    )
-
-    st.subheader("表1 · 洗盘存在性：最终大涨的股票，中途跌了多少？")
-    st.dataframe(result["washout"].round(2), width="stretch", hide_index=True)
-    st.caption(
-        "**这张表决定后面所有讨论有没有意义。**\n\n"
-        "看「翻倍以上」那一行的「跌超15%比例」：如果很高，"
-        "说明即使是最终翻倍的股票，中途也普遍深跌——"
-        "固定15%止损确实在提前赶走赢家，你的洗盘假设成立。\n\n"
-        "但同时对比「失败」那一行：如果失败组跌得更深、比例更高，"
-        "说明深跌本身仍是负面信号，只是不够干净。"
-    )
-
-    st.subheader("表2 · 入场方式对比：等洗盘后再买是否更好？")
-    st.dataframe(result["entries"].round(2), width="stretch", hide_index=True)
-    st.caption(
-        "**看三列**：「止损后收益%」是最终结果；"
-        "「中途最大跌幅中位%」反映在更低位置进场是否真的减轻了持仓压力；"
-        "「成交率%」反映会错过多少机会。\n\n"
-        "如果等回撤的方式收益更高**且**中途跌幅更小，"
-        "那就是双赢——不用放宽止损就解决了被洗出的问题。"
-    )
-
-    if not result["stops"].empty:
-        st.subheader("表3 · 止损误杀分析：止损该设多少？")
-        st.dataframe(result["stops"].round(2), width="stretch", hide_index=True)
-        st.caption(
-            "各入场方式下，不同止损幅度会误杀掉多少比例的大涨行情"
-            "（那些最终涨超50%、但中途被止损打出的）。\n\n"
-            "**对比同一行的8%到20%**：如果从15%放宽到20%误杀率大幅下降，"
-            "说明止损确实偏紧；如果差别不大，说明问题不在止损幅度。"
+        f"测试区间 {result['period']}　|　"
+        f"全池观测 {result['panel_rows']:,} 个「个股-周」，"
+        f"其中符合冻结规则的信号 {result['signal_count']:,} 个"
+        + (
+            f"　|　内存 {result['memory_mb']:.0f} MB"
+            if math.isfinite(result.get("memory_mb", float("nan")))
+            else ""
         )
+    )
+
+    st.subheader("表1 · 新区间：信号 vs 全池基准")
+    st.dataframe(result["comparison"].round(2), width="stretch", hide_index=True)
+
+    st.subheader("表2 · 与样本内结果并排对照")
+    reference = pd.DataFrame(
+        [
+            IN_SAMPLE_REFERENCE,
+            {
+                "期间": f"{result['period']}（样本外，规则冻结）",
+                "信号数": result["signal_count"],
+                "翻倍概率%": (
+                    result["comparison"]["翻倍概率%"].iloc[1]
+                    if len(result["comparison"]) > 1
+                    else np.nan
+                ),
+                "全池基准翻倍概率%": (
+                    result["comparison"]["翻倍概率%"].iloc[0]
+                    if len(result["comparison"]) > 0
+                    else np.nan
+                ),
+                "提升倍数": (
+                    result["comparison"]["翻倍概率%"].iloc[2]
+                    if len(result["comparison"]) > 2
+                    else np.nan
+                ),
+                "止损后收益%": (
+                    result["comparison"]["止损后收益%"].iloc[1]
+                    if len(result["comparison"]) > 1
+                    else np.nan
+                ),
+                "止损后胜率%": (
+                    result["comparison"]["止损后胜率%"].iloc[1]
+                    if len(result["comparison"]) > 1
+                    else np.nan
+                ),
+                "涨超50%比例": (
+                    result["comparison"]["涨超50%比例"].iloc[1]
+                    if len(result["comparison"]) > 1
+                    else np.nan
+                ),
+            },
+        ]
+    )
+    st.dataframe(reference.round(2), width="stretch", hide_index=True)
+    st.caption(
+        "**这是全部结论所在。**样本内提升2.10倍、收益6.47%。"
+        "如果样本外也接近这个水平，说明是真规律；"
+        "如果明显衰减或转负，那么之前的结果就含有大量运气或过拟合成分。"
+    )
 
     if not result["yearly"].empty:
-        st.subheader("表4 · 各入场方式分年度")
+        st.subheader("表3 · 新区间分年度")
         st.dataframe(result["yearly"].round(2), width="stretch", hide_index=True)
-        st.caption("确认最优方式不是靠某一年。")
+        st.caption(
+            "**即使整体结果不好，也要看这里**：如果新区间内部也是"
+            "某一两年特别好、其余年份亏，说明这个策略一直都靠特定行情吃饭，"
+            "只是每个时代的好年份不同——那它是行情依赖型策略，不是坏策略，"
+            "但必须接受连亏几年的可能。"
+        )
 
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_washout_evidence.csv",
-            result["washout"].to_csv(index=False, encoding="utf-8-sig"),
+            "01_comparison.csv",
+            result["comparison"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "02_entry_methods.csv",
-            result["entries"].to_csv(index=False, encoding="utf-8-sig"),
+            "02_in_vs_out_sample.csv",
+            reference.to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "03_stop_sensitivity.csv",
-            result["stops"].to_csv(index=False, encoding="utf-8-sig"),
-        )
-        archive.writestr(
-            "04_yearly.csv",
+            "03_yearly.csv",
             result["yearly"].to_csv(index=False, encoding="utf-8-sig"),
         )
-        archive.writestr(
-            "05_all_signals.csv",
-            signals.to_csv(index=False, encoding="utf-8-sig"),
-        )
     st.download_button(
-        "下载验证结果",
+        "下载样本外测试结果",
         data=output.getvalue(),
-        file_name="washout_validation.zip",
+        file_name="out_of_sample_validation.zip",
         mime="application/zip",
-        key="download_wash",
+        key="download_oos",
     )
     return True
 
