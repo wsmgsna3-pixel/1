@@ -1,33 +1,28 @@
 # -*- coding: utf-8 -*-
-"""强弱反弹判别验证器（单文件独立版，直接覆盖 app.py 运行）。
+"""退出规则对比验证器（单文件独立版，直接覆盖 app.py 运行）。
 
-要解决的问题：周线上很多股票呈波浪起伏，在低点买入等待上涨是合理思路，
-但反弹分两种——真强势和弱反弹。如何提前分辨？
+此前十几轮全部在优化"买什么""何时买"，退出一直雷打不动固定持有3周。
+但固定持有期会把所有大赢家提前砍断——这可能正是
+"157笔交易里剔掉最好的5笔就归零"的真正原因。
 
-此前已验证：
-- 周线SKDJ低位拐头能较好地识别"波浪低点"（横截面超额+1.34%，t=8.9）
-- 26周回撤可作为周内排序（超额+0.99%）
-- 挂低于前收3%的限价单优于直接买入（配对+2.92%）
-- 但整体超额仅约0.4~0.8%，接近"随便买一篮子科技股"的水平
-- 市场择时层全部失效；成交量、换手率、收盘位置等个股自身指标也全部失效
+本次只改一件事：卖出方式。
+同一批信号、同一个买入价、同一段行情，唯一差别是何时卖出，
+因此收益差异纯粹来自退出规则。
 
-本次测两个从未验证过的方向：
+对比的退出方式：
+  固定持有 3/4/6/10/13 周
+  移动止损（从持有期最高收盘价回撤N%）
+  持有到SKDJ进入高位区（吃完一整个波浪）
+  跌破N周均线
 
-方向一 · 相对强度
-  "弱反弹"很可能就是"只是跟着大盘一起涨"——大盘涨5%它也涨5%是beta不是强势。
-  此前失效的指标（量能、收盘位置）都只看个股自己，没有和市场比较。
-  本次加入：个股涨幅减全池中位数、减行业中位数。
+判断标准与之前不同：
+本次改变的是收益分布的形状而非平均值，因此除了平均收益，更要看
+  - 赚>50%的交易占比（能否留住大波段）
+  - 大涨样本捕获率（在真正出现大涨的交易里，实际吃到了理论涨幅的多少）
+  - 平均持有周数（决定交易节奏是否可接受）
 
-方向二 · 观察一周再决定
-  不在信号周就买，先看完下一周表现再定。日线层面的"等确认"已证明失败（追高吃亏），
-  但一整周的表现比5天内的日线波动更能反映真实资金态度，值得单独验证。
-
-同时补测趋势背景（距40周均线）——现有"回撤越深越买"的逻辑，
-可能正在系统性地挑下降趋势里的股票。
-
-判断标准（比之前更严格）：
-  一个真能识别弱反弹的特征，必须同时做到 强组收益更高 + 胜率更高 + 大跌比例更低。
-  因为"识别弱反弹"本质是降低失败率，不只是抬高平均值。
+成交口径：所有规则统一按周收盘价卖出，不假设能卖在盘中最高点。
+最长持有周数为所有非固定规则设置上限，避免无限持有。
 
 行情缓存与之前共用，已下载数据不会重复下载。
 """
@@ -59,7 +54,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "强弱反弹判别验证"
+APP_TITLE = "退出规则对比验证"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
@@ -673,6 +668,10 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # 指标与信号
 # -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# 指标与信号
+# -----------------------------------------------------------------------------
 def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame:
     low = pd.to_numeric(weekly["low"], errors="coerce")
     high = pd.to_numeric(weekly["high"], errors="coerce")
@@ -686,265 +685,324 @@ def add_skdj(weekly: pd.DataFrame, n_period: int, m_period: int) -> pd.DataFrame
     return weekly
 
 
-def build_all_weeks(weekly: pd.DataFrame, ts_code: str) -> pd.DataFrame:
-    """全部周（不只信号周），用于计算全池/行业中位数作为相对强度基准。"""
-    close = pd.to_numeric(weekly["close"], errors="coerce")
-    return pd.DataFrame(
-        {
-            "ts_code": ts_code,
-            "Week": weekly["trade_date_str"].astype(str),
-            "Return_1W_pct": (close / close.shift(1) - 1.0) * 100.0,
-        }
-    ).dropna(subset=["Return_1W_pct"])
+def simulate_exits(
+    weekly: pd.DataFrame,
+    entry_index: int,
+    entry_price: float,
+    max_weeks: int,
+    trail_pct: float,
+    skdj_top: float,
+    ma_exit_weeks: int,
+    fixed_weeks_list,
+):
+    """从买入那一周开始，逐周推进，模拟多种退出规则。
 
+    所有规则共用同一个买入价和同一段行情，唯一差别是何时卖出，
+    因此收益差异纯粹来自退出方式。
 
-def build_signal_features(
-    weekly: pd.DataFrame, ts_code: str, n_period: int, m_period: int,
-    level: float, require_kd: bool, hold_weeks: int,
-) -> pd.DataFrame:
-    """信号周特征 + 观察周(t+1)特征 + 两种入场方式的收益。
-
-    立即买入：t+1周开盘买 -> t+hold周收盘卖
-    观察后买：先看完t+1周表现，t+2周开盘买 -> t+1+hold周收盘卖
-    两者持有周数相同，可直接比较。
+    统一口径：每周收盘判断是否满足退出条件，满足则按该周收盘价卖出。
+    这样不存在"用盘中最高价卖出"这种做不到的假设。
     """
+    results = {}
+    n = len(weekly)
+    close = pd.to_numeric(weekly["close"], errors="coerce")
+    high = pd.to_numeric(weekly["high"], errors="coerce")
+    k_series = pd.to_numeric(weekly["K"], errors="coerce")
+    ma_exit = close.rolling(ma_exit_weeks).mean()
+
+    last_index = min(entry_index + max_weeks, n - 1)
+    if last_index <= entry_index or not math.isfinite(entry_price) or entry_price <= 0:
+        return results
+
+    # ---- 固定持有N周 ----
+    for weeks in fixed_weeks_list:
+        exit_index = entry_index + weeks
+        if exit_index < n:
+            exit_price = _safe_float(close.iloc[exit_index])
+            if math.isfinite(exit_price):
+                results[f"固定持有{weeks}周"] = {
+                    "return_pct": (exit_price / entry_price - 1.0) * 100.0,
+                    "weeks_held": weeks,
+                }
+
+    # ---- 移动止损：从最高收盘价回撤trail_pct则卖出 ----
+    peak = entry_price
+    trail_result = None
+    for step in range(1, last_index - entry_index + 1):
+        idx = entry_index + step
+        current = _safe_float(close.iloc[idx])
+        if not math.isfinite(current):
+            continue
+        peak = max(peak, current)
+        if current <= peak * (1.0 - trail_pct / 100.0):
+            trail_result = {
+                "return_pct": (current / entry_price - 1.0) * 100.0,
+                "weeks_held": step,
+            }
+            break
+    if trail_result is None:
+        final = _safe_float(close.iloc[last_index])
+        if math.isfinite(final):
+            trail_result = {
+                "return_pct": (final / entry_price - 1.0) * 100.0,
+                "weeks_held": last_index - entry_index,
+            }
+    if trail_result:
+        results[f"移动止损{trail_pct:.0f}%"] = trail_result
+
+    # ---- 持有到SKDJ进入高位区（吃完一整个波浪）----
+    skdj_result = None
+    for step in range(1, last_index - entry_index + 1):
+        idx = entry_index + step
+        k_value = _safe_float(k_series.iloc[idx])
+        current = _safe_float(close.iloc[idx])
+        if not math.isfinite(k_value) or not math.isfinite(current):
+            continue
+        if k_value >= skdj_top:
+            skdj_result = {
+                "return_pct": (current / entry_price - 1.0) * 100.0,
+                "weeks_held": step,
+            }
+            break
+    if skdj_result is None:
+        final = _safe_float(close.iloc[last_index])
+        if math.isfinite(final):
+            skdj_result = {
+                "return_pct": (final / entry_price - 1.0) * 100.0,
+                "weeks_held": last_index - entry_index,
+            }
+    if skdj_result:
+        results[f"持有到SKDJ≥{skdj_top:.0f}"] = skdj_result
+
+    # ---- 跌破均线卖出 ----
+    ma_result = None
+    for step in range(1, last_index - entry_index + 1):
+        idx = entry_index + step
+        current = _safe_float(close.iloc[idx])
+        ma_value = _safe_float(ma_exit.iloc[idx])
+        if not math.isfinite(current) or not math.isfinite(ma_value):
+            continue
+        if current < ma_value:
+            ma_result = {
+                "return_pct": (current / entry_price - 1.0) * 100.0,
+                "weeks_held": step,
+            }
+            break
+    if ma_result is None:
+        final = _safe_float(close.iloc[last_index])
+        if math.isfinite(final):
+            ma_result = {
+                "return_pct": (final / entry_price - 1.0) * 100.0,
+                "weeks_held": last_index - entry_index,
+            }
+    if ma_result:
+        results[f"跌破{ma_exit_weeks}周均线"] = ma_result
+
+    # ---- 参考值：这段行情的理论最大涨幅（无法实际获得，仅用于衡量各规则吃到了多少）----
+    window_high = pd.to_numeric(
+        high.iloc[entry_index + 1 : last_index + 1], errors="coerce"
+    )
+    if window_high.notna().any():
+        results["__max_possible__"] = {
+            "return_pct": (window_high.max() / entry_price - 1.0) * 100.0,
+            "weeks_held": np.nan,
+        }
+    return results
+
+
+def build_signals_with_exits(
+    weekly: pd.DataFrame, ts_code: str, n_period: int, m_period: int,
+    level: float, require_kd: bool, max_weeks: int, trail_pct: float,
+    skdj_top: float, ma_exit_weeks: int, fixed_weeks_list,
+) -> pd.DataFrame:
     weekly = add_skdj(weekly, n_period, m_period)
-    if len(weekly) < 50:
+    if len(weekly) < 60:
         return pd.DataFrame()
 
     close = pd.to_numeric(weekly["close"], errors="coerce")
     high = pd.to_numeric(weekly["high"], errors="coerce")
-    low = pd.to_numeric(weekly["low"], errors="coerce")
     open_p = pd.to_numeric(weekly["open"], errors="coerce")
-    volume = (
-        pd.to_numeric(weekly["vol"], errors="coerce")
-        if "vol" in weekly.columns
-        else pd.Series(np.nan, index=weekly.index, dtype="float64")
-    )
-    dates = weekly["trade_date_str"].astype(str)
-
     k_now = pd.to_numeric(weekly["K"], errors="coerce")
     k_prev = k_now.shift(1)
     d_now = pd.to_numeric(weekly["D"], errors="coerce")
+    dates = weekly["trade_date_str"].astype(str)
+
     signal = (k_prev <= k_now) & (k_now <= level)
     if require_kd:
         signal = signal & (k_now > d_now)
     signal = signal.fillna(False)
 
-    return_1w = (close / close.shift(1) - 1.0) * 100.0
-    ma40 = close.rolling(40).mean()
-    price_range = (high - low).replace(0, np.nan)
-    close_location = (close - low) / price_range
-    vol_ratio = volume / volume.shift(1).rolling(8).mean().replace(0, np.nan)
-    prior_high_4w = high.shift(1).rolling(4).max()
     drawdown_26w = (close / high.rolling(26).max() - 1.0) * 100.0
+    ma40 = close.rolling(40).mean()
 
-    frame = pd.DataFrame(
-        {
-            "ts_code": ts_code,
-            "Week": dates,
-            "Signal": signal,
-            # ---- 信号周(t)特征 ----
-            "T_Return_1W_pct": return_1w,
-            "T_Dist_MA40_pct": (close / ma40 - 1.0) * 100.0,
-            "T_Close_Location": close_location,
-            "T_Vol_Ratio": vol_ratio,
-            "T_Breakout_4W": (close > prior_high_4w).astype(float),
-            "T_Drawdown_26W_pct": drawdown_26w,
-            # ---- 观察周(t+1)特征：只用t+1周收盘时已知的信息 ----
-            "N_Return_1W_pct": return_1w.shift(-1),
-            "N_Close_Location": close_location.shift(-1),
-            "N_Vol_Ratio": vol_ratio.shift(-1),
-            "N_Break_T_High": (close.shift(-1) > high).astype(float),
-            # ---- 收益 ----
-            "Ret_Immediate": (
-                close.shift(-hold_weeks) / open_p.shift(-1).replace(0, np.nan) - 1.0
-            ) * 100.0,
-            "Ret_Delayed": (
-                close.shift(-(hold_weeks + 1)) / open_p.shift(-2).replace(0, np.nan) - 1.0
-            ) * 100.0,
-        }
-    )
-    return frame[frame["Signal"]].drop(columns=["Signal"])
-
-
-# -----------------------------------------------------------------------------
-# 强弱判别检验
-# -----------------------------------------------------------------------------
-SIGNAL_WEEK_FEATURES = [
-    ("RS_Pool_T", "相对全池强度（信号周）"),
-    ("RS_Industry_T", "相对行业强度（信号周）"),
-    ("T_Dist_MA40_pct", "距40周均线（趋势背景）"),
-    ("T_Close_Location", "周内收盘位置"),
-    ("T_Vol_Ratio", "成交量比（信号周）"),
-    ("T_Breakout_4W", "突破前4周高点"),
-    ("T_Drawdown_26W_pct", "26周回撤（越深越好，对照组）"),
-]
-
-OBSERVE_WEEK_FEATURES = [
-    ("RS_Pool_N", "相对全池强度（观察周）"),
-    ("RS_Industry_N", "相对行业强度（观察周）"),
-    ("N_Return_1W_pct", "观察周涨幅"),
-    ("N_Close_Location", "观察周收盘位置"),
-    ("N_Vol_Ratio", "观察周成交量比"),
-    ("N_Break_T_High", "观察周突破信号周高点"),
-]
-
-
-def discriminator_test(
-    signals: pd.DataFrame, features, return_column: str, cost_pct: float,
-    label_prefix: str,
-):
-    """把信号按各特征分成强/弱两组，看能否区分反弹质量。
-
-    这不是排序检验（每周挑最好的几只），而是筛选检验（判断该不该买）。
-    重点看：强组是否同时做到 平均收益更高 + 胜率更高 + 大跌概率更低。
-    只有一项好可能是噪声；三项都好才是真的能识别弱反弹。
-    """
-    work = signals.copy()
-    work["_ret"] = pd.to_numeric(work[return_column], errors="coerce") - cost_pct
-    work = work.dropna(subset=["_ret"])
-    if work.empty:
-        return pd.DataFrame()
-
-    overall_mean = work["_ret"].mean()
     rows = []
-    for column, name in features:
-        if column not in work.columns:
+    for i in range(len(weekly)):
+        if not bool(signal.iloc[i]):
             continue
-        values = pd.to_numeric(work[column], errors="coerce")
-        subset = work.assign(_v=values).dropna(subset=["_v"])
-        if len(subset) < 200:
+        entry_index = i + 1
+        if entry_index >= len(weekly):
             continue
-        # 布尔型按0/1分组，连续型按中位数分组
-        unique_values = subset["_v"].nunique()
-        if unique_values <= 2:
-            strong = subset[subset["_v"] > 0.5]["_ret"]
-            weak = subset[subset["_v"] <= 0.5]["_ret"]
-        else:
-            median = subset["_v"].median()
-            strong = subset[subset["_v"] > median]["_ret"]
-            weak = subset[subset["_v"] <= median]["_ret"]
-        if len(strong) < 100 or len(weak) < 100:
+        entry_price = _safe_float(open_p.iloc[entry_index])
+        if not math.isfinite(entry_price) or entry_price <= 0:
             continue
-
-        diff = strong.mean() - weak.mean()
-        pooled_se = math.sqrt(
-            strong.var(ddof=1) / len(strong) + weak.var(ddof=1) / len(weak)
+        exits = simulate_exits(
+            weekly, entry_index, entry_price, max_weeks, trail_pct,
+            skdj_top, ma_exit_weeks, fixed_weeks_list,
         )
-        t_stat = diff / pooled_se if pooled_se > 0 else np.nan
+        if not exits:
+            continue
+        row = {
+            "ts_code": ts_code,
+            "Signal_Week": dates.iloc[i],
+            "Entry_Week": dates.iloc[entry_index],
+            "Entry_Price": entry_price,
+            "K": _safe_float(k_now.iloc[i]),
+            "Drawdown_26W_pct": _safe_float(drawdown_26w.iloc[i]),
+            "Dist_MA40_pct": _safe_float((close.iloc[i] / ma40.iloc[i] - 1.0) * 100.0)
+            if math.isfinite(_safe_float(ma40.iloc[i]))
+            else np.nan,
+        }
+        for label, payload in exits.items():
+            if label == "__max_possible__":
+                row["理论最大涨幅%"] = payload["return_pct"]
+                continue
+            row[f"收益_{label}"] = payload["return_pct"]
+            row[f"周数_{label}"] = payload["weeks_held"]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# -----------------------------------------------------------------------------
+# 分析
+# -----------------------------------------------------------------------------
+def compare_exit_rules(signals: pd.DataFrame, cost_pct: float):
+    """各退出规则的正面对比。
+
+    重点不只是平均收益，更要看收益分布的形状：
+    大赢家占比决定了能否留住"黄金"，这正是固定持有期最可能损害的地方。
+    """
+    labels = [c[3:] for c in signals.columns if c.startswith("收益_")]
+    rows = []
+    for label in labels:
+        returns = pd.to_numeric(signals[f"收益_{label}"], errors="coerce").dropna()
+        if returns.empty:
+            continue
+        net = returns - cost_pct
+        weeks_column = f"周数_{label}"
+        weeks = (
+            pd.to_numeric(signals[weeks_column], errors="coerce").dropna()
+            if weeks_column in signals.columns
+            else pd.Series(dtype=float)
+        )
         rows.append(
             {
-                "判别特征": f"{label_prefix}{name}",
-                "强组样本": int(len(strong)),
-                "强组收益%": float(strong.mean()),
-                "弱组收益%": float(weak.mean()),
-                "收益差%": float(diff),
-                "强组胜率%": float((strong > 0).mean() * 100.0),
-                "弱组胜率%": float((weak > 0).mean() * 100.0),
-                "强组大跌<-15%比例": float((strong < -15).mean() * 100.0),
-                "弱组大跌<-15%比例": float((weak < -15).mean() * 100.0),
-                "t值": t_stat,
+                "退出规则": label,
+                "样本数": int(len(net)),
+                "平均收益%": float(net.mean()),
+                "中位收益%": float(net.median()),
+                "胜率%": float((net > 0).mean() * 100.0),
+                "平均持有周数": float(weeks.mean()) if len(weeks) else np.nan,
+                "赚>30%比例": float((net > 30).mean() * 100.0),
+                "赚>50%比例": float((net > 50).mean() * 100.0),
+                "赚>100%比例": float((net > 100).mean() * 100.0),
+                "亏>20%比例": float((net < -20).mean() * 100.0),
+                "最大单笔%": float(net.max()),
+                "收益/波动": (
+                    net.mean() / net.std(ddof=1)
+                    if len(net) > 1 and net.std(ddof=1) > 0
+                    else np.nan
+                ),
             }
         )
     result = pd.DataFrame(rows)
     if not result.empty:
-        result = result.sort_values("收益差%", ascending=False).reset_index(drop=True)
+        result = result.sort_values("平均收益%", ascending=False).reset_index(drop=True)
     return result
 
 
-def entry_timing_comparison(signals: pd.DataFrame, cost_pct: float):
-    """立即买入 vs 观察一周再买（不加任何筛选，纯比较入场时点）。"""
+def capture_ratio_table(signals: pd.DataFrame, cost_pct: float):
+    """各规则吃到了理论最大涨幅的多少——直接衡量"留住黄金"的能力。"""
+    if "理论最大涨幅%" not in signals.columns:
+        return pd.DataFrame()
+    max_possible = pd.to_numeric(signals["理论最大涨幅%"], errors="coerce")
+    labels = [c[3:] for c in signals.columns if c.startswith("收益_")]
     rows = []
-    for column, label in (
-        ("Ret_Immediate", "立即买入（t+1周开盘）"),
-        ("Ret_Delayed", "观察一周后买入（t+2周开盘）"),
-    ):
-        values = pd.to_numeric(signals[column], errors="coerce").dropna() - cost_pct
-        if values.empty:
+    # 只在真正出现过大涨的样本上比较，否则会被大量平庸样本稀释
+    big_mask = max_possible >= 30.0
+    for label in labels:
+        returns = pd.to_numeric(signals[f"收益_{label}"], errors="coerce") - cost_pct
+        valid = returns.notna() & max_possible.notna() & (max_possible > 0)
+        if valid.sum() == 0:
             continue
+        ratio_all = (returns[valid] / max_possible[valid]).clip(-2, 2)
+        big_valid = valid & big_mask
         rows.append(
             {
-                "入场时点": label,
-                "样本数": int(len(values)),
-                "平均收益%": float(values.mean()),
-                "中位收益%": float(values.median()),
-                "胜率%": float((values > 0).mean() * 100.0),
-                "标准差%": float(values.std(ddof=1)),
-                "大涨>20%比例": float((values > 20).mean() * 100.0),
-                "大跌<-15%比例": float((values < -15).mean() * 100.0),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def combined_filter_test(
-    signals: pd.DataFrame, cost_pct: float, top_n: int,
-):
-    """把最有希望的判别条件组合起来，看筛选后的实际效果。
-
-    对比：不筛选 / 只用观察周强度筛选 / 观察周强度+回撤排序。
-    """
-    work = signals.copy()
-    work["_imm"] = pd.to_numeric(work["Ret_Immediate"], errors="coerce") - cost_pct
-    work["_del"] = pd.to_numeric(work["Ret_Delayed"], errors="coerce") - cost_pct
-
-    schemes = []
-
-    base = work.dropna(subset=["_imm"])
-    schemes.append(("① 全部信号，立即买入（基准）", base, "_imm"))
-
-    delayed = work.dropna(subset=["_del"])
-    schemes.append(("② 全部信号，观察一周后买入", delayed, "_del"))
-
-    if "RS_Pool_N" in work.columns:
-        strong_rs = work[
-            pd.to_numeric(work["RS_Pool_N"], errors="coerce") > 0
-        ].dropna(subset=["_del"])
-        schemes.append(("③ 观察周跑赢全池才买", strong_rs, "_del"))
-
-    if "N_Break_T_High" in work.columns:
-        breakout = work[
-            pd.to_numeric(work["N_Break_T_High"], errors="coerce") > 0.5
-        ].dropna(subset=["_del"])
-        schemes.append(("④ 观察周突破信号周高点才买", breakout, "_del"))
-
-    if {"RS_Pool_N", "N_Break_T_High"}.issubset(work.columns):
-        both = work[
-            (pd.to_numeric(work["RS_Pool_N"], errors="coerce") > 0)
-            & (pd.to_numeric(work["N_Break_T_High"], errors="coerce") > 0.5)
-        ].dropna(subset=["_del"])
-        schemes.append(("⑤ 跑赢全池 且 突破信号周高点", both, "_del"))
-
-    rows = []
-    total_weeks = work["Week"].nunique()
-    for label, subset, column in schemes:
-        if subset.empty:
-            continue
-        values = subset[column].dropna()
-        if values.empty:
-            continue
-        # 每周取回撤最深的top_n只，模拟实际选股
-        ranked = subset.groupby("Week")["T_Drawdown_26W_pct"].rank(
-            method="first", ascending=True
-        )
-        picked = subset[ranked <= top_n]
-        by_week = picked.groupby("Week")[column].mean().dropna()
-        rows.append(
-            {
-                "方案": label,
-                "信号数": int(len(values)),
-                "保留比例%": float(len(values) / len(base) * 100.0) if len(base) else np.nan,
-                "单笔平均收益%": float(values.mean()),
-                "单笔胜率%": float((values > 0).mean() * 100.0),
-                "可交易周数": int(len(by_week)),
-                "周覆盖率%": float(len(by_week) / total_weeks * 100.0),
-                f"每周Top{top_n}收益%": float(by_week.mean()) if len(by_week) else np.nan,
-                f"每周Top{top_n}胜率%": (
-                    float((by_week > 0).mean() * 100.0) if len(by_week) else np.nan
+                "退出规则": label,
+                "全部样本 捕获率%": float(ratio_all.mean() * 100.0),
+                "大涨样本数": int(big_valid.sum()),
+                "大涨样本 理论涨幅%": float(max_possible[big_valid].mean()),
+                "大涨样本 实际收益%": float(returns[big_valid].mean()),
+                "大涨样本 捕获率%": float(
+                    (returns[big_valid] / max_possible[big_valid]).clip(-2, 2).mean()
+                    * 100.0
                 ),
             }
         )
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values(
+            "大涨样本 捕获率%", ascending=False
+        ).reset_index(drop=True)
+    return result
+
+
+def exit_by_selection(signals: pd.DataFrame, cost_pct: float, top_n: int):
+    """在实际选股条件下（每周按回撤最深取TopN）对比各退出规则。"""
+    if signals.empty:
+        return pd.DataFrame()
+    ranked = signals.groupby("Entry_Week")["Drawdown_26W_pct"].rank(
+        method="first", ascending=True
+    )
+    picked = signals[ranked <= top_n]
+    if picked.empty:
+        return pd.DataFrame()
+    labels = [c[3:] for c in signals.columns if c.startswith("收益_")]
+    rows = []
+    for label in labels:
+        returns = pd.to_numeric(picked[f"收益_{label}"], errors="coerce").dropna()
+        if returns.empty:
+            continue
+        net = returns - cost_pct
+        rows.append(
+            {
+                "退出规则": label,
+                f"Top{top_n}样本数": int(len(net)),
+                "平均收益%": float(net.mean()),
+                "中位收益%": float(net.median()),
+                "胜率%": float((net > 0).mean() * 100.0),
+                "赚>50%比例": float((net > 50).mean() * 100.0),
+                "亏>20%比例": float((net < -20).mean() * 100.0),
+            }
+        )
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("平均收益%", ascending=False).reset_index(drop=True)
+    return result
+
+
+def yearly_exit_table(signals: pd.DataFrame, cost_pct: float):
+    work = signals.copy()
+    work["年份"] = work["Signal_Week"].astype(str).str[:4]
+    labels = [c[3:] for c in work.columns if c.startswith("收益_")]
+    rows = []
+    for year, group in work.groupby("年份"):
+        row = {"年份": year, "信号数": len(group)}
+        for label in labels:
+            row[label] = float(
+                (pd.to_numeric(group[f"收益_{label}"], errors="coerce") - cost_pct).mean()
+            )
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -953,19 +1011,17 @@ def combined_filter_test(
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"🌊 {APP_TITLE}")
-    st.caption("周线低点买入之后，怎么分辨哪些是真强势、哪些只是弱反弹。")
+    st.title(f"🎯 {APP_TITLE}")
+    st.caption("同一批信号、同一个买入价，只改卖出方式——看能不能把大波段留住。")
     st.info(
-        "**这次测两个此前从未验证过的方向：**\n\n"
-        "**方向一 · 相对强度**　"
-        "所谓弱反弹，很可能就是只是跟着大盘一起涨。大盘涨5%它也涨5%，那是beta不是强势。"
-        "之前测过的量能、收盘位置都只看个股自己，全部失效；"
-        "这次加入减去全池中位数、减去行业中位数的超额涨幅。\n\n"
-        "**方向二 · 观察一周再决定**　"
-        "不在信号周就买，先看完下一周的表现再定。日线层面的等确认已被证明失败（追高吃亏），"
-        "但一整周的表现比5天内的日线波动更能反映真实资金态度，值得单独验证。\n\n"
-        "同时补测**趋势背景**（距40周均线）——"
-        "现在回撤越深越买的逻辑，可能正在系统性地挑下降趋势里的股票。"
+        "**为什么测这个**：此前十几轮全在优化买什么、何时买，"
+        "退出一直雷打不动固定3周。但固定持有期会**把所有大赢家提前砍断**——"
+        "这可能正是157笔里剔掉最好5笔就归零的原因。\n\n"
+        "**这次改的是收益分布的形状**，不是平均值：让赚钱的单子跑得更远，"
+        "亏钱的单子照样早砍。所以判断标准不只看平均收益，"
+        "更要看**赚>50%的比例**和**大涨样本捕获率**。\n\n"
+        "所有规则共用同一个买入价和同一段行情，且统一按**周收盘价**成交，"
+        "不假设能卖在盘中最高点。"
     )
 
     with st.sidebar:
@@ -980,12 +1036,28 @@ def main():
         end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.subheader("周线信号（波浪低点）")
+        st.subheader("买入信号（已验证配置）")
         n_period = st.number_input("N", value=4, min_value=2, max_value=60, step=1)
         m_period = st.number_input("M", value=3, min_value=2, max_value=30, step=1)
         level = st.number_input("K值阈值", value=20.0, min_value=1.0, max_value=90.0, step=5.0)
         require_kd = st.checkbox("要求 K > D", value=True)
-        hold_weeks = st.number_input("持有周数", value=3, min_value=1, max_value=8, step=1)
+
+        st.markdown("---")
+        st.subheader("退出规则参数")
+        max_weeks = st.number_input(
+            "最长持有周数（超过则强制卖出）", value=26, min_value=4, max_value=104, step=2,
+            help="给移动止损、SKDJ高位等规则一个上限，避免无限持有。",
+        )
+        trail_pct = st.number_input(
+            "移动止损：从最高收盘价回撤%", value=15.0, min_value=5.0, max_value=50.0, step=5.0,
+        )
+        skdj_top = st.number_input(
+            "SKDJ高位线（K达到即卖）", value=75.0, min_value=50.0, max_value=95.0, step=5.0,
+            help="你图中指标的顶部线就是75。",
+        )
+        ma_exit_weeks = st.number_input(
+            "跌破几周均线卖出", value=10, min_value=3, max_value=40, step=1,
+        )
         top_n = st.number_input("每周选几只", value=3, min_value=1, max_value=20, step=1)
         cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
 
@@ -1005,32 +1077,34 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
-        if st.session_state.get("wave_result"):
+        if st.session_state.get("exit_result"):
             return
         st.markdown(
             """
+### 对比的退出方式
+
+| 规则 | 说明 |
+|---|---|
+| 固定持有3/4/6/10/13周 | 到期就卖，现在的做法是3周 |
+| 移动止损15% | 从持有期最高收盘价回撤15%才卖，让利润奔跑 |
+| 持有到SKDJ≥75 | 吃完一整个波浪再走（对应你图中的顶部线） |
+| 跌破10周均线 | 趋势走坏才卖 |
+
 ### 四张表
 
-**表1 · 信号周判别特征**　在信号周就能算出的强弱特征，能否区分后续表现。
-新增：相对全池强度、相对行业强度、距40周均线（趋势背景）。
+**表1 · 退出规则总对比**　除了平均收益，重点看**赚>50%比例**和**亏>20%比例**。
 
-**表2 · 观察周判别特征**　用信号后第一周的表现来判断，能否区分。
-新增：观察周超额涨幅、是否突破信号周高点。
+**表2 · 大涨捕获率**　在那些理论上确实出现过30%以上涨幅的交易里，
+每种规则实际吃到了多少。**这张表直接回答"能不能留住黄金"。**
 
-**表3 · 立即买入 vs 观察一周**　纯粹比较入场时点，不加任何筛选。
+**表3 · 实际选股条件下的对比**　每周按回撤最深取Top3，更接近真实操作。
 
-**表4 · 组合筛选效果**　把有效的判别条件组合起来，看实际能提升多少，
-以及**周覆盖率**下降多少（这决定实操性）。
+**表4 · 分年度**　确认结论不是靠某一年撑起来的。
 
-### 判断标准
-
-一个真正能识别弱反弹的特征，应该**同时满足三条**：
-- 强组平均收益更高
-- 强组胜率更高
-- 强组大跌（<-15%）比例更低
-
-只满足一条大概率是噪声。这个标准比之前只看平均收益更严格，
-因为"识别弱反弹"本质上是要**降低失败率**，不只是提高平均值。
+---
+**你需要有心理准备**：如果移动止损或SKDJ高位退出确实更好，
+那意味着平均持有周数会从3周拉长到可能十几周，交易节奏完全改变。
+表1的"平均持有周数"一列会告诉你具体是多久。
             """
         )
         return
@@ -1047,7 +1121,9 @@ def main():
     start_date = start_input.strftime("%Y%m%d")
     end_date = end_input.strftime("%Y%m%d")
     fetch_start = (pd.Timestamp(start_input) - timedelta(days=500)).strftime("%Y%m%d")
-    fetch_end = (pd.Timestamp(end_input) + timedelta(days=90)).strftime("%Y%m%d")
+    fetch_end = (
+        pd.Timestamp(end_input) + timedelta(days=int(max_weeks) * 7 + 60)
+    ).strftime("%Y%m%d")
 
     with st.spinner("构建科技股研究池……"):
         whitelist_set, name_map, industry_map = load_custom_tech_whitelist(token_clean)
@@ -1068,90 +1144,52 @@ def main():
         f"本次下载{sync_stats.get('downloaded_days', 0)}天。"
     )
 
-    progress = st.progress(0.0, text="计算信号与判别特征……")
-    all_week_parts = []
-    signal_parts = []
+    fixed_weeks_list = [3, 4, 6, 10, 13]
+    progress = st.progress(0.0, text="模拟各种退出规则……")
+    parts = []
     codes = sorted(stocks.keys())
     for idx, ts_code in enumerate(codes):
         weekly = build_weekly_bars(stocks[ts_code])
-        if weekly.empty or len(weekly) < 50 + int(hold_weeks):
+        if weekly.empty or len(weekly) < 60:
             continue
-        weekly = add_skdj(weekly, int(n_period), int(m_period))
-        all_week_parts.append(build_all_weeks(weekly, ts_code))
-        rows = build_signal_features(
-            weekly, ts_code, int(n_period), int(m_period),
-            float(level), bool(require_kd), int(hold_weeks),
+        rows = build_signals_with_exits(
+            weekly, ts_code, int(n_period), int(m_period), float(level),
+            bool(require_kd), int(max_weeks), float(trail_pct),
+            float(skdj_top), int(ma_exit_weeks), fixed_weeks_list,
         )
         if not rows.empty:
-            signal_parts.append(rows)
-        if idx % 50 == 0:
+            parts.append(rows)
+        if idx % 40 == 0:
             progress.progress(
                 min((idx + 1) / len(codes), 1.0),
-                text=f"计算信号与判别特征……{idx + 1}/{len(codes)}",
+                text=f"模拟各种退出规则……{idx + 1}/{len(codes)}",
             )
     progress.empty()
     del stocks
     gc.collect()
 
-    if not signal_parts or not all_week_parts:
+    if not parts:
         st.error("没有产生信号。")
         return
-
-    all_weeks = pd.concat(all_week_parts, ignore_index=True)
-    signals = pd.concat(signal_parts, ignore_index=True)
-    del all_week_parts, signal_parts
+    signals = pd.concat(parts, ignore_index=True)
+    del parts
     gc.collect()
 
-    # 相对强度基准：全池中位数与行业中位数
-    all_weeks["Industry"] = all_weeks["ts_code"].map(industry_map).fillna("未分类")
-    pool_median = all_weeks.groupby("Week")["Return_1W_pct"].median().rename("Pool_Median")
-    industry_median = (
-        all_weeks.groupby(["Week", "Industry"])["Return_1W_pct"]
-        .median()
-        .rename("Industry_Median")
-        .reset_index()
-    )
-    # 观察周(t+1)的基准需要用下一周的中位数
-    pool_median_frame = pool_median.reset_index()
-    week_order = sorted(all_weeks["Week"].unique())
-    next_week_map = {
-        week: week_order[i + 1] for i, week in enumerate(week_order[:-1])
-    }
-
-    signals["Industry"] = signals["ts_code"].map(industry_map).fillna("未分类")
-    signals = signals.merge(pool_median_frame, on="Week", how="left")
-    signals = signals.merge(industry_median, on=["Week", "Industry"], how="left")
-    signals["Next_Week"] = signals["Week"].map(next_week_map)
-    signals = signals.merge(
-        pool_median_frame.rename(
-            columns={"Week": "Next_Week", "Pool_Median": "Pool_Median_N"}
-        ),
-        on="Next_Week", how="left",
-    )
-    signals = signals.merge(
-        industry_median.rename(
-            columns={"Week": "Next_Week", "Industry_Median": "Industry_Median_N"}
-        ),
-        on=["Next_Week", "Industry"], how="left",
-    )
-
-    signals["RS_Pool_T"] = signals["T_Return_1W_pct"] - signals["Pool_Median"]
-    signals["RS_Industry_T"] = signals["T_Return_1W_pct"] - signals["Industry_Median"]
-    signals["RS_Pool_N"] = signals["N_Return_1W_pct"] - signals["Pool_Median_N"]
-    signals["RS_Industry_N"] = signals["N_Return_1W_pct"] - signals["Industry_Median_N"]
-
     signals = signals[
-        (signals["Week"] >= start_date) & (signals["Week"] <= end_date)
+        (signals["Signal_Week"] >= start_date) & (signals["Signal_Week"] <= end_date)
+    ]
+    signals = signals[
+        pd.to_numeric(signals["Entry_Price"], errors="coerce") >= min_price
     ]
     if not basic_indexed.empty:
         basic_reset = basic_indexed.reset_index().rename(
-            columns={"trade_date_str": "Week"}
+            columns={"trade_date_str": "Signal_Week"}
         )
-        keep = [c for c in ("Week", "ts_code", "circ_mv") if c in basic_reset.columns]
+        keep = [c for c in ("Signal_Week", "ts_code", "circ_mv") if c in basic_reset.columns]
         if len(keep) == 3:
             signals = signals.merge(
-                basic_reset[keep].drop_duplicates(["Week", "ts_code"]),
-                on=["Week", "ts_code"], how="left",
+                basic_reset[keep].drop_duplicates(["Signal_Week", "ts_code"]),
+                on=["Signal_Week", "ts_code"], how="left",
             )
             mv = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
             signals = signals[mv.between(min_mv, max_mv) | mv.isna()]
@@ -1160,89 +1198,80 @@ def main():
         st.error("过滤后无信号。")
         return
 
-    table_t = discriminator_test(
-        signals, SIGNAL_WEEK_FEATURES, "Ret_Immediate", float(cost_pct), ""
-    )
-    table_n = discriminator_test(
-        signals, OBSERVE_WEEK_FEATURES, "Ret_Delayed", float(cost_pct), ""
-    )
-    timing = entry_timing_comparison(signals, float(cost_pct))
-    combos = combined_filter_test(signals, float(cost_pct), int(top_n))
-
-    st.session_state["wave_result"] = {
+    st.session_state["exit_result"] = {
         "signals": signals,
-        "table_t": table_t,
-        "table_n": table_n,
-        "timing": timing,
-        "combos": combos,
+        "compare": compare_exit_rules(signals, float(cost_pct)),
+        "capture": capture_ratio_table(signals, float(cost_pct)),
+        "selection": exit_by_selection(signals, float(cost_pct), int(top_n)),
+        "yearly": yearly_exit_table(signals, float(cost_pct)),
         "params": {
-            "N": int(n_period), "M": int(m_period), "阈值": float(level),
-            "持有": int(hold_weeks), "每周选": int(top_n),
+            "最长持有": int(max_weeks), "移动止损": float(trail_pct),
+            "SKDJ高位": float(skdj_top), "均线": int(ma_exit_weeks),
+            "每周选": int(top_n),
         },
     }
 
 
 def render_results():
-    result = st.session_state.get("wave_result")
+    result = st.session_state.get("exit_result")
     if not result:
         return False
     params = result["params"]
     signals = result["signals"]
 
     st.markdown("---")
-    st.header("强弱反弹判别结果")
+    st.header("退出规则对比结果")
     st.caption(
-        f"信号 {len(signals):,} 笔，覆盖 {signals['Week'].min()} — {signals['Week'].max()}"
-        f"　|　持有{params['持有']}周"
+        f"信号 {len(signals):,} 笔，覆盖 {signals['Signal_Week'].min()} — "
+        f"{signals['Signal_Week'].max()}　|　最长持有{params['最长持有']}周　"
+        f"移动止损{params['移动止损']:.0f}%　SKDJ高位{params['SKDJ高位']:.0f}"
     )
 
-    st.subheader("表1 · 信号周就能看出的强弱特征")
-    st.dataframe(result["table_t"].round(3), width="stretch", hide_index=True)
+    st.subheader("表1 · 退出规则总对比")
+    st.dataframe(result["compare"].round(2), width="stretch", hide_index=True)
     st.caption(
-        "**三条同时满足才算有效**：强组收益更高 + 强组胜率更高 + 强组大跌比例更低。"
-        "「相对全池/行业强度」和「距40周均线」是本次新增的、此前从未测过的角度。"
+        "**不要只看平均收益。**「赚>50%比例」反映能否留住大波段，"
+        "「亏>20%比例」反映代价，「平均持有周数」决定你的交易节奏是否能接受，"
+        "「收益/波动」是风险调整后的综合比较。"
     )
 
-    st.subheader("表2 · 观察一周后才能看出的强弱特征")
-    st.dataframe(result["table_n"].round(3), width="stretch", hide_index=True)
-    st.caption(
-        "用信号后第一周的表现判断。**注意**：这一层多等了一周，"
-        "所以即使判别有效，也要和表3的延迟入场代价一起看净效果。"
-    )
+    if not result["capture"].empty:
+        st.subheader("表2 · 大涨捕获率（这张表直接回答能否留住黄金）")
+        st.dataframe(result["capture"].round(2), width="stretch", hide_index=True)
+        st.caption(
+            "只在**理论最大涨幅≥30%**的那批交易上比较——这些就是真正的黄金。"
+            "「大涨样本 捕获率%」= 实际收益 ÷ 理论最大涨幅。"
+            "固定3周的捕获率如果很低，就证实了它在系统性地砍断大赢家。"
+        )
 
-    st.subheader("表3 · 入场时点：立即买 vs 观察一周")
-    st.dataframe(result["timing"].round(3), width="stretch", hide_index=True)
-    st.caption(
-        "不加任何筛选，纯粹比较入场时点的代价。"
-        "如果观察一周本身就明显亏，那表2的判别能力必须大到能覆盖这个代价才划算。"
-    )
+    if not result["selection"].empty:
+        st.subheader("表3 · 实际选股条件下（每周回撤最深Top3）")
+        st.dataframe(result["selection"].round(2), width="stretch", hide_index=True)
+        st.caption("更接近真实操作的结果。")
 
-    st.subheader("表4 · 组合筛选的实际效果")
-    st.dataframe(result["combos"].round(3), width="stretch", hide_index=True)
-    st.caption(
-        "**重点看「周覆盖率%」**——筛选越严，能交易的周越少。"
-        "之前的教训是：靠大幅牺牲交易机会换来的收益提升，没有实操价值。"
-        "理想结果是收益和胜率明显提升，而周覆盖率保持在70%以上。"
-    )
+    if not result["yearly"].empty:
+        st.subheader("表4 · 分年度")
+        st.dataframe(result["yearly"].round(2), width="stretch", hide_index=True)
+        st.caption("确认最优规则不是靠某一年撑起来的。")
 
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_signal_week_discriminators.csv",
-            result["table_t"].to_csv(index=False, encoding="utf-8-sig"),
+            "01_exit_comparison.csv",
+            result["compare"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "02_observe_week_discriminators.csv",
-            result["table_n"].to_csv(index=False, encoding="utf-8-sig"),
+            "02_capture_ratio.csv",
+            result["capture"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "03_entry_timing.csv",
-            result["timing"].to_csv(index=False, encoding="utf-8-sig"),
+            "03_with_selection.csv",
+            result["selection"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "04_combined_filters.csv",
-            result["combos"].to_csv(index=False, encoding="utf-8-sig"),
+            "04_yearly.csv",
+            result["yearly"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
             "05_all_signals.csv",
@@ -1251,9 +1280,9 @@ def render_results():
     st.download_button(
         "下载验证结果",
         data=output.getvalue(),
-        file_name="wave_strength_validation.zip",
+        file_name="exit_rule_validation.zip",
         mime="application/zip",
-        key="download_wave",
+        key="download_exit",
     )
     return True
 
