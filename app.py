@@ -630,6 +630,11 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
     }
     if "raw_close" in frame.columns:
         aggregations["raw_close"] = "last"
+    # 量能类列按周求和（换手率逐日相加即为周换手率），
+    # 缺了这几列会导致后续量能因子拿到标量而不是序列。
+    for column in ("vol", "amount", "turnover_rate"):
+        if column in frame.columns:
+            aggregations[column] = "sum"
     weekly = (
         frame.groupby("year_week", as_index=False)
         .agg(aggregations)
@@ -670,7 +675,11 @@ def prepare_daily_indicators(daily: pd.DataFrame) -> pd.DataFrame:
     close = pd.to_numeric(frame["close"], errors="coerce")
     high = pd.to_numeric(frame["high"], errors="coerce")
     low = pd.to_numeric(frame["low"], errors="coerce")
-    volume = pd.to_numeric(frame.get("vol", np.nan), errors="coerce")
+    volume = (
+        pd.to_numeric(frame["vol"], errors="coerce")
+        if "vol" in frame.columns
+        else pd.Series(np.nan, index=frame.index, dtype="float64")
+    )
 
     frame["d_ma5"] = close.rolling(5).mean()
     frame["d_vol_ma5"] = volume.shift(1).rolling(5).mean()
@@ -775,14 +784,24 @@ def build_signals_with_daily_entry(
     if len(weekly) < 30:
         return pd.DataFrame()
 
+    def column_series(frame: pd.DataFrame, name: str) -> pd.Series:
+        """取列并转数值；列不存在时返回等长的全NaN序列。
+
+        直接用 frame.get(name, np.nan) 在列缺失时会返回标量，
+        后续 .shift()/.rolling() 就会抛 AttributeError。
+        """
+        if name in frame.columns:
+            return pd.to_numeric(frame[name], errors="coerce")
+        return pd.Series(np.nan, index=frame.index, dtype="float64")
+
     k_now = pd.to_numeric(weekly["K"], errors="coerce")
     k_prev = k_now.shift(1)
     d_now = pd.to_numeric(weekly["D"], errors="coerce")
     close_w = pd.to_numeric(weekly["close"], errors="coerce")
     high_w = pd.to_numeric(weekly["high"], errors="coerce")
-    volume_w = pd.to_numeric(weekly.get("vol", np.nan), errors="coerce")
-    turnover_w = pd.to_numeric(weekly.get("turnover_rate", np.nan), errors="coerce")
-    amount_w = pd.to_numeric(weekly.get("amount", np.nan), errors="coerce")
+    volume_w = column_series(weekly, "vol")
+    turnover_w = column_series(weekly, "turnover_rate")
+    amount_w = column_series(weekly, "amount")
 
     signal = (k_prev <= k_now) & (k_now <= level)
     if require_kd:
