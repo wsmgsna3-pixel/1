@@ -1,21 +1,26 @@
 # -*- coding: utf-8 -*-
-"""趋势启动信号验证器 V2（单文件独立版，直接覆盖 app.py 运行）。
+"""洗盘验证器（单文件独立版，直接覆盖 app.py 运行）。
 
-上一轮（V1）的关键发现，两条都是干净单调、幅度接近两倍：
-  - 越接近两年高点，突破后大涨概率越高（18.96% -> 35.08%）
-  - 横盘区间越宽，大涨概率越高（18.93% -> 33.06%）
+上一轮结论：突破+接近两年高点+波动压缩的组合，涨超100%的概率是全池基准的
+2.37倍——选股确实找对了。但移动止损后的实际收益却只有3.95%，
+且加入"区间宽"特征后收益转负、止损中位数从-7%恶化到-14%、胜率从40%掉到31%。
 
-这两条都与从K线图得到的直觉相反（图上看是"低位极窄横盘后暴涨"），
-属于典型的幸存者偏差：低位窄幅横盘的股票，突破后恰恰是大涨概率最低的一组。
+诊断：不是选错股票，而是固定止损把赢家提前赶走了。
 
-而V1的最优组合⑦（突破+压缩+放量）完全没用到这两条，提升倍数仅1.46；
-⑧因为加了反方向的"低位启动"条件，提升倍数掉到0.83、收益转负。
+本工具验证两个假设：
+  1. 真正的上涨浪起来之前存在洗盘（即使最终大涨的股票，中途也深度回撤）
+  2. 如果洗盘存在，能否等洗盘结束后再介入
 
-本轮用已验证方向的特征重新组合，目标是把涨超50%的提升倍数从1.46推到2以上。
-同时对这两个关键特征做分年度单调性检验——V1只验证了全期。
+第二点的关键优势：在更低位置进场后，同样15%的止损从更低成本算起，
+被打掉的概率自然更小——不需要把止损放宽到实盘无法承受的25~40%。
 
-所有特征只用当周及之前数据；前瞻指标从下一周开盘算起，无未来函数。
-退出统一用移动止损（趋势型信号配趋势型退出）。
+必须同时验证的前提：洗盘和失败在事前是否可区分。如果不可区分，
+"等回撤再买"就等于把失败的票也一起买了，这会体现在成交率和大涨比例上。
+
+止损范围限定在5~25%（实盘可承受），不再测更宽的止损。
+
+所有判断只用当周及之前数据；限价单按盘中触及成交，确认类按当周收盘确认、
+次周开盘买入，无未来函数。
 
 行情缓存与之前共用，已下载数据不会重复下载。
 """
@@ -47,7 +52,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "趋势启动信号验证 V2"
+APP_TITLE = "洗盘验证：能否等洗盘后再介入"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
@@ -673,282 +678,375 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # 特征与前瞻
 # -----------------------------------------------------------------------------
-def build_trend_panel(
-    weekly: pd.DataFrame,
-    ts_code: str,
-    breakout_weeks: int,
-    base_weeks: int,
-    forward_weeks: int,
-    trail_pct: float,
-) -> pd.DataFrame:
-    """逐周一行：趋势启动特征 + 未来大涨情况。无未来函数。"""
+
+# -----------------------------------------------------------------------------
+# 信号与路径
+# -----------------------------------------------------------------------------
+def compute_features(weekly: pd.DataFrame, breakout_weeks: int, base_weeks: int):
     close = pd.to_numeric(weekly["close"], errors="coerce")
     high = pd.to_numeric(weekly["high"], errors="coerce")
     low = pd.to_numeric(weekly["low"], errors="coerce")
-    open_p = pd.to_numeric(weekly["open"], errors="coerce")
     volume = (
         pd.to_numeric(weekly["vol"], errors="coerce")
         if "vol" in weekly.columns
         else pd.Series(np.nan, index=weekly.index, dtype="float64")
     )
-    dates = weekly["trade_date_str"].astype(str)
-    n = len(weekly)
-    if n < base_weeks + 20:
-        return pd.DataFrame()
-
     return_1w = (close / close.shift(1) - 1.0) * 100.0
 
-    prior_high_close = close.shift(1).rolling(breakout_weeks).max()
-    breakout = close > prior_high_close
-
-    base_high = high.shift(1).rolling(base_weeks).max()
-    base_low = low.shift(1).rolling(base_weeks).min()
-    base_mid = close.shift(1).rolling(base_weeks).mean()
-    base_range_pct = (base_high - base_low) / base_mid.replace(0, np.nan) * 100.0
-
+    features = pd.DataFrame(index=weekly.index)
+    features["breakout"] = close > close.shift(1).rolling(breakout_weeks).max()
+    features["position_2y"] = close / high.shift(1).rolling(104).max().replace(0, np.nan)
     vol_recent = return_1w.shift(1).rolling(8).std()
     vol_earlier = return_1w.shift(9).rolling(18).std()
-    vol_contraction = vol_recent / vol_earlier.replace(0, np.nan)
+    features["vol_contraction"] = vol_recent / vol_earlier.replace(0, np.nan)
+    features["volume_surge"] = (
+        volume / volume.shift(1).rolling(8).mean().replace(0, np.nan)
+    )
+    # 个股自身的周波动率，用于判断回撤是否属于其正常波动范围
+    features["weekly_vol"] = return_1w.rolling(26).std()
+    return features
 
-    volume_surge = volume / volume.shift(1).rolling(8).mean().replace(0, np.nan)
 
-    long_high = high.shift(1).rolling(104).max()
-    position_vs_2y_high = close / long_high.replace(0, np.nan)
+def analyze_signal_path(
+    close_values, high_values, low_values, open_values,
+    signal_index: int, forward_weeks: int, stop_pct: float,
+    pullback_levels, confirm_modes,
+):
+    """对单个突破信号，模拟"立即买入"与各种"等洗盘后买入"的结果。
 
-    ma5 = close.rolling(5).mean()
-    ma10 = close.rolling(10).mean()
-    ma20 = close.rolling(20).mean()
-    ma_bull = (ma5 > ma10) & (ma10 > ma20)
+    统一口径：
+      - 限价单：盘中最低价触及目标价即成交；若开盘已低于目标价则按开盘价
+      - 确认类：当周收盘满足条件 -> 次周开盘买入
+      - 所有方式共用同一个观察截止周，止损幅度也相同
+    """
+    n = len(close_values)
+    stop_index = min(signal_index + forward_weeks, n - 1)
+    if stop_index <= signal_index + 1:
+        return None
 
-    # V2新增：中期动量（接近高点的另一种表达，且不依赖104周历史）
-    momentum_26w = (close / close.shift(26) - 1.0) * 100.0
+    entry_index_immediate = signal_index + 1
+    entry_immediate = open_values[entry_index_immediate]
+    if not math.isfinite(entry_immediate) or entry_immediate <= 0:
+        return None
+    signal_close = close_values[signal_index]
 
-    entry = open_p.shift(-1)
-    max_gain = pd.Series(np.nan, index=weekly.index, dtype="float64")
-    final_return = pd.Series(np.nan, index=weekly.index, dtype="float64")
-    trail_return = pd.Series(np.nan, index=weekly.index, dtype="float64")
-
-    high_values = high.to_numpy()
-    close_values = close.to_numpy()
-    entry_values = entry.to_numpy()
-
-    for i in range(n):
-        entry_price = entry_values[i]
-        if not math.isfinite(entry_price) or entry_price <= 0:
-            continue
-        stop = min(i + forward_weeks, n - 1)
-        if stop <= i:
-            continue
-        window_high = high_values[i + 1 : stop + 1]
+    def outcome_from(entry_idx, entry_price):
+        """给定入场点，算最大涨幅、止损收益、持有到期收益、以及最大逆向波动。"""
+        if entry_idx is None or not math.isfinite(entry_price) or entry_price <= 0:
+            return None
+        if entry_idx > stop_index:
+            return None
+        window_high = high_values[entry_idx : stop_index + 1]
+        window_low = low_values[entry_idx : stop_index + 1]
         finite_high = window_high[np.isfinite(window_high)]
+        max_gain = (
+            (finite_high.max() / entry_price - 1.0) * 100.0 if finite_high.size else np.nan
+        )
+        # 到达最高点之前的最大跌幅（衡量"要忍多少痛才等到涨"）
         if finite_high.size:
-            max_gain.iloc[i] = (finite_high.max() / entry_price - 1.0) * 100.0
-        final_close = close_values[stop]
-        if math.isfinite(final_close):
-            final_return.iloc[i] = (final_close / entry_price - 1.0) * 100.0
+            peak_offset = int(np.nanargmax(window_high))
+            pre_peak_low = window_low[: peak_offset + 1]
+            finite_low = pre_peak_low[np.isfinite(pre_peak_low)]
+            max_adverse = (
+                (finite_low.min() / entry_price - 1.0) * 100.0 if finite_low.size else np.nan
+            )
+        else:
+            max_adverse = np.nan
+        # 止损收益
         peak = entry_price
         exit_price = None
-        for j in range(i + 1, stop + 1):
+        for j in range(entry_idx, stop_index + 1):
             current = close_values[j]
             if not math.isfinite(current):
                 continue
             peak = max(peak, current)
-            if current <= peak * (1.0 - trail_pct / 100.0):
+            if current <= peak * (1.0 - stop_pct / 100.0):
                 exit_price = current
                 break
         if exit_price is None:
-            exit_price = close_values[stop]
-        if math.isfinite(exit_price):
-            trail_return.iloc[i] = (exit_price / entry_price - 1.0) * 100.0
-
-    return pd.DataFrame(
-        {
-            "ts_code": ts_code,
-            "Week": dates,
-            "Breakout": breakout.fillna(False),
-            "Base_Range_pct": base_range_pct,
-            "Vol_Contraction": vol_contraction,
-            "Volume_Surge": volume_surge,
-            "Position_vs_2Y_High": position_vs_2y_high,
-            "Momentum_26W_pct": momentum_26w,
-            "MA_Bull": ma_bull.fillna(False),
-            "Entry_Open": entry,
-            "Max_Gain_pct": max_gain,
-            "Final_Return_pct": final_return,
-            "Trail_Return_pct": trail_return,
-        }
-    ).dropna(subset=["Max_Gain_pct"])
-
-
-# -----------------------------------------------------------------------------
-# 统计
-# -----------------------------------------------------------------------------
-def big_move_stats(values: pd.Series, thresholds=(30, 50, 100)):
-    numeric = pd.to_numeric(values, errors="coerce").dropna()
-    stats = {"样本数": int(len(numeric))}
-    for threshold in thresholds:
-        stats[f"涨超{threshold}%概率"] = (
-            float((numeric > threshold).mean() * 100.0) if len(numeric) else np.nan
+            exit_price = close_values[stop_index]
+        trail_return = (
+            (exit_price / entry_price - 1.0) * 100.0 if math.isfinite(exit_price) else np.nan
         )
-    stats["平均最大涨幅%"] = float(numeric.mean()) if len(numeric) else np.nan
-    return stats
+        hold_return = (
+            (close_values[stop_index] / entry_price - 1.0) * 100.0
+            if math.isfinite(close_values[stop_index])
+            else np.nan
+        )
+        return {
+            "max_gain": max_gain,
+            "max_adverse": max_adverse,
+            "trail": trail_return,
+            "hold": hold_return,
+            "entry_index": entry_idx,
+        }
+
+    result = {"signal_index": signal_index}
+    immediate = outcome_from(entry_index_immediate, entry_immediate)
+    if immediate is None:
+        return None
+    result["立即买入"] = immediate
+
+    # ---- 等回撤到指定幅度再买（限价单）----
+    for level in pullback_levels:
+        target = signal_close * (1.0 - level / 100.0)
+        filled_index = None
+        fill_price = np.nan
+        for j in range(signal_index + 1, stop_index + 1):
+            day_low = low_values[j]
+            day_open = open_values[j]
+            if math.isfinite(day_low) and day_low <= target:
+                fill_price = (
+                    day_open
+                    if math.isfinite(day_open) and day_open < target
+                    else target
+                )
+                filled_index = j
+                break
+        outcome = outcome_from(filled_index, fill_price) if filled_index else None
+        result[f"回撤{level:.0f}%买入"] = outcome
+
+    # ---- 洗盘后需要回升确认 ----
+    for level, mode in confirm_modes:
+        target = signal_close * (1.0 - level / 100.0)
+        pullback_index = None
+        for j in range(signal_index + 1, stop_index + 1):
+            day_low = low_values[j]
+            if math.isfinite(day_low) and day_low <= target:
+                pullback_index = j
+                break
+        outcome = None
+        if pullback_index is not None:
+            for j in range(pullback_index, stop_index):
+                current = close_values[j]
+                if not math.isfinite(current):
+                    continue
+                confirmed = False
+                if mode == "站回突破价":
+                    confirmed = current >= signal_close
+                elif mode == "周线收阳":
+                    prev = close_values[j - 1] if j > 0 else np.nan
+                    confirmed = math.isfinite(prev) and current > prev
+                if confirmed:
+                    entry_price = open_values[j + 1]
+                    outcome = outcome_from(j + 1, entry_price)
+                    break
+        result[f"回撤{level:.0f}%后{mode}"] = outcome
+
+    return result
 
 
-def v2_variants_test(panel: pd.DataFrame, cost_pct: float, quantile_cut: float):
-    """按上一轮验证出的正确方向重新组合特征。
+def build_signals(
+    weekly: pd.DataFrame, ts_code: str, breakout_weeks: int, base_weeks: int,
+    forward_weeks: int, stop_pct: float, pullback_levels, confirm_modes,
+    position_quantile_value: float, use_contraction: bool,
+) -> pd.DataFrame:
+    if len(weekly) < base_weeks + 30:
+        return pd.DataFrame()
+    features = compute_features(weekly, breakout_weeks, base_weeks)
+    close_values = pd.to_numeric(weekly["close"], errors="coerce").to_numpy()
+    high_values = pd.to_numeric(weekly["high"], errors="coerce").to_numpy()
+    low_values = pd.to_numeric(weekly["low"], errors="coerce").to_numpy()
+    open_values = pd.to_numeric(weekly["open"], errors="coerce").to_numpy()
+    dates = weekly["trade_date_str"].astype(str).tolist()
 
-    上一轮关键发现（两条都是干净单调、幅度接近两倍）：
-      - 越接近两年高点，大涨概率越高（18.96% -> 35.08%）
-      - 横盘区间越宽，大涨概率越高（18.93% -> 33.06%）
-    而上一轮最优组合⑦完全没用到这两条，⑧还用了反方向的"低位启动"导致失效。
-    本轮用正确方向替换，看提升倍数能否从1.46推高。
-    """
-    baseline = big_move_stats(panel["Max_Gain_pct"])
-    breakout = panel["Breakout"].astype(bool)
-    base_range = pd.to_numeric(panel["Base_Range_pct"], errors="coerce")
-    vol_contract = pd.to_numeric(panel["Vol_Contraction"], errors="coerce")
-    volume_surge = pd.to_numeric(panel["Volume_Surge"], errors="coerce")
-    position = pd.to_numeric(panel["Position_vs_2Y_High"], errors="coerce")
-    momentum = pd.to_numeric(panel["Momentum_26W_pct"], errors="coerce")
-    ma_bull = panel["MA_Bull"].astype(bool)
-
-    # 方向已由上一轮数据确定：位置高、区间宽、压缩强、放量
-    near_high = position >= position.quantile(1.0 - quantile_cut)
-    wide_range = base_range >= base_range.quantile(1.0 - quantile_cut)
-    strong_contract = vol_contract <= 0.8
-    with_volume = volume_surge >= 1.5
-    strong_momentum = momentum >= momentum.quantile(1.0 - quantile_cut)
-
-    variants = [
-        ("全池基准（不筛选）", pd.Series(True, index=panel.index)),
-        ("上轮最优⑦：突破+压缩+放量", breakout & strong_contract & with_volume),
-        ("A 突破 + 接近两年高点", breakout & near_high),
-        ("B 突破 + 区间宽", breakout & wide_range),
-        ("C 突破 + 接近高点 + 区间宽", breakout & near_high & wide_range),
-        ("D 突破 + 接近高点 + 放量", breakout & near_high & with_volume),
-        ("E 突破 + 接近高点 + 区间宽 + 放量", breakout & near_high & wide_range & with_volume),
-        ("F 突破 + 接近高点 + 区间宽 + 压缩", breakout & near_high & wide_range & strong_contract),
-        (
-            "G 全条件：突破+接近高点+区间宽+压缩+放量",
-            breakout & near_high & wide_range & strong_contract & with_volume,
-        ),
-        ("H 突破 + 26周动量强 + 放量", breakout & strong_momentum & with_volume),
-        ("I 突破 + 接近高点 + 均线多头 + 放量", breakout & near_high & ma_bull & with_volume),
-    ]
+    breakout = features["breakout"].fillna(False).to_numpy()
+    position = features["position_2y"].to_numpy()
+    contraction = features["vol_contraction"].to_numpy()
+    volume_surge = features["volume_surge"].to_numpy()
+    weekly_vol = features["weekly_vol"].to_numpy()
 
     rows = []
-    for label, mask in variants:
-        subset = panel.loc[mask.fillna(False)]
-        if len(subset) < 30:
+    for i in range(len(weekly)):
+        if not breakout[i]:
             continue
-        stats = big_move_stats(subset["Max_Gain_pct"])
-        trail = (
-            pd.to_numeric(subset["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
+        if math.isfinite(position_quantile_value) and not (
+            math.isfinite(position[i]) and position[i] >= position_quantile_value
+        ):
+            continue
+        if use_contraction and not (
+            math.isfinite(contraction[i]) and contraction[i] <= 0.8
+        ):
+            continue
+        path = analyze_signal_path(
+            close_values, high_values, low_values, open_values,
+            i, forward_weeks, stop_pct, pullback_levels, confirm_modes,
         )
-        final = (
-            pd.to_numeric(subset["Final_Return_pct"], errors="coerce").dropna() - cost_pct
-        )
+        if path is None:
+            continue
         row = {
-            "信号定义": label,
-            "样本数": stats["样本数"],
-            "占全池%": float(len(subset) / len(panel) * 100.0),
+            "ts_code": ts_code,
+            "Week": dates[i],
+            "Signal_Close": close_values[i],
+            "Position_2Y": position[i],
+            "Vol_Contraction": contraction[i],
+            "Volume_Surge": volume_surge[i],
+            "Weekly_Vol": weekly_vol[i],
         }
-        for threshold in (50, 100):
-            key = f"涨超{threshold}%概率"
-            row[key] = stats[key]
-            base_value = baseline[key]
-            row[f"涨超{threshold}%提升倍数"] = (
-                stats[key] / base_value if base_value and base_value > 0 else np.nan
-            )
-        row["移动止损收益%"] = float(trail.mean()) if len(trail) else np.nan
-        row["移动止损胜率%"] = float((trail > 0).mean() * 100.0) if len(trail) else np.nan
-        row["移动止损中位%"] = float(trail.median()) if len(trail) else np.nan
-        row["持有到期收益%"] = float(final.mean()) if len(final) else np.nan
+        for key, outcome in path.items():
+            if key == "signal_index":
+                continue
+            if outcome is None:
+                row[f"{key}_成交"] = False
+                continue
+            row[f"{key}_成交"] = True
+            row[f"{key}_最大涨幅"] = outcome["max_gain"]
+            row[f"{key}_最大逆向"] = outcome["max_adverse"]
+            row[f"{key}_止损收益"] = outcome["trail"]
+            row[f"{key}_持有到期"] = outcome["hold"]
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def feature_yearly_monotonicity(panel: pd.DataFrame, feature: str, label: str, ascending: bool):
-    """分年度检验特征的单调性——上一轮只看了全期，这次逐年验证。
+# -----------------------------------------------------------------------------
+# 分析
+# -----------------------------------------------------------------------------
+def washout_evidence(signals: pd.DataFrame):
+    """洗盘存在性检验：把最终大涨的和没涨的分开，看它们中途各回撤了多少。
 
-    一个真规律应该每年都保持同方向；如果只有某几年单调，可信度就要打折。
+    如果连最终大涨的股票，中途也普遍深度回撤，
+    就证明"固定止损把赢家提前赶走"这个诊断成立。
     """
-    breakout = panel[panel["Breakout"].astype(bool)].copy()
-    breakout["年份"] = breakout["Week"].astype(str).str[:4]
-    values = pd.to_numeric(breakout[feature], errors="coerce")
-    work = breakout.assign(_v=values).dropna(subset=["_v"])
+    gain = pd.to_numeric(signals.get("立即买入_最大涨幅"), errors="coerce")
+    adverse = pd.to_numeric(signals.get("立即买入_最大逆向"), errors="coerce")
+    work = pd.DataFrame({"gain": gain, "adverse": adverse}).dropna()
+    if work.empty:
+        return pd.DataFrame()
+    buckets = [
+        ("失败（最大涨幅<10%）", work["gain"] < 10),
+        ("一般（10~30%）", (work["gain"] >= 10) & (work["gain"] < 30)),
+        ("良好（30~50%）", (work["gain"] >= 30) & (work["gain"] < 50)),
+        ("大涨（50~100%）", (work["gain"] >= 50) & (work["gain"] < 100)),
+        ("翻倍以上（>100%）", work["gain"] >= 100),
+    ]
     rows = []
-    for year, group in work.groupby("年份"):
-        if len(group) < 100:
+    for label, mask in buckets:
+        subset = work.loc[mask, "adverse"]
+        if subset.empty:
             continue
-        try:
-            group = group.assign(
-                _q=pd.qcut(group["_v"].rank(method="first", ascending=ascending), 5, labels=False)
-            )
-        except ValueError:
-            continue
-        record = {"特征": label, "年份": year, "样本数": len(group)}
-        means = []
-        for q in range(5):
-            sub = group[group["_q"] == q]["Max_Gain_pct"]
-            value = float((sub > 50).mean() * 100.0) if len(sub) else np.nan
-            record[f"第{q + 1}组涨超50%"] = value
-            means.append(value)
-        valid = [m for m in means if math.isfinite(m)]
-        record["首尾差"] = (valid[-1] - valid[0]) if len(valid) >= 2 else np.nan
-        diffs = [b - a for a, b in zip(valid, valid[1:])]
-        record["单调性"] = (
-            f"{sum(1 for d in diffs if d > 0)}升/{sum(1 for d in diffs if d < 0)}降"
+        rows.append(
+            {
+                "最终结果分组": label,
+                "样本数": int(len(subset)),
+                "中途最大跌幅 中位数%": float(subset.median()),
+                "中途最大跌幅 平均%": float(subset.mean()),
+                "跌超10%比例": float((subset <= -10).mean() * 100.0),
+                "跌超15%比例": float((subset <= -15).mean() * 100.0),
+                "跌超20%比例": float((subset <= -20).mean() * 100.0),
+                "跌超30%比例": float((subset <= -30).mean() * 100.0),
+            }
         )
-        rows.append(record)
     return pd.DataFrame(rows)
 
 
-def best_variant_yearly(panel: pd.DataFrame, cost_pct: float, quantile_cut: float):
-    """几个候选组合的分年度对比。"""
-    work = panel.copy()
+def entry_method_comparison(signals: pd.DataFrame, cost_pct: float):
+    """各入场方式对比：洗盘后介入是否真的更好。"""
+    methods = sorted(
+        {
+            column.rsplit("_", 1)[0]
+            for column in signals.columns
+            if column.endswith("_止损收益")
+        }
+    )
+    total = len(signals)
+    rows = []
+    for method in methods:
+        filled = signals.get(f"{method}_成交", pd.Series(False, index=signals.index))
+        filled = filled.fillna(False).astype(bool)
+        trail = (
+            pd.to_numeric(signals.loc[filled, f"{method}_止损收益"], errors="coerce").dropna()
+            - cost_pct
+        )
+        hold = (
+            pd.to_numeric(signals.loc[filled, f"{method}_持有到期"], errors="coerce").dropna()
+            - cost_pct
+        )
+        gain = pd.to_numeric(
+            signals.loc[filled, f"{method}_最大涨幅"], errors="coerce"
+        ).dropna()
+        adverse = pd.to_numeric(
+            signals.loc[filled, f"{method}_最大逆向"], errors="coerce"
+        ).dropna()
+        if trail.empty:
+            continue
+        rows.append(
+            {
+                "入场方式": method,
+                "成交数": int(filled.sum()),
+                "成交率%": float(filled.sum() / total * 100.0) if total else np.nan,
+                "止损后收益%": float(trail.mean()),
+                "止损后中位%": float(trail.median()),
+                "止损后胜率%": float((trail > 0).mean() * 100.0),
+                "持有到期收益%": float(hold.mean()) if len(hold) else np.nan,
+                "涨超50%比例": float((gain > 50).mean() * 100.0) if len(gain) else np.nan,
+                "涨超100%比例": float((gain > 100).mean() * 100.0) if len(gain) else np.nan,
+                "中途最大跌幅中位%": float(adverse.median()) if len(adverse) else np.nan,
+            }
+        )
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("止损后收益%", ascending=False).reset_index(drop=True)
+    return result
+
+
+def stop_sensitivity(signals: pd.DataFrame, cost_pct: float):
+    """在最优入场方式下，不同止损幅度的效果（只测实盘可承受的范围）。
+
+    注意：这里用"中途最大跌幅"重新推算不同止损的触发情况是近似的，
+    真实结果需要重跑；本表用于判断方向，不作为最终依据。
+    """
+    methods = sorted(
+        {
+            column.rsplit("_", 1)[0]
+            for column in signals.columns
+            if column.endswith("_最大逆向")
+        }
+    )
+    rows = []
+    for method in methods:
+        filled = signals.get(f"{method}_成交", pd.Series(False, index=signals.index))
+        filled = filled.fillna(False).astype(bool)
+        adverse = pd.to_numeric(
+            signals.loc[filled, f"{method}_最大逆向"], errors="coerce"
+        )
+        gain = pd.to_numeric(
+            signals.loc[filled, f"{method}_最大涨幅"], errors="coerce"
+        )
+        work = pd.DataFrame({"adverse": adverse, "gain": gain}).dropna()
+        if work.empty:
+            continue
+        big = work["gain"] >= 50
+        row = {"入场方式": method, "成交数": int(len(work))}
+        for stop in (8, 10, 12, 15, 20):
+            killed = work["adverse"] <= -stop
+            row[f"{stop}%止损误杀大涨比例"] = (
+                float((killed & big).sum() / big.sum() * 100.0) if big.sum() else np.nan
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def yearly_entry_table(signals: pd.DataFrame, cost_pct: float):
+    work = signals.copy()
     work["年份"] = work["Week"].astype(str).str[:4]
-    breakout = work["Breakout"].astype(bool)
-    base_range = pd.to_numeric(work["Base_Range_pct"], errors="coerce")
-    vol_contract = pd.to_numeric(work["Vol_Contraction"], errors="coerce")
-    volume_surge = pd.to_numeric(work["Volume_Surge"], errors="coerce")
-    position = pd.to_numeric(work["Position_vs_2Y_High"], errors="coerce")
-
-    near_high = position >= position.quantile(1.0 - quantile_cut)
-    wide_range = base_range >= base_range.quantile(1.0 - quantile_cut)
-    strong_contract = vol_contract <= 0.8
-    with_volume = volume_surge >= 1.5
-
-    candidates = {
-        "上轮⑦(压缩+放量)": breakout & strong_contract & with_volume,
-        "E(高点+宽+放量)": breakout & near_high & wide_range & with_volume,
-        "G(全条件)": breakout & near_high & wide_range & strong_contract & with_volume,
-    }
+    methods = sorted(
+        {
+            column.rsplit("_", 1)[0]
+            for column in signals.columns
+            if column.endswith("_止损收益")
+        }
+    )
     rows = []
     for year, group in work.groupby("年份"):
-        base_stats = big_move_stats(group["Max_Gain_pct"])
-        record = {
-            "年份": year,
-            "基准涨超50%": base_stats["涨超50%概率"],
-        }
-        for name, mask in candidates.items():
-            sub = group[mask.reindex(group.index).fillna(False)]
-            if len(sub) < 5:
-                record[f"{name}信号数"] = len(sub)
-                record[f"{name}提升"] = np.nan
-                record[f"{name}止损收益%"] = np.nan
-                continue
-            stats = big_move_stats(sub["Max_Gain_pct"])
+        record = {"年份": year, "信号数": len(group)}
+        for method in methods:
+            filled = group.get(f"{method}_成交", pd.Series(False, index=group.index))
+            filled = filled.fillna(False).astype(bool)
             trail = (
-                pd.to_numeric(sub["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
+                pd.to_numeric(group.loc[filled, f"{method}_止损收益"], errors="coerce").dropna()
+                - cost_pct
             )
-            record[f"{name}信号数"] = int(len(sub))
-            record[f"{name}提升"] = (
-                stats["涨超50%概率"] / base_stats["涨超50%概率"]
-                if base_stats["涨超50%概率"]
-                else np.nan
-            )
-            record[f"{name}止损收益%"] = float(trail.mean()) if len(trail) else np.nan
+            record[method] = float(trail.mean()) if len(trail) else np.nan
         rows.append(record)
     return pd.DataFrame(rows)
 
@@ -958,17 +1056,19 @@ def best_variant_yearly(panel: pd.DataFrame, cost_pct: float, quantile_cut: floa
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"🚀 {APP_TITLE}")
-    st.caption("用上一轮验证出的正确方向重新组合——不是碰运气加条件。")
+    st.title(f"🔍 {APP_TITLE}")
+    st.caption("先证明洗盘存在，再测能不能等洗盘结束后再进场。")
     st.info(
-        "**上一轮的关键发现（两条都是干净单调、幅度接近两倍）：**\n\n"
-        "- 越**接近两年高点**，突破后大涨概率越高（18.96% → 35.08%）\n"
-        "- 横盘**区间越宽**，大涨概率越高（18.93% → 33.06%）\n\n"
-        "这两条都和从K线图得出的直觉相反（图上看是低位极窄横盘后暴涨），"
-        "属于典型的幸存者偏差。而上一轮最优组合⑦完全没用到这两条，"
-        "⑧还用了反方向的低位启动条件，提升倍数掉到0.83。\n\n"
-        "**本轮用正确方向替换，看提升倍数能否从1.46推到2以上。**"
-        "同时对这两个特征做分年度单调性检验——上一轮只看了全期。"
+        "**两步验证：**\n\n"
+        "**第一步 · 洗盘是否真实存在**　把突破后最终大涨的股票和没涨的分开，"
+        "看它们中途各自回撤了多少。如果连最终翻倍的股票中途也普遍跌15%以上，"
+        "就证明固定止损确实在提前赶走赢家。\n\n"
+        "**第二步 · 能否等洗盘后再买**　对比立即买入与几种等回撤后介入的方式。"
+        "**关键优势**：在更低的位置进场，同样15%的止损从更低成本算起，"
+        "被打掉的概率自然更小——不用放宽止损就能解决被洗出的问题。\n\n"
+        "**但有个前提要验证**：洗盘和失败在事前长得一样。"
+        "如果分不出来，等回撤再买就等于把失败的票也一起买了——"
+        "这会体现在成交率和涨超50%比例的变化上。"
     )
 
     with st.sidebar:
@@ -983,20 +1083,25 @@ def main():
         end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.subheader("信号定义")
+        st.subheader("突破信号")
         breakout_weeks = st.number_input("突破几周新高", value=26, min_value=4, max_value=104, step=2)
-        base_weeks = st.number_input("横盘基底考察周数", value=26, min_value=8, max_value=104, step=2)
-        quantile_cut = st.slider(
-            "「接近高点」「区间宽」取前百分之几",
-            min_value=0.10, max_value=0.60, value=0.33, step=0.05,
-            help="0.33表示取该特征排名前33%的样本。放宽会增加信号数但降低纯度。",
+        base_weeks = st.number_input("基底考察周数", value=26, min_value=8, max_value=104, step=2)
+        position_cut = st.slider(
+            "只保留接近两年高点的前百分之几",
+            min_value=0.10, max_value=1.00, value=0.33, step=0.05,
+            help="上轮验证：越接近两年高点，大涨概率越高（5年里4年正向）。设为1.00则不筛选。",
+        )
+        use_contraction = st.checkbox(
+            "同时要求波动率压缩（≤0.8）", value=True,
+            help="上轮F组合的组成部分，涨超100%提升2.37倍。",
         )
 
         st.markdown("---")
-        st.subheader("前瞻与退出")
+        st.subheader("洗盘与止损")
         forward_weeks = st.number_input("前瞻观察周数", value=26, min_value=8, max_value=104, step=2)
-        trail_pct = st.number_input(
-            "移动止损：从最高收盘价回撤%", value=20.0, min_value=5.0, max_value=50.0, step=5.0
+        stop_pct = st.number_input(
+            "移动止损%（实盘可承受范围）", value=15.0, min_value=5.0, max_value=25.0, step=1.0,
+            help="不再测25%以上——单笔亏那么多实盘扛不住。",
         )
         cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
 
@@ -1016,39 +1121,34 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
-        if st.session_state.get("trend2_result"):
+        if st.session_state.get("wash_result"):
             return
         st.markdown(
             """
-### 本轮测试的组合
+### 对比的入场方式
 
-| 代号 | 组合 |
+| 方式 | 说明 |
 |---|---|
-| ⑦ | 上轮最优：突破+压缩+放量（对照） |
-| A | 突破 + 接近两年高点 |
-| B | 突破 + 区间宽 |
-| C | 突破 + 接近高点 + 区间宽 |
-| D | 突破 + 接近高点 + 放量 |
-| E | 突破 + 接近高点 + 区间宽 + 放量 |
-| F | 突破 + 接近高点 + 区间宽 + 压缩 |
-| G | 全条件叠加 |
-| H | 突破 + 26周动量强 + 放量 |
-| I | 突破 + 接近高点 + 均线多头 + 放量 |
+| 立即买入 | 突破次周开盘买（基准） |
+| 回撤8/12/15%买入 | 挂低于突破周收盘价N%的限价单 |
+| 回撤12%后站回突破价 | 洗完盘、价格重新站上突破价才买 |
+| 回撤12%后周线收阳 | 洗完盘、出现一根周阳线才买 |
 
-### 三张表
+后两种是"等洗盘结束的信号"，比单纯挂限价单更谨慎，
+代价是买得更高、可能错过。
 
-**表1 · 各组合 vs 基准**　核心是**涨超50%/100%的提升倍数**，
-以及**移动止损收益**（真正能落袋的）。
+### 四张表
 
-**表2 · 分年度单调性**　上一轮只看全期单调，这次逐年验证。
-一个真规律应该每年都同方向；只有某几年单调的话，可信度要打折。
+**表1 · 洗盘存在性**　按最终涨幅分组，看各组中途跌了多少。
+**这张表决定后面所有讨论有没有意义。**
 
-**表3 · 候选组合分年度**　对比⑦、E、G三个方案逐年的表现，
-看新组合是否稳定优于上一轮的⑦。
+**表2 · 入场方式对比**　重点看「止损后收益%」和「中途最大跌幅中位%」——
+后者反映在更低位置进场是否真的减轻了持仓压力。
 
----
-**判断标准**：提升倍数>2 且分年度大部分>1.5，才算真正找到东西。
-上一轮⑦只有1.46，且5年里3年移动止损是亏的。
+**表3 · 止损误杀分析**　在各入场方式下，8/10/12/15/20%的止损
+分别会误杀掉多少比例的大涨行情。这直接回答"止损该设多少"。
+
+**表4 · 分年度**　确认结论稳定。
             """
         )
         return
@@ -1090,143 +1190,177 @@ def main():
         f"本次下载{sync_stats.get('downloaded_days', 0)}天。"
     )
 
-    progress = st.progress(0.0, text="计算趋势启动特征……")
-    parts = []
+    pullback_levels = [8.0, 12.0, 15.0]
+    confirm_modes = [(12.0, "站回突破价"), (12.0, "周线收阳")]
+
+    # 先算全池的位置分位数，作为筛选门槛
+    position_samples = []
+    weekly_cache = {}
     codes = sorted(stocks.keys())
+    prep = st.progress(0.0, text="计算全池位置分布……")
     for idx, ts_code in enumerate(codes):
         weekly = build_weekly_bars(stocks[ts_code])
-        if weekly.empty:
+        if weekly.empty or len(weekly) < int(base_weeks) + 30:
             continue
-        rows = build_trend_panel(
+        weekly_cache[ts_code] = weekly
+        features = compute_features(weekly, int(breakout_weeks), int(base_weeks))
+        values = features.loc[features["breakout"].fillna(False), "position_2y"]
+        position_samples.append(values.dropna())
+        if idx % 60 == 0:
+            prep.progress(min((idx + 1) / len(codes), 1.0))
+    prep.empty()
+    if not position_samples:
+        st.error("数据不足。")
+        return
+    all_positions = pd.concat(position_samples, ignore_index=True)
+    position_threshold = (
+        float(all_positions.quantile(1.0 - float(position_cut)))
+        if float(position_cut) < 1.0
+        else float("-inf")
+    )
+    st.caption(
+        f"位置门槛：只保留突破时价格 ≥ 两年高点的 "
+        f"{position_threshold:.3f} 倍（前{float(position_cut)*100:.0f}%）"
+    )
+
+    progress = st.progress(0.0, text="模拟洗盘与各种入场方式……")
+    parts = []
+    for idx, (ts_code, weekly) in enumerate(weekly_cache.items()):
+        rows = build_signals(
             weekly, ts_code, int(breakout_weeks), int(base_weeks),
-            int(forward_weeks), float(trail_pct),
+            int(forward_weeks), float(stop_pct), pullback_levels, confirm_modes,
+            position_threshold, bool(use_contraction),
         )
         if not rows.empty:
             parts.append(rows)
         if idx % 40 == 0:
-            progress.progress(
-                min((idx + 1) / len(codes), 1.0),
-                text=f"计算趋势启动特征……{idx + 1}/{len(codes)}",
-            )
+            progress.progress(min((idx + 1) / len(weekly_cache), 1.0))
     progress.empty()
-    del stocks
+    del stocks, weekly_cache
     gc.collect()
 
     if not parts:
-        st.error("数据不足。")
+        st.error("没有产生信号，请放宽筛选条件。")
         return
-    panel = pd.concat(parts, ignore_index=True)
+    signals = pd.concat(parts, ignore_index=True)
     del parts
     gc.collect()
 
-    panel = panel[(panel["Week"] >= start_date) & (panel["Week"] <= end_date)]
-    panel = panel[pd.to_numeric(panel["Entry_Open"], errors="coerce") >= min_price]
+    signals = signals[(signals["Week"] >= start_date) & (signals["Week"] <= end_date)]
+    signals = signals[
+        pd.to_numeric(signals["Signal_Close"], errors="coerce") >= min_price
+    ]
     if not basic_indexed.empty:
         basic_reset = basic_indexed.reset_index().rename(columns={"trade_date_str": "Week"})
         keep = [c for c in ("Week", "ts_code", "circ_mv") if c in basic_reset.columns]
         if len(keep) == 3:
-            panel = panel.merge(
+            signals = signals.merge(
                 basic_reset[keep].drop_duplicates(["Week", "ts_code"]),
                 on=["Week", "ts_code"], how="left",
             )
-            mv = pd.to_numeric(panel["circ_mv"], errors="coerce") / 10000.0
-            panel = panel[mv.between(min_mv, max_mv) | mv.isna()]
-    panel = panel.reset_index(drop=True)
-    if panel.empty:
-        st.error("过滤后无数据。")
+            mv = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
+            signals = signals[mv.between(min_mv, max_mv) | mv.isna()]
+    signals = signals.reset_index(drop=True)
+    if signals.empty:
+        st.error("过滤后无信号。")
         return
 
-    variants = v2_variants_test(panel, float(cost_pct), float(quantile_cut))
-    monotonic = pd.concat(
-        [
-            feature_yearly_monotonicity(
-                panel, "Position_vs_2Y_High", "相对两年高点（第5组最接近高点）", True
-            ),
-            feature_yearly_monotonicity(
-                panel, "Base_Range_pct", "横盘区间宽度（第5组最宽）", True
-            ),
-        ],
-        ignore_index=True,
-    )
-    yearly = best_variant_yearly(panel, float(cost_pct), float(quantile_cut))
-
-    st.session_state["trend2_result"] = {
-        "panel_size": len(panel),
-        "breakout_count": int(panel["Breakout"].astype(bool).sum()),
-        "variants": variants,
-        "monotonic": monotonic,
-        "yearly": yearly,
+    st.session_state["wash_result"] = {
+        "signals": signals,
+        "washout": washout_evidence(signals),
+        "entries": entry_method_comparison(signals, float(cost_pct)),
+        "stops": stop_sensitivity(signals, float(cost_pct)),
+        "yearly": yearly_entry_table(signals, float(cost_pct)),
         "params": {
-            "突破周数": int(breakout_weeks), "基底周数": int(base_weeks),
-            "前瞻周数": int(forward_weeks), "移动止损": float(trail_pct),
-            "分位": float(quantile_cut),
+            "突破周数": int(breakout_weeks), "前瞻": int(forward_weeks),
+            "止损": float(stop_pct), "位置前": float(position_cut),
+            "要求压缩": bool(use_contraction),
         },
     }
 
 
 def render_results():
-    result = st.session_state.get("trend2_result")
+    result = st.session_state.get("wash_result")
     if not result:
         return False
     params = result["params"]
+    signals = result["signals"]
 
     st.markdown("---")
-    st.header("趋势启动 V2 验证结果")
+    st.header("洗盘验证结果")
     st.caption(
-        f"全池观测 {result['panel_size']:,} 个「个股-周」，突破样本 "
-        f"{result['breakout_count']:,} 个　|　突破{params['突破周数']}周新高　"
-        f"前瞻{params['前瞻周数']}周　移动止损{params['移动止损']:.0f}%　"
-        f"特征取前{params['分位']*100:.0f}%"
+        f"突破信号 {len(signals):,} 个，覆盖 {signals['Week'].min()} — "
+        f"{signals['Week'].max()}　|　突破{params['突破周数']}周新高　"
+        f"前瞻{params['前瞻']}周　移动止损{params['止损']:.0f}%　"
+        f"位置前{params['位置前']*100:.0f}%"
+        f"{'　含波动压缩' if params['要求压缩'] else ''}"
     )
 
-    st.subheader("表1 · 各组合 vs 全池基准")
-    st.dataframe(result["variants"].round(2), width="stretch", hide_index=True)
+    st.subheader("表1 · 洗盘存在性：最终大涨的股票，中途跌了多少？")
+    st.dataframe(result["washout"].round(2), width="stretch", hide_index=True)
     st.caption(
-        "**核心两列**：「涨超50%提升倍数」要大于2才算真正有能力；"
-        "「移动止损收益%」是实际能落袋的。\n\n"
-        "第二行是上一轮最优的⑦（提升1.46倍、收益4.65%），"
-        "新组合必须明显超过它才算这一轮有进展。"
-        "同时留意「占全池%」——筛得太狠会导致信号太少没法交易。"
+        "**这张表决定后面所有讨论有没有意义。**\n\n"
+        "看「翻倍以上」那一行的「跌超15%比例」：如果很高，"
+        "说明即使是最终翻倍的股票，中途也普遍深跌——"
+        "固定15%止损确实在提前赶走赢家，你的洗盘假设成立。\n\n"
+        "但同时对比「失败」那一行：如果失败组跌得更深、比例更高，"
+        "说明深跌本身仍是负面信号，只是不够干净。"
     )
 
-    if not result["monotonic"].empty:
-        st.subheader("表2 · 两个关键特征的分年度单调性")
-        st.dataframe(result["monotonic"].round(2), width="stretch", hide_index=True)
+    st.subheader("表2 · 入场方式对比：等洗盘后再买是否更好？")
+    st.dataframe(result["entries"].round(2), width="stretch", hide_index=True)
+    st.caption(
+        "**看三列**：「止损后收益%」是最终结果；"
+        "「中途最大跌幅中位%」反映在更低位置进场是否真的减轻了持仓压力；"
+        "「成交率%」反映会错过多少机会。\n\n"
+        "如果等回撤的方式收益更高**且**中途跌幅更小，"
+        "那就是双赢——不用放宽止损就解决了被洗出的问题。"
+    )
+
+    if not result["stops"].empty:
+        st.subheader("表3 · 止损误杀分析：止损该设多少？")
+        st.dataframe(result["stops"].round(2), width="stretch", hide_index=True)
         st.caption(
-            "上一轮只验证了全期单调，这次逐年检查。**看「单调性」列**："
-            "如果多数年份是4升/0降或3升/1降，说明规律稳定可信；"
-            "如果各年方向不一致，那全期的单调可能是少数年份主导的假象。"
+            "各入场方式下，不同止损幅度会误杀掉多少比例的大涨行情"
+            "（那些最终涨超50%、但中途被止损打出的）。\n\n"
+            "**对比同一行的8%到20%**：如果从15%放宽到20%误杀率大幅下降，"
+            "说明止损确实偏紧；如果差别不大，说明问题不在止损幅度。"
         )
 
     if not result["yearly"].empty:
-        st.subheader("表3 · 三个候选方案的分年度对比")
+        st.subheader("表4 · 各入场方式分年度")
         st.dataframe(result["yearly"].round(2), width="stretch", hide_index=True)
-        st.caption(
-            "对比上轮⑦与新组合E、G。**看新组合是否每年都优于⑦**，"
-            "以及止损收益为负的年份是否减少（⑦是5年里3年亏）。"
-        )
+        st.caption("确认最优方式不是靠某一年。")
 
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_variants_v2.csv",
-            result["variants"].to_csv(index=False, encoding="utf-8-sig"),
+            "01_washout_evidence.csv",
+            result["washout"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "02_yearly_monotonicity.csv",
-            result["monotonic"].to_csv(index=False, encoding="utf-8-sig"),
+            "02_entry_methods.csv",
+            result["entries"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "03_yearly_variants.csv",
+            "03_stop_sensitivity.csv",
+            result["stops"].to_csv(index=False, encoding="utf-8-sig"),
+        )
+        archive.writestr(
+            "04_yearly.csv",
             result["yearly"].to_csv(index=False, encoding="utf-8-sig"),
+        )
+        archive.writestr(
+            "05_all_signals.csv",
+            signals.to_csv(index=False, encoding="utf-8-sig"),
         )
     st.download_button(
         "下载验证结果",
         data=output.getvalue(),
-        file_name="trend_start_v2.zip",
+        file_name="washout_validation.zip",
         mime="application/zip",
-        key="download_trend2",
+        key="download_wash",
     )
     return True
 
