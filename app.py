@@ -1,29 +1,27 @@
 # -*- coding: utf-8 -*-
-"""样本外测试器（单文件独立版，直接覆盖 app.py 运行）。
+"""市值分层分析器（单文件独立版，直接覆盖 app.py 运行）。
 
-背景与目的：
-突破策略在2022-2026期间表现为：翻倍概率15.41%（全池基准7.33%，提升2.10倍），
-移动止损后收益6.47%。但77%的信号（988/1285）集中在2025-2026两年，
-所谓"四年回测"在信息量上其实只有两年。
+回答三个问题：
+  1. A股科技类股票（不含北交所）到底有多少只，按市值如何分布
+  2. 把选股范围从100亿放宽到50亿，能多多少选股机会
+  3. 小市值是否真的波动更大（验证实盘观察）
 
-更值得注意的是：2024年全市场+4.12%而该策略-3.91%；
-2026年全市场-2.29%而该策略+8.16%。说明它不是单纯的牛市beta，
-2025-2026与2022-2024之间存在某种市场结构差异。
+同时这也是一次横截面维度的样本外检验：50-100亿、30-50亿这两个区间，
+此前所有回测都没有碰过。若同一套冻结规则在这些新股票上依然有效，
+则是继2018-2022时间维度之后的又一个独立证据。
 
-但用同一份数据无法分辨以下两种可能：
-  (a) 过拟合——参数是在这份数据上试出来的，换时期即失效
-  (b) 行情依赖——逻辑真实，但只在特定市场结构下有效
+重要偏差提示：
+股票池构建时会剔除"当前名称含ST或退"的在架股票，即一只现在是ST的票，
+其健康时期的历史也被排除。这个幸存者偏差对小市值股票远比大市值严重
+（50-100亿变ST或退市的概率高得多），因此放宽到50亿后，
+回测结果会比真实情况更乐观，且乐观程度大于当前范围。解读时需打折扣。
 
-唯一的分辨方法是拿全新的数据做样本外测试。本工具即为此设计：
-策略参数全部锁死为模块级常量，只允许修改测试区间。
+策略规则与样本外测试完全一致并锁死为模块级常量，不允许修改。
 
-使用纪律：绝对不要在新数据上调整这些参数。样本外测试的全部价值就在于
-"规则不动，只换数据"；一旦调参，就等于又做了一轮样本内拟合，测试立即失效。
+内存优化：边构建周线边释放日线，避免两份完整数据共存。
 
-内存优化：边构建周线边释放日线，避免两份完整数据共存
-（Streamlit Cloud 上限约1GB，超出会被静默杀死、需重新部署）。
-
-行情缓存与之前共用，但测试早期区间需要额外下载历史数据。
+行情缓存与之前共用。注意：股票池本身不含市值过滤，
+因此放宽市值下限不会增加下载量，只影响分析阶段的筛选。
 """
 
 from __future__ import annotations
@@ -53,7 +51,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "样本外测试：规则冻结，只换数据"
+APP_TITLE = "科技股池市值分层分析"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
@@ -684,29 +682,27 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 # 信号与路径
 # -----------------------------------------------------------------------------
 
-# =============================================================================
-# 冻结的策略规则 —— 这些数值来自 2022-2026 样本内测试，本工具不允许修改。
-# 样本外测试的全部意义就在于"规则不动，只换数据"。
-# 一旦在新数据上调参数，这次测试就失去价值，等于又做了一轮样本内拟合。
-# =============================================================================
-FROZEN_BREAKOUT_WEEKS = 26          # 突破26周新高
-FROZEN_POSITION_QUANTILE = 0.33     # 只取接近两年高点的前33%
-FROZEN_VOL_CONTRACTION_MAX = 0.8    # 波动率压缩 ≤0.8
-FROZEN_FORWARD_WEEKS = 26           # 前瞻26周
-FROZEN_STOP_PCT = 15.0              # 移动止损15%（实盘可承受范围）
-FROZEN_ENTRY = "立即买入"            # 突破次周开盘买入（洗盘验证已证明等回撤更差）
 
-# 2022-2026 样本内基准结果，用于并排对照
-IN_SAMPLE_REFERENCE = {
-    "期间": "2022-2026（样本内，已反复优化）",
-    "信号数": 1285,
-    "翻倍概率%": 15.41,
-    "全池基准翻倍概率%": 7.33,
-    "提升倍数": 2.10,
-    "止损后收益%": 6.47,
-    "止损后胜率%": 38.75,
-    "涨超50%比例": 36.34,
-}
+# =============================================================================
+# 冻结规则（与样本外测试完全一致，不允许修改）
+# =============================================================================
+FROZEN_BREAKOUT_WEEKS = 26
+FROZEN_POSITION_QUANTILE = 0.33
+FROZEN_VOL_CONTRACTION_MAX = 0.8
+FROZEN_FORWARD_WEEKS = 26
+FROZEN_STOP_PCT = 15.0
+
+# 市值分层（亿元）。100亿以上是此前全部回测的范围，
+# 50-100亿和30-50亿是从未测试过的区间——对它们的检验等于一次
+# 横截面维度上的样本外验证。
+MV_TIERS = [
+    (0, 30, "30亿以下"),
+    (30, 50, "30-50亿"),
+    (50, 100, "50-100亿（新）"),
+    (100, 300, "100-300亿"),
+    (300, 1000, "300-1000亿"),
+    (1000, 1e9, "1000亿以上"),
+]
 
 
 def compute_features(weekly: pd.DataFrame):
@@ -714,25 +710,17 @@ def compute_features(weekly: pd.DataFrame):
     high = pd.to_numeric(weekly["high"], errors="coerce")
     return_1w = (close / close.shift(1) - 1.0) * 100.0
     features = pd.DataFrame(index=weekly.index)
-    features["breakout"] = (
-        close > close.shift(1).rolling(FROZEN_BREAKOUT_WEEKS).max()
-    )
+    features["breakout"] = close > close.shift(1).rolling(FROZEN_BREAKOUT_WEEKS).max()
     features["position_2y"] = close / high.shift(1).rolling(104).max().replace(0, np.nan)
     vol_recent = return_1w.shift(1).rolling(8).std()
     vol_earlier = return_1w.shift(9).rolling(18).std()
     features["vol_contraction"] = vol_recent / vol_earlier.replace(0, np.nan)
+    # 个股周波动率：用来验证"小市值波动更大"这个观察
+    features["weekly_vol"] = return_1w.rolling(26).std()
     return features
 
 
-def evaluate_stock(
-    weekly: pd.DataFrame, ts_code: str, position_threshold: float
-) -> pd.DataFrame:
-    """对单只股票：算出全部周的基准结果 + 符合冻结规则的信号结果。
-
-    基准 = 该股所有周（无条件买入），用于计算"随机买入"的翻倍概率。
-    信号 = 满足 突破+接近高点+波动压缩 的周。
-    两者用完全相同的前瞻与止损口径，可直接比较。
-    """
+def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float):
     if len(weekly) < 140:
         return pd.DataFrame()
     features = compute_features(weekly)
@@ -745,6 +733,7 @@ def evaluate_stock(
     breakout = features["breakout"].fillna(False).to_numpy()
     position = features["position_2y"].to_numpy()
     contraction = features["vol_contraction"].to_numpy()
+    weekly_vol = features["weekly_vol"].to_numpy()
 
     rows = []
     for i in range(n - 1):
@@ -774,108 +763,148 @@ def evaluate_stock(
             exit_price = close_values[stop_index]
         if not math.isfinite(exit_price):
             continue
-        trail_return = (exit_price / entry_price - 1.0) * 100.0
 
-        is_signal = bool(
-            breakout[i]
-            and math.isfinite(position[i])
-            and position[i] >= position_threshold
-            and math.isfinite(contraction[i])
-            and contraction[i] <= FROZEN_VOL_CONTRACTION_MAX
-        )
         rows.append(
             {
                 "ts_code": ts_code,
                 "Week": dates[i],
-                "Is_Signal": is_signal,
+                "Is_Signal": bool(
+                    breakout[i]
+                    and math.isfinite(position[i])
+                    and position[i] >= position_threshold
+                    and math.isfinite(contraction[i])
+                    and contraction[i] <= FROZEN_VOL_CONTRACTION_MAX
+                ),
                 "Entry_Price": entry_price,
+                "Weekly_Vol": weekly_vol[i],
                 "Max_Gain_pct": max_gain,
-                "Trail_Return_pct": trail_return,
+                "Trail_Return_pct": (exit_price / entry_price - 1.0) * 100.0,
             }
         )
     return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
-# 汇总
+# 分层统计
 # -----------------------------------------------------------------------------
-def summarize(panel: pd.DataFrame, cost_pct: float, label: str):
-    gain = pd.to_numeric(panel["Max_Gain_pct"], errors="coerce")
-    trail = pd.to_numeric(panel["Trail_Return_pct"], errors="coerce") - cost_pct
-    valid = gain.notna() & trail.notna()
-    gain, trail = gain[valid], trail[valid]
-    if gain.empty:
-        return {}
-    return {
-        "组别": label,
-        "样本数": int(len(gain)),
-        "涨超50%比例": float((gain > 50).mean() * 100.0),
-        "翻倍概率%": float((gain > 100).mean() * 100.0),
-        "止损后收益%": float(trail.mean()),
-        "止损后中位%": float(trail.median()),
-        "止损后胜率%": float((trail > 0).mean() * 100.0),
-    }
+def assign_tier(mv_billion: pd.Series):
+    tier = pd.Series("未知", index=mv_billion.index, dtype=object)
+    for low, high, label in MV_TIERS:
+        mask = (mv_billion >= low) & (mv_billion < high)
+        tier[mask] = label
+    return tier
 
 
-def main_comparison(panel: pd.DataFrame, cost_pct: float):
-    signal = panel[panel["Is_Signal"].astype(bool)]
-    baseline = panel
+def tier_summary(panel: pd.DataFrame, cost_pct: float):
     rows = []
-    base_stats = summarize(baseline, cost_pct, "全池基准（所有周无条件买入）")
-    signal_stats = summarize(signal, cost_pct, "冻结规则信号")
-    if base_stats:
-        rows.append(base_stats)
-    if signal_stats:
-        rows.append(signal_stats)
-    table = pd.DataFrame(rows)
-    if len(table) == 2:
-        lift = pd.Series(
-            {
-                "组别": "提升倍数（信号÷基准）",
-                "样本数": np.nan,
-                "涨超50%比例": table["涨超50%比例"].iloc[1] / table["涨超50%比例"].iloc[0]
-                if table["涨超50%比例"].iloc[0]
-                else np.nan,
-                "翻倍概率%": table["翻倍概率%"].iloc[1] / table["翻倍概率%"].iloc[0]
-                if table["翻倍概率%"].iloc[0]
-                else np.nan,
-                "止损后收益%": np.nan,
-                "止损后中位%": np.nan,
-                "止损后胜率%": np.nan,
-            }
-        )
-        table = pd.concat([table, lift.to_frame().T], ignore_index=True)
-    return table
-
-
-def yearly_table(panel: pd.DataFrame, cost_pct: float):
-    work = panel.copy()
-    work["年份"] = work["Week"].astype(str).str[:4]
-    rows = []
-    for year, group in work.groupby("年份"):
+    order = [label for _, _, label in MV_TIERS]
+    for label in order:
+        group = panel[panel["Tier"] == label]
+        if group.empty:
+            continue
         signal = group[group["Is_Signal"].astype(bool)]
         base_gain = pd.to_numeric(group["Max_Gain_pct"], errors="coerce").dropna()
-        if signal.empty or base_gain.empty:
+        base_double = float((base_gain > 100).mean() * 100.0) if len(base_gain) else np.nan
+        if signal.empty:
+            rows.append(
+                {
+                    "市值区间": label,
+                    "股票数": int(group["ts_code"].nunique()),
+                    "周观测数": int(len(group)),
+                    "信号数": 0,
+                    "周波动率中位%": float(
+                        pd.to_numeric(group["Weekly_Vol"], errors="coerce").median()
+                    ),
+                }
+            )
             continue
         gain = pd.to_numeric(signal["Max_Gain_pct"], errors="coerce").dropna()
         trail = (
             pd.to_numeric(signal["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
         )
-        base_double = float((base_gain > 100).mean() * 100.0)
         signal_double = float((gain > 100).mean() * 100.0) if len(gain) else np.nan
         rows.append(
             {
-                "年份": year,
+                "市值区间": label,
+                "股票数": int(group["ts_code"].nunique()),
+                "周观测数": int(len(group)),
                 "信号数": int(len(signal)),
+                "信号占比%": float(len(signal) / len(group) * 100.0),
+                "周波动率中位%": float(
+                    pd.to_numeric(group["Weekly_Vol"], errors="coerce").median()
+                ),
                 "信号翻倍概率%": signal_double,
-                "基准翻倍概率%": base_double,
+                "同层基准翻倍概率%": base_double,
                 "提升倍数": (
                     signal_double / base_double if base_double and base_double > 0 else np.nan
                 ),
+                "涨超50%比例": float((gain > 50).mean() * 100.0) if len(gain) else np.nan,
                 "止损后收益%": float(trail.mean()) if len(trail) else np.nan,
                 "止损后胜率%": float((trail > 0).mean() * 100.0) if len(trail) else np.nan,
             }
         )
+    return pd.DataFrame(rows)
+
+
+def opportunity_comparison(panel: pd.DataFrame, cost_pct: float):
+    """对比不同市值下限带来的机会增量与表现变化。"""
+    thresholds = [(100, "现在：100亿以上"), (50, "放宽到：50亿以上"), (30, "放宽到：30亿以上")]
+    rows = []
+    for min_mv, label in thresholds:
+        group = panel[panel["MV_Billion"] >= min_mv]
+        if group.empty:
+            continue
+        signal = group[group["Is_Signal"].astype(bool)]
+        if signal.empty:
+            continue
+        gain = pd.to_numeric(signal["Max_Gain_pct"], errors="coerce").dropna()
+        trail = (
+            pd.to_numeric(signal["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
+        )
+        base_gain = pd.to_numeric(group["Max_Gain_pct"], errors="coerce").dropna()
+        base_double = float((base_gain > 100).mean() * 100.0) if len(base_gain) else np.nan
+        signal_double = float((gain > 100).mean() * 100.0)
+        weeks = group["Week"].nunique()
+        rows.append(
+            {
+                "选股范围": label,
+                "股票数": int(group["ts_code"].nunique()),
+                "信号数": int(len(signal)),
+                "每周平均信号数": float(len(signal) / weeks) if weeks else np.nan,
+                "翻倍股数量": int((gain > 100).sum()),
+                "信号翻倍概率%": signal_double,
+                "同范围基准%": base_double,
+                "提升倍数": (
+                    signal_double / base_double if base_double and base_double > 0 else np.nan
+                ),
+                "止损后收益%": float(trail.mean()),
+                "止损后胜率%": float((trail > 0).mean() * 100.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def yearly_by_range(panel: pd.DataFrame, cost_pct: float):
+    work = panel.copy()
+    work["年份"] = work["Week"].astype(str).str[:4]
+    rows = []
+    for year, group in work.groupby("年份"):
+        record = {"年份": year}
+        for min_mv, label in [(100, "100亿以上"), (50, "50亿以上")]:
+            sub = group[(group["MV_Billion"] >= min_mv) & group["Is_Signal"].astype(bool)]
+            if sub.empty:
+                record[f"{label}信号数"] = 0
+                record[f"{label}翻倍股"] = 0
+                record[f"{label}收益%"] = np.nan
+                continue
+            gain = pd.to_numeric(sub["Max_Gain_pct"], errors="coerce").dropna()
+            trail = (
+                pd.to_numeric(sub["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
+            )
+            record[f"{label}信号数"] = int(len(sub))
+            record[f"{label}翻倍股"] = int((gain > 100).sum())
+            record[f"{label}收益%"] = float(trail.mean()) if len(trail) else np.nan
+        rows.append(record)
     return pd.DataFrame(rows)
 
 
@@ -895,24 +924,18 @@ def _memory_usage_mb():
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"🧊 {APP_TITLE}")
-    st.caption("规则完全冻结，只换数据——这是唯一能分辨真规律与过拟合的方法。")
-    st.error(
-        "**使用纪律：这个工具里的策略参数是锁死的，请不要修改代码去调它们。**\n\n"
-        "样本外测试的全部价值就在于「规则不动，只换数据」。"
-        "一旦在新数据上试参数，这次测试立刻失效，等于又做了一轮样本内拟合。"
-        "如果结果不好，那就是不好——那本身就是最有价值的信息。"
+    st.title(f"📊 {APP_TITLE}")
+    st.caption("科技股池有多少只、放宽市值能多多少机会、小市值是不是真的波动更大。")
+    st.warning(
+        "**一个必须先知道的偏差**：股票池构建时会剔除「当前名称含ST或退」的在架股票，"
+        "也就是说一只现在是ST的票，它healthy时期的历史也被排除了。\n\n"
+        "**这个偏差对小市值股票严重得多**——50-100亿的票变成ST或退市的概率远高于100亿以上。"
+        "所以放宽到50亿后，回测结果会比真实情况更乐观，且乐观程度大于现在。看结果时请打折扣。"
     )
     st.info(
-        "**冻结的规则**（来自2022-2026样本内测试）：\n\n"
-        f"- 突破 {FROZEN_BREAKOUT_WEEKS} 周新高\n"
-        f"- 价格接近两年高点（前 {FROZEN_POSITION_QUANTILE*100:.0f}%）\n"
-        f"- 波动率压缩 ≤ {FROZEN_VOL_CONTRACTION_MAX}\n"
-        f"- 突破次周开盘买入（洗盘验证已证明等回撤更差）\n"
-        f"- 移动止损 {FROZEN_STOP_PCT:.0f}%，最长持有 {FROZEN_FORWARD_WEEKS} 周\n\n"
-        "**要检验的问题**：2022-2026期间该规则翻倍概率15.41%，是基准7.33%的2.1倍。"
-        "但77%的信号集中在2025-2026两年——这究竟是真规律，"
-        "还是只在最近两年的市场结构下成立？"
+        "**同时这也是一次横截面维度的样本外检验**：50-100亿和30-50亿这两个区间，"
+        "此前所有回测都没碰过。如果同一套冻结规则在这些新股票上也有效，"
+        "那是继2018-2022时间维度之后的又一个独立证据。"
     )
 
     with st.sidebar:
@@ -922,23 +945,18 @@ def main():
         except Exception:
             secret_token = ""
         token_input = st.text_input("Tushare Token", value=secret_token, type="password")
+        today = pd.Timestamp.now().date()
+        start_input = st.date_input("开始日期", value=today - timedelta(days=365 * 4))
+        end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.subheader("测试区间（这是唯一该改的东西）")
-        st.caption("建议先跑 2018-01-01 至 2022-08-31，这段我们从未碰过。")
-        start_input = st.date_input("开始日期", value=date(2018, 1, 1))
-        end_input = st.date_input("结束日期", value=date(2022, 8, 31))
-
-        st.markdown("---")
-        st.subheader("股票池（与样本内保持一致）")
+        st.caption("策略规则已锁死，与样本外测试完全一致，不可修改。")
         min_price = st.number_input("最低股价（元）", value=10.0, min_value=0.0, step=1.0)
-        min_mv = st.number_input("最低流通市值（亿元）", value=100.0, min_value=0.0, step=10.0)
-        max_mv = st.number_input("最高流通市值（亿元）", value=1000.0, min_value=100.0, step=100.0)
         cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
 
         st.markdown("---")
         clear_cache_clicked = st.button("清空行情缓存")
-        run_clicked = st.button("开始样本外测试", type="primary")
+        run_clicked = st.button("开始分析", type="primary")
 
     if clear_cache_clicked:
         if os.path.isdir(MARKET_CACHE_ROOT):
@@ -946,36 +964,27 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
-        if st.session_state.get("oos_result"):
+        if st.session_state.get("tier_result"):
             return
         st.markdown(
             """
-### 结果会怎么读
+### 会回答的三个问题
 
-跑完会得到「新区间」的三个数字，和2022-2026并排对照：
+**1. 科技股池到底有多少只？** 按市值分层列出（30亿以下 / 30-50 / 50-100 / 100-300 / 300-1000 / 1000亿以上）。
+注：股票池已排除北交所（只含主板、创业板、科创板）。
 
-| 情形 | 含义 | 该怎么办 |
-|---|---|---|
-| 提升倍数 ≈ 2，收益为正 | **真规律**，跨越完全不同的市场环境仍成立 | 可以认真考虑 |
-| 提升倍数 1.2~1.5 | 有效但弱，之前的2.1倍含运气成分 | 降低预期，小仓位试 |
-| 提升倍数 ≈ 1 或收益为负 | **要么过拟合，要么市场结构已变** | 见下方 |
+**2. 放宽到50亿能多多少机会？** 直接对比100亿以上 / 50亿以上 / 30亿以上三种范围的
+股票数、信号数、每周平均信号数、翻倍股数量。
 
-### 如果最后一种情况发生
+**3. 小市值是不是真的波动更大？** 每层给出周波动率中位数，验证你的实盘观察。
 
-那还需要再分辨一次：
+### 但最关键的是第四列
 
-- **过拟合**：策略从来就没用过，2025-2026是撞上的
-- **结构变化**：老规律在老市场有效、在新市场失效，或反过来
+**「提升倍数」**——在每个市值层内部，信号相对同层基准的翻倍概率提升。
 
-区分方法：看2018-2022内部的分年度。如果那几年里也有某一两年特别好、其余年份亏，
-说明这个策略**一直都是靠特定行情吃饭**，只是每个时代的好年份不同——
-那它就是个高波动的行情依赖型策略，而不是坏策略，
-但你必须接受连亏几年的可能。
-
-### 数据量提醒
-
-需要额外下载2016年起的行情（位置特征要104周历史），
-首次运行会比较慢。如果崩溃，把区间缩短到2-3年分次跑。
+如果50-100亿这层的提升倍数和100亿以上接近（1.5-2倍），说明策略在新区间同样有效，
+放宽范围是安全的；如果明显更低甚至小于1，说明小市值股票的突破更多是噪声，
+放宽只会增加信号数量而不增加质量。
             """
         )
         return
@@ -985,16 +994,9 @@ def main():
     if not valid:
         st.error(f"Token校验失败：{message}")
         return
-    if max_mv <= min_mv:
-        st.error("最高流通市值必须大于最低流通市值。")
-        return
-    if start_input >= end_input:
-        st.error("开始日期必须早于结束日期。")
-        return
 
     start_date = start_input.strftime("%Y%m%d")
     end_date = end_input.strftime("%Y%m%d")
-    # 位置特征需104周历史，前瞻需26周
     fetch_start = (pd.Timestamp(start_input) - timedelta(days=900)).strftime("%Y%m%d")
     fetch_end = (pd.Timestamp(end_input) + timedelta(days=220)).strftime("%Y%m%d")
 
@@ -1003,9 +1005,9 @@ def main():
     if not whitelist_set:
         st.error("未取得研究池。")
         return
-    st.success(f"科技股研究池：{len(whitelist_set)}只")
+    st.success(f"科技股研究池（不含北交所）：{len(whitelist_set)}只")
 
-    with st.spinner("加载行情（首次跑早期区间需要下载，较慢）……"):
+    with st.spinner("加载行情（复用缓存）……"):
         stocks, basic_indexed, _, _, failed_dates, sync_stats = load_optimized_market_data(
             fetch_start, fetch_end, token_clean, tuple(sorted(whitelist_set))
         )
@@ -1028,16 +1030,16 @@ def main():
         ).astype("float32")
         mv_lookup = mv_lookup.drop_duplicates(["Week", "ts_code"])
     else:
-        mv_lookup = pd.DataFrame()
+        st.error("缺少市值数据，无法分层。")
+        return
     del basic_indexed
     gc.collect()
 
-    # 边建周线边释放日线，避免两份数据共存导致内存溢出
     needed = ["trade_date_str", "open", "high", "low", "close"]
     weekly_cache = {}
     position_samples = []
     codes = sorted(stocks.keys())
-    prep = st.progress(0.0, text="构建周线并计算位置分布……")
+    prep = st.progress(0.0, text="构建周线……")
     for idx, ts_code in enumerate(codes):
         daily = stocks.pop(ts_code)
         weekly = build_weekly_bars(daily)
@@ -1068,9 +1070,7 @@ def main():
     all_positions = pd.concat(position_samples, ignore_index=True)
     del position_samples
     gc.collect()
-    position_threshold = float(
-        all_positions.quantile(1.0 - FROZEN_POSITION_QUANTILE)
-    )
+    position_threshold = float(all_positions.quantile(1.0 - FROZEN_POSITION_QUANTILE))
     del all_positions
     gc.collect()
 
@@ -1098,39 +1098,37 @@ def main():
 
     panel = panel[(panel["Week"] >= start_date) & (panel["Week"] <= end_date)]
     panel = panel[pd.to_numeric(panel["Entry_Price"], errors="coerce") >= min_price]
-    if not mv_lookup.empty:
-        panel = panel.merge(mv_lookup, on=["Week", "ts_code"], how="left")
-        mv = pd.to_numeric(panel["circ_mv"], errors="coerce") / 10000.0
-        panel = panel[mv.between(min_mv, max_mv) | mv.isna()]
-        del mv_lookup
-        gc.collect()
+    panel = panel.merge(mv_lookup, on=["Week", "ts_code"], how="left")
+    del mv_lookup
+    gc.collect()
+    panel["MV_Billion"] = pd.to_numeric(panel["circ_mv"], errors="coerce") / 10000.0
+    panel = panel.dropna(subset=["MV_Billion"])
+    panel["Tier"] = assign_tier(panel["MV_Billion"])
     panel = panel.reset_index(drop=True)
     if panel.empty:
         st.error("过滤后无数据。")
         return
 
-    used_mb = _memory_usage_mb()
-    st.session_state["oos_result"] = {
-        "panel_rows": len(panel),
-        "signal_count": int(panel["Is_Signal"].astype(bool).sum()),
-        "comparison": main_comparison(panel, float(cost_pct)),
-        "yearly": yearly_table(panel, float(cost_pct)),
+    st.session_state["tier_result"] = {
+        "pool_size": len(whitelist_set),
+        "tiers": tier_summary(panel, float(cost_pct)),
+        "opportunity": opportunity_comparison(panel, float(cost_pct)),
+        "yearly": yearly_by_range(panel, float(cost_pct)),
         "period": f"{start_date} — {end_date}",
-        "memory_mb": used_mb,
+        "memory_mb": _memory_usage_mb(),
     }
 
 
 def render_results():
-    result = st.session_state.get("oos_result")
+    result = st.session_state.get("tier_result")
     if not result:
         return False
 
     st.markdown("---")
-    st.header("样本外测试结果")
+    st.header("市值分层分析结果")
     st.caption(
-        f"测试区间 {result['period']}　|　"
-        f"全池观测 {result['panel_rows']:,} 个「个股-周」，"
-        f"其中符合冻结规则的信号 {result['signal_count']:,} 个"
+        f"科技股池（不含北交所）共 {result['pool_size']} 只　|　"
+        f"区间 {result['period']}"
         + (
             f"　|　内存 {result['memory_mb']:.0f} MB"
             if math.isfinite(result.get("memory_mb", float("nan")))
@@ -1138,87 +1136,51 @@ def render_results():
         )
     )
 
-    st.subheader("表1 · 新区间：信号 vs 全池基准")
-    st.dataframe(result["comparison"].round(2), width="stretch", hide_index=True)
-
-    st.subheader("表2 · 与样本内结果并排对照")
-    reference = pd.DataFrame(
-        [
-            IN_SAMPLE_REFERENCE,
-            {
-                "期间": f"{result['period']}（样本外，规则冻结）",
-                "信号数": result["signal_count"],
-                "翻倍概率%": (
-                    result["comparison"]["翻倍概率%"].iloc[1]
-                    if len(result["comparison"]) > 1
-                    else np.nan
-                ),
-                "全池基准翻倍概率%": (
-                    result["comparison"]["翻倍概率%"].iloc[0]
-                    if len(result["comparison"]) > 0
-                    else np.nan
-                ),
-                "提升倍数": (
-                    result["comparison"]["翻倍概率%"].iloc[2]
-                    if len(result["comparison"]) > 2
-                    else np.nan
-                ),
-                "止损后收益%": (
-                    result["comparison"]["止损后收益%"].iloc[1]
-                    if len(result["comparison"]) > 1
-                    else np.nan
-                ),
-                "止损后胜率%": (
-                    result["comparison"]["止损后胜率%"].iloc[1]
-                    if len(result["comparison"]) > 1
-                    else np.nan
-                ),
-                "涨超50%比例": (
-                    result["comparison"]["涨超50%比例"].iloc[1]
-                    if len(result["comparison"]) > 1
-                    else np.nan
-                ),
-            },
-        ]
-    )
-    st.dataframe(reference.round(2), width="stretch", hide_index=True)
+    st.subheader("表1 · 各市值层的股票数、波动率与策略表现")
+    st.dataframe(result["tiers"].round(2), width="stretch", hide_index=True)
     st.caption(
-        "**这是全部结论所在。**样本内提升2.10倍、收益6.47%。"
-        "如果样本外也接近这个水平，说明是真规律；"
-        "如果明显衰减或转负，那么之前的结果就含有大量运气或过拟合成分。"
+        "**「周波动率中位%」验证你的观察**：小市值是否真的波动更大。\n\n"
+        "**「提升倍数」是关键**：50-100亿这层如果和100亿以上接近（1.5-2倍），"
+        "说明策略在新区间同样有效；如果明显更低或小于1，"
+        "说明小市值突破更多是噪声，放宽只增加数量不增加质量。"
+    )
+
+    st.subheader("表2 · 放宽市值下限能多多少机会")
+    st.dataframe(result["opportunity"].round(2), width="stretch", hide_index=True)
+    st.caption(
+        "直接对比三种选股范围。**同时看「信号数」增量和「提升倍数」变化**——"
+        "如果信号翻倍但提升倍数下降，等于用质量换数量，未必划算。"
     )
 
     if not result["yearly"].empty:
-        st.subheader("表3 · 新区间分年度")
+        st.subheader("表3 · 分年度：100亿以上 vs 50亿以上")
         st.dataframe(result["yearly"].round(2), width="stretch", hide_index=True)
         st.caption(
-            "**即使整体结果不好，也要看这里**：如果新区间内部也是"
-            "某一两年特别好、其余年份亏，说明这个策略一直都靠特定行情吃饭，"
-            "只是每个时代的好年份不同——那它是行情依赖型策略，不是坏策略，"
-            "但必须接受连亏几年的可能。"
+            "重点看2022-2024这三个亏损年：放宽范围后能不能抓到翻倍股？"
+            "如果依然是0，说明扩大范围解决不了「差年份颗粒无收」这个根本问题。"
         )
 
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_comparison.csv",
-            result["comparison"].to_csv(index=False, encoding="utf-8-sig"),
+            "01_tier_summary.csv",
+            result["tiers"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "02_in_vs_out_sample.csv",
-            reference.to_csv(index=False, encoding="utf-8-sig"),
+            "02_opportunity.csv",
+            result["opportunity"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
             "03_yearly.csv",
             result["yearly"].to_csv(index=False, encoding="utf-8-sig"),
         )
     st.download_button(
-        "下载样本外测试结果",
+        "下载分析结果",
         data=output.getvalue(),
-        file_name="out_of_sample_validation.zip",
+        file_name="market_cap_tier_analysis.zip",
         mime="application/zip",
-        key="download_oos",
+        key="download_tier",
     )
     return True
 
