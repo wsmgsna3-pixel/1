@@ -686,6 +686,13 @@ def build_stock_signals(
     entry_open = open_price.shift(-1)
     exit_close = close_price.shift(-hold_weeks)
 
+    # --- 候选排序变量：全部只用信号周及之前的数据，无未来函数 ---
+    high_price = pd.to_numeric(weekly["high"], errors="coerce")
+    low_price = pd.to_numeric(weekly["low"], errors="coerce")
+    ma10 = close_price.rolling(10).mean()
+    ma20 = close_price.rolling(20).mean()
+    high_26 = high_price.rolling(26).max()
+
     frame = pd.DataFrame(
         {
             "ts_code": ts_code,
@@ -696,6 +703,19 @@ def build_stock_signals(
             "D": d_now,
             "Entry_Open": entry_open,
             "Exit_Close": exit_close,
+            # 候选排序变量
+            "KD_Spread": k_now - d_now,
+            "Drawdown_26W_pct": (close_price / high_26 - 1.0) * 100.0,
+            "Dist_MA10_pct": (close_price / ma10 - 1.0) * 100.0,
+            "Dist_MA20_pct": (close_price / ma20 - 1.0) * 100.0,
+            "Return_13W_pct": (close_price / close_price.shift(13) - 1.0) * 100.0,
+            "Weekly_Range_pct": (
+                (high_price - low_price) / close_price.replace(0, np.nan) * 100.0
+            ),
+            "Close_Location": (
+                (close_price - low_price)
+                / (high_price - low_price).replace(0, np.nan)
+            ),
         }
     )
     # 持仓期内每周收盘，用于组合按周盯市
@@ -926,6 +946,82 @@ def apply_density_filter(signals: pd.DataFrame, min_signals_per_week: int):
         return signals
     counts = signals.groupby("Entry_Week")["ts_code"].transform("size")
     return signals[counts >= min_signals_per_week].copy()
+
+
+def test_ranking_variables(signals: pd.DataFrame, top_n: int, cost_pct: float):
+    """检验各候选变量能否在"同一周内部"挑出更好的股票。
+
+    这是三仓能否成立的关键：3个仓位意味着每周只能买极少数信号，
+    如果没有任何变量能在周内区分好坏，那么选谁都一样，结果只能靠运气。
+
+    方法：每周按变量排序取前top_n只，算其平均收益，与"该周全部信号平均收益"
+    对比。差值为正说明该变量有选股能力。同时给出反向（取后top_n只）作对照——
+    如果正反两个方向都是正的，那多半是噪声而不是真信号。
+    """
+    if signals.empty:
+        return pd.DataFrame()
+    work = signals.copy()
+    work["_ret"] = pd.to_numeric(work["Return_pct"], errors="coerce") - cost_pct
+    work = work.dropna(subset=["_ret"])
+    baseline = work.groupby("Entry_Week")["_ret"].mean()
+
+    candidates = [
+        ("K", "K值（越低越超卖）", True),
+        ("KD_Spread", "K-D差值（越大转向越强）", False),
+        ("Drawdown_26W_pct", "26周回撤（越深跌得越多）", True),
+        ("Dist_MA10_pct", "距MA10距离", True),
+        ("Dist_MA20_pct", "距MA20距离", True),
+        ("Return_13W_pct", "13周涨幅（相对强度）", False),
+        ("Weekly_Range_pct", "本周振幅", True),
+        ("Close_Location", "收盘位置（越高越强）", False),
+    ]
+    rows = []
+    for column, label, ascending in candidates:
+        if column not in work.columns:
+            continue
+        values = pd.to_numeric(work[column], errors="coerce")
+        if values.notna().sum() < len(work) * 0.5:
+            continue
+        work["_v"] = values
+        subset = work.dropna(subset=["_v"])
+        ranked = subset.groupby("Entry_Week")["_v"].rank(
+            method="first", ascending=ascending
+        )
+        top_mask = ranked <= top_n
+        # 反向对照：按相反方向取同样数量
+        ranked_rev = subset.groupby("Entry_Week")["_v"].rank(
+            method="first", ascending=not ascending
+        )
+        bottom_mask = ranked_rev <= top_n
+
+        top_by_week = subset.loc[top_mask].groupby("Entry_Week")["_ret"].mean()
+        bottom_by_week = subset.loc[bottom_mask].groupby("Entry_Week")["_ret"].mean()
+        base_aligned = baseline.reindex(top_by_week.index)
+        edge = (top_by_week - base_aligned).dropna()
+        base_rev = baseline.reindex(bottom_by_week.index)
+        edge_rev = (bottom_by_week - base_rev).dropna()
+
+        if len(edge) > 1 and edge.std(ddof=1) > 0:
+            t_stat = edge.mean() / (edge.std(ddof=1) / math.sqrt(len(edge)))
+        else:
+            t_stat = np.nan
+
+        rows.append(
+            {
+                "排序变量": label,
+                "方向": "升序取小" if ascending else "降序取大",
+                f"每周Top{top_n}平均收益%": float(top_by_week.mean()),
+                "同周全部信号平均%": float(base_aligned.mean()),
+                "选股超额%": float(edge.mean()),
+                "反向对照超额%": float(edge_rev.mean()) if len(edge_rev) else np.nan,
+                "有效周数": int(len(edge)),
+                "粗略t值": t_stat,
+            }
+        )
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("选股超额%", ascending=False).reset_index(drop=True)
+    return result
 
 
 def sweep_slot_counts(
@@ -1222,6 +1318,10 @@ def main():
         )
         sweep_progress.empty()
 
+    rank_table = test_ranking_variables(
+        signals, int(slot_count), float(cost_pct)
+    )
+
     year_frame = signals.copy()
     year_frame["年份"] = year_frame["Signal_Week"].astype(str).str[:4]
     year_frame["净收益%"] = pd.to_numeric(
@@ -1247,6 +1347,7 @@ def main():
         "outcomes": outcomes,
         "year_table": year_table,
         "sweep_table": sweep_table,
+        "rank_table": rank_table,
         "mc_runs": int(mc_runs),
         "density": {
             "门槛": int(min_week_signals),
@@ -1279,6 +1380,7 @@ def render_results():
     outcomes = result["outcomes"]
     year_table = result["year_table"]
     sweep_table = result.get("sweep_table", pd.DataFrame())
+    rank_table = result.get("rank_table", pd.DataFrame())
     density = result.get("density", {})
     mc_runs = result["mc_runs"]
     params = result["params"]
@@ -1390,6 +1492,17 @@ def render_results():
             "而那正是最该重仓的时刻）。"
         )
 
+    if not rank_table.empty:
+        st.subheader(f"表A · 排序变量检验：能否在同一周内挑出好股票？")
+        st.dataframe(rank_table.round(3), width="stretch", hide_index=True)
+        st.caption(
+            f"**这是{params['仓位数']}仓能否成立的关键。**每周按各变量取前{params['仓位数']}只，"
+            "与「同周全部信号的平均收益」对比。\n\n"
+            "- **选股超额%** 明显为正且 |t|>2 → 该变量真能挑出好股票，少数仓位可行\n"
+            "- 全部接近0 → 周内选谁都一样，结果只能靠运气，必须靠增加仓位来分散\n"
+            "- **反向对照超额%** 也为正 → 多半是噪声，不要采信（真信号应该反向为负）"
+        )
+
     if not sweep_table.empty:
         st.subheader("表4 · 仓位数扫描：实盘能拿几只才站得住？")
         st.dataframe(sweep_table.round(2), width="stretch", hide_index=True)
@@ -1424,6 +1537,10 @@ def render_results():
         archive.writestr(
             "08_slot_count_sweep.csv",
             sweep_table.to_csv(index=False, encoding="utf-8-sig"),
+        )
+        archive.writestr(
+            "09_ranking_variable_test.csv",
+            rank_table.to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
             "05_all_signals.csv", signals.to_csv(index=False, encoding="utf-8-sig")
