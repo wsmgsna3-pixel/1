@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""R25 13/9/6周市场分类与近期方向对照审计版。
+"""R26 13/11/9/6周市场分类与近期方向对照审计版。
 
 R3中性Top2和市场三分法保持不变；R6正式Top1，第二名保留影子。
 强市完整整理再启动池先筛ATR3/ATR13在0.70—0.90，再按ATR升序取Top1。
 R7与R11第二名只做影子观察；所有正式信号采用无限资金等额独立成交。
-正式结果保留R24基准；9周、6周、13周近期下跌暂停组均隔离对照。
+正式结果保留R24基准；11周、9周、6周、13周近期下跌暂停组均隔离对照。
 """
 
 from __future__ import annotations
@@ -36,16 +36,16 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R25-REGIME-13-9-6-DIRECTION-AUDIT"
-APP_TITLE = "R25 市场周期与近期方向对照审计"
-ENGINE_PATCH = "R25-REGIME-COMPARISON"
+APP_VERSION = "R26-REGIME-13-11-9-6-DIRECTION-AUDIT"
+APP_TITLE = "R26 11周最终周期对照审计"
+ENGINE_PATCH = "R26-REGIME-COMPARISON"
 # R11正式强市入口与R22不同，必须使用新的配置身份和结果文件；行情缓存继续复用。
-STRATEGY_CONFIG_VERSION = "R25-REGIME-13-9-6-DIRECTION"
+STRATEGY_CONFIG_VERSION = "R26-REGIME-13-11-9-6-DIRECTION"
 
-CHECKPOINT_FILE = "r25_market_regime_comparison_candidates.csv"
-SCAN_LEDGER_FILE = "r25_market_regime_comparison_scanned_dates.csv"
-RUN_TASK_FILE = "r25_market_regime_comparison_running_task.json"
-RESULT_STATE_GUARD_FILE = "r25_market_regime_comparison_result_state.guard"
+CHECKPOINT_FILE = "r26_market_regime_comparison_candidates.csv"
+SCAN_LEDGER_FILE = "r26_market_regime_comparison_scanned_dates.csv"
+RUN_TASK_FILE = "r26_market_regime_comparison_running_task.json"
+RESULT_STATE_GUARD_FILE = "r26_market_regime_comparison_result_state.guard"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -85,8 +85,8 @@ R16_PRIMARY_STOP_PCT = -10.0
 R16_PRIMARY_EXIT_RULE = "日内-10%硬止损（主规则）"
 PORTFOLIO_CAPITAL_DEFAULT = 200000.0
 PORTFOLIO_SLOT_COUNT = 3
-R25_BOOTSTRAP_REPETITIONS = 2000
-R25_BOOTSTRAP_BLOCK_WEEKS = 4
+R26_BOOTSTRAP_REPETITIONS = 2000
+R26_BOOTSTRAP_BLOCK_WEEKS = 4
 
 # -----------------------------------------------------------------------------
 # 通用安全读写
@@ -882,6 +882,7 @@ def _weekly_bars(stock: pd.DataFrame, end_date: str):
     weekly["return_8w_pct"] = (close / close.shift(8) - 1.0) * 100.0
     weekly["return_6w_pct"] = (close / close.shift(6) - 1.0) * 100.0
     weekly["return_9w_pct"] = (close / close.shift(9) - 1.0) * 100.0
+    weekly["return_11w_pct"] = (close / close.shift(11) - 1.0) * 100.0
     weekly["return_13w_pct"] = (close / close.shift(13) - 1.0) * 100.0
     weekly["pre_signal_4w_return_pct"] = (close.shift(1) / close.shift(5) - 1.0) * 100.0
     weekly["prior_high_13w"] = high.shift(1).rolling(13).max()
@@ -957,7 +958,7 @@ def compute_signal_snapshot(
     )
     trend_eligible = bool(base_trend_eligible and setup_candidate)
 
-    # R25恢复R11原始口径。R22简化触发仍单独保存为观察字段，只用于维持
+    # R26恢复R11原始口径。R22简化触发仍单独保存为观察字段，只用于维持
     # R3/R6横截面候选口径和对照，不再进入强市正式交易。
     strong_trend_eligible = bool(
         base_trend_eligible
@@ -1242,6 +1243,7 @@ def compute_signal_snapshot(
         "Return_8W_pct": _safe_float(current.get("return_8w_pct")),
         "Return_6W_pct": _safe_float(current.get("return_6w_pct")),
         "Return_9W_pct": _safe_float(current.get("return_9w_pct")),
+        "Return_11W_pct": _safe_float(current.get("return_11w_pct")),
         "Return_13W_pct": _safe_float(current.get("return_13w_pct")),
         "Breakout_13W_pct": _safe_float(current.get("breakout_13w_pct")),
         "ATR_Contraction": _safe_float(current.get("atr_contraction")),
@@ -1517,7 +1519,7 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame, market_override=None):
     candidates["R11_Second_Shadow"] = False
     candidates["R7_Early_Strong_Context"] = False
     candidates["R7_Shadow_Top2"] = False
-    candidates["R25_Shadow_Tracked"] = False
+    candidates["R26_Shadow_Tracked"] = False
     candidates["R19_Selected"] = False
     candidates["Entry_Eligible"] = False
 
@@ -1615,22 +1617,22 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame, market_override=None):
         inclusive="both",
     )
     r11_rank = pd.to_numeric(candidates["R11_Strong_Rank"], errors="coerce")
-    candidates["R25_R11_Baseline"] = (
+    candidates["R26_R11_Baseline"] = (
         (market_regime == "强势")
         & r11_rank.eq(1)
         & _bool_series(candidates, "R11_ATR_Band_Pass")
     )
     band_pool = candidates.loc[strong_eligible_mask & candidates["R11_ATR_Band_Pass"]]
     band_order = band_pool.sort_values(["ATR_Contraction", "ts_code"], kind="mergesort")
-    candidates["R25_Band_Rank"] = np.nan
-    candidates.loc[band_order.index, "R25_Band_Rank"] = np.arange(1, len(band_order) + 1)
-    r11_top1 = (market_regime == "强势") & candidates["R25_Band_Rank"].eq(1)
-    candidates["R25_R11_Added"] = r11_top1 & ~candidates["R25_R11_Baseline"]
-    candidates["R25_R6_Second"] = (
+    candidates["R26_Band_Rank"] = np.nan
+    candidates.loc[band_order.index, "R26_Band_Rank"] = np.arange(1, len(band_order) + 1)
+    r11_top1 = (market_regime == "强势") & candidates["R26_Band_Rank"].eq(1)
+    candidates["R26_R11_Added"] = r11_top1 & ~candidates["R26_R11_Baseline"]
+    candidates["R26_R6_Second"] = (
         (market_regime == "弱势") & (len(recovery_eligible) >= MIN_VALID_SELECTION_SIZE)
         & pd.to_numeric(candidates["Recovery_Rank"], errors="coerce").eq(2)
     )
-    candidates["R25_R6_First"] = (
+    candidates["R26_R6_First"] = (
         (market_regime == "弱势") & (len(recovery_eligible) >= MIN_VALID_SELECTION_SIZE)
         & pd.to_numeric(candidates["Recovery_Rank"], errors="coerce").eq(1)
     )
@@ -1640,7 +1642,7 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame, market_override=None):
         & pd.to_numeric(candidates["R7_Strong_Rank"], errors="coerce").le(TOP_N)
     )
     r11_second_shadow = (
-        bool(candidates["R25_R11_Baseline"].any())
+        bool(candidates["R26_R11_Baseline"].any())
         & (market_regime == "强势")
         & strong_eligible_mask
         & r11_rank.eq(2)
@@ -1648,7 +1650,7 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame, market_override=None):
     candidates["R11_Strong_Top1"] = r11_top1
     candidates["R11_Second_Shadow"] = r11_second_shadow
     candidates["R7_Shadow_Top2"] = r7_shadow
-    candidates["R25_Shadow_Tracked"] = r11_second_shadow | r7_shadow | candidates["R25_R6_Second"]
+    candidates["R26_Shadow_Tracked"] = r11_second_shadow | r7_shadow | candidates["R26_R6_Second"]
 
     r3_count = len(r3_eligible)
     recovery_count = len(recovery_eligible)
@@ -1656,7 +1658,7 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame, market_override=None):
     if market_regime == "强势":
         active_branch = "R11强势温和ATR Top1"
         active_count = strong_count
-        candidates["Rank"] = candidates["R25_Band_Rank"]
+        candidates["Rank"] = candidates["R26_Band_Rank"]
         candidates["Entry_Eligible"] = strong_eligible_mask
         candidates["R19_Selected"] = r11_top1
         selection_valid = bool(r11_top1.any())
@@ -1728,7 +1730,7 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame, market_override=None):
         )
 
     candidates = candidates.sort_values(
-        ["R19_Selected", "R25_Shadow_Tracked", "Entry_Eligible", "Rank", "ts_code"],
+        ["R19_Selected", "R26_Shadow_Tracked", "Entry_Eligible", "Rank", "ts_code"],
         ascending=[False, False, False, True, True],
         na_position="last",
         kind="mergesort",
@@ -1738,26 +1740,27 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame, market_override=None):
 # -----------------------------------------------------------------------------
 # 买入后固定路径标签：只评价入口，不构造退出策略
 # -----------------------------------------------------------------------------
-R25_SCENARIOS = {
+R26_SCENARIOS = {
     "B13": "13周基准（R24规则）",
+    "W11": "11周分类（最后一个周期对照，阈值±5%）",
     "W9": "9周分类（阈值仍为±5%）",
     "W6": "6周分类（阈值仍为±5%）",
     "D13": "13周背景＋当周下跌暂停新买入",
 }
 
 
-def r25_score_comparison(pool):
+def r26_score_comparison(pool):
     """只用完整股票池当周已知数据判定环境；所有组共用同一排序和退出。"""
     base, raw, eligible = score_frozen_candidates(pool)
     if base.empty:
         return base, raw, eligible
     state = _market_state_metrics(pool)
-    for key in R25_SCENARIOS:
+    for key in R26_SCENARIOS:
         regime = state["Market_Regime"]
         median = state["Market_13W_Median_pct"]
         available = True
-        if key in ("W9", "W6"):
-            values = _numeric_series(pool, "Return_9W_pct" if key == "W9" else "Return_6W_pct")
+        if key in ("W11", "W9", "W6"):
+            values = _numeric_series(pool, f"Return_{key[1:]}W_pct")
             available = bool(values.notna().all() and len(values))
             median = float(values.median())
             regime = "强势" if median >= 5 else "弱势" if median <= -5 else "中性"
@@ -1766,15 +1769,15 @@ def r25_score_comparison(pool):
             selected = base
         blocked = key == "D13" and state["Market_1W_Median_pct"] < 0
         codes = set(selected.loc[_bool_series(selected, "R19_Selected"), "ts_code"])
-        base[f"R25_{key}_Selected"] = base["ts_code"].isin(codes) & available & (not blocked)
+        base[f"R26_{key}_Selected"] = base["ts_code"].isin(codes) & available & (not blocked)
         if blocked or not available:
-            base[f"R25_{key}_Selected"] = False
-        base[f"R25_{key}_Regime"] = regime
-        base[f"R25_{key}_Median"] = median
-        base[f"R25_{key}_Available"] = available
-        base[f"R25_{key}_Paused"] = blocked
-    comparison = pd.concat([_bool_series(base, f"R25_{k}_Selected") for k in R25_SCENARIOS], axis=1).any(axis=1)
-    base["R25_Shadow_Tracked"] = _bool_series(base, "R25_Shadow_Tracked") | comparison
+            base[f"R26_{key}_Selected"] = False
+        base[f"R26_{key}_Regime"] = regime
+        base[f"R26_{key}_Median"] = median
+        base[f"R26_{key}_Available"] = available
+        base[f"R26_{key}_Paused"] = blocked
+    comparison = pd.concat([_bool_series(base, f"R26_{k}_Selected") for k in R26_SCENARIOS], axis=1).any(axis=1)
+    base["R26_Shadow_Tracked"] = _bool_series(base, "R26_Shadow_Tracked") | comparison
     return base, raw, eligible
 
 
@@ -2384,7 +2387,7 @@ def scan_one_date(
     if not pool_records:
         return pd.DataFrame(), 0, 0
     pool = pd.DataFrame(pool_records)
-    candidates, raw_count, eligible_count = r25_score_comparison(pool)
+    candidates, raw_count, eligible_count = r26_score_comparison(pool)
 
     if is_preview_mode:
         if not candidates.empty:
@@ -2404,7 +2407,7 @@ def scan_one_date(
                 # 正式信号与影子审计共用完全相同的买入、止损和W3退出路径；
                 # 影子行只用于比较，R19_Selected仍是进入正式总收益的唯一开关。
                 if bool(row.get("R19_Selected", False)) or bool(
-                    row.get("R25_Shadow_Tracked", False)
+                    row.get("R26_Shadow_Tracked", False)
                 ):
                     outcome_rows.append(
                         track_w3_future_path(
@@ -3397,7 +3400,7 @@ def r20_concentration_audit(universe: pd.DataFrame):
     )
 
 
-def r25_branch_robustness_audit(universe: pd.DataFrame):
+def r26_branch_robustness_audit(universe: pd.DataFrame):
     """逐分支检查典型收益、盈亏结构与去除头部盈利后的主体贡献。"""
     columns = [
         "市场分支", "完整交易", "平均收益%", "中位收益%", "Profit_Factor",
@@ -3458,7 +3461,7 @@ def r25_branch_robustness_audit(universe: pd.DataFrame):
     return pd.DataFrame(rows, columns=columns)
 
 
-def _r25_shadow_outcomes(history: pd.DataFrame, flag_column: str):
+def _r26_shadow_outcomes(history: pd.DataFrame, flag_column: str):
     """按正式交易同口径提取影子信号的真实退出收益。"""
     if history.empty or flag_column not in history.columns:
         return history.iloc[0:0].copy()
@@ -3487,12 +3490,12 @@ def _r25_shadow_outcomes(history: pd.DataFrame, flag_column: str):
         & trigger_day.le(PRIMARY_HOLD_WEEKS * MARKET_DAYS_PER_WEEK)
         & stop_return.notna()
     )
-    frame["R25_Realized_Return_pct"] = fixed
-    frame.loc[use_stop, "R25_Realized_Return_pct"] = stop_return.loc[use_stop]
+    frame["R26_Realized_Return_pct"] = fixed
+    frame.loc[use_stop, "R26_Realized_Return_pct"] = stop_return.loc[use_stop]
     return frame
 
 
-def r25_shadow_group_summary(history: pd.DataFrame):
+def r26_shadow_group_summary(history: pd.DataFrame):
     """R11正式、R11第二名和R7影子必须分开判卷。"""
     columns = [
         "审计组", "完整交易", "信号周", "胜率%", "平均收益%", "中位收益%",
@@ -3502,16 +3505,16 @@ def r25_shadow_group_summary(history: pd.DataFrame):
     rows = []
     for label, flag in (
         ("R11正式Top1", "R11_Strong_Top1"),
-        ("R11原有信号", "R25_R11_Baseline"),
-        ("R11新增信号", "R25_R11_Added"),
-        ("R6正式第一名", "R25_R6_First"),
-        ("R6第二名影子", "R25_R6_Second"),
+        ("R11原有信号", "R26_R11_Baseline"),
+        ("R11新增信号", "R26_R11_Added"),
+        ("R6正式第一名", "R26_R6_First"),
+        ("R6第二名影子", "R26_R6_Second"),
         ("R11原有信号周原第二名影子", "R11_Second_Shadow"),
         ("R7早期强势Top2影子", "R7_Shadow_Top2"),
     ):
-        frame = _r25_shadow_outcomes(history, flag)
+        frame = _r26_shadow_outcomes(history, flag)
         returns = pd.to_numeric(
-            frame.get("R25_Realized_Return_pct", pd.Series(dtype=float)),
+            frame.get("R26_Realized_Return_pct", pd.Series(dtype=float)),
             errors="coerce",
         ).dropna().sort_values(ascending=False).reset_index(drop=True)
         net = returns.sum() if len(returns) else np.nan
@@ -3536,15 +3539,15 @@ def r25_shadow_group_summary(history: pd.DataFrame):
     return pd.DataFrame(rows, columns=columns)
 
 
-def r25_rank2_acceptance(history: pd.DataFrame):
+def r26_rank2_acceptance(history: pd.DataFrame):
     """提前冻结第二名准入条件；任何单项失败都不得升级为正式信号。"""
-    second = _r25_shadow_outcomes(history, "R11_Second_Shadow")
-    top1 = _r25_shadow_outcomes(history, "R11_Strong_Top1")
+    second = _r26_shadow_outcomes(history, "R11_Second_Shadow")
+    top1 = _r26_shadow_outcomes(history, "R11_Strong_Top1")
     values = pd.to_numeric(
-        second.get("R25_Realized_Return_pct", pd.Series(dtype=float)), errors="coerce"
+        second.get("R26_Realized_Return_pct", pd.Series(dtype=float)), errors="coerce"
     ).dropna().sort_values(ascending=False).reset_index(drop=True)
     top1_values = pd.to_numeric(
-        top1.get("R25_Realized_Return_pct", pd.Series(dtype=float)), errors="coerce"
+        top1.get("R26_Realized_Return_pct", pd.Series(dtype=float)), errors="coerce"
     ).dropna()
     pf = _profit_factor(values)
     checks = [
@@ -3562,7 +3565,7 @@ def r25_rank2_acceptance(history: pd.DataFrame):
     return result
 
 
-def _r25_zero_run_lengths(signal_flags):
+def _r26_zero_run_lengths(signal_flags):
     runs, current = [], 0
     for flag in signal_flags:
         if bool(flag):
@@ -3576,7 +3579,7 @@ def _r25_zero_run_lengths(signal_flags):
     return runs
 
 
-def r25_signal_gap_audit(history: pd.DataFrame, ledger: pd.DataFrame):
+def r26_signal_gap_audit(history: pd.DataFrame, ledger: pd.DataFrame):
     """同时报告新信号空窗与市场状态序列空窗，不用交易数冒充覆盖率。"""
     columns = [
         "范围", "扫描周", "新信号周", "无新信号周", "新信号覆盖率%",
@@ -3611,7 +3614,7 @@ def r25_signal_gap_audit(history: pd.DataFrame, ledger: pd.DataFrame):
     for label, regime in (("全部市场", None), ("强势", "强势"), ("中性", "中性"), ("弱势", "弱势")):
         group = weeks if regime is None else weeks[weeks["Market_Regime"].eq(regime)]
         flags = group["Has_Signal"].tolist()
-        runs = _r25_zero_run_lengths(flags)
+        runs = _r26_zero_run_lengths(flags)
         rows.append(
             {
                 "范围": label,
@@ -3630,7 +3633,7 @@ def r25_signal_gap_audit(history: pd.DataFrame, ledger: pd.DataFrame):
     return pd.DataFrame(rows, columns=columns)
 
 
-def r25_w3_holding_coverage_audit(history: pd.DataFrame, ledger: pd.DataFrame):
+def r26_w3_holding_coverage_audit(history: pd.DataFrame, ledger: pd.DataFrame):
     columns = ["持有上限", "可观察周", "理论有持仓周", "理论空仓周", "理论持仓覆盖率%", "计算边界"]
     if history.empty or ledger.empty:
         return pd.DataFrame(columns=columns)
@@ -3658,13 +3661,13 @@ def r25_w3_holding_coverage_audit(history: pd.DataFrame, ledger: pd.DataFrame):
     }], columns=columns)
 
 
-def r25_actual_coverage(history: pd.DataFrame, observation_dates=None):
+def r26_actual_coverage(history: pd.DataFrame, observation_dates=None):
     """同一成熟观察窗口；按行情路径交易日和真实退出统计。退出当日仍算持仓日。"""
-    tracked = history.loc[_bool_series(history, "R19_Selected") | _bool_series(history, "R25_R6_Second")].copy()
+    tracked = history.loc[_bool_series(history, "R19_Selected") | _bool_series(history, "R26_R6_Second")].copy()
     if tracked.empty:
         return pd.DataFrame(), pd.DataFrame()
     tracked["_coverage_flag"] = True
-    complete = _r25_shadow_outcomes(tracked, "_coverage_flag")
+    complete = _r26_shadow_outcomes(tracked, "_coverage_flag")
     if complete.empty:
         return pd.DataFrame(), pd.DataFrame()
     complete["_entry"] = complete["Entry_Date"].map(parse_yyyymmdd)
@@ -3697,7 +3700,7 @@ def r25_actual_coverage(history: pd.DataFrame, observation_dates=None):
     weak = complete["Market_Regime"].eq("弱势")
     groups = {
         "正式全分支": formal,
-        "全分支加R6第二名对照": formal | _bool_series(complete, "R25_R6_Second"),
+        "全分支加R6第二名对照": formal | _bool_series(complete, "R26_R6_Second"),
         "R6仅第一名": formal & weak,
         "R6前两名对照": weak,
     }
@@ -3707,7 +3710,7 @@ def r25_actual_coverage(history: pd.DataFrame, observation_dates=None):
         for _, row in complete.loc[mask].iterrows():
             count += np.array([row["_entry"] <= d <= row["_exit"] for d in dates], dtype=int)
         daily[label] = count
-        runs = _r25_zero_run_lengths(count > 0)
+        runs = _r26_zero_run_lengths(count > 0)
         rows.append({"方案": label, "起始交易日": dates[0], "截止交易日": dates[-1],
                      "观察交易日": len(dates), "有持仓日": int((count > 0).sum()),
                      "空仓日": int((count == 0).sum()), "最长连续空仓交易日": max(runs, default=0),
@@ -3716,22 +3719,22 @@ def r25_actual_coverage(history: pd.DataFrame, observation_dates=None):
     return pd.DataFrame(rows), daily
 
 
-def r25_comparison_reports(history, ledger):
+def r26_comparison_reports(history, ledger):
     """对照不进入基准收益；按真实替代交易汇总，亏损阶段仅为事后诊断。"""
     summaries, trades, weekly, coverage, checks = [], [], [], [], []
     dates = sorted(ledger.get("Signal_Date", pd.Series(dtype=str)).map(parse_yyyymmdd).dropna().unique())
     union = history.copy()
-    union["R19_Selected"] = pd.concat([_bool_series(history, f"R25_{k}_Selected") for k in R25_SCENARIOS], axis=1).any(axis=1)
-    union["R25_R6_Second"] = False
-    _, union_daily = r25_actual_coverage(union)
+    union["R19_Selected"] = pd.concat([_bool_series(history, f"R26_{k}_Selected") for k in R26_SCENARIOS], axis=1).any(axis=1)
+    union["R26_R6_Second"] = False
+    _, union_daily = r26_actual_coverage(union)
     common_dates = union_daily.get("交易日", pd.Series(dtype=str)).tolist()
-    for key, label in R25_SCENARIOS.items():
-        flag = f"R25_{key}_Selected"
+    for key, label in R26_SCENARIOS.items():
+        flag = f"R26_{key}_Selected"
         if flag not in history:
             checks.append({"方案": label, "检查": "对照字段存在", "结果": "未通过"})
             continue
         selected = history.loc[_bool_series(history, flag)]
-        outcomes = _r25_shadow_outcomes(history, flag).copy()
+        outcomes = _r26_shadow_outcomes(history, flag).copy()
         known = {}
         for d, g in history.groupby("Signal_Date"):
             d = parse_yyyymmdd(d)
@@ -3740,25 +3743,25 @@ def r25_comparison_reports(history, ledger):
         switches = 0
         for d in dates:
             g = known.get(d)
-            valid = g is not None and _bool_series(g, f"R25_{key}_Available").all()
-            regime = str(g[f"R25_{key}_Regime"].iloc[0]) if valid else "未知"
+            valid = g is not None and _bool_series(g, f"R26_{key}_Available").all()
+            regime = str(g[f"R26_{key}_Regime"].iloc[0]) if valid else "未知"
             if valid and last_regime is not None and regime != last_regime:
                 switches += 1
             last_regime = regime if valid else None
             n = int(_bool_series(g, flag).sum()) if valid else np.nan
             weekly.append({"方案": label, "Signal_Date": d, "市场分类": regime,
-                           "分类收益中位数%": g[f"R25_{key}_Median"].iloc[0] if valid else np.nan,
-                           "暂停新买入": bool(g[f"R25_{key}_Paused"].iloc[0]) if valid else None,
+                           "分类收益中位数%": g[f"R26_{key}_Median"].iloc[0] if valid else np.nan,
+                           "暂停新买入": bool(g[f"R26_{key}_Paused"].iloc[0]) if valid else None,
                            "入选数": n, "环境数据完整": valid})
         if not outcomes.empty:
             outcomes["方案"] = label
-            outcomes["对照市场分支"] = outcomes[f"R25_{key}_Regime"]
+            outcomes["对照市场分支"] = outcomes[f"R26_{key}_Regime"]
             outcomes["实际退出日"] = outcomes["Fixed_Exit_W3_Date"]
             stop = (_bool_series(outcomes, "R16_Stop_Minus10_Triggered")
                     & pd.to_numeric(outcomes["R16_Stop_Minus10_Trigger_Day"], errors="coerce").le(15)
                     & pd.to_numeric(outcomes["R16_Stop_Minus10_Return_Net_pct"], errors="coerce").notna())
             outcomes.loc[stop, "实际退出日"] = outcomes.loc[stop, "R16_Stop_Minus10_Exit_Date"]
-            trades.append(outcomes[["方案", "Signal_Date", "ts_code", "name", "对照市场分支", "Entry_Date", "实际退出日", "R25_Realized_Return_pct"]])
+            trades.append(outcomes[["方案", "Signal_Date", "ts_code", "name", "对照市场分支", "Entry_Date", "实际退出日", "R26_Realized_Return_pct"]])
         periods = {"全区间": outcomes}
         if not outcomes.empty:
             years = outcomes.Signal_Date.astype(str).str[:4]
@@ -3766,7 +3769,7 @@ def r25_comparison_reports(history, ledger):
             periods["20250307—20250425信号（已见失败段）"] = outcomes.loc[outcomes.Signal_Date.map(parse_yyyymmdd).between("20250307", "20250425")]
             periods.update({"分支：" + r: outcomes.loc[outcomes["对照市场分支"].eq(r)] for r in ["强势", "中性", "弱势"]})
         for period, group in periods.items():
-            ret = pd.to_numeric(group.get("R25_Realized_Return_pct", pd.Series(dtype=float)), errors="coerce").dropna()
+            ret = pd.to_numeric(group.get("R26_Realized_Return_pct", pd.Series(dtype=float)), errors="coerce").dropna()
             loss = -ret[ret < 0].sum()
             summaries.append({"方案": label, "范围": period, "完整交易": len(ret),
                 "完整信号周": group.Signal_Date.nunique() if len(group) else 0,
@@ -3779,9 +3782,9 @@ def r25_comparison_reports(history, ledger):
                 "全区间未完成或未成交入选": len(selected) - len(outcomes)})
         shadow = history.copy()
         shadow["R19_Selected"] = _bool_series(shadow, flag)
-        shadow["R25_R6_Second"] = False
-        shadow["Market_Regime"] = shadow[f"R25_{key}_Regime"]
-        cov, _ = r25_actual_coverage(shadow, observation_dates=common_dates)
+        shadow["R26_R6_Second"] = False
+        shadow["Market_Regime"] = shadow[f"R26_{key}_Regime"]
+        cov, _ = r26_actual_coverage(shadow, observation_dates=common_dates)
         if not cov.empty:
             cov = cov.iloc[:1].copy()
             cov["方案"] = label
@@ -3800,7 +3803,7 @@ def r20_block_bootstrap(universe: pd.DataFrame, scan_ledger: pd.DataFrame):
     scan_dates = sorted(
         {value for value in scan_ledger["Signal_Date"].map(parse_yyyymmdd) if value}
     )
-    if len(scan_dates) < R25_BOOTSTRAP_BLOCK_WEEKS:
+    if len(scan_dates) < R26_BOOTSTRAP_BLOCK_WEEKS:
         return pd.DataFrame(columns=columns)
     signal_text = universe["Signal_Date"].map(parse_yyyymmdd)
     returns_by_week = {
@@ -3810,11 +3813,11 @@ def r20_block_bootstrap(universe: pd.DataFrame, scan_ledger: pd.DataFrame):
         ).dropna().to_numpy(dtype=float)
         for day in scan_dates
     }
-    block = R25_BOOTSTRAP_BLOCK_WEEKS
+    block = R26_BOOTSTRAP_BLOCK_WEEKS
     starts = np.arange(0, len(scan_dates) - block + 1)
     rng = np.random.default_rng(20200907)
     mean_values, win_values, pf_values = [], [], []
-    for _ in range(R25_BOOTSTRAP_REPETITIONS):
+    for _ in range(R26_BOOTSTRAP_REPETITIONS):
         sampled = []
         while len(sampled) < len(scan_dates):
             start = int(rng.choice(starts))
@@ -3869,7 +3872,7 @@ def r20_internal_robustness_scorecard(
         if len(universe)
         else pd.DataFrame()
     )
-    branch_audit = r25_branch_robustness_audit(universe)
+    branch_audit = r26_branch_robustness_audit(universe)
     all_branch_medians_ok = (
         len(branch_audit) == 3
         and branch_audit["中位收益检查"].eq("通过").all()
@@ -3917,7 +3920,7 @@ def r20_internal_robustness_scorecard(
     )
 
 
-def r25_integrity_gates(
+def r26_integrity_gates(
     history: pd.DataFrame,
     scan_ledger: pd.DataFrame,
     all_signal_ledger: pd.DataFrame,
@@ -3946,7 +3949,7 @@ def r25_integrity_gates(
     r11_exact = bool(strong_selected.equals(r11_selected))
     r11_rule_ok = bool(
         (
-            pd.to_numeric(history.loc[strong_selected, "R25_Band_Rank"], errors="coerce").eq(1)
+            pd.to_numeric(history.loc[strong_selected, "R26_Band_Rank"], errors="coerce").eq(1)
             & _bool_series(history.loc[strong_selected], "R11_ATR_Band_Pass")
         ).all()
     ) if strong_selected.any() else True
@@ -3963,14 +3966,14 @@ def r25_integrity_gates(
         ("收益完整", "全部纳入交易均有真实退出收益", returns_ok, f"完整{int(pd.to_numeric(all_signal_ledger.get('交易净收益%', pd.Series(dtype=float)), errors='coerce').notna().sum())}/{len(all_signal_ledger)}笔"),
         ("R11隔离", "强市正式信号与R11 Top1完全一致", r11_exact, f"正式{int(strong_selected.sum())}笔 / R11标记{int(r11_selected.sum())}笔"),
         ("R11冻结", "强市每周至多一只且为ATR区间内第一名", (strong_week_counts.le(1).all() if len(strong_week_counts) else True) and r11_rule_ok, f"最多{int(strong_week_counts.max()) if len(strong_week_counts) else 0}只/周"),
-        ("R6隔离", "弱市正式仅第一名，第二名不进入正式交易", bool((_bool_series(history, "R19_Selected") & regime.eq("弱势")).equals(_bool_series(history, "R25_R6_First"))), "保留原至少两只合格候选门槛"),
+        ("R6隔离", "弱市正式仅第一名，第二名不进入正式交易", bool((_bool_series(history, "R19_Selected") & regime.eq("弱势")).equals(_bool_series(history, "R26_R6_First"))), "保留原至少两只合格候选门槛"),
         ("影子隔离", "R7和R11第二名不能单独进入正式收益", r11_exact, "影子只计算同口径未来路径"),
     ]
     return pd.DataFrame(
         [
             {
                 "验收阶段": phase,
-                "R25完整性项目": name,
+                "R26完整性项目": name,
                 "结果": "通过" if passed else "未通过",
                 "当前值": value,
             }
@@ -4255,7 +4258,7 @@ def import_prior_results_zip(
     config_id: str,
     roundtrip_cost_pct: float,
 ):
-    """事务导入同策略R25结果；旧版候选不得冒充恢复后的R11结果。"""
+    """事务导入同策略R26结果；旧版候选不得冒充恢复后的R11结果。"""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         infos = {
             info.filename: info
@@ -4265,11 +4268,11 @@ def import_prior_results_zip(
         candidate_names = [
             name
             for name in infos
-            if name.startswith("01_all_r25_")
+            if name.startswith("01_all_r26_")
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R25候选明细；旧版结果不能转换为R25。")
+            raise ValueError("结果包中未找到唯一的R26候选明细；旧版结果不能转换为R26。")
         info = infos[candidate_names[0]]
         if info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -4297,14 +4300,14 @@ def import_prior_results_zip(
             "R11_Strong_Top1",
             "R11_Second_Shadow",
             "R7_Shadow_Top2",
-            "R25_Shadow_Tracked",
-            "R25_Band_Rank", "R25_R11_Baseline", "R25_R11_Added",
-            "R25_R6_First", "R25_R6_Second",
+            "R26_Shadow_Tracked",
+            "R26_Band_Rank", "R26_R11_Baseline", "R26_R11_Added",
+            "R26_R6_First", "R26_R6_Second",
             "R19_Selected",
             "ATR_Contraction",
         }
         missing = sorted(required.difference(candidates.columns))
-        missing += sorted({f"R25_{k}_{suffix}" for k in R25_SCENARIOS for suffix in ["Selected", "Regime", "Median", "Available", "Paused"]}.difference(candidates.columns))
+        missing += sorted({f"R26_{k}_{suffix}" for k in R26_SCENARIOS for suffix in ["Selected", "Regime", "Median", "Available", "Paused"]}.difference(candidates.columns))
         if missing:
             raise ValueError("结果包缺少冻结主策略字段：" + "、".join(missing))
         candidates["Signal_Date"] = candidates["Signal_Date"].map(
@@ -4357,7 +4360,7 @@ def import_prior_results_zip(
         ledger["Config_ID"] = str(config_id)
 
         selected = candidates[_bool_series(candidates, "R19_Selected")].copy()
-        # R25只使用每笔实际退出收益，不构造三仓每日净值。
+        # R26只使用每笔实际退出收益，不构造三仓每日净值。
         missing_path_dates: set[str] = set()
         pending_mask = pd.Series(False, index=ledger.index)
         ledger.loc[
@@ -4540,7 +4543,7 @@ def build_export_zip(
     return output.getvalue()
 
 
-def build_r25_export_zip(
+def build_r26_export_zip(
     history: pd.DataFrame,
     ledger: pd.DataFrame,
     data_gaps: pd.DataFrame,
@@ -4563,9 +4566,9 @@ def build_r25_export_zip(
     integrity: pd.DataFrame,
     audit_metadata: pd.DataFrame,
 ):
-    """R25导出正式全信号、强市影子和空窗审计，不含三仓或复投。"""
+    """R26导出正式全信号、强市影子和空窗审计，不含三仓或复投。"""
     files = {
-        "01_all_r25_market_regime_comparison_candidates.csv": history,
+        "01_all_r26_market_regime_comparison_candidates.csv": history,
         "02_scan_ledger.csv": ledger,
         "03_market_data_gap_audit.csv": data_gaps,
         "04_all_signal_equal_notional_summary.csv": all_signal_summary,
@@ -4584,13 +4587,13 @@ def build_r25_export_zip(
         "17_r11_rank2_acceptance_gates.csv": rank2_acceptance,
         "18_signal_gap_audit.csv": signal_gap_audit,
         "19_w3_holding_coverage_audit.csv": holding_coverage,
-        "20_r25_integrity_gates.csv": integrity,
+        "20_r26_integrity_gates.csv": integrity,
         "21_audit_metadata.csv": audit_metadata,
     }
-    actual_summary, actual_daily = r25_actual_coverage(history)
+    actual_summary, actual_daily = r26_actual_coverage(history)
     files["22_actual_exit_coverage_comparison.csv"] = actual_summary
     files["23_actual_exit_daily_holdings.csv"] = actual_daily
-    reports = r25_comparison_reports(history, ledger)
+    reports = r26_comparison_reports(history, ledger)
     for name, report in zip([
         "24_regime_comparison_summary.csv", "25_regime_comparison_trades.csv",
         "26_regime_comparison_weeks.csv", "27_regime_actual_coverage.csv", "28_regime_comparison_integrity.csv"
@@ -4653,11 +4656,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R25全信号与空窗审计", "最新选股预览"],
+            ["历史R26全信号与空窗审计", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R25全信号与空窗审计")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R26全信号与空窗审计")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -4697,11 +4700,11 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R25历史结果")
+        clear_history_clicked = st.button("清除R26历史结果")
         imported_results = st.file_uploader(
-            "导入R25结果包",
+            "导入R26结果包",
             type=["zip"],
-            help="只能导入同一R25策略结果；R22候选不能安全转换为恢复后的R11及影子路径。",
+            help="只能导入同一R26策略结果；R22候选不能安全转换为恢复后的R11及影子路径。",
         )
         import_results_clicked = st.button(
             "恢复结果包中的断点",
@@ -4711,7 +4714,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R25全信号与空窗审计":
+    if start_input > end_input and mode == "历史R26全信号与空窗审计":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -4730,8 +4733,8 @@ def main():
             ):
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
-        st.session_state.pop("r25_preview", None)
-        st.success("R25历史结果和断点任务已清除。")
+        st.session_state.pop("r26_preview", None)
+        st.success("R26历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
@@ -4746,14 +4749,14 @@ def main():
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个扫描周、"
                 f"{import_stats['selected_rows']}笔冻结信号。"
-                "R25只审计正式信号与隔离影子，无需补算三仓每日净值。"
+                "R26只审计正式信号与隔离影子，无需补算三仓每日净值。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
-    if "r25_worker_id" not in st.session_state:
-        st.session_state["r25_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r25_worker_id"])
+    if "r26_worker_id" not in st.session_state:
+        st.session_state["r26_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r26_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -4777,7 +4780,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R25全信号与空窗审计"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R26全信号与空窗审计"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -5112,7 +5115,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r25_preview"] = candidates
+                            st.session_state["r26_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -5178,7 +5181,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R25全信号与空窗审计扫描完成。")
+                            st.success("历史R26全信号与空窗审计扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -5205,7 +5208,7 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r25_preview")
+    preview = st.session_state.get("r26_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
@@ -5338,7 +5341,7 @@ def main():
             st.markdown("---")
             st.error(
                 f"发现{len(state_issues)}周账本与候选明细不一致。"
-                "当前禁止生成审计结论；重新启动R25后只补扫异常周。"
+                "当前禁止生成审计结论；重新启动R26后只补扫异常周。"
             )
             st.dataframe(state_issues, width="stretch", hide_index=True)
             return
@@ -5357,14 +5360,14 @@ def main():
         weekly_summary = r20_weekly_summary(universe)
         rolling_summary = r20_rolling_26week_summary(universe, ledger)
         concentration = r20_concentration_audit(universe)
-        branch_robustness = r25_branch_robustness_audit(universe)
-        strong_shadow_summary = r25_shadow_group_summary(history)
-        rank2_acceptance = r25_rank2_acceptance(history)
-        signal_gap_audit = r25_signal_gap_audit(history, ledger)
-        holding_coverage = r25_w3_holding_coverage_audit(history, ledger)
+        branch_robustness = r26_branch_robustness_audit(universe)
+        strong_shadow_summary = r26_shadow_group_summary(history)
+        rank2_acceptance = r26_rank2_acceptance(history)
+        signal_gap_audit = r26_signal_gap_audit(history, ledger)
+        holding_coverage = r26_w3_holding_coverage_audit(history, ledger)
         bootstrap = r20_block_bootstrap(universe, ledger)
         robustness = r20_internal_robustness_scorecard(universe, bootstrap)
-        integrity_gates = r25_integrity_gates(
+        integrity_gates = r26_integrity_gates(
             history, ledger, all_signal_ledger, equal_notional
         )
         audit_metadata = pd.DataFrame(
@@ -5382,22 +5385,22 @@ def main():
                     "退出": "未止损则固定W3收盘",
                     "R11规则": "完整整理再启动合格池先筛ATR0.70—0.90，再按ATR升序取Top1",
                     "R6规则": "保持原资格门槛和评分，正式Top1，第二名影子",
-                    "R25对照计划": "B13基准；W9/W6只替换分类周期且保持±5%；D13在当周池收益中位数<0时暂停新买入；不提前退出",
-                    "R25实验边界": "不自动选优；已见20250307—20250425只作诊断；须检查全期、分年及替代交易；分类收益来自当周完整合格股票池",
+                    "R26对照计划": "B13基准；W11为最后一个周期对照；W11/W9/W6只替换分类周期且保持±5%；D13在当周池收益中位数<0时暂停新买入；不提前退出",
+                    "R26实验边界": "不自动选优；已见20250307—20250425只作诊断；须检查全期、分年及替代交易；分类收益来自当周完整合格股票池",
                     "影子规则": "R11同信号周第二名与R7早期强势Top2只记录未来路径，不进入正式收益",
                 }
             ]
         )
 
         st.markdown("---")
-        st.header("R25 市场周期与近期方向对照审计")
-        st.info("正式收益仍是R24的13周基准。以下三组是研究对照，不自动升级或修改买卖规则。")
-        comparison_summary, _, comparison_weeks, comparison_coverage, comparison_checks = r25_comparison_reports(history, ledger)
-        st.subheader("13周、9周、6周及近期方向对照")
-        st.caption("9周/6周保持±5%阈值，变化同时包含周期与分类比例；方向组仅在当周股票池收益中位数<0时暂停新买入，已有持仓照常退出。")
+        st.header("R26 市场周期与近期方向对照审计")
+        st.info("正式收益仍是R24的13周基准。新增11周作为最后一个周期对照；9周、6周与暂停组保留，不自动选优或升级。")
+        comparison_summary, _, comparison_weeks, comparison_coverage, comparison_checks = r26_comparison_reports(history, ledger)
+        st.subheader("13周、11周、9周、6周及近期方向对照")
+        st.caption("11周/9周/6周保持±5%阈值，变化同时包含周期与分类比例；方向组仅在当周股票池收益中位数<0时暂停新买入，已有持仓照常退出。")
         st.dataframe(_format_report_frame(comparison_summary), width="stretch", hide_index=True)
         st.dataframe(_format_report_frame(comparison_coverage), width="stretch", hide_index=True)
-        st.caption("四组覆盖采用同一成熟观察窗口；信号收益按最终退出归属，不能当作窗口截止日净值。")
+        st.caption("五组覆盖采用同一成熟观察窗口；信号收益按最终退出归属，不能当作窗口截止日净值。")
         st.dataframe(comparison_checks, width="stretch", hide_index=True)
         with st.expander("逐周分类、暂停与信号数"):
             st.dataframe(_format_report_frame(comparison_weeks), width="stretch", hide_index=True)
@@ -5441,11 +5444,11 @@ def main():
             with st.expander("查看行情缺口"):
                 st.dataframe(actual_data_gaps, width="stretch", hide_index=True)
 
-        st.subheader("R25完整性验收")
+        st.subheader("R26完整性验收")
         st.dataframe(integrity_gates, width="stretch", hide_index=True)
 
         st.subheader("新信号空窗与W3理论持仓覆盖")
-        actual_summary, _ = r25_actual_coverage(history)
+        actual_summary, _ = r26_actual_coverage(history)
         st.dataframe(_format_report_frame(actual_summary), width="stretch", hide_index=True)
         st.caption("上表按真实止损/到期退出；R6两名对照与正式方案采用相同成熟窗口。空表表示没有足够完整路径。")
         st.dataframe(_format_report_frame(signal_gap_audit), width="stretch", hide_index=True)
@@ -5569,7 +5572,7 @@ def main():
             )
 
         with st.expander("查看R11第二名与R7影子明细"):
-            shadow_detail = history[_bool_series(history, "R25_Shadow_Tracked")].copy()
+            shadow_detail = history[_bool_series(history, "R26_Shadow_Tracked")].copy()
             shadow_columns = [
                 "Signal_Date", "Entry_Date", "name", "ts_code", "Industry",
                 "Market_Regime", "R11_Strong_Rank", "R11_Second_Shadow",
@@ -5585,7 +5588,7 @@ def main():
                 width="stretch", hide_index=True,
             )
 
-        export_bytes = build_r25_export_zip(
+        export_bytes = build_r26_export_zip(
             history.drop(columns=["Config_ID"], errors="ignore"),
             ledger.drop(columns=["Config_ID"], errors="ignore"),
             data_gap_rows,
@@ -5609,9 +5612,9 @@ def main():
             audit_metadata,
         )
         st.download_button(
-            "下载R25 市场周期与近期方向对照结果",
+            "下载R26 市场周期与近期方向对照结果",
             data=export_bytes,
-            file_name="r25_market_regime_comparison_audit_results.zip",
+            file_name="r26_market_regime_comparison_audit_results.zip",
             mime="application/zip",
         )
 
