@@ -1,27 +1,32 @@
 # -*- coding: utf-8 -*-
-"""突破策略实盘版（单文件独立版，直接覆盖 app.py 运行）。
+"""突破策略实盘助手 V2（单文件独立版，直接覆盖 app.py 运行）。
 
-不做回测，只做两件事：
-  1. 本周选股——扫描全池，列出符合条件的股票并给出前3只的买入指引
-  2. 持仓管理——输入已持仓，计算当前移动止损位、持有周数、是否该退出
+三个功能：
+  1. 本周选股——扫描全池，列出符合条件的股票及前3只的买入指引
+  2. 近期信号回顾——查看最近N周每周选出了什么、是否处于空窗期
+  3. 持仓管理——输入已持仓，计算移动止损位、持有周数、是否该退出
 
-规则来源（全部经独立验证，不要随意改动）：
+V2 相对 V1 的修正：
+  - 周完整性判断：V1无条件弹出"请确认信号周已收盘"的警告，造成误导。
+    现改为按ISO周比较——信号周早于当前周即判定已收盘，明确显示绿色确认；
+    仅当信号周就是本周时才提示尚未收盘。
+  - 新增"近期信号回顾"：解决"没有回测功能就不知道最近选出过什么、
+    也无法判断当前是偶发无信号还是连续空窗"的问题。
+  - 新增完整交易规则说明：买入时点、移动止损的逐周更新方式（含算例）、
+    为何不设止盈、到期处理、空窗期怎么办。
+
+规则来源（全部经独立验证）：
   信号  突破26周新高 + 接近两年高点前33% + 波动率压缩≤0.8
         样本外2018-2022：提升1.57倍、收益7.53%、胜率43.28%
   排序  同周多个信号按流通市值从大到小
-        十个候选变量中唯一三关全过：正向+1.31%/t=1.97、反向-2.02%、
-        四年全部为正、TopN衰减平滑；12周持有下各仓位分位稳定在82-98%
+        十个候选变量中唯一三关全过；12周持有下各仓位分位稳定在82-98%
   退出  移动止损15%，最长持有12周
         持有期对比：10-12周胜率约50%（26周时仅39%）
 
-已知的策略性格（回测与样本外验证得出，使用前必须接受）：
-  胜率约50%；收益靠每年一两只大赢家；五年里两年亏损；
-  四年内约36%概率遇到5连亏；单笔最差可能超过止损线（跌停/跳空，实测有-33%）。
+移动止损口径与回测完全一致：以持有期内最高周收盘价为基准下移15%，
+按周收盘判断，只上移不下移。
 
-时点要求：本策略按周线运作，应在周线收盘后扫描，下周一开盘买入。
-若在周中扫描，信号可能在周五收盘前变化，程序会给出提示。
-
-行情缓存与之前共用；实盘版只需约3.5年数据，比回测轻量。
+行情缓存与回测共用；实盘版只需约3.5年数据。
 """
 
 from __future__ import annotations
@@ -687,16 +692,9 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 
 
 
+
 # =============================================================================
-# 冻结的实盘规则 —— 全部经过独立验证，不要随意改动
-#
-# 信号：突破26周新高 + 接近两年高点前33% + 波动率压缩≤0.8
-#   依据：样本外(2018-2022)提升1.57倍、收益7.53%、胜率43.28%
-# 排序：同一周多个信号时按流通市值从大到小
-#   依据：十个候选变量中唯一三关全过（正向+1.31%/t=1.97、反向-2.02%、
-#         四年全部为正、TopN衰减平滑），且12周持有下各仓位分位稳定在82-98%
-# 退出：移动止损15%，最长持有10-12周
-#   依据：持有期对比显示10-12周胜率约50%（26周时仅39%），分位稳定
+# 冻结的实盘规则
 # =============================================================================
 BREAKOUT_WEEKS = 26
 POSITION_QUANTILE = 0.33
@@ -724,40 +722,71 @@ def compute_features(weekly: pd.DataFrame):
     return features
 
 
-def scan_latest(weekly: pd.DataFrame, ts_code: str, target_week: str):
-    """只判断指定的那一周是否出信号，返回该股的全部判定明细。
+def week_is_complete(signal_week: str, today: date):
+    """判断信号周是否已经收盘。
 
-    明细包含每一项条件的实际数值，方便你人工复核，而不是只给一个是/否。
+    按ISO周比较：信号周所在的周若早于今天所在的周，即为已完成。
+    这样周一到周日任何时候运行，都能准确判断，而不是无条件弹警告。
     """
+    try:
+        signal_date = datetime.strptime(str(signal_week), "%Y%m%d").date()
+    except (TypeError, ValueError):
+        return False, "无法解析信号周日期"
+    signal_iso = signal_date.isocalendar()
+    today_iso = today.isocalendar()
+    signal_key = (signal_iso[0], signal_iso[1])
+    today_key = (today_iso[0], today_iso[1])
+    if signal_key < today_key:
+        return True, (
+            f"信号周 {signal_week}（{signal_date.strftime('%A')}）所在周已收盘，结果有效。"
+        )
+    return False, (
+        f"信号周 {signal_week} 就是本周，**尚未收盘**，"
+        "信号可能在周五收盘前变化，仅供预览。"
+    )
+
+
+def scan_weeks(weekly: pd.DataFrame, ts_code: str, target_weeks):
+    """一次性判断多个目标周，用于本周选股与近期回顾。"""
     if len(weekly) < 140:
-        return None
+        return []
     features = compute_features(weekly)
     dates = weekly["trade_date_str"].astype(str).tolist()
-    if target_week not in dates:
-        return None
-    i = dates.index(target_week)
-    close = pd.to_numeric(weekly["close"], errors="coerce")
-    return {
-        "ts_code": ts_code,
-        "信号周": target_week,
-        "收盘价": float(close.iloc[i]) if math.isfinite(close.iloc[i]) else np.nan,
-        "前26周最高收盘": float(features["prior_high"].iloc[i]),
-        "突破": bool(features["breakout"].iloc[i]),
-        "两年高点位置": float(features["position_2y"].iloc[i]),
-        "波动率压缩": float(features["vol_contraction"].iloc[i]),
-    }
+    close = pd.to_numeric(weekly["close"], errors="coerce").tolist()
+    index_map = {d: i for i, d in enumerate(dates)}
+    latest_close = next(
+        (close[j] for j in range(len(close) - 1, -1, -1) if math.isfinite(close[j])),
+        np.nan,
+    )
+    results = []
+    for week in target_weeks:
+        i = index_map.get(week)
+        if i is None:
+            continue
+        signal_close = close[i]
+        if not math.isfinite(signal_close):
+            continue
+        results.append(
+            {
+                "ts_code": ts_code,
+                "信号周": week,
+                "收盘价": float(signal_close),
+                "前26周最高收盘": float(features["prior_high"].iloc[i]),
+                "突破": bool(features["breakout"].iloc[i]),
+                "两年高点位置": float(features["position_2y"].iloc[i]),
+                "波动率压缩": float(features["vol_contraction"].iloc[i]),
+                "信号后至今%": (latest_close / signal_close - 1.0) * 100.0
+                if math.isfinite(latest_close)
+                else np.nan,
+            }
+        )
+    return results
 
 
 def position_status(weekly: pd.DataFrame, buy_week: str, buy_price: float):
-    """已持仓个股的当前状态：移动止损位、持有周数、是否该退出。
-
-    移动止损口径与回测完全一致：以买入后各周收盘价的最高值为基准，
-    回撤达到15%即在该周收盘卖出。
-    """
     dates = weekly["trade_date_str"].astype(str).tolist()
     close = pd.to_numeric(weekly["close"], errors="coerce").tolist()
     if buy_week not in dates:
-        # 买入周可能不是周线最后交易日，取其后最近的一周
         later = [d for d in dates if d >= buy_week]
         if not later:
             return None
@@ -777,16 +806,17 @@ def position_status(weekly: pd.DataFrame, buy_week: str, buy_price: float):
         np.nan,
     )
     held_weeks = len(dates) - start
+    stop_level = peak * (1.0 - STOP_PCT / 100.0)
     return {
         "持有周数": held_weeks,
         "最新收盘": latest_close,
         "期间最高收盘": peak,
-        "当前移动止损位": peak * (1.0 - STOP_PCT / 100.0),
+        "当前移动止损位": stop_level,
         "浮动盈亏%": (latest_close / buy_price - 1.0) * 100.0
         if math.isfinite(latest_close) and buy_price > 0
         else np.nan,
-        "距止损位%": (latest_close / (peak * (1.0 - STOP_PCT / 100.0)) - 1.0) * 100.0
-        if math.isfinite(latest_close)
+        "距止损位%": (latest_close / stop_level - 1.0) * 100.0
+        if math.isfinite(latest_close) and stop_level > 0
         else np.nan,
         "已触发止损周": triggered_week,
         "是否到期": held_weeks >= MAX_HOLD_WEEKS,
@@ -805,48 +835,99 @@ def _memory_usage_mb():
 
 
 # -----------------------------------------------------------------------------
-# Streamlit
+# 交易规则说明
 # -----------------------------------------------------------------------------
-def render_rules():
+def render_trading_manual():
     st.markdown(
         f"""
-| 环节 | 规则 |
-|---|---|
-| 股票池 | 科技股（主板/创业板/科创板），流通市值 {MIN_MV_BILLION:.0f}-{MAX_MV_BILLION:.0f}亿，股价≥{MIN_PRICE:.0f}元 |
-| 信号 | 周线收盘突破前{BREAKOUT_WEEKS}周最高收盘 |
-| 条件① | 价格接近两年高点（全池前{POSITION_QUANTILE*100:.0f}%） |
-| 条件② | 波动率压缩 ≤ {VOL_CONTRACTION_MAX} |
-| 排序 | 同周多个信号时，按流通市值从大到小取前{SLOT_COUNT}只 |
-| 买入 | 信号周的下一周开盘 |
-| 止损 | 移动止损{STOP_PCT:.0f}%（以持有期内最高周收盘为基准） |
-| 持有 | 最长{MAX_HOLD_WEEKS}周，到期卖出 |
+### 一、什么时候扫描
+
+**周五收盘后到周日之间**运行选股。周线要收盘才算数，周中运行的信号会变。
+
+### 二、买什么
+
+程序列出所有满足全部条件的股票，**按流通市值从大到小排序**，取前 {SLOT_COUNT} 只。
+
+如果当前已有持仓，只补空缺的仓位。例如已持有2只，本周只买排名第1的那1只。
+**不要为了买满而往下顺延到排名靠后的，也不要因为看好某只而超配。**
+
+### 三、怎么买
+
+**下周第一个交易日（通常周一）开盘价买入。** 不挂限价、不等回调——
+回测已验证等回调会系统性买到较弱的股票（回撤8%/12%/15%买入的收益依次是
+4.90%/3.64%/3.14%，都低于立即买入的6.47%）。
+
+### 四、止损怎么设（这是移动止损，不是固定止损）
+
+**初始止损** = 实际成交价 × 0.85
+
+**之后每周更新**：每周五收盘后，看这只股票**持有期内出现过的最高周收盘价**，
+止损位 = 最高周收盘价 × 0.85。**止损位只上移，不下移。**
+
+具体例子：
+
+| 周次 | 周收盘价 | 期间最高收盘 | 止损位 | 说明 |
+|---|---|---|---|---|
+| 买入 | 100（成交价） | 100 | 85.0 | 初始 |
+| 第1周 | 110 | 110 | 93.5 | 止损上移 |
+| 第2周 | 105 | 110 | 93.5 | 最高价没变，止损不动 |
+| 第3周 | 130 | 130 | 110.5 | 止损上移，此时已锁定盈利 |
+| 第4周 | 108 | 130 | 110.5 | **收盘108 < 110.5，触发卖出** |
+
+**判断时点**：每周五收盘后判断。如果该周收盘价 ≤ 止损位，下周一开盘卖出。
+不要盘中看到跌破就卖——回测是按周收盘判断的，盘中止损会被震荡打出去。
+
+### 五、止盈怎么做
+
+**没有固定止盈。** 这是刻意的设计。
+
+回测验证过：固定持有3周的胜率有57.6%，但**四年里赚超100%的交易一笔都没有**；
+而移动止损虽然胜率只有35.9%，却抓到过517%的单子。
+**提前止盈会系统性砍掉大赢家**，而这个策略的全部收益就来自每年那一两只大赢家。
+
+所以卖出只有两个理由：**触发移动止损**，或**持有满 {MAX_HOLD_WEEKS} 周到期**。
+
+### 六、到期卖出
+
+持有满 {MAX_HOLD_WEEKS} 周（从买入那一周算起），无论盈亏，下周一开盘卖出。
+
+### 七、卖出后
+
+仓位空出来，下一次扫描时按排名补入新的股票。
+
+### 八、遇到空窗期怎么办
+
+**空仓等待，不要降低标准。** 回测中最长空窗约2个月。
+2022-2024那三年信号稀少且多数亏损，这是策略性格的一部分。
 """
     )
 
 
+# -----------------------------------------------------------------------------
+# Streamlit
+# -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"📋 {APP_TITLE}")
-    st.caption("每周选股 + 持仓管理。规则已冻结，不做回测。")
+    st.caption("每周选股 · 持仓管理 · 近期信号回顾")
 
-    with st.expander("查看冻结的完整规则", expanded=False):
-        render_rules()
+    with st.expander("📖 完整交易规则（买卖、止损、止盈的详细说明）", expanded=False):
+        render_trading_manual()
 
     with st.expander("⚠️ 使用前必读：这套策略的真实性格", expanded=False):
         st.markdown(
             """
-这些数字来自四年回测与2018-2022样本外验证，**请在开始前就接受它们**，
-而不是等发生时才判断策略是否失效：
+以下数字来自四年回测与2018-2022样本外验证，**请在开始前就接受它们**：
 
 - **胜率约50%**，一半交易是亏的
-- **多数交易赚得少，收益靠每年一两只大赢家**（单笔中位数常年接近0）
+- **单笔收益中位数接近0**，收益靠每年一两只大赢家
 - **五年里两年是亏的**（2022约-8%，2023约-0.5%）
-- **四年内有约36%的概率遇到5连亏**
+- **四年内约36%的概率遇到5连亏**
 - 单笔最差可能超过止损线（跌停/跳空），回测中出现过-33%
-- 3仓满仓时，单笔止损=账户-5%；**如需降低冲击，可每仓只用20%资金**
+- 3仓满仓时单笔止损=账户-5%；**如需降低冲击，可每仓只用20%资金**
+- **会有连续1-2个月没有信号的空窗期**
 
-**最危险的时刻不是连亏，而是连亏之后改规则。** 建议事先写下
-"连亏5次、回撤X%以内属正常"，并在那之前不做任何修改。
+**最危险的不是连亏，而是连亏之后改规则。**
             """
         )
 
@@ -857,9 +938,16 @@ def main():
         except Exception:
             secret_token = ""
         token_input = st.text_input("Tushare Token", value=secret_token, type="password")
-        mode = st.radio("功能", ["本周选股", "持仓管理"], index=0)
+        mode = st.radio(
+            "功能", ["本周选股", "近期信号回顾", "持仓管理"], index=0
+        )
+        lookback_weeks = 20
+        if mode == "近期信号回顾":
+            lookback_weeks = st.number_input(
+                "回顾最近几周", value=20, min_value=4, max_value=52, step=2,
+                help="20周约等于最近5个月，能看清是不是连续空窗。",
+            )
         st.markdown("---")
-        st.caption("规则已锁死。如需调整请重新回测验证，不要直接改。")
         run_clicked = st.button("运行", type="primary")
         st.markdown("---")
         if st.button("清空行情缓存"):
@@ -869,17 +957,13 @@ def main():
 
     if mode == "持仓管理":
         st.subheader("持仓管理")
-        st.caption(
-            "填入你的持仓，计算当前移动止损位与是否该退出。"
-            "买入周填该笔交易买入那一周的任意日期即可（格式YYYYMMDD）。"
-        )
+        st.caption("买入周填该笔交易买入那一周的任意日期（格式YYYYMMDD）。")
         default = pd.DataFrame(
             {"股票代码": ["", "", ""], "买入周": ["", "", ""], "买入价": [0.0, 0.0, 0.0]}
         )
-        holdings = st.data_editor(
+        st.session_state["holdings_input"] = st.data_editor(
             default, num_rows="dynamic", width="stretch", key="holdings_editor"
         )
-        st.session_state["holdings_input"] = holdings
 
     if not run_clicked:
         if st.session_state.get("live_result"):
@@ -912,14 +996,17 @@ def main():
         st.error("未加载到行情。")
         return
 
-    latest_mv = {}
     if not basic_indexed.empty and "circ_mv" in basic_indexed.columns:
-        mv_reset = basic_indexed[["circ_mv"]].reset_index()
-        mv_reset = mv_reset.sort_values("trade_date_str")
-        for ts_code, group in mv_reset.groupby("ts_code"):
-            value = pd.to_numeric(group["circ_mv"], errors="coerce").dropna()
-            if len(value):
-                latest_mv[str(ts_code)] = float(value.iloc[-1]) / 10000.0
+        mv_frame = basic_indexed[["circ_mv"]].reset_index()
+        mv_frame = mv_frame.rename(columns={"trade_date_str": "信号周"})
+        mv_frame["流通市值(亿)"] = (
+            pd.to_numeric(mv_frame["circ_mv"], errors="coerce") / 10000.0
+        ).astype("float32")
+        mv_frame = mv_frame.drop_duplicates(["信号周", "ts_code"])[
+            ["信号周", "ts_code", "流通市值(亿)"]
+        ]
+    else:
+        mv_frame = pd.DataFrame()
     del basic_indexed
     gc.collect()
 
@@ -935,18 +1022,18 @@ def main():
                 continue
             daily = stocks.get(code)
             if daily is None:
-                rows.append({"股票代码": code, "状态": "未找到行情（是否在科技股池内？）"})
+                rows.append({"股票代码": code, "建议": "未找到行情（是否在科技股池内？）"})
                 continue
-            weekly = build_weekly_bars(daily)
-            status = position_status(weekly, buy_week, buy_price)
+            status = position_status(build_weekly_bars(daily), buy_week, buy_price)
             if status is None:
-                rows.append({"股票代码": code, "状态": "数据不足"})
+                rows.append({"股票代码": code, "建议": "数据不足"})
                 continue
-            action = "继续持有"
             if status["已触发止损周"]:
-                action = f"⚠️ 已触发止损（{status['已触发止损周']}）"
+                action = f"⚠️ 卖出（{status['已触发止损周']}触发止损）"
             elif status["是否到期"]:
-                action = f"⚠️ 已达最长持有{MAX_HOLD_WEEKS}周，应卖出"
+                action = f"⚠️ 卖出（已满{MAX_HOLD_WEEKS}周）"
+            else:
+                action = "继续持有"
             rows.append(
                 {
                     "股票代码": code,
@@ -971,23 +1058,25 @@ def main():
         render_results()
         return
 
-    # ---- 本周选股 ----
-    progress = st.progress(0.0, text="扫描全池……")
+    # ---- 扫描（本周选股 / 近期回顾共用）----
+    progress = st.progress(0.0, text="构建周线……")
     weekly_cache = {}
     position_values = []
+    week_pool = set()
     codes = sorted(stocks.keys())
-    latest_weeks = []
     for idx, ts_code in enumerate(codes):
         daily = stocks.pop(ts_code)
         weekly = build_weekly_bars(daily)
         del daily
         if weekly.empty or len(weekly) < 140:
             continue
+        weekly = weekly[["trade_date_str", "open", "high", "low", "close"]].copy()
         weekly_cache[ts_code] = weekly
-        latest_weeks.append(weekly["trade_date_str"].astype(str).iloc[-1])
+        week_pool.update(weekly["trade_date_str"].astype(str).tolist())
         features = compute_features(weekly)
-        values = features.loc[features["breakout"].fillna(False), "position_2y"]
-        position_values.append(values.dropna())
+        position_values.append(
+            features.loc[features["breakout"].fillna(False), "position_2y"].dropna()
+        )
         del features
         if idx % 60 == 0:
             progress.progress(min((idx + 1) / len(codes), 1.0))
@@ -999,7 +1088,10 @@ def main():
         st.error("数据不足。")
         return
 
-    target_week = max(latest_weeks)
+    sorted_weeks = sorted(week_pool)
+    n_weeks = 1 if mode == "本周选股" else int(lookback_weeks)
+    target_weeks = sorted_weeks[-n_weeks:]
+
     all_positions = pd.concat(position_values, ignore_index=True)
     position_threshold = float(all_positions.quantile(1.0 - POSITION_QUANTILE))
     del all_positions, position_values
@@ -1007,14 +1099,10 @@ def main():
 
     records = []
     for ts_code, weekly in weekly_cache.items():
-        info = scan_latest(weekly, ts_code, target_week)
-        if info is None:
-            continue
-        mv = latest_mv.get(ts_code, np.nan)
-        info["流通市值(亿)"] = mv
-        info["名称"] = name_map.get(ts_code, "")
-        info["行业"] = industry_map.get(ts_code, "")
-        records.append(info)
+        for item in scan_weeks(weekly, ts_code, target_weeks):
+            item["名称"] = name_map.get(ts_code, "")
+            item["行业"] = industry_map.get(ts_code, "")
+            records.append(item)
     del weekly_cache
     gc.collect()
 
@@ -1022,6 +1110,10 @@ def main():
     if frame.empty:
         st.error("无数据。")
         return
+    if not mv_frame.empty:
+        frame = frame.merge(mv_frame, on=["信号周", "ts_code"], how="left")
+    else:
+        frame["流通市值(亿)"] = np.nan
 
     qualified = frame[
         frame["突破"]
@@ -1030,15 +1122,23 @@ def main():
         & (frame["收盘价"] >= MIN_PRICE)
         & frame["流通市值(亿)"].between(MIN_MV_BILLION, MAX_MV_BILLION)
     ].copy()
-    qualified = qualified.sort_values("流通市值(亿)", ascending=False).reset_index(drop=True)
-    qualified.insert(0, "排名", range(1, len(qualified) + 1))
+    qualified = qualified.sort_values(
+        ["信号周", "流通市值(亿)"], ascending=[True, False]
+    )
+    qualified["排名"] = qualified.groupby("信号周").cumcount() + 1
+
+    today = _shanghai_now().date()
+    complete, note = week_is_complete(target_weeks[-1], today)
 
     st.session_state["live_result"] = {
-        "mode": "本周选股",
-        "target_week": target_week,
+        "mode": mode,
+        "target_week": target_weeks[-1],
+        "target_weeks": target_weeks,
+        "week_complete": complete,
+        "week_note": note,
         "data_through": fetch_end,
         "position_threshold": position_threshold,
-        "pool_size": len(frame),
+        "pool_size": frame["ts_code"].nunique(),
         "qualified": qualified,
         "memory_mb": _memory_usage_mb(),
     }
@@ -1059,58 +1159,107 @@ def render_results():
         else:
             st.dataframe(result["table"], width="stretch", hide_index=True)
             st.caption(
-                f"**止损位每周更新**：以买入后各周最高收盘价为基准下移{STOP_PCT:.0f}%。"
-                "「距止损位%」为正表示还有缓冲，为负表示已跌破（应卖出）。"
+                f"止损位 = 持有期内最高周收盘价 × {(1 - STOP_PCT / 100):.2f}，只上移不下移。"
+                "「距止损位%」为负表示已跌破，应在下周一开盘卖出。"
             )
         return True
 
+    qualified = result["qualified"]
+
+    # ---- 近期信号回顾 ----
+    if result["mode"] == "近期信号回顾":
+        st.markdown("---")
+        st.header("近期信号回顾")
+        weeks = result["target_weeks"]
+        st.caption(
+            f"回顾 {len(weeks)} 周：{weeks[0]} — {weeks[-1]}　|　"
+            f"扫描 {result['pool_size']} 只科技股"
+        )
+        counts = (
+            qualified.groupby("信号周").size().reindex(weeks).fillna(0).astype(int)
+        )
+        summary = pd.DataFrame(
+            {"信号周": counts.index, "符合条件只数": counts.values}
+        )
+        summary["是否空窗"] = np.where(summary["符合条件只数"] == 0, "空窗", "")
+        st.subheader("每周信号数量")
+        st.dataframe(summary, width="stretch", hide_index=True)
+        empty_weeks = int((counts == 0).sum())
+        st.markdown(
+            f"**{len(weeks)}周里有 {empty_weeks} 周没有信号**"
+            f"（占 {empty_weeks / len(weeks) * 100:.0f}%）。"
+            "回测显示这个策略确实会出现连续1-2个月的空窗，属正常。"
+        )
+        st.bar_chart(summary.set_index("信号周")["符合条件只数"])
+
+        if not qualified.empty:
+            st.subheader(f"各周入选的前{SLOT_COUNT}只（含信号后至今涨跌）")
+            top = qualified[qualified["排名"] <= SLOT_COUNT].copy()
+            show = top[
+                ["信号周", "排名", "ts_code", "名称", "行业", "流通市值(亿)",
+                 "收盘价", "信号后至今%"]
+            ].rename(columns={"ts_code": "股票代码"})
+            st.dataframe(
+                show.sort_values(["信号周", "排名"], ascending=[False, True]).round(2),
+                width="stretch", hide_index=True,
+            )
+            st.caption(
+                "「信号后至今%」是从信号周收盘价到最新收盘价的涨跌幅，"
+                "**仅供直观感受，不等于实际收益**——实际交易是下周开盘买入、"
+                "并受移动止损和12周到期约束。"
+            )
+        return True
+
+    # ---- 本周选股 ----
     st.markdown("---")
     st.header("本周选股结果")
     st.caption(
         f"信号周：**{result['target_week']}**　|　行情截至 {result['data_through']}　|　"
-        f"扫描 {result['pool_size']} 只　|　"
-        f"两年高点位置门槛 ≥{result['position_threshold']:.3f}"
+        f"扫描 {result['pool_size']} 只　|　位置门槛 ≥{result['position_threshold']:.3f}"
+        + (
+            f"　|　内存 {result['memory_mb']:.0f} MB"
+            if math.isfinite(result.get("memory_mb", float("nan")))
+            else ""
+        )
     )
-    st.warning(
-        f"**请确认信号周 {result['target_week']} 已经收盘。** "
-        "如果这一周还没结束，信号可能在周五收盘前发生变化。"
-        "本策略按周线运作，应在周线收盘后（周五收盘或周末）扫描，下周一开盘买入。"
-    )
+    if result["week_complete"]:
+        st.success(f"✅ {result['week_note']}")
+    else:
+        st.warning(f"⚠️ {result['week_note']}")
 
-    qualified = result["qualified"]
     if qualified.empty:
-        st.info("本周没有符合条件的股票。空仓等待，不要降低标准。")
+        st.info(
+            "**本周没有符合条件的股票 —— 空仓等待，不要降低标准。**\n\n"
+            "如果想知道这是偶发还是连续空窗，切换到左侧「近期信号回顾」查看最近几周的情况。"
+        )
         return True
 
     st.subheader(f"符合全部条件的股票（共 {len(qualified)} 只）")
     show = qualified[
-        ["排名", "股票代码" if "股票代码" in qualified.columns else "ts_code",
-         "名称", "行业", "流通市值(亿)", "收盘价", "前26周最高收盘",
-         "两年高点位置", "波动率压缩"]
+        ["排名", "ts_code", "名称", "行业", "流通市值(亿)", "收盘价",
+         "前26周最高收盘", "两年高点位置", "波动率压缩"]
     ].rename(columns={"ts_code": "股票代码"})
     st.dataframe(show.round(3), width="stretch", hide_index=True)
 
     st.subheader(f"🎯 建议买入（市值最大的前{SLOT_COUNT}只）")
-    top = qualified.head(SLOT_COUNT)
-    for _, row in top.iterrows():
+    for _, row in qualified.head(SLOT_COUNT).iterrows():
         close_price = row["收盘价"]
         st.markdown(
             f"""
-**{row['排名']}. {row.get('名称', '')}　{row['ts_code']}**　
+**{int(row['排名'])}. {row.get('名称', '')}　{row['ts_code']}**　
 行业：{row.get('行业', '—')}　流通市值：{row['流通市值(亿)']:.0f}亿
 
-- 信号周收盘价：**{close_price:.2f}**（突破前26周最高 {row['前26周最高收盘']:.2f}）
-- **买入方式：下周第一个交易日开盘价买入**
-- **初始止损：按实际成交价 × 0.85**（例如成交价{close_price:.2f}则止损{close_price * 0.85:.2f}）
-- 之后每周更新：以持有期内最高周收盘价 × 0.85 上移止损
-- 最长持有 {MAX_HOLD_WEEKS} 周，到期无条件卖出
+- 信号周收盘：**{close_price:.2f}**（突破前26周最高 {row['前26周最高收盘']:.2f}）
+- **买入：下周第一个交易日开盘价**
+- **初始止损：成交价 × 0.85**（若按{close_price:.2f}成交，则止损 {close_price * 0.85:.2f}）
+- 之后每周五收盘后更新：止损 = 持有期内最高周收盘 × 0.85，只上移
+- 最长持有 {MAX_HOLD_WEEKS} 周到期卖出，**不设止盈**
 """
         )
 
     st.info(
-        f"**仓位提醒**：策略设计为{SLOT_COUNT}个仓位。如果当前已有持仓，"
-        f"只买入空缺的仓位数量，按上面的排名顺序补。"
-        f"**不要为了买满而降低排名标准，也不要因为看好某只而超配。**"
+        f"**仓位提醒**：策略设计{SLOT_COUNT}个仓位。已有持仓时只补空缺，按排名顺序。"
+        "不要为买满而顺延到排名靠后的，也不要超配。"
     )
 
     output = io.BytesIO()
