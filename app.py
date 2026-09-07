@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""R21 R15强势核心简化全信号等权审计版。
+"""R22 R15强势最小确认全信号等权审计版。
 
-R3中性Top2、R6弱势Top2和市场三分法保持不变。R15删除ATR 0.70—0.90窄门、
-不递补规则及重复的价格/波动硬门，只保留强趋势中的一次性整理再启动结构；
-候选仍按ATR3/ATR13从小到大取Top1，但ATR只排序、不再决定能否入选。所有完整
-入选信号按同一名义本金独立买入，不设仓位上限、不复投。买入次日起执行日内
--10%灾难止损，否则固定W3退出。
+R3中性Top2、R6弱势Top2和市场三分法保持不变。R15在R21简化核心上只恢复两个
+具有样本证据和结构含义的确认：收盘站上MA10、ATR3/ATR13不低于0.70；删除
+0.90上限，并在满足ATR下限的候选中重新排序取Top1，因此低于0.70的第一只不会
+令整周归零。所有完整入选信号等额独立买入，不设仓位上限、不复投；买入次日起
+执行日内-10%灾难止损，否则固定W3退出。
 """
 
 from __future__ import annotations
@@ -37,16 +37,16 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R21-R15-SIMPLIFIED-CORE-EQUAL-NOTIONAL-AUDIT"
-APP_TITLE = "R21 R15强势核心简化审计"
-ENGINE_PATCH = "R21-R15-NO-ATR-BAND-NO-REDUNDANT-GATES"
-# R15入场已经改变，必须使用新的配置身份与结果文件；行情缓存仍可安全复用。
-STRATEGY_CONFIG_VERSION = "R21-R15-SIMPLIFIED-CORE-TOP1"
+APP_VERSION = "R22-R15-MA10-ATR-FLOOR-EQUAL-NOTIONAL-AUDIT"
+APP_TITLE = "R22 R15强势最小确认审计"
+ENGINE_PATCH = "R22-R15-MA10-ATR070-FALLBACK-TOP1"
+# R15入场再次改变，必须使用新的配置身份与结果文件；行情缓存仍可安全复用。
+STRATEGY_CONFIG_VERSION = "R22-R15-MA10-ATR070-FALLBACK-TOP1"
 
-CHECKPOINT_FILE = "r21_r15_simplified_core_candidates.csv"
-SCAN_LEDGER_FILE = "r21_r15_simplified_core_scanned_dates.csv"
-RUN_TASK_FILE = "r21_r15_simplified_core_running_task.json"
-RESULT_STATE_GUARD_FILE = "r21_r15_simplified_core_result_state.guard"
+CHECKPOINT_FILE = "r22_r15_ma10_atr_floor_candidates.csv"
+SCAN_LEDGER_FILE = "r22_r15_ma10_atr_floor_scanned_dates.csv"
+RUN_TASK_FILE = "r22_r15_ma10_atr_floor_running_task.json"
+RESULT_STATE_GUARD_FILE = "r22_r15_ma10_atr_floor_result_state.guard"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -60,6 +60,7 @@ DOWNLOAD_WORKERS = 4
 MARKET_NEUTRAL_LOWER_PCT = -5.0
 MARKET_NEUTRAL_UPPER_PCT = 5.0
 REACCEL_MAX_PREVIOUS_RETURN_PCT = 5.0
+STRONG_ATR_CONTRACTION_FLOOR = 0.70
 RECOVERY_OVERSOLD_LEVEL = 35.0
 RECOVERY_DEEP_DRAWDOWN_PCT = -20.0
 RECOVERY_MAX_WEEKLY_RETURN_PCT = 25.0
@@ -73,9 +74,8 @@ R16_PRIMARY_STOP_PCT = -10.0
 R16_PRIMARY_EXIT_RULE = "日内-10%硬止损（主规则）"
 PORTFOLIO_CAPITAL_DEFAULT = 200000.0
 PORTFOLIO_SLOT_COUNT = 3
-R21_EQUAL_NOTIONAL_DEFAULT = 10000.0
-R21_BOOTSTRAP_REPETITIONS = 2000
-R21_BOOTSTRAP_BLOCK_WEEKS = 4
+R22_BOOTSTRAP_REPETITIONS = 2000
+R22_BOOTSTRAP_BLOCK_WEEKS = 4
 
 # -----------------------------------------------------------------------------
 # 通用安全读写
@@ -941,9 +941,9 @@ def compute_signal_snapshot(
     )
     trend_eligible = bool(base_trend_eligible and setup_candidate)
 
-    # R21只精简R15强势分支：保留可解释的一次性“整理后再启动”核心。
-    # close > previous high 已经蕴含本周上涨，因此不再重复要求本周涨幅、
-    # MA10、收盘位置、离MA20距离和周振幅；ATR仅用于横截面排序。
+    # R22只在R21简化核心上恢复MA10价格确认；close > previous high 已经
+    # 蕴含本周上涨，因此仍不重复要求涨幅、收盘位置、离MA20距离和周振幅。
+    # ATR下限在横截面阶段处理，以便跳过过度收缩者后重新取Top1。
     strong_trend_eligible = bool(
         base_trend_eligible
         and math.isfinite(ma40)
@@ -964,6 +964,7 @@ def compute_signal_snapshot(
         )
         and previous_return_1w <= REACCEL_MAX_PREVIOUS_RETURN_PCT
         and current_close > previous_high_value
+        and current_close >= ma10
         and current_hist > previous_hist
     )
 
@@ -1094,6 +1095,12 @@ def compute_signal_snapshot(
         "R3_Setup_Type": setup_type,
         "Strong_Trend_Eligible": strong_trend_eligible,
         "Strong_Reacceleration_Trigger": strong_reacceleration_trigger,
+        "Strong_MA10_Confirmed": bool(
+            strong_reacceleration_trigger
+            and math.isfinite(current_close)
+            and math.isfinite(ma10)
+            and current_close >= ma10
+        ),
         "Strong_Reacceleration_Setup_Type": (
             "强趋势整理后再启动-简化核心"
             if strong_reacceleration_trigger
@@ -1379,7 +1386,8 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     candidates["Recovery_Rank"] = np.nan
     candidates["R15_Strong_Rank"] = np.nan
     candidates["Selected_Top2"] = False
-    candidates["R15_Strong_Core_Top1"] = False
+    candidates["R15_Strong_MA10_ATR_Top1"] = False
+    candidates["Strong_ATR_Floor_OK"] = False
     candidates["R19_Selected"] = False
     candidates["Entry_Eligible"] = False
 
@@ -1423,8 +1431,12 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
             1, len(ordered) + 1, dtype=float
         )
 
-    strong_eligible_mask = _bool_series(
-        candidates, "Strong_Reacceleration_Trigger"
+    r15_atr = pd.to_numeric(candidates["ATR_Contraction"], errors="coerce")
+    strong_atr_floor_ok = r15_atr.ge(STRONG_ATR_CONTRACTION_FLOOR)
+    candidates["Strong_ATR_Floor_OK"] = strong_atr_floor_ok
+    strong_eligible_mask = (
+        _bool_series(candidates, "Strong_Reacceleration_Trigger")
+        & strong_atr_floor_ok
     )
     strong_eligible = candidates.loc[strong_eligible_mask].copy()
     if not strong_eligible.empty:
@@ -1438,8 +1450,8 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
             1, len(ordered) + 1, dtype=float
         )
 
-    # ATR只决定同周候选的先后顺序。只要存在核心结构候选，第一名就入选；
-    # 不再用0.70—0.90窄区间二次归零，也不存在“第一名越界且不递补”。
+    # 先剔除ATR3/ATR13低于0.70的过度收缩候选，再在剩余股票中从小到大
+    # 排序取Top1。没有0.90上限；原绝对第一名低于0.70时允许下一只递补。
     r15_top1 = pd.to_numeric(
         candidates["R15_Strong_Rank"], errors="coerce"
     ).eq(1)
@@ -1449,14 +1461,18 @@ def score_frozen_candidates(pool_snapshots: pd.DataFrame):
     recovery_count = len(recovery_eligible)
     strong_count = len(strong_eligible)
     if market_regime == "强势":
-        active_branch = "R15强势简化核心 Top1"
+        active_branch = "R15强势MA10+ATR下限 Top1"
         active_count = strong_count
         candidates["Rank"] = candidates["R15_Strong_Rank"]
         candidates["Entry_Eligible"] = strong_eligible_mask
-        candidates["R15_Strong_Core_Top1"] = r15_top1
+        candidates["R15_Strong_MA10_ATR_Top1"] = r15_top1
         candidates["R19_Selected"] = r15_top1
         selection_valid = bool(r15_top1.any())
-        block_reason = "" if selection_valid else "R15强势简化核心没有候选"
+        block_reason = (
+            ""
+            if selection_valid
+            else "R15强势没有同时满足MA10与ATR≥0.70的候选"
+        )
     elif market_regime == "中性":
         active_branch = "R3中性趋势"
         active_count = r3_count
@@ -2280,7 +2296,7 @@ def _r19_selected(history: pd.DataFrame, require_complete: bool = False):
     else:
         selected_mask = (
             _bool_series(history, "Selected_Top2")
-            | _bool_series(history, "R15_Strong_Core_Top1")
+            | _bool_series(history, "R15_Strong_MA10_ATR_Top1")
         )
     selected = history.loc[selected_mask].copy()
     regime = selected.get(
@@ -3138,6 +3154,67 @@ def r20_concentration_audit(universe: pd.DataFrame):
     )
 
 
+def r22_branch_robustness_audit(universe: pd.DataFrame):
+    """逐分支检查典型收益、盈亏结构与去除头部盈利后的主体贡献。"""
+    columns = [
+        "市场分支", "完整交易", "平均收益%", "中位收益%", "Profit_Factor",
+        "第一大盈利占净收益%", "前五大盈利占净收益%",
+        "删除前五大后收益点", "删除前五大后平均收益%",
+        "样本数检查", "平均收益检查", "中位收益检查", "PF检查",
+        "去前五大检查", "分支综合结论",
+    ]
+    rows = []
+    for branch in ("R15强势", "R3中性", "R6弱势"):
+        group = universe[
+            universe.get(
+                "R19_市场分支", pd.Series("", index=universe.index)
+            ).astype(str).eq(branch)
+        ].copy()
+        returns = pd.to_numeric(
+            group.get("R19_Realized_Return_pct", pd.Series(dtype=float)),
+            errors="coerce",
+        ).dropna().sort_values(ascending=False).reset_index(drop=True)
+        net = returns.sum() if len(returns) else np.nan
+        gains = returns[returns > 0.0].sum()
+        losses = -returns[returns < 0.0].sum()
+        pf = gains / losses if losses > 0.0 else (np.inf if gains > 0.0 else np.nan)
+        after5 = returns.iloc[5:] if len(returns) > 5 else pd.Series(dtype=float)
+        sample_ok = len(returns) >= 10
+        mean_ok = len(returns) > 0 and returns.mean() > 0.0
+        median_ok = len(returns) > 0 and returns.median() > 0.0
+        pf_ok = pd.notna(pf) and pf > 1.2
+        after5_ok = len(after5) > 0 and after5.sum() > 0.0
+        all_ok = sample_ok and mean_ok and median_ok and pf_ok and after5_ok
+        rows.append(
+            {
+                "市场分支": branch,
+                "完整交易": len(returns),
+                "平均收益%": returns.mean() if len(returns) else np.nan,
+                "中位收益%": returns.median() if len(returns) else np.nan,
+                "Profit_Factor": pf,
+                "第一大盈利占净收益%": (
+                    returns.head(1).sum() / net * 100.0
+                    if math.isfinite(_safe_float(net)) and net > 0.0
+                    else np.nan
+                ),
+                "前五大盈利占净收益%": (
+                    returns.head(5).sum() / net * 100.0
+                    if math.isfinite(_safe_float(net)) and net > 0.0
+                    else np.nan
+                ),
+                "删除前五大后收益点": after5.sum() if len(after5) else np.nan,
+                "删除前五大后平均收益%": after5.mean() if len(after5) else np.nan,
+                "样本数检查": "通过" if sample_ok else "未通过",
+                "平均收益检查": "通过" if mean_ok else "未通过",
+                "中位收益检查": "通过" if median_ok else "未通过",
+                "PF检查": "通过" if pf_ok else "未通过",
+                "去前五大检查": "通过" if after5_ok else "未通过",
+                "分支综合结论": "通过" if all_ok else "未通过",
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
 def r20_block_bootstrap(universe: pd.DataFrame, scan_ledger: pd.DataFrame):
     """按连续4个扫描周成块重采样，保留同周股票及W3重叠的相关性。"""
     columns = ["统计量", "2.5%下界", "中位数", "97.5%上界", "重复次数", "区组周数"]
@@ -3146,7 +3223,7 @@ def r20_block_bootstrap(universe: pd.DataFrame, scan_ledger: pd.DataFrame):
     scan_dates = sorted(
         {value for value in scan_ledger["Signal_Date"].map(parse_yyyymmdd) if value}
     )
-    if len(scan_dates) < R21_BOOTSTRAP_BLOCK_WEEKS:
+    if len(scan_dates) < R22_BOOTSTRAP_BLOCK_WEEKS:
         return pd.DataFrame(columns=columns)
     signal_text = universe["Signal_Date"].map(parse_yyyymmdd)
     returns_by_week = {
@@ -3156,11 +3233,11 @@ def r20_block_bootstrap(universe: pd.DataFrame, scan_ledger: pd.DataFrame):
         ).dropna().to_numpy(dtype=float)
         for day in scan_dates
     }
-    block = R21_BOOTSTRAP_BLOCK_WEEKS
+    block = R22_BOOTSTRAP_BLOCK_WEEKS
     starts = np.arange(0, len(scan_dates) - block + 1)
     rng = np.random.default_rng(20200907)
     mean_values, win_values, pf_values = [], [], []
-    for _ in range(R21_BOOTSTRAP_REPETITIONS):
+    for _ in range(R22_BOOTSTRAP_REPETITIONS):
         sampled = []
         while len(sampled) < len(scan_dates):
             start = int(rng.choice(starts))
@@ -3215,6 +3292,19 @@ def r20_internal_robustness_scorecard(
         if len(universe)
         else pd.DataFrame()
     )
+    branch_audit = r22_branch_robustness_audit(universe)
+    all_branch_medians_ok = (
+        len(branch_audit) == 3
+        and branch_audit["中位收益检查"].eq("通过").all()
+    )
+    all_branch_pf_ok = (
+        len(branch_audit) == 3
+        and branch_audit["PF检查"].eq("通过").all()
+    )
+    all_branch_after5_ok = (
+        len(branch_audit) == 3
+        and branch_audit["去前五大检查"].eq("通过").all()
+    )
     boot_lower = np.nan
     if not bootstrap.empty:
         match = bootstrap[bootstrap["统计量"].eq("平均单笔收益%")]
@@ -3232,6 +3322,9 @@ def r20_internal_robustness_scorecard(
         ("删除前五大盈利后仍为正", len(ordered) > 5 and ordered.iloc[5:].sum() > 0.0, f"剩余收益点{ordered.iloc[5:].sum() if len(ordered) > 5 else np.nan:.2f}"),
         ("前五大盈利占比不超过50%", math.isfinite(_safe_float(top5_share)) and top5_share <= 50.0, f"当前{top5_share:.2f}%"),
         ("三个分支均至少10笔且平均为正", not branch_means.empty and len(branch_means) == 3 and bool(((branch_means['size'] >= 10) & (branch_means['mean'] > 0.0)).all()), "; ".join(f"{idx}:{int(row['size'])}笔/{row['mean']:.2f}%" for idx, row in branch_means.iterrows())),
+        ("三个分支中位收益均为正", all_branch_medians_ok, "; ".join(f"{row['市场分支']}:{row['中位收益%']:.2f}%" for _, row in branch_audit.iterrows())),
+        ("三个分支Profit Factor均高于1.2", all_branch_pf_ok, "; ".join(f"{row['市场分支']}:{row['Profit_Factor']:.2f}" for _, row in branch_audit.iterrows())),
+        ("三个分支删除前五大盈利后均为正", all_branch_after5_ok, "; ".join(f"{row['市场分支']}:{row['删除前五大后收益点']:.2f}" for _, row in branch_audit.iterrows())),
         ("4周区组自助95%下界为正", math.isfinite(boot_lower) and boot_lower > 0.0, f"当前下界{boot_lower:.2f}%"),
     ]
     return pd.DataFrame(
@@ -3281,7 +3374,7 @@ def r20_integrity_gates(
         [
             {
                 "验收阶段": phase,
-                "R21完整性项目": name,
+                "R22完整性项目": name,
                 "结果": "通过" if passed else "未通过",
                 "当前值": value,
             }
@@ -3566,7 +3659,7 @@ def import_prior_results_zip(
     config_id: str,
     roundtrip_cost_pct: float,
 ):
-    """事务导入同策略R21结果；旧策略候选不得冒充新R15结果。"""
+    """事务导入同策略R22结果；旧策略候选不得冒充新R15结果。"""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         infos = {
             info.filename: info
@@ -3576,11 +3669,11 @@ def import_prior_results_zip(
         candidate_names = [
             name
             for name in infos
-            if name.startswith("01_all_r21_")
+            if name.startswith("01_all_r22_")
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R21候选明细；旧版结果不能转换为简化R15。")
+            raise ValueError("结果包中未找到唯一的R22候选明细；旧版结果不能转换为R22。")
         info = infos[candidate_names[0]]
         if info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -3602,7 +3695,9 @@ def import_prior_results_zip(
             "R16_Stop_Minus10_Return_Net_pct",
             "R16_Stop_Minus10_Exit_Date",
             "Strong_Reacceleration_Trigger",
-            "R15_Strong_Core_Top1",
+            "Strong_MA10_Confirmed",
+            "R15_Strong_MA10_ATR_Top1",
+            "Strong_ATR_Floor_OK",
             "R19_Selected",
             "ATR_Contraction",
         }
@@ -3659,7 +3754,7 @@ def import_prior_results_zip(
         ledger["Config_ID"] = str(config_id)
 
         selected = candidates[_bool_series(candidates, "R19_Selected")].copy()
-        # R21只使用每笔实际退出收益，不构造三仓每日净值。
+        # R22只使用每笔实际退出收益，不构造三仓每日净值。
         missing_path_dates: set[str] = set()
         pending_mask = pd.Series(False, index=ledger.index)
         ledger.loc[
@@ -3842,7 +3937,7 @@ def build_export_zip(
     return output.getvalue()
 
 
-def build_r21_export_zip(
+def build_r22_export_zip(
     history: pd.DataFrame,
     ledger: pd.DataFrame,
     data_gaps: pd.DataFrame,
@@ -3857,12 +3952,13 @@ def build_r21_export_zip(
     concentration: pd.DataFrame,
     bootstrap: pd.DataFrame,
     robustness: pd.DataFrame,
+    branch_robustness: pd.DataFrame,
     integrity: pd.DataFrame,
     audit_metadata: pd.DataFrame,
 ):
-    """R21只导出全信号等权审计，不导出三仓或复投净值。"""
+    """R22只导出全信号等权审计，不导出三仓或复投净值。"""
     files = {
-        "01_all_r21_r15_simplified_core_candidates.csv": history,
+        "01_all_r22_r15_ma10_atr_floor_candidates.csv": history,
         "02_scan_ledger.csv": ledger,
         "03_market_data_gap_audit.csv": data_gaps,
         "04_all_signal_equal_notional_summary.csv": all_signal_summary,
@@ -3876,8 +3972,9 @@ def build_r21_export_zip(
         "12_profit_concentration_audit.csv": concentration,
         "13_four_week_block_bootstrap.csv": bootstrap,
         "14_internal_robustness_scorecard.csv": robustness,
-        "15_r21_integrity_gates.csv": integrity,
-        "16_audit_metadata.csv": audit_metadata,
+        "15_branch_robustness_scorecard.csv": branch_robustness,
+        "16_r22_integrity_gates.csv": integrity,
+        "17_audit_metadata.csv": audit_metadata,
     }
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -3904,7 +4001,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "R3/R6与市场三分法保持冻结；R15仅保留强势整理再启动核心；"
+        "R3/R6与市场三分法保持冻结；R15采用整理再启动核心、MA10确认和ATR≥0.70；"
         "T+1日内-10%止损和W3退出不变；"
         "所有完整入选信号等额独立成交，不设仓位上限、不复投。"
     )
@@ -3918,12 +4015,12 @@ def main():
             """
 - **R3中性**：MACD首红趋势池按原词典序取Top2；不足2只则空仓。
 - **R6弱势**：26周深跌、SKDJ固定N=6的首次转折池按原五项早期阶段排名取Top2；不足2只则空仓。
-- **R15强势简化核心**：强趋势中，前周涨幅不超过5%，本周收盘突破前周最高价且MACD柱增强；ATR3/ATR13只排序取Top1，不设数值区间。
+- **R15强势最小确认**：强趋势中，前周涨幅不超过5%，本周收盘突破前周最高价、站上MA10且MACD柱增强；先保留ATR3/ATR13≥0.70者，再按ATR从小到大取Top1，不设0.90上限。
 - **买入**：下一交易日开盘；一字涨停不虚构成交。
 - **止损**：买入日不可卖，从下一交易日起执行日内-10%；计0.3%不利滑点，停牌或一字跌停顺延。
 - **退出**：未触发止损的交易固定W3收盘卖出。
 - **资金口径**：每笔完整入选信号投入相同名义本金；无限资金、无仓位冲突、无复投。
-- **本版删除的R15条件**：ATR 0.70—0.90准入门、第一名越界全周归零、前周跌幅下限、MA10重复确认、当周涨幅上限、强收盘、离MA20距离和周振幅硬门。
+- **仍然删除的R15条件**：ATR 0.90上限、绝对第一名越界全周归零、前周跌幅下限、当周涨幅上限、强收盘、离MA20距离和周振幅硬门。
 - **其他已删除研究**：R7/R9、R12/R13、R14周末退出、R17整仓W4、R18盈利尾仓及全池大牛机会反查。
             """
         )
@@ -3934,11 +4031,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R21全信号等权审计", "最新选股预览"],
+            ["历史R22全信号等权审计", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R21全信号等权审计")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R22全信号等权审计")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -3978,11 +4075,11 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R21历史结果")
+        clear_history_clicked = st.button("清除R22历史结果")
         imported_results = st.file_uploader(
-            "导入R21结果包",
+            "导入R22结果包",
             type=["zip"],
-            help="只能导入同一R21策略结果；旧版R15缺少被硬门过滤的候选，不能安全转换。",
+            help="只能导入同一R22策略结果；旧版候选不能安全转换为新的MA10与ATR下限规则。",
         )
         import_results_clicked = st.button(
             "恢复结果包中的断点",
@@ -3992,7 +4089,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R21全信号等权审计":
+    if start_input > end_input and mode == "历史R22全信号等权审计":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -4011,8 +4108,8 @@ def main():
             ):
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
-        st.session_state.pop("r21_preview", None)
-        st.success("R21历史结果和断点任务已清除。")
+        st.session_state.pop("r22_preview", None)
+        st.success("R22历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
@@ -4027,14 +4124,14 @@ def main():
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个扫描周、"
                 f"{import_stats['selected_rows']}笔冻结信号。"
-                "R21只审计全部信号收益，无需补算三仓每日净值。"
+                "R22只审计全部信号收益，无需补算三仓每日净值。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
     is_preview_mode = mode == "最新选股预览"
-    if "r21_worker_id" not in st.session_state:
-        st.session_state["r21_worker_id"] = uuid.uuid4().hex
-    worker_id = str(st.session_state["r21_worker_id"])
+    if "r22_worker_id" not in st.session_state:
+        st.session_state["r22_worker_id"] = uuid.uuid4().hex
+    worker_id = str(st.session_state["r22_worker_id"])
     task_before = read_json_safe(RUN_TASK_FILE)
 
     if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
@@ -4058,7 +4155,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R21全信号等权审计"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R22全信号等权审计"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -4393,7 +4490,7 @@ def main():
                             else 0
                         )
                         if run_preview:
-                            st.session_state["r21_preview"] = candidates
+                            st.session_state["r22_preview"] = candidates
                         else:
                             if not candidates.empty:
                                 candidates["Config_ID"] = run_config_id
@@ -4454,7 +4551,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R21全信号等权审计扫描完成。")
+                            st.success("历史R22全信号等权审计扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -4481,7 +4578,7 @@ def main():
                 else:
                     st.error(f"运行失败：{exc}")
 
-    preview = st.session_state.get("r21_preview")
+    preview = st.session_state.get("r22_preview")
     if is_preview_mode and isinstance(preview, pd.DataFrame):
         st.markdown("---")
         st.header("最新选股预览")
@@ -4506,6 +4603,7 @@ def main():
                     "ts_code", "Industry", "Strategy_Branch",
                     "R3_Setup_Type", "Strong_Reacceleration_Setup_Type",
                     "Recovery_Setup_Type", "R15_Strong_Rank",
+                    "Strong_MA10_Confirmed", "Strong_ATR_Floor_OK",
                     "ATR_Contraction", "Recovery_Early_Stage_100",
                     "Weekly_SKDJ_K6", "Weekly_SKDJ_D6",
                     "Drawdown_26W_pct", "Return_1W_pct",
@@ -4589,7 +4687,7 @@ def main():
             st.markdown("---")
             st.error(
                 f"发现{len(state_issues)}周账本与候选明细不一致。"
-                "当前禁止生成审计结论；重新启动R21后只补扫异常周。"
+                "当前禁止生成审计结论；重新启动R22后只补扫异常周。"
             )
             st.dataframe(state_issues, width="stretch", hide_index=True)
             return
@@ -4608,6 +4706,7 @@ def main():
         weekly_summary = r20_weekly_summary(universe)
         rolling_summary = r20_rolling_26week_summary(universe, ledger)
         concentration = r20_concentration_audit(universe)
+        branch_robustness = r22_branch_robustness_audit(universe)
         bootstrap = r20_block_bootstrap(universe, ledger)
         robustness = r20_internal_robustness_scorecard(universe, bootstrap)
         integrity_gates = r20_integrity_gates(
@@ -4626,12 +4725,13 @@ def main():
                     "每笔名义本金": equal_notional,
                     "止损": "买入次日起日内-10%，另计0.3%不利滑点",
                     "退出": "未止损则固定W3收盘",
+                    "R15规则": "强趋势整理再启动+MA10确认；ATR3/ATR13≥0.70后升序Top1；无0.90上限",
                 }
             ]
         )
 
         st.markdown("---")
-        st.header("R21 R15强势核心简化全信号等权审计")
+        st.header("R22 R15强势最小确认全信号等权审计")
         st.info(
             "本报告把每一笔完整入选股票都视为等额独立交易。"
             "没有三仓、没有跳过、没有复投，因此不存在起始仓位路径和后期大仓位放大。"
@@ -4672,7 +4772,7 @@ def main():
             with st.expander("查看行情缺口"):
                 st.dataframe(actual_data_gaps, width="stretch", hide_index=True)
 
-        st.subheader("R21完整性验收")
+        st.subheader("R22完整性验收")
         st.dataframe(integrity_gates, width="stretch", hide_index=True)
 
         st.subheader("全部入选信号等额结果")
@@ -4687,6 +4787,15 @@ def main():
         st.caption(
             "这些项目只能发现样本过少、利润集中、分支失效或统计区间不稳定；"
             "即使全部通过，也必须再用冻结后未见样本或前向记录验证。"
+        )
+
+        st.subheader("分支级稳健性检查")
+        st.dataframe(
+            _format_report_frame(branch_robustness), width="stretch", hide_index=True
+        )
+        st.caption(
+            "每个分支必须单独满足样本数、平均与中位收益、Profit Factor及删除前五大盈利后仍为正；"
+            "总体盈利不能替代分支通过。"
         )
 
         st.subheader("利润集中度")
@@ -4744,7 +4853,8 @@ def main():
             detail_columns = [
                 "Signal_Date", "Entry_Date", "Rank", "name", "ts_code",
                 "Industry", "Market_Regime", "Strategy_Branch",
-                "R15_Strong_Rank", "ATR_Contraction",
+                "R15_Strong_Rank", "Strong_MA10_Confirmed",
+                "Strong_ATR_Floor_OK", "ATR_Contraction",
                 "Recovery_Early_Stage_100", "Weekly_SKDJ_K6",
                 "Weekly_SKDJ_D6", "Drawdown_26W_pct",
                 "Entry_Open", "Fixed_Return_W3_Net_pct",
@@ -4770,7 +4880,7 @@ def main():
                 hide_index=True,
             )
 
-        export_bytes = build_r21_export_zip(
+        export_bytes = build_r22_export_zip(
             history.drop(columns=["Config_ID"], errors="ignore"),
             ledger.drop(columns=["Config_ID"], errors="ignore"),
             data_gap_rows,
@@ -4785,13 +4895,14 @@ def main():
             concentration,
             bootstrap,
             robustness,
+            branch_robustness,
             integrity_gates,
             audit_metadata,
         )
         st.download_button(
-            "下载R21 R15强势核心简化审计结果",
+            "下载R22 R15强势最小确认审计结果",
             data=export_bytes,
-            file_name="r21_r15_simplified_core_equal_notional_audit_results.zip",
+            file_name="r22_r15_ma10_atr_floor_equal_notional_audit_results.zip",
             mime="application/zip",
         )
 
