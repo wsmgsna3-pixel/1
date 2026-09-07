@@ -1,27 +1,28 @@
 # -*- coding: utf-8 -*-
-"""市值分层分析器（单文件独立版，直接覆盖 app.py 运行）。
+"""突破策略排序层验证器（单文件独立版，直接覆盖 app.py 运行）。
 
-回答三个问题：
-  1. A股科技类股票（不含北交所）到底有多少只，按市值如何分布
-  2. 把选股范围从100亿放宽到50亿，能多多少选股机会
-  3. 小市值是否真的波动更大（验证实盘观察）
+当前突破策略只有筛选（能不能买），没有排序（先买哪个）。
+每周平均产生6.27个信号，意味着在仓位受限时，一半以上的选择完全没有依据。
 
-同时这也是一次横截面维度的样本外检验：50-100亿、30-50亿这两个区间，
-此前所有回测都没有碰过。若同一套冻结规则在这些新股票上依然有效，
-则是继2018-2022时间维度之后的又一个独立证据。
+SKDJ阶段已验证排序层的决定性作用：同一批信号，用K值排序时三仓收益-7.3%、
+蒙特卡洛分位45%（不如随机）；换成26周回撤排序后变成+45.7%、分位94%。
+只换排序规则，结果天差地别。
 
-重要偏差提示：
-股票池构建时会剔除"当前名称含ST或退"的在架股票，即一只现在是ST的票，
-其健康时期的历史也被排除。这个幸存者偏差对小市值股票远比大市值严重
-（50-100亿变ST或退市的概率高得多），因此放宽到50亿后，
-回测结果会比真实情况更乐观，且乐观程度大于当前范围。解读时需打折扣。
+本轮先不加资金约束，纯粹测量排序变量本身的选股能力：
+每周按各变量取前N名，与"该周全部信号的平均"对比。
 
-策略规则与样本外测试完全一致并锁死为模块级常量，不允许修改。
+判断标准（三条同时满足）：
+  1. 正向TopN收益明显高于全部信号，且 |t|>2
+  2. 反向对照明显更差（正反都好说明是噪声）
+  3. 分年度大部分为正
 
-内存优化：边构建周线边释放日线，避免两份完整数据共存。
+另设"随机取N只"作为参照，代表只受数量限制、完全无选股能力的水平；
+任何排序变量跑不赢它即为无效。
 
-行情缓存与之前共用。注意：股票池本身不含市值过滤，
-因此放宽市值下限不会增加下载量，只影响分析阶段的筛选。
+信号规则与样本外测试完全一致并锁死，本轮不做任何修改。
+内存优化：边构建周线边释放日线。
+
+行情缓存与之前共用。
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "科技股池市值分层分析"
+APP_TITLE = "突破策略排序层验证"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
@@ -683,8 +684,10 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 
+
 # =============================================================================
-# 冻结规则（与样本外测试完全一致，不允许修改）
+# 冻结的信号规则（与样本外测试一致，不修改）
+# 本轮唯一新增的是"排序层"：同一周有多个信号时，先买哪几个。
 # =============================================================================
 FROZEN_BREAKOUT_WEEKS = 26
 FROZEN_POSITION_QUANTILE = 0.33
@@ -692,35 +695,42 @@ FROZEN_VOL_CONTRACTION_MAX = 0.8
 FROZEN_FORWARD_WEEKS = 26
 FROZEN_STOP_PCT = 15.0
 
-# 市值分层（亿元）。100亿以上是此前全部回测的范围，
-# 50-100亿和30-50亿是从未测试过的区间——对它们的检验等于一次
-# 横截面维度上的样本外验证。
-MV_TIERS = [
-    (0, 30, "30亿以下"),
-    (30, 50, "30-50亿"),
-    (50, 100, "50-100亿（新）"),
-    (100, 300, "100-300亿"),
-    (300, 1000, "300-1000亿"),
-    (1000, 1e9, "1000亿以上"),
-]
-
 
 def compute_features(weekly: pd.DataFrame):
     close = pd.to_numeric(weekly["close"], errors="coerce")
     high = pd.to_numeric(weekly["high"], errors="coerce")
+    low = pd.to_numeric(weekly["low"], errors="coerce")
+    volume = (
+        pd.to_numeric(weekly["vol"], errors="coerce")
+        if "vol" in weekly.columns
+        else pd.Series(np.nan, index=weekly.index, dtype="float64")
+    )
     return_1w = (close / close.shift(1) - 1.0) * 100.0
+
     features = pd.DataFrame(index=weekly.index)
-    features["breakout"] = close > close.shift(1).rolling(FROZEN_BREAKOUT_WEEKS).max()
+    prior_high = close.shift(1).rolling(FROZEN_BREAKOUT_WEEKS).max()
+    features["breakout"] = close > prior_high
     features["position_2y"] = close / high.shift(1).rolling(104).max().replace(0, np.nan)
     vol_recent = return_1w.shift(1).rolling(8).std()
     vol_earlier = return_1w.shift(9).rolling(18).std()
     features["vol_contraction"] = vol_recent / vol_earlier.replace(0, np.nan)
-    # 个股周波动率：用来验证"小市值波动更大"这个观察
+    features["volume_surge"] = volume / volume.shift(1).rolling(8).mean().replace(0, np.nan)
+    # 突破幅度：本周收盘超出前高多少
+    features["breakout_strength"] = (close / prior_high.replace(0, np.nan) - 1.0) * 100.0
+    # 横盘区间宽度
+    base_high = high.shift(1).rolling(26).max()
+    base_low = low.shift(1).rolling(26).min()
+    base_mid = close.shift(1).rolling(26).mean()
+    features["base_range"] = (base_high - base_low) / base_mid.replace(0, np.nan) * 100.0
+    features["momentum_26w"] = (close / close.shift(26) - 1.0) * 100.0
     features["weekly_vol"] = return_1w.rolling(26).std()
+    features["dist_ma40"] = (close / close.rolling(40).mean() - 1.0) * 100.0
+    features["return_1w"] = return_1w
     return features
 
 
 def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float):
+    """只输出符合冻结信号的周，附带全部候选排序变量与结果。"""
     if len(weekly) < 140:
         return pd.DataFrame()
     features = compute_features(weekly)
@@ -733,10 +743,17 @@ def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float
     breakout = features["breakout"].fillna(False).to_numpy()
     position = features["position_2y"].to_numpy()
     contraction = features["vol_contraction"].to_numpy()
-    weekly_vol = features["weekly_vol"].to_numpy()
 
     rows = []
     for i in range(n - 1):
+        if not breakout[i]:
+            continue
+        if not (math.isfinite(position[i]) and position[i] >= position_threshold):
+            continue
+        if not (
+            math.isfinite(contraction[i]) and contraction[i] <= FROZEN_VOL_CONTRACTION_MAX
+        ):
+            continue
         entry_price = open_values[i + 1]
         if not math.isfinite(entry_price) or entry_price <= 0:
             continue
@@ -768,15 +785,16 @@ def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float
             {
                 "ts_code": ts_code,
                 "Week": dates[i],
-                "Is_Signal": bool(
-                    breakout[i]
-                    and math.isfinite(position[i])
-                    and position[i] >= position_threshold
-                    and math.isfinite(contraction[i])
-                    and contraction[i] <= FROZEN_VOL_CONTRACTION_MAX
-                ),
                 "Entry_Price": entry_price,
-                "Weekly_Vol": weekly_vol[i],
+                "Position_2Y": position[i],
+                "Vol_Contraction": contraction[i],
+                "Volume_Surge": features["volume_surge"].iloc[i],
+                "Breakout_Strength": features["breakout_strength"].iloc[i],
+                "Base_Range": features["base_range"].iloc[i],
+                "Momentum_26W": features["momentum_26w"].iloc[i],
+                "Weekly_Vol": features["weekly_vol"].iloc[i],
+                "Dist_MA40": features["dist_ma40"].iloc[i],
+                "Return_1W": features["return_1w"].iloc[i],
                 "Max_Gain_pct": max_gain,
                 "Trail_Return_pct": (exit_price / entry_price - 1.0) * 100.0,
             }
@@ -785,125 +803,184 @@ def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float
 
 
 # -----------------------------------------------------------------------------
-# 分层统计
+# 排序层检验
 # -----------------------------------------------------------------------------
-def assign_tier(mv_billion: pd.Series):
-    tier = pd.Series("未知", index=mv_billion.index, dtype=object)
-    for low, high, label in MV_TIERS:
-        mask = (mv_billion >= low) & (mv_billion < high)
-        tier[mask] = label
-    return tier
+RANK_CANDIDATES = [
+    ("Position_2Y", "两年高点位置（越高越优先）", False),
+    ("MV_Billion", "流通市值（越大越优先）", False),
+    ("Vol_Contraction", "波动率压缩（越强越优先）", True),
+    ("Volume_Surge", "突破量能（越大越优先）", False),
+    ("Breakout_Strength", "突破幅度（超出前高越多越优先）", False),
+    ("Base_Range", "横盘区间宽度（越宽越优先）", False),
+    ("Momentum_26W", "26周动量（越强越优先）", False),
+    ("Weekly_Vol", "个股波动率（越大越优先）", False),
+    ("Dist_MA40", "距40周均线（越远越优先）", False),
+    ("Return_1W", "信号周涨幅（越大越优先）", False),
+]
 
 
-def tier_summary(panel: pd.DataFrame, cost_pct: float):
+def ranking_test(signals: pd.DataFrame, top_n: int, cost_pct: float, random_draws: int = 30):
+    """无资金约束下，检验各排序变量能否在同一周内挑出更好的股票。
+
+    对比三组，全部按周先取均值再对周求平均，因此不受"某些周信号特别多"的影响：
+      - 全部信号：该周所有信号的平均（不做任何排序）
+      - 正向TopN：按变量取前N名
+      - 反向TopN：按相反方向取N名（噪声检测——真信号的反向应明显更差）
+      - 随机TopN：随机取N名，反映"只受仓位数限制、无选股能力"的水平
+    """
+    work = signals.copy()
+    work["_gain"] = pd.to_numeric(work["Max_Gain_pct"], errors="coerce")
+    work["_ret"] = pd.to_numeric(work["Trail_Return_pct"], errors="coerce") - cost_pct
+    work = work.dropna(subset=["_gain", "_ret"])
+    if work.empty:
+        return pd.DataFrame()
+
+    baseline_ret = work.groupby("Week")["_ret"].mean()
+    baseline_gain = work.groupby("Week")["_gain"].mean()
+    baseline_double = work.groupby("Week")["_gain"].apply(lambda s: (s > 100).mean() * 100.0)
+
+    rng = np.random.default_rng(20240501)
+
+    def week_stats(subset: pd.DataFrame):
+        by_week_ret = subset.groupby("Week")["_ret"].mean()
+        by_week_gain = subset.groupby("Week")["_gain"].mean()
+        by_week_double = subset.groupby("Week")["_gain"].apply(
+            lambda s: (s > 100).mean() * 100.0
+        )
+        return by_week_ret, by_week_gain, by_week_double
+
     rows = []
-    order = [label for _, _, label in MV_TIERS]
-    for label in order:
-        group = panel[panel["Tier"] == label]
-        if group.empty:
+
+    # 基准行：全部信号
+    rows.append(
+        {
+            "排序规则": "【基准】全部信号（无排序）",
+            "方向": "—",
+            "覆盖周数": int(len(baseline_ret)),
+            "止损后收益%": float(baseline_ret.mean()),
+            "止损后胜率%": float((baseline_ret > 0).mean() * 100.0),
+            "平均最大涨幅%": float(baseline_gain.mean()),
+            "翻倍概率%": float(baseline_double.mean()),
+            "vs基准收益差%": 0.0,
+            "粗略t值": np.nan,
+        }
+    )
+
+    # 随机TopN
+    random_means = []
+    for _ in range(random_draws):
+        picks = work.groupby("Week", group_keys=False).apply(
+            lambda g: g.sample(n=min(top_n, len(g)), random_state=int(rng.integers(1e9))),
+            include_groups=False,
+        )
+        random_means.append(picks.groupby(picks.index if "Week" not in picks.columns else "Week")["_ret"].mean())
+    if random_means:
+        stacked = pd.concat(random_means, axis=1)
+        random_by_week = stacked.mean(axis=1)
+        aligned = baseline_ret.reindex(random_by_week.index)
+        rows.append(
+            {
+                "排序规则": f"【对照】随机取{top_n}只",
+                "方向": "随机",
+                "覆盖周数": int(len(random_by_week)),
+                "止损后收益%": float(random_by_week.mean()),
+                "止损后胜率%": float((random_by_week > 0).mean() * 100.0),
+                "平均最大涨幅%": np.nan,
+                "翻倍概率%": np.nan,
+                "vs基准收益差%": float((random_by_week - aligned).dropna().mean()),
+                "粗略t值": np.nan,
+            }
+        )
+
+    for column, label, ascending in RANK_CANDIDATES:
+        if column not in work.columns:
             continue
-        signal = group[group["Is_Signal"].astype(bool)]
-        base_gain = pd.to_numeric(group["Max_Gain_pct"], errors="coerce").dropna()
-        base_double = float((base_gain > 100).mean() * 100.0) if len(base_gain) else np.nan
-        if signal.empty:
+        values = pd.to_numeric(work[column], errors="coerce")
+        if values.notna().sum() < len(work) * 0.5:
+            continue
+        subset = work.assign(_v=values).dropna(subset=["_v"])
+        rank_fwd = subset.groupby("Week")["_v"].rank(method="first", ascending=ascending)
+        rank_rev = subset.groupby("Week")["_v"].rank(method="first", ascending=not ascending)
+
+        for direction, mask in (("正向", rank_fwd <= top_n), ("反向", rank_rev <= top_n)):
+            picked = subset[mask]
+            if picked.empty:
+                continue
+            by_ret, by_gain, by_double = week_stats(picked)
+            aligned = baseline_ret.reindex(by_ret.index)
+            diff = (by_ret - aligned).dropna()
+            if len(diff) > 1 and diff.std(ddof=1) > 0:
+                t_stat = diff.mean() / (diff.std(ddof=1) / math.sqrt(len(diff)))
+            else:
+                t_stat = np.nan
             rows.append(
                 {
-                    "市值区间": label,
-                    "股票数": int(group["ts_code"].nunique()),
-                    "周观测数": int(len(group)),
-                    "信号数": 0,
-                    "周波动率中位%": float(
-                        pd.to_numeric(group["Weekly_Vol"], errors="coerce").median()
-                    ),
+                    "排序规则": label if direction == "正向" else f"　└ 反向对照",
+                    "方向": direction,
+                    "覆盖周数": int(len(by_ret)),
+                    "止损后收益%": float(by_ret.mean()),
+                    "止损后胜率%": float((by_ret > 0).mean() * 100.0),
+                    "平均最大涨幅%": float(by_gain.mean()),
+                    "翻倍概率%": float(by_double.mean()),
+                    "vs基准收益差%": float(diff.mean()),
+                    "粗略t值": t_stat,
                 }
             )
-            continue
-        gain = pd.to_numeric(signal["Max_Gain_pct"], errors="coerce").dropna()
-        trail = (
-            pd.to_numeric(signal["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
-        )
-        signal_double = float((gain > 100).mean() * 100.0) if len(gain) else np.nan
-        rows.append(
-            {
-                "市值区间": label,
-                "股票数": int(group["ts_code"].nunique()),
-                "周观测数": int(len(group)),
-                "信号数": int(len(signal)),
-                "信号占比%": float(len(signal) / len(group) * 100.0),
-                "周波动率中位%": float(
-                    pd.to_numeric(group["Weekly_Vol"], errors="coerce").median()
-                ),
-                "信号翻倍概率%": signal_double,
-                "同层基准翻倍概率%": base_double,
-                "提升倍数": (
-                    signal_double / base_double if base_double and base_double > 0 else np.nan
-                ),
-                "涨超50%比例": float((gain > 50).mean() * 100.0) if len(gain) else np.nan,
-                "止损后收益%": float(trail.mean()) if len(trail) else np.nan,
-                "止损后胜率%": float((trail > 0).mean() * 100.0) if len(trail) else np.nan,
-            }
-        )
     return pd.DataFrame(rows)
 
 
-def opportunity_comparison(panel: pd.DataFrame, cost_pct: float):
-    """对比不同市值下限带来的机会增量与表现变化。"""
-    thresholds = [(100, "现在：100亿以上"), (50, "放宽到：50亿以上"), (30, "放宽到：30亿以上")]
+def top_n_sensitivity(signals: pd.DataFrame, cost_pct: float, best_columns):
+    """同一排序变量在取前3/5/10名时的表现，判断优势是否随N平滑衰减。"""
+    work = signals.copy()
+    work["_ret"] = pd.to_numeric(work["Trail_Return_pct"], errors="coerce") - cost_pct
+    work["_gain"] = pd.to_numeric(work["Max_Gain_pct"], errors="coerce")
+    work = work.dropna(subset=["_ret", "_gain"])
+    baseline = work.groupby("Week")["_ret"].mean()
     rows = []
-    for min_mv, label in thresholds:
-        group = panel[panel["MV_Billion"] >= min_mv]
-        if group.empty:
+    for column, label, ascending in best_columns:
+        if column not in work.columns:
             continue
-        signal = group[group["Is_Signal"].astype(bool)]
-        if signal.empty:
-            continue
-        gain = pd.to_numeric(signal["Max_Gain_pct"], errors="coerce").dropna()
-        trail = (
-            pd.to_numeric(signal["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
-        )
-        base_gain = pd.to_numeric(group["Max_Gain_pct"], errors="coerce").dropna()
-        base_double = float((base_gain > 100).mean() * 100.0) if len(base_gain) else np.nan
-        signal_double = float((gain > 100).mean() * 100.0)
-        weeks = group["Week"].nunique()
-        rows.append(
-            {
-                "选股范围": label,
-                "股票数": int(group["ts_code"].nunique()),
-                "信号数": int(len(signal)),
-                "每周平均信号数": float(len(signal) / weeks) if weeks else np.nan,
-                "翻倍股数量": int((gain > 100).sum()),
-                "信号翻倍概率%": signal_double,
-                "同范围基准%": base_double,
-                "提升倍数": (
-                    signal_double / base_double if base_double and base_double > 0 else np.nan
-                ),
-                "止损后收益%": float(trail.mean()),
-                "止损后胜率%": float((trail > 0).mean() * 100.0),
-            }
-        )
+        values = pd.to_numeric(work[column], errors="coerce")
+        subset = work.assign(_v=values).dropna(subset=["_v"])
+        record = {"排序规则": label}
+        for n in (3, 5, 10, 20):
+            rank = subset.groupby("Week")["_v"].rank(method="first", ascending=ascending)
+            picked = subset[rank <= n]
+            if picked.empty:
+                continue
+            by_week = picked.groupby("Week")["_ret"].mean()
+            record[f"Top{n}收益%"] = float(by_week.mean())
+            record[f"Top{n}翻倍%"] = float(
+                picked.groupby("Week")["_gain"].apply(lambda s: (s > 100).mean() * 100.0).mean()
+            )
+        record["全部信号收益%"] = float(baseline.mean())
+        rows.append(record)
     return pd.DataFrame(rows)
 
 
-def yearly_by_range(panel: pd.DataFrame, cost_pct: float):
-    work = panel.copy()
+def yearly_ranking(signals: pd.DataFrame, cost_pct: float, top_n: int, best_columns):
+    work = signals.copy()
     work["年份"] = work["Week"].astype(str).str[:4]
+    work["_ret"] = pd.to_numeric(work["Trail_Return_pct"], errors="coerce") - cost_pct
+    work = work.dropna(subset=["_ret"])
     rows = []
     for year, group in work.groupby("年份"):
-        record = {"年份": year}
-        for min_mv, label in [(100, "100亿以上"), (50, "50亿以上")]:
-            sub = group[(group["MV_Billion"] >= min_mv) & group["Is_Signal"].astype(bool)]
-            if sub.empty:
-                record[f"{label}信号数"] = 0
-                record[f"{label}翻倍股"] = 0
-                record[f"{label}收益%"] = np.nan
+        record = {"年份": year, "信号数": len(group)}
+        record["全部信号%"] = float(group.groupby("Week")["_ret"].mean().mean())
+        for column, label, ascending in best_columns:
+            if column not in group.columns:
                 continue
-            gain = pd.to_numeric(sub["Max_Gain_pct"], errors="coerce").dropna()
-            trail = (
-                pd.to_numeric(sub["Trail_Return_pct"], errors="coerce").dropna() - cost_pct
+            values = pd.to_numeric(group[column], errors="coerce")
+            subset = group.assign(_v=values).dropna(subset=["_v"])
+            if subset.empty:
+                continue
+            rank = subset.groupby("Week")["_v"].rank(method="first", ascending=ascending)
+            picked = subset[rank <= top_n]
+            record[label] = (
+                float(picked.groupby("Week")["_ret"].mean().mean())
+                if not picked.empty
+                else np.nan
             )
-            record[f"{label}信号数"] = int(len(sub))
-            record[f"{label}翻倍股"] = int((gain > 100).sum())
-            record[f"{label}收益%"] = float(trail.mean()) if len(trail) else np.nan
         rows.append(record)
     return pd.DataFrame(rows)
 
@@ -924,18 +1001,16 @@ def _memory_usage_mb():
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"📊 {APP_TITLE}")
-    st.caption("科技股池有多少只、放宽市值能多多少机会、小市值是不是真的波动更大。")
-    st.warning(
-        "**一个必须先知道的偏差**：股票池构建时会剔除「当前名称含ST或退」的在架股票，"
-        "也就是说一只现在是ST的票，它healthy时期的历史也被排除了。\n\n"
-        "**这个偏差对小市值股票严重得多**——50-100亿的票变成ST或退市的概率远高于100亿以上。"
-        "所以放宽到50亿后，回测结果会比真实情况更乐观，且乐观程度大于现在。看结果时请打折扣。"
-    )
+    st.title(f"🏅 {APP_TITLE}")
+    st.caption("无资金约束，只问一件事：同一周多个突破信号，先买哪几个更好？")
     st.info(
-        "**同时这也是一次横截面维度的样本外检验**：50-100亿和30-50亿这两个区间，"
-        "此前所有回测都没碰过。如果同一套冻结规则在这些新股票上也有效，"
-        "那是继2018-2022时间维度之后的又一个独立证据。"
+        "**为什么这是目前最大的空白**：突破策略现在只有筛选（能不能买），"
+        "没有排序（先买哪个）。而每周平均有6.27个信号——"
+        "**意味着一半以上的选择完全没有依据，等于随机**。\n\n"
+        "SKDJ阶段已经验证过排序层的威力：同一批信号，K值排序时3仓收益-7.3%、"
+        "蒙特卡洛分位45%（不如随机）；换成26周回撤排序后变成+45.7%、分位94%。"
+        "**只换排序规则，结果天差地别。**\n\n"
+        "本轮先不加三仓约束，纯粹测量排序变量本身的选股能力。"
     )
 
     with st.sidebar:
@@ -950,13 +1025,20 @@ def main():
         end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.caption("策略规则已锁死，与样本外测试完全一致，不可修改。")
+        st.subheader("排序检验设置")
+        top_n = st.number_input(
+            "每周取前几名", value=5, min_value=1, max_value=30, step=1,
+            help="先用5验证排序能力本身，暂不模拟三仓资金约束。",
+        )
+        st.caption("信号规则已锁死，与样本外测试一致，不可修改。")
         min_price = st.number_input("最低股价（元）", value=10.0, min_value=0.0, step=1.0)
+        min_mv = st.number_input("最低流通市值（亿元）", value=100.0, min_value=0.0, step=10.0)
+        max_mv = st.number_input("最高流通市值（亿元）", value=1000.0, min_value=100.0, step=100.0)
         cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
 
         st.markdown("---")
         clear_cache_clicked = st.button("清空行情缓存")
-        run_clicked = st.button("开始分析", type="primary")
+        run_clicked = st.button("开始验证", type="primary")
 
     if clear_cache_clicked:
         if os.path.isdir(MARKET_CACHE_ROOT):
@@ -964,27 +1046,40 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
-        if st.session_state.get("tier_result"):
+        if st.session_state.get("rank_result"):
             return
         st.markdown(
             """
-### 会回答的三个问题
+### 测试的十个排序变量
 
-**1. 科技股池到底有多少只？** 按市值分层列出（30亿以下 / 30-50 / 50-100 / 100-300 / 300-1000 / 1000亿以上）。
-注：股票池已排除北交所（只含主板、创业板、科创板）。
+| 变量 | 已有线索 |
+|---|---|
+| 两年高点位置 | 五分组18.96%→35.08%，5年4年正向（现在只当筛选，没当排序） |
+| 流通市值 | 分层显示提升倍数随市值单调上升（1.44→2.68） |
+| 波动率压缩程度 | 弱 |
+| 突破量能 | 弱 |
+| 突破幅度 | 未测过 |
+| 横盘区间宽度 | 全期单调但2022强烈反向，不稳 |
+| 26周动量 | 未单独测过 |
+| 个股波动率 | 未测过 |
+| 距40周均线 | 未测过 |
+| 信号周涨幅 | 未测过 |
 
-**2. 放宽到50亿能多多少机会？** 直接对比100亿以上 / 50亿以上 / 30亿以上三种范围的
-股票数、信号数、每周平均信号数、翻倍股数量。
+### 判断标准（三条同时满足才可信）
 
-**3. 小市值是不是真的波动更大？** 每层给出周波动率中位数，验证你的实盘观察。
+1. **正向Top5收益明显高于「全部信号」**，且 |t|>2
+2. **反向对照明显更差**——如果正反都好，那是噪声
+3. **分年度大部分为正**——不能只靠某一年
 
-### 但最关键的是第四列
+### 三张表
 
-**「提升倍数」**——在每个市值层内部，信号相对同层基准的翻倍概率提升。
+**表1 · 排序变量检验**　每个变量都带反向对照，另有「随机取5只」作为参照，
+反映"只受数量限制、无选股能力"的水平。
 
-如果50-100亿这层的提升倍数和100亿以上接近（1.5-2倍），说明策略在新区间同样有效，
-放宽范围是安全的；如果明显更低甚至小于1，说明小市值股票的突破更多是噪声，
-放宽只会增加信号数量而不增加质量。
+**表2 · Top N敏感性**　同一变量取前3/5/10/20名的表现。
+真实的选股能力应该随N增大而平滑衰减；如果只有某个N好，那是噪声。
+
+**表3 · 分年度**　确认最优排序不是靠某一年。
             """
         )
         return
@@ -993,6 +1088,9 @@ def main():
     valid, message = verify_token_connection(token_clean)
     if not valid:
         st.error(f"Token校验失败：{message}")
+        return
+    if max_mv <= min_mv:
+        st.error("最高流通市值必须大于最低流通市值。")
         return
 
     start_date = start_input.strftime("%Y%m%d")
@@ -1005,7 +1103,7 @@ def main():
     if not whitelist_set:
         st.error("未取得研究池。")
         return
-    st.success(f"科技股研究池（不含北交所）：{len(whitelist_set)}只")
+    st.success(f"科技股研究池：{len(whitelist_set)}只")
 
     with st.spinner("加载行情（复用缓存）……"):
         stocks, basic_indexed, _, _, failed_dates, sync_stats = load_optimized_market_data(
@@ -1030,12 +1128,11 @@ def main():
         ).astype("float32")
         mv_lookup = mv_lookup.drop_duplicates(["Week", "ts_code"])
     else:
-        st.error("缺少市值数据，无法分层。")
-        return
+        mv_lookup = pd.DataFrame()
     del basic_indexed
     gc.collect()
 
-    needed = ["trade_date_str", "open", "high", "low", "close"]
+    needed = ["trade_date_str", "open", "high", "low", "close", "vol"]
     weekly_cache = {}
     position_samples = []
     codes = sorted(stocks.keys())
@@ -1048,7 +1145,7 @@ def main():
             continue
         keep = [c for c in needed if c in weekly.columns]
         weekly = weekly[keep].copy()
-        for column in ("open", "high", "low", "close"):
+        for column in ("open", "high", "low", "close", "vol"):
             if column in weekly.columns:
                 weekly[column] = pd.to_numeric(
                     weekly[column], errors="coerce"
@@ -1074,7 +1171,7 @@ def main():
     del all_positions
     gc.collect()
 
-    progress = st.progress(0.0, text="应用冻结规则……")
+    progress = st.progress(0.0, text="生成信号与排序变量……")
     parts = []
     cached = list(weekly_cache.keys())
     for idx, ts_code in enumerate(cached):
@@ -1090,45 +1187,61 @@ def main():
     gc.collect()
 
     if not parts:
-        st.error("没有产生数据。")
+        st.error("没有产生信号。")
         return
-    panel = pd.concat(parts, ignore_index=True)
+    signals = pd.concat(parts, ignore_index=True)
     del parts
     gc.collect()
 
-    panel = panel[(panel["Week"] >= start_date) & (panel["Week"] <= end_date)]
-    panel = panel[pd.to_numeric(panel["Entry_Price"], errors="coerce") >= min_price]
-    panel = panel.merge(mv_lookup, on=["Week", "ts_code"], how="left")
-    del mv_lookup
-    gc.collect()
-    panel["MV_Billion"] = pd.to_numeric(panel["circ_mv"], errors="coerce") / 10000.0
-    panel = panel.dropna(subset=["MV_Billion"])
-    panel["Tier"] = assign_tier(panel["MV_Billion"])
-    panel = panel.reset_index(drop=True)
-    if panel.empty:
-        st.error("过滤后无数据。")
+    signals = signals[(signals["Week"] >= start_date) & (signals["Week"] <= end_date)]
+    signals = signals[
+        pd.to_numeric(signals["Entry_Price"], errors="coerce") >= min_price
+    ]
+    if not mv_lookup.empty:
+        signals = signals.merge(mv_lookup, on=["Week", "ts_code"], how="left")
+        signals["MV_Billion"] = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
+        signals = signals[
+            signals["MV_Billion"].between(min_mv, max_mv) | signals["MV_Billion"].isna()
+        ]
+        del mv_lookup
+        gc.collect()
+    else:
+        signals["MV_Billion"] = np.nan
+    signals = signals.reset_index(drop=True)
+    if signals.empty:
+        st.error("过滤后无信号。")
         return
 
-    st.session_state["tier_result"] = {
-        "pool_size": len(whitelist_set),
-        "tiers": tier_summary(panel, float(cost_pct)),
-        "opportunity": opportunity_comparison(panel, float(cost_pct)),
-        "yearly": yearly_by_range(panel, float(cost_pct)),
+    table = ranking_test(signals, int(top_n), float(cost_pct))
+    # 取正向组里收益最高的三个变量做后续分析
+    forward = table[table["方向"] == "正向"].copy()
+    best = forward.nlargest(3, "止损后收益%")["排序规则"].tolist() if not forward.empty else []
+    best_columns = [
+        (col, label, asc) for col, label, asc in RANK_CANDIDATES if label in best
+    ]
+
+    st.session_state["rank_result"] = {
+        "signal_count": len(signals),
+        "weeks": signals["Week"].nunique(),
+        "table": table,
+        "sensitivity": top_n_sensitivity(signals, float(cost_pct), best_columns),
+        "yearly": yearly_ranking(signals, float(cost_pct), int(top_n), best_columns),
+        "top_n": int(top_n),
         "period": f"{start_date} — {end_date}",
         "memory_mb": _memory_usage_mb(),
     }
 
 
 def render_results():
-    result = st.session_state.get("tier_result")
+    result = st.session_state.get("rank_result")
     if not result:
         return False
 
     st.markdown("---")
-    st.header("市值分层分析结果")
+    st.header("排序层验证结果")
     st.caption(
-        f"科技股池（不含北交所）共 {result['pool_size']} 只　|　"
-        f"区间 {result['period']}"
+        f"突破信号 {result['signal_count']:,} 个，覆盖 {result['weeks']} 周　|　"
+        f"区间 {result['period']}　|　每周取前{result['top_n']}名"
         + (
             f"　|　内存 {result['memory_mb']:.0f} MB"
             if math.isfinite(result.get("memory_mb", float("nan")))
@@ -1136,51 +1249,54 @@ def render_results():
         )
     )
 
-    st.subheader("表1 · 各市值层的股票数、波动率与策略表现")
-    st.dataframe(result["tiers"].round(2), width="stretch", hide_index=True)
+    st.subheader(f"表1 · 十个排序变量的选股能力（每周取前{result['top_n']}名）")
+    st.dataframe(result["table"].round(2), width="stretch", hide_index=True)
     st.caption(
-        "**「周波动率中位%」验证你的观察**：小市值是否真的波动更大。\n\n"
-        "**「提升倍数」是关键**：50-100亿这层如果和100亿以上接近（1.5-2倍），"
-        "说明策略在新区间同样有效；如果明显更低或小于1，"
-        "说明小市值突破更多是噪声，放宽只增加数量不增加质量。"
+        "**三条同时满足才可信**：\n"
+        "1. 正向收益明显高于第一行「全部信号」，且 |t|>2\n"
+        "2. 紧跟其下的「反向对照」明显更差——正反都好说明是噪声\n"
+        "3. 分年度大部分为正（见表3）\n\n"
+        "第二行「随机取N只」是重要参照：它代表**只受数量限制、完全没有选股能力**的水平。"
+        "任何排序变量如果跑不赢它，就等于没用。"
     )
 
-    st.subheader("表2 · 放宽市值下限能多多少机会")
-    st.dataframe(result["opportunity"].round(2), width="stretch", hide_index=True)
-    st.caption(
-        "直接对比三种选股范围。**同时看「信号数」增量和「提升倍数」变化**——"
-        "如果信号翻倍但提升倍数下降，等于用质量换数量，未必划算。"
-    )
+    if not result["sensitivity"].empty:
+        st.subheader("表2 · Top N 敏感性（取最好的三个变量）")
+        st.dataframe(result["sensitivity"].round(2), width="stretch", hide_index=True)
+        st.caption(
+            "真实的选股能力应该**随N增大平滑衰减**（取的越多越接近全池平均）。"
+            "如果只有某一个N特别好、相邻的N反而差，那多半是噪声。"
+        )
 
     if not result["yearly"].empty:
-        st.subheader("表3 · 分年度：100亿以上 vs 50亿以上")
+        st.subheader("表3 · 分年度")
         st.dataframe(result["yearly"].round(2), width="stretch", hide_index=True)
         st.caption(
-            "重点看2022-2024这三个亏损年：放宽范围后能不能抓到翻倍股？"
-            "如果依然是0，说明扩大范围解决不了「差年份颗粒无收」这个根本问题。"
+            "**重点看2022-2024那三个亏损年**：好的排序规则应该至少减轻亏损。"
+            "如果只在2025-2026有效，那它就只是又一个依赖行情的东西。"
         )
 
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_tier_summary.csv",
-            result["tiers"].to_csv(index=False, encoding="utf-8-sig"),
+            "01_ranking_test.csv",
+            result["table"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "02_opportunity.csv",
-            result["opportunity"].to_csv(index=False, encoding="utf-8-sig"),
+            "02_topn_sensitivity.csv",
+            result["sensitivity"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
             "03_yearly.csv",
             result["yearly"].to_csv(index=False, encoding="utf-8-sig"),
         )
     st.download_button(
-        "下载分析结果",
+        "下载验证结果",
         data=output.getvalue(),
-        file_name="market_cap_tier_analysis.zip",
+        file_name="ranking_validation.zip",
         mime="application/zip",
-        key="download_tier",
+        key="download_rank",
     )
     return True
 
