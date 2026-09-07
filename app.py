@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
-"""R19.1 冻结三仓W3组合风险审计修复版。
+"""R20 冻结全信号等权过拟合审计版。
 
-只保留已经进入主方案的R3中性Top2、R6弱势Top2、R15强势Top1，买入次日起
-执行日内-10%灾难止损，否则固定W3退出。R7/R9、R12/R13、R14、R17整仓W4和
-R18盈利尾仓均已验证失败并从执行链、报告与导出中删除。
-
-本版不优化任何入场或退出参数，只记录三仓逐仓复投的真实资金占用和每日净值，
-审计最大回撤、恢复时间、连续亏损、月度收益与资金暴露。
+只保留已经进入主方案的R3中性Top2、R6弱势Top2、R15强势Top1；所有完整入选
+信号均按同一名义本金独立买入，不设置仓位上限，也不进行复投。买入次日起执行
+日内-10%灾难止损，否则固定W3退出。本版不优化任何入场或退出参数，只审计
+信号本身的时间稳定性、分支稳定性、排名、利润集中度和区组自助置信区间。
 """
 
 from __future__ import annotations
@@ -38,11 +36,11 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R19.1-FROZEN-THREE-SLOT-W3-PORTFOLIO-RISK-AUDIT"
-APP_TITLE = "R19.1三仓W3组合风险审计"
-ENGINE_PATCH = "R19.1-SAME-SCALE-DAILY-NAV-BASELINE"
-# R19.1没有改变任何选股或交易参数，因此沿用R19策略配置身份，
-# 让同一部署中的旧断点进入“只补路径”而不是被误判为全新策略重扫。
+APP_VERSION = "R20-FROZEN-ALL-SIGNAL-EQUAL-NOTIONAL-OVERFIT-AUDIT"
+APP_TITLE = "R20全信号等权过拟合审计"
+ENGINE_PATCH = "R20-NO-SLOT-NO-REINVESTMENT-SIGNAL-AUDIT"
+# R20没有改变任何选股或交易参数，因此沿用R19策略配置身份，
+# 可直接复用R19/R19.1候选与交易结果，不重新下载行情或重排股票。
 STRATEGY_CONFIG_VERSION = "R19-FROZEN-THREE-SLOT-W3-PORTFOLIO-RISK-AUDIT"
 
 CHECKPOINT_FILE = "r19_three_slot_w3_risk_candidates.csv"
@@ -82,6 +80,9 @@ R16_PRIMARY_STOP_PCT = -10.0
 R16_PRIMARY_EXIT_RULE = "日内-10%硬止损（主规则）"
 PORTFOLIO_CAPITAL_DEFAULT = 200000.0
 PORTFOLIO_SLOT_COUNT = 3
+R20_EQUAL_NOTIONAL_DEFAULT = 10000.0
+R20_BOOTSTRAP_REPETITIONS = 2000
+R20_BOOTSTRAP_BLOCK_WEEKS = 4
 
 # -----------------------------------------------------------------------------
 # 通用安全读写
@@ -2940,6 +2941,385 @@ def r19_branch_summary(history: pd.DataFrame):
         )
     return pd.DataFrame(rows, columns=columns)
 
+
+# -----------------------------------------------------------------------------
+# R20 全信号等权过拟合审计（不构造任何有限仓位或复投资金路径）
+# -----------------------------------------------------------------------------
+def _r20_summary_row(label: str, group: pd.DataFrame, notional: float):
+    returns = pd.to_numeric(
+        group.get("R19_Realized_Return_pct", pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    gains = returns[returns > 0.0].sum()
+    losses = -returns[returns < 0.0].sum()
+    return {
+        "分组": label,
+        "完整交易": len(returns),
+        "信号周": int(group["Signal_Date"].nunique()) if len(group) else 0,
+        "止损交易": int(
+            group.get("R19_Exit_Reason", pd.Series("", index=group.index))
+            .astype(str)
+            .str.contains("止损")
+            .sum()
+        ),
+        "胜率%": (returns > 0.0).mean() * 100.0 if len(returns) else np.nan,
+        "平均收益%": returns.mean() if len(returns) else np.nan,
+        "中位收益%": returns.median() if len(returns) else np.nan,
+        "收益点合计": returns.sum() if len(returns) else np.nan,
+        "Profit_Factor": (
+            gains / losses if losses > 0.0 else (np.inf if gains > 0.0 else np.nan)
+        ),
+        "最差收益%": returns.min() if len(returns) else np.nan,
+        "最佳收益%": returns.max() if len(returns) else np.nan,
+        "每笔名义本金": float(notional),
+        "累计投入名义本金": float(notional) * len(returns),
+        "名义总盈亏": float(notional) * returns.sum() / 100.0,
+        "投入资金平均收益%": returns.mean() if len(returns) else np.nan,
+    }
+
+
+def r20_all_signal_ledger(history: pd.DataFrame, notional: float):
+    """每个完整入选信号都投入相同名义本金；无仓位上限、无复投。"""
+    universe = r19_trade_universe(history).copy()
+    columns = [
+        "Signal_Date", "Entry_Date", "Exit_Date", "Rank", "ts_code", "name",
+        "Industry", "市场分支", "退出原因", "交易净收益%", "名义本金", "名义盈亏",
+        "Outcome_Grade", "MFE_W3_Net_pct", "MAE_W3_Raw_pct",
+    ]
+    if universe.empty:
+        return pd.DataFrame(columns=columns), universe
+    universe["Signal_Date"] = universe["Signal_Date"].map(parse_yyyymmdd)
+    universe["Entry_Date"] = universe["R19_Entry_Date"].dt.strftime("%Y%m%d")
+    universe["Exit_Date"] = universe["R19_Exit_Date"].dt.strftime("%Y%m%d")
+    universe["Rank"] = pd.to_numeric(
+        universe["R19_Priority_Rank"], errors="coerce"
+    )
+    universe["市场分支"] = universe["R19_市场分支"]
+    universe["退出原因"] = universe["R19_Exit_Reason"]
+    universe["交易净收益%"] = pd.to_numeric(
+        universe["R19_Realized_Return_pct"], errors="coerce"
+    )
+    universe["名义本金"] = float(notional)
+    universe["名义盈亏"] = (
+        float(notional) * universe["交易净收益%"] / 100.0
+    )
+    for column in columns:
+        if column not in universe.columns:
+            universe[column] = np.nan
+    ledger = universe[columns].sort_values(
+        ["Signal_Date", "Rank", "ts_code"], kind="mergesort"
+    ).reset_index(drop=True)
+    return ledger, universe
+
+
+def r20_group_summaries(universe: pd.DataFrame, notional: float):
+    overall_columns = list(_r20_summary_row("合计", universe, notional).keys())
+    if universe.empty:
+        empty = pd.DataFrame(columns=overall_columns)
+        return empty, empty.copy(), empty.copy(), empty.copy()
+
+    total = pd.DataFrame([_r20_summary_row("合计", universe, notional)])
+
+    branch_rows = [
+        _r20_summary_row(str(label), group, notional)
+        for label, group in universe.groupby("R19_市场分支", sort=False)
+    ]
+    branch = pd.DataFrame(branch_rows, columns=overall_columns)
+
+    dated = universe.copy()
+    signal_dt = pd.to_datetime(
+        dated["Signal_Date"].map(parse_yyyymmdd), format="%Y%m%d", errors="coerce"
+    )
+    dated["_year"] = signal_dt.dt.year.astype("Int64").astype(str)
+    dated["_half"] = (
+        signal_dt.dt.year.astype("Int64").astype(str)
+        + "H"
+        + np.where(signal_dt.dt.month <= 6, "1", "2")
+    )
+    year = pd.DataFrame(
+        [
+            _r20_summary_row(str(label), group, notional)
+            for label, group in dated.groupby("_year", sort=True)
+        ],
+        columns=overall_columns,
+    )
+    half = pd.DataFrame(
+        [
+            _r20_summary_row(str(label), group, notional)
+            for label, group in dated.groupby("_half", sort=True)
+        ],
+        columns=overall_columns,
+    )
+    return total, branch, year, half
+
+
+def r20_rank_summary(universe: pd.DataFrame, notional: float):
+    if universe.empty:
+        return pd.DataFrame()
+    ranks = pd.to_numeric(universe["R19_Priority_Rank"], errors="coerce")
+    frame = universe.copy()
+    frame["_rank_label"] = ranks.map(
+        lambda value: f"第{int(value)}名" if math.isfinite(_safe_float(value)) else "未知"
+    )
+    return pd.DataFrame(
+        [
+            _r20_summary_row(str(label), group, notional)
+            for label, group in frame.groupby("_rank_label", sort=True)
+        ]
+    )
+
+
+def r20_weekly_summary(universe: pd.DataFrame):
+    columns = [
+        "Signal_Date", "市场分支", "入选数", "盈利数", "止损数", "周内胜率%",
+        "周内等权平均收益%", "周内中位收益%", "周内最差收益%", "周内最佳收益%",
+    ]
+    if universe.empty:
+        return pd.DataFrame(columns=columns)
+    rows = []
+    for signal_date, group in universe.groupby("Signal_Date", sort=True):
+        returns = pd.to_numeric(group["R19_Realized_Return_pct"], errors="coerce").dropna()
+        branches = "/".join(sorted(group["R19_市场分支"].dropna().astype(str).unique()))
+        rows.append(
+            {
+                "Signal_Date": parse_yyyymmdd(signal_date),
+                "市场分支": branches,
+                "入选数": len(returns),
+                "盈利数": int((returns > 0.0).sum()),
+                "止损数": int(group["R19_Exit_Reason"].astype(str).str.contains("止损").sum()),
+                "周内胜率%": (returns > 0.0).mean() * 100.0,
+                "周内等权平均收益%": returns.mean(),
+                "周内中位收益%": returns.median(),
+                "周内最差收益%": returns.min(),
+                "周内最佳收益%": returns.max(),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r20_rolling_26week_summary(universe: pd.DataFrame, scan_ledger: pd.DataFrame):
+    columns = [
+        "窗口截止周", "窗口起始周", "扫描周数", "完整交易", "信号周", "胜率%",
+        "平均收益%", "中位收益%", "收益点合计", "Profit_Factor", "最差收益%",
+    ]
+    if universe.empty or scan_ledger.empty:
+        return pd.DataFrame(columns=columns)
+    scan_dates = sorted(
+        {
+            value
+            for value in scan_ledger["Signal_Date"].map(parse_yyyymmdd)
+            if value
+        }
+    )
+    if len(scan_dates) < 26:
+        return pd.DataFrame(columns=columns)
+    signal_text = universe["Signal_Date"].map(parse_yyyymmdd)
+    rows = []
+    for end_index in range(25, len(scan_dates)):
+        window_dates = set(scan_dates[end_index - 25 : end_index + 1])
+        group = universe.loc[signal_text.isin(window_dates)].copy()
+        returns = pd.to_numeric(group["R19_Realized_Return_pct"], errors="coerce").dropna()
+        gains = returns[returns > 0.0].sum()
+        losses = -returns[returns < 0.0].sum()
+        rows.append(
+            {
+                "窗口截止周": scan_dates[end_index],
+                "窗口起始周": scan_dates[end_index - 25],
+                "扫描周数": 26,
+                "完整交易": len(returns),
+                "信号周": int(group["Signal_Date"].nunique()) if len(group) else 0,
+                "胜率%": (returns > 0.0).mean() * 100.0 if len(returns) else np.nan,
+                "平均收益%": returns.mean() if len(returns) else np.nan,
+                "中位收益%": returns.median() if len(returns) else np.nan,
+                "收益点合计": returns.sum() if len(returns) else 0.0,
+                "Profit_Factor": gains / losses if losses > 0.0 else np.nan,
+                "最差收益%": returns.min() if len(returns) else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def r20_concentration_audit(universe: pd.DataFrame):
+    columns = ["项目", "当前值", "说明"]
+    if universe.empty:
+        return pd.DataFrame(columns=columns)
+    frame = universe.copy()
+    frame["_return"] = pd.to_numeric(
+        frame["R19_Realized_Return_pct"], errors="coerce"
+    )
+    frame = frame.dropna(subset=["_return"]).sort_values("_return", ascending=False)
+    net = frame["_return"].sum()
+    top1 = frame.head(1)["_return"].sum()
+    top5 = frame.head(5)["_return"].sum()
+    after1 = frame.iloc[1:]["_return"]
+    after5 = frame.iloc[5:]["_return"]
+    best = frame.iloc[0]
+    return pd.DataFrame(
+        [
+            {"项目": "全部收益点合计", "当前值": net, "说明": "每笔等额时的净收益百分点之和"},
+            {"项目": "第一大盈利交易", "当前值": top1, "说明": f"{best.get('name', '')} / {parse_yyyymmdd(best.get('Signal_Date'))}"},
+            {"项目": "第一大盈利占净收益%", "当前值": top1 / net * 100.0 if net > 0 else np.nan, "说明": "越低越不依赖单一牛股"},
+            {"项目": "前五大盈利占净收益%", "当前值": top5 / net * 100.0 if net > 0 else np.nan, "说明": "等额口径，不含复投放大"},
+            {"项目": "删除第一大后收益点", "当前值": after1.sum(), "说明": f"剩余{len(after1)}笔"},
+            {"项目": "删除第一大后平均收益%", "当前值": after1.mean(), "说明": "仍为正才说明不靠一只股票"},
+            {"项目": "删除前五大后收益点", "当前值": after5.sum(), "说明": f"剩余{len(after5)}笔"},
+            {"项目": "删除前五大后平均收益%", "当前值": after5.mean(), "说明": "仍为正才说明主体样本有贡献"},
+        ],
+        columns=columns,
+    )
+
+
+def r20_block_bootstrap(universe: pd.DataFrame, scan_ledger: pd.DataFrame):
+    """按连续4个扫描周成块重采样，保留同周股票及W3重叠的相关性。"""
+    columns = ["统计量", "2.5%下界", "中位数", "97.5%上界", "重复次数", "区组周数"]
+    if universe.empty or scan_ledger.empty:
+        return pd.DataFrame(columns=columns)
+    scan_dates = sorted(
+        {value for value in scan_ledger["Signal_Date"].map(parse_yyyymmdd) if value}
+    )
+    if len(scan_dates) < R20_BOOTSTRAP_BLOCK_WEEKS:
+        return pd.DataFrame(columns=columns)
+    signal_text = universe["Signal_Date"].map(parse_yyyymmdd)
+    returns_by_week = {
+        day: pd.to_numeric(
+            universe.loc[signal_text.eq(day), "R19_Realized_Return_pct"],
+            errors="coerce",
+        ).dropna().to_numpy(dtype=float)
+        for day in scan_dates
+    }
+    block = R20_BOOTSTRAP_BLOCK_WEEKS
+    starts = np.arange(0, len(scan_dates) - block + 1)
+    rng = np.random.default_rng(20200907)
+    mean_values, win_values, pf_values = [], [], []
+    for _ in range(R20_BOOTSTRAP_REPETITIONS):
+        sampled = []
+        while len(sampled) < len(scan_dates):
+            start = int(rng.choice(starts))
+            sampled.extend(scan_dates[start : start + block])
+        chunks = [returns_by_week[day] for day in sampled[: len(scan_dates)] if len(returns_by_week[day])]
+        if not chunks:
+            continue
+        values = np.concatenate(chunks)
+        gains = values[values > 0.0].sum()
+        losses = -values[values < 0.0].sum()
+        mean_values.append(float(values.mean()))
+        win_values.append(float((values > 0.0).mean() * 100.0))
+        pf_values.append(float(gains / losses) if losses > 0.0 else np.nan)
+
+    def row(label, values):
+        numeric = np.asarray(values, dtype=float)
+        numeric = numeric[np.isfinite(numeric)]
+        return {
+            "统计量": label,
+            "2.5%下界": np.quantile(numeric, 0.025) if len(numeric) else np.nan,
+            "中位数": np.quantile(numeric, 0.50) if len(numeric) else np.nan,
+            "97.5%上界": np.quantile(numeric, 0.975) if len(numeric) else np.nan,
+            "重复次数": len(numeric),
+            "区组周数": block,
+        }
+    return pd.DataFrame(
+        [
+            row("平均单笔收益%", mean_values),
+            row("交易胜率%", win_values),
+            row("Profit_Factor", pf_values),
+        ],
+        columns=columns,
+    )
+
+
+def r20_internal_robustness_scorecard(
+    universe: pd.DataFrame,
+    bootstrap: pd.DataFrame,
+):
+    returns = pd.to_numeric(
+        universe.get("R19_Realized_Return_pct", pd.Series(dtype=float)),
+        errors="coerce",
+    ).dropna()
+    ordered = returns.sort_values(ascending=False).reset_index(drop=True)
+    gains = returns[returns > 0.0].sum()
+    losses = -returns[returns < 0.0].sum()
+    pf = gains / losses if losses > 0.0 else np.nan
+    branch_means = (
+        universe.assign(_ret=pd.to_numeric(universe["R19_Realized_Return_pct"], errors="coerce"))
+        .groupby("R19_市场分支")["_ret"]
+        .agg(["size", "mean"])
+        if len(universe)
+        else pd.DataFrame()
+    )
+    boot_lower = np.nan
+    if not bootstrap.empty:
+        match = bootstrap[bootstrap["统计量"].eq("平均单笔收益%")]
+        if not match.empty:
+            boot_lower = _safe_float(match.iloc[0]["2.5%下界"])
+    net = returns.sum()
+    top5_share = ordered.head(5).sum() / net * 100.0 if net > 0 else np.nan
+    checks = [
+        ("完整交易不少于60笔", len(returns) >= 60, f"当前{len(returns)}笔"),
+        ("信号覆盖不少于30周", universe["Signal_Date"].nunique() >= 30 if len(universe) else False, f"当前{universe['Signal_Date'].nunique() if len(universe) else 0}周"),
+        ("平均收益为正", len(returns) > 0 and returns.mean() > 0.0, f"当前{returns.mean() if len(returns) else np.nan:.2f}%"),
+        ("中位收益为正", len(returns) > 0 and returns.median() > 0.0, f"当前{returns.median() if len(returns) else np.nan:.2f}%"),
+        ("Profit Factor高于1.5", math.isfinite(_safe_float(pf)) and pf > 1.5, f"当前{pf:.2f}"),
+        ("删除第一大盈利后仍为正", len(ordered) > 1 and ordered.iloc[1:].sum() > 0.0, f"剩余收益点{ordered.iloc[1:].sum() if len(ordered) > 1 else np.nan:.2f}"),
+        ("删除前五大盈利后仍为正", len(ordered) > 5 and ordered.iloc[5:].sum() > 0.0, f"剩余收益点{ordered.iloc[5:].sum() if len(ordered) > 5 else np.nan:.2f}"),
+        ("前五大盈利占比不超过50%", math.isfinite(_safe_float(top5_share)) and top5_share <= 50.0, f"当前{top5_share:.2f}%"),
+        ("三个分支均至少10笔且平均为正", not branch_means.empty and len(branch_means) == 3 and bool(((branch_means['size'] >= 10) & (branch_means['mean'] > 0.0)).all()), "; ".join(f"{idx}:{int(row['size'])}笔/{row['mean']:.2f}%" for idx, row in branch_means.iterrows())),
+        ("4周区组自助95%下界为正", math.isfinite(boot_lower) and boot_lower > 0.0, f"当前下界{boot_lower:.2f}%"),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "内部稳健性项目": name,
+                "结果": "通过" if passed else "未通过",
+                "当前值": value,
+                "解释边界": "只检验当前样本内部稳健性，不能替代未见样本或前向验证",
+            }
+            for name, passed, value in checks
+        ]
+    )
+
+
+def r20_integrity_gates(
+    history: pd.DataFrame,
+    scan_ledger: pd.DataFrame,
+    all_signal_ledger: pd.DataFrame,
+    notional: float,
+):
+    universe = r19_trade_universe(history)
+    status = scan_ledger.get(
+        "Scan_Status", pd.Series("COMPLETED", index=scan_ledger.index)
+    ).astype(str)
+    unique_trades = not all_signal_ledger.duplicated(["Signal_Date", "ts_code"]).any()
+    returns_ok = (
+        len(all_signal_ledger) > 0
+        and pd.to_numeric(all_signal_ledger["交易净收益%"], errors="coerce").notna().all()
+    )
+    notional_values = pd.to_numeric(
+        all_signal_ledger.get("名义本金", pd.Series(dtype=float)), errors="coerce"
+    )
+    gates = [
+        ("冻结规则", "最长持有严格为W3", PRIMARY_HOLD_WEEKS == 3, f"当前W{PRIMARY_HOLD_WEEKS}"),
+        ("冻结规则", "灾难止损严格为T+1日内-10%", R16_PRIMARY_STOP_PCT == -10.0, f"当前{R16_PRIMARY_STOP_PCT:.1f}%"),
+        ("冻结规则", "止损计0.3%不利滑点", np.isclose(R16_STOP_SLIPPAGE_PCT, 0.30), f"当前{R16_STOP_SLIPPAGE_PCT:.2f}%"),
+        ("数据完整", "全部扫描周无缺口且已完成", len(scan_ledger) > 0 and status.eq("COMPLETED").all(), f"完成{int(status.eq('COMPLETED').sum())}/{len(scan_ledger)}周"),
+        ("数据完整", "扫描账本与候选明细一致", result_state_consistency_audit(history, scan_ledger).empty, "已核对"),
+        ("全量执行", "全部完整入选交易均纳入", len(all_signal_ledger) == len(universe), f"纳入{len(all_signal_ledger)}/{len(universe)}笔"),
+        ("全量执行", "不存在仓位冲突或跳过交易", "执行状态" not in all_signal_ledger.columns and "仓位编号" not in all_signal_ledger.columns, "无限资金、无仓位路径"),
+        ("等权口径", "每笔名义本金完全相同", len(notional_values) > 0 and np.allclose(notional_values, float(notional)), f"每笔{float(notional):.2f}元"),
+        ("交易唯一", "同一信号周同一股票不重复", unique_trades, "已核对"),
+        ("收益完整", "全部纳入交易均有真实退出收益", returns_ok, f"完整{int(pd.to_numeric(all_signal_ledger.get('交易净收益%', pd.Series(dtype=float)), errors='coerce').notna().sum())}/{len(all_signal_ledger)}笔"),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "验收阶段": phase,
+                "R20完整性项目": name,
+                "结果": "通过" if passed else "未通过",
+                "当前值": value,
+            }
+            for phase, name, passed, value in gates
+        ]
+    )
+
 def r19_integrity_gates(
     history: pd.DataFrame,
     ledger: pd.DataFrame,
@@ -3277,7 +3657,7 @@ def import_prior_results_zip(
     config_id: str,
     roundtrip_cost_pct: float,
 ):
-    """事务导入R18/R19/R19.1；旧结果只补同尺度每日净值路径。"""
+    """事务导入R18/R19/R19.1/R20；R20不要求三仓每日净值路径。"""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         infos = {
             info.filename: info
@@ -3287,11 +3667,11 @@ def import_prior_results_zip(
         candidate_names = [
             name
             for name in infos
-            if name.startswith(("01_all_r18_", "01_all_r19_"))
+            if name.startswith(("01_all_r18_", "01_all_r19_", "01_all_r20_"))
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R18、R19或R19.1候选明细。")
+            raise ValueError("结果包中未找到唯一的R18、R19、R19.1或R20候选明细。")
         info = infos[candidate_names[0]]
         if info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -3370,14 +3750,16 @@ def import_prior_results_zip(
         ledger["Config_ID"] = str(config_id)
 
         selected = candidates[_bool_series(candidates, "R19_Selected")].copy()
-        missing_path_dates = r19_missing_bought_path_dates(candidates)
-        pending_mask = ledger["Signal_Date"].astype(str).isin(
-            missing_path_dates
-        )
-        ledger.loc[pending_mask, "Scan_Status"] = "PENDING_R19_NAV"
+        # R20只使用每笔冻结的实际退出收益，不构造三仓每日净值；旧包即使缺少
+        # 每日路径也无需重下行情。已有完整W3与止损字段即可直接审计。
+        missing_path_dates: set[str] = set()
+        pending_mask = pd.Series(False, index=ledger.index)
         ledger.loc[
-            pending_mask, "Selection_Block_Reason"
-        ] = "冻结交易已恢复；等待补算R19.1同尺度每日净值路径"
+            ledger.get("Scan_Status", pd.Series("", index=ledger.index))
+            .astype(str)
+            .eq("PENDING_R19_NAV"),
+            "Scan_Status",
+        ] = "COMPLETED"
 
         row_counts = candidates.groupby("Signal_Date").size().to_dict()
         selected_counts = (
@@ -3551,6 +3933,53 @@ def build_export_zip(
             )
     return output.getvalue()
 
+
+def build_r20_export_zip(
+    history: pd.DataFrame,
+    ledger: pd.DataFrame,
+    data_gaps: pd.DataFrame,
+    all_signal_summary: pd.DataFrame,
+    all_signal_ledger: pd.DataFrame,
+    branch_summary: pd.DataFrame,
+    year_summary: pd.DataFrame,
+    halfyear_summary: pd.DataFrame,
+    rank_summary: pd.DataFrame,
+    weekly_summary: pd.DataFrame,
+    rolling_summary: pd.DataFrame,
+    concentration: pd.DataFrame,
+    bootstrap: pd.DataFrame,
+    robustness: pd.DataFrame,
+    integrity: pd.DataFrame,
+    audit_metadata: pd.DataFrame,
+):
+    """R20只导出全信号等权审计，不导出三仓或复投净值。"""
+    files = {
+        "01_all_r20_frozen_signal_candidates.csv": history,
+        "02_scan_ledger.csv": ledger,
+        "03_market_data_gap_audit.csv": data_gaps,
+        "04_all_signal_equal_notional_summary.csv": all_signal_summary,
+        "05_all_signal_equal_notional_trade_ledger.csv": all_signal_ledger,
+        "06_branch_stability.csv": branch_summary,
+        "07_calendar_year_stability.csv": year_summary,
+        "08_halfyear_stability.csv": halfyear_summary,
+        "09_rank_stability.csv": rank_summary,
+        "10_signal_week_equal_weight.csv": weekly_summary,
+        "11_rolling_26_scan_week_stability.csv": rolling_summary,
+        "12_profit_concentration_audit.csv": concentration,
+        "13_four_week_block_bootstrap.csv": bootstrap,
+        "14_internal_robustness_scorecard.csv": robustness,
+        "15_r20_integrity_gates.csv": integrity,
+        "16_audit_metadata.csv": audit_metadata,
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, frame in files.items():
+            archive.writestr(
+                name,
+                frame.to_csv(index=False, encoding="utf-8-sig"),
+            )
+    return output.getvalue()
+
 # -----------------------------------------------------------------------------
 # Streamlit 主程序
 # -----------------------------------------------------------------------------
@@ -3567,12 +3996,13 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
-        "入场、排名、三仓、T+1日内-10%止损和W3退出全部冻结；"
-        "本版只修复同尺度每日净值并审计实盘风险。"
+        "R3/R6/R15入场、排名、T+1日内-10%止损和W3退出全部冻结；"
+        "所有完整入选信号等额独立成交，不设仓位上限、不复投。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "最大回撤是观察结果，不是调参目标；本版不会为了改善回撤修改选股或退出。"
+        "本版衡量选股信号本身，不计算账户年收益或三仓最大回撤；"
+        "内部稳健性通过也不能替代未见样本和冻结后的前向验证。"
     )
     with st.expander("查看冻结交易规则"):
         st.markdown(
@@ -3582,8 +4012,8 @@ def main():
 - **R15强势**：整理后首次再启动候选仅按ATR3/ATR13从小到大取Top1；第一名必须位于0.70—0.90，不递补。
 - **买入**：下一交易日开盘；一字涨停不虚构成交。
 - **止损**：买入日不可卖，从下一交易日起执行日内-10%；计0.3%不利滑点，停牌或一字跌停顺延。
-- **退出**：未触发止损的交易固定W3收盘卖出；卖出日资金不能用于当日开盘新信号。
-- **资金**：本金等分三仓，每个仓位卖出后连同盈亏投入下一次新信号；仓位满时不追买旧信号。
+- **退出**：未触发止损的交易固定W3收盘卖出。
+- **资金口径**：每笔完整入选信号投入相同名义本金；无限资金、无仓位冲突、无复投。
 - **已删除**：R7/R9、R12/R13、R14周末退出、R17整仓W4、R18盈利尾仓及全池大牛机会反查。
             """
         )
@@ -3594,11 +4024,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R19.1三仓W3风险审计", "最新选股预览"],
+            ["历史R20全信号等权审计", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R19.1三仓W3风险审计")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R20全信号等权审计")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -3614,13 +4044,19 @@ def main():
             step=0.05,
             help="固定W3与-10%硬止损收益都扣除该往返成本。",
         )
-        portfolio_capital_wan = st.number_input(
-            "三仓组合本金（万元）",
-            value=20.0,
-            min_value=1.0,
+        equal_notional_wan = st.number_input(
+            "每笔等额名义本金（万元）",
+            value=1.0,
+            min_value=0.01,
             max_value=10000.0,
-            step=1.0,
-            help="只改变资金报告的金额，不改变候选、排名、缓存或回测配置。",
+            step=0.5,
+            help="只用于把收益率换算成名义盈亏；不限制资金、不改变任何信号。",
+        )
+        sample_status = st.selectbox(
+            "本次区间属性",
+            ["研发样本（已经看过）", "冻结后未见样本", "冻结后前向记录"],
+            index=0,
+            help="标签只写入审计元数据，不改变计算。未见样本必须在查看结果前指定。",
         )
 
         st.markdown("---")
@@ -3632,9 +4068,9 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R19.1历史结果")
+        clear_history_clicked = st.button("清除R20历史结果")
         imported_results = st.file_uploader(
-            "导入R18、R19或R19.1结果包",
+            "导入R18、R19、R19.1或R20结果包",
             type=["zip"],
             help="部署更新导致本地断点丢失时，可导入此前下载的结果包后继续。",
         )
@@ -3646,7 +4082,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R19.1三仓W3风险审计":
+    if start_input > end_input and mode == "历史R20全信号等权审计":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -3666,7 +4102,7 @@ def main():
                 remove_with_backup(path)
         remove_with_backup(RUN_TASK_FILE)
         st.session_state.pop("r19_preview", None)
-        st.success("R19.1历史结果和断点任务已清除。")
+        st.success("R20历史结果和断点任务已清除。")
 
     token_clean = clean_token_str(token_input)
     config_id = make_config_id(min_price, min_mv, max_mv, roundtrip_cost_pct)
@@ -3677,31 +4113,14 @@ def main():
                 config_id,
                 float(roundtrip_cost_pct),
             )
-            pending = int(import_stats["pending_nav_weeks"])
-            recovered = int(import_stats.get("recovered_path_rows", 0))
-            note = (
-                f"；其中{pending}个信号周需补算每日净值路径"
-                if pending
-                else (
-                    f"；已自动修复{recovered}笔旧路径基准，无需重新下载行情"
-                    if recovered
-                    else "；每日净值路径完整"
-                )
-            )
             st.success(
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个扫描周、"
-                f"{import_stats['selected_rows']}笔冻结信号{note}。"
+                f"{import_stats['selected_rows']}笔冻结信号。"
+                "R20只审计全部信号收益，无需补算三仓每日净值。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
-    if not import_results_clicked:
-        legacy_pending = mark_legacy_r19_paths_pending()
-        if legacy_pending:
-            st.info(
-                f"检测到{legacy_pending}个旧结果信号周使用旧复权路径。"
-                "点击启动历史R19.1后只补每日路径，不会重选股票或改变交易收益。"
-            )
     is_preview_mode = mode == "最新选股预览"
     if "r19_worker_id" not in st.session_state:
         st.session_state["r19_worker_id"] = uuid.uuid4().hex
@@ -3729,7 +4148,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R19.1三仓W3风险审计"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R20全信号等权审计"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -4125,7 +4544,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R19.1三仓W3风险审计扫描完成。")
+                            st.success("历史R20全信号等权审计扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -4260,176 +4679,154 @@ def main():
             st.markdown("---")
             st.error(
                 f"发现{len(state_issues)}周账本与候选明细不一致。"
-                "当前禁止生成组合结论；重新启动R19.1后只补扫异常周。"
+                "当前禁止生成审计结论；重新启动R20后只补扫异常周。"
             )
             st.dataframe(state_issues, width="stretch", hide_index=True)
             return
 
-        total_capital = float(portfolio_capital_wan) * 10000.0
-        branch_summary = r19_branch_summary(history)
-        (
-            portfolio_summary,
-            portfolio_ledger,
-            daily_equity,
-            monthly_returns,
-            risk_summary,
-        ) = r19_three_slot_portfolio(
-            history,
-            total_capital=total_capital,
+        equal_notional = float(equal_notional_wan) * 10000.0
+        all_signal_ledger, universe = r20_all_signal_ledger(
+            history, equal_notional
         )
-        integrity_gates = r19_integrity_gates(
-            history,
-            ledger,
-            portfolio_summary,
-            portfolio_ledger,
-            daily_equity,
+        (
+            all_signal_summary,
+            branch_summary,
+            year_summary,
+            halfyear_summary,
+        ) = r20_group_summaries(universe, equal_notional)
+        rank_summary = r20_rank_summary(universe, equal_notional)
+        weekly_summary = r20_weekly_summary(universe)
+        rolling_summary = r20_rolling_26week_summary(universe, ledger)
+        concentration = r20_concentration_audit(universe)
+        bootstrap = r20_block_bootstrap(universe, ledger)
+        robustness = r20_internal_robustness_scorecard(universe, bootstrap)
+        integrity_gates = r20_integrity_gates(
+            history, ledger, all_signal_ledger, equal_notional
+        )
+        audit_metadata = pd.DataFrame(
+            [
+                {
+                    "App_Version": APP_VERSION,
+                    "Strategy_Config": STRATEGY_CONFIG_VERSION,
+                    "区间属性": sample_status,
+                    "声明": (
+                        "区间属性必须在查看结果前确定；内部稳健性不能证明不存在过拟合。"
+                    ),
+                    "资金口径": "每笔等额独立名义本金；无限资金；无仓位上限；无复投",
+                    "每笔名义本金": equal_notional,
+                    "止损": "买入次日起日内-10%，另计0.3%不利滑点",
+                    "退出": "未止损则固定W3收盘",
+                }
+            ]
         )
 
         st.markdown("---")
-        st.header("R19.1 冻结三仓W3组合风险报告")
-        st.caption(
-            "本报告不比较新策略，只回答当前主方案在真实三仓调度下赚了多少、"
-            "会承受多大账户回撤、多久恢复以及资金是否经常闲置。"
-        )
+        st.header("R20 冻结全信号等权过拟合审计")
         st.info(
-            "三仓模拟从所选区间内第一笔信号开始，起点默认三仓均为空，"
-            "不会继承开始日期以前的持仓。改变回测开始日可能改变后续实际买入集合，"
-            "但不会改变每周候选名单和排名。"
+            "本报告把每一笔完整入选股票都视为等额独立交易。"
+            "没有三仓、没有跳过、没有复投，因此不存在起始仓位路径和后期大仓位放大。"
+        )
+        st.warning(
+            "“名义总盈亏”只是每笔投入相同金额后的加总；因为假设资金无限，"
+            "不能把它解释为某个真实账户的年收益率或累计收益率。"
         )
 
+        selected_all = _r19_selected(history, require_complete=False)
+        pending_outcomes = max(0, len(selected_all) - len(universe))
         summary_row = (
-            portfolio_summary.iloc[0]
-            if not portfolio_summary.empty
-            else pd.Series(dtype=object)
-        )
-        risk_row = (
-            risk_summary.iloc[0]
-            if not risk_summary.empty
+            all_signal_summary.iloc[0]
+            if not all_signal_summary.empty
             else pd.Series(dtype=object)
         )
         metric_columns = st.columns(10)
         metric_columns[0].metric("扫描周", len(ledger))
-        metric_columns[1].metric(
-            "冻结完整交易", len(r19_trade_universe(history))
-        )
-        metric_columns[2].metric(
-            "三仓实际买入", int(_safe_float(summary_row.get("实际买入"), 0))
-        )
-        metric_columns[3].metric(
-            "错过第一名", int(_safe_float(summary_row.get("错过第一名"), 0))
-        )
-        metric_columns[4].metric(
-            "组合交易胜率",
-            f"{_safe_float(summary_row.get('胜率%')):.1f}%",
-        )
-        metric_columns[5].metric(
-            "固定仓额收益",
-            f"{_safe_float(summary_row.get('固定仓额总收益率%')):.2f}%",
-        )
-        metric_columns[6].metric(
-            "逐仓复投收益",
-            f"{_safe_float(summary_row.get('逐仓复投总收益率%')):.2f}%",
-        )
-        metric_columns[7].metric(
-            "最大回撤",
-            (
-                f"{_safe_float(risk_row.get('最大回撤%')):.2f}%"
-                if not risk_summary.empty
-                else "待补日线"
-            ),
-        )
-        metric_columns[8].metric(
-            "最大连续亏损",
-            f"{int(_safe_float(summary_row.get('最大连续亏损笔数'), 0))}笔",
-        )
-        metric_columns[9].metric(
-            "路径覆盖内空仓日",
-            (
-                int(_safe_float(risk_row.get("路径覆盖内空仓日"), 0))
-                if not risk_summary.empty
-                else "待补日线"
-            ),
-        )
-
-        if not pending_nav_rows.empty:
-            st.info(
-                f"已恢复旧结果，但有{len(pending_nav_rows)}个信号周缺少每日净值路径。"
-                "点击启动历史R19.1后只补扫这些周；入场、止损和W3收益不会重排。"
+        metric_columns[1].metric("全部完整交易", int(_safe_float(summary_row.get("完整交易"), 0)))
+        metric_columns[2].metric("信号周", int(_safe_float(summary_row.get("信号周"), 0)))
+        metric_columns[3].metric("胜率", f"{_safe_float(summary_row.get('胜率%')):.1f}%")
+        metric_columns[4].metric("平均单笔收益", f"{_safe_float(summary_row.get('平均收益%')):.2f}%")
+        metric_columns[5].metric("中位收益", f"{_safe_float(summary_row.get('中位收益%')):.2f}%")
+        metric_columns[6].metric("Profit Factor", f"{_safe_float(summary_row.get('Profit_Factor')):.2f}")
+        metric_columns[7].metric("止损交易", int(_safe_float(summary_row.get("止损交易"), 0)))
+        metric_columns[8].metric("内部稳健性", f"{int(robustness['结果'].eq('通过').sum())}/{len(robustness)}")
+        metric_columns[9].metric("尚未完成", pending_outcomes)
+        if pending_outcomes:
+            st.caption(
+                f"最近{pending_outcomes}笔入选信号尚未走完W3，当前全部统计只使用"
+                "已经拥有真实退出结果的交易，不用未来价格填充。"
             )
+
         if not actual_data_gaps.empty:
             st.error(
-                f"存在{len(actual_data_gaps)}个行情缺口或跳过周，当前组合结果不完整。"
+                f"存在{len(actual_data_gaps)}个行情缺口或未完成周，当前审计不完整。"
             )
             with st.expander("查看行情缺口"):
                 st.dataframe(actual_data_gaps, width="stretch", hide_index=True)
 
-        st.subheader("冻结规则与结果完整性")
+        st.subheader("R20完整性验收")
         st.dataframe(integrity_gates, width="stretch", hide_index=True)
 
-        st.subheader(
-            f"三仓资金结果（本金{float(portfolio_capital_wan):.0f}万元）"
-        )
-        portfolio_display = portfolio_summary.copy()
-        for column in (
-            "初始资金", "初始单仓", "固定仓额期末资金",
-            "逐仓复投期末资金", "最大连续亏损金额",
-        ):
-            if column in portfolio_display.columns:
-                portfolio_display[column] = pd.to_numeric(
-                    portfolio_display[column], errors="coerce"
-                ).round(0)
+        st.subheader("全部入选信号等额结果")
         st.dataframe(
-            _format_report_frame(portfolio_display),
-            width="stretch",
-            hide_index=True,
+            _format_report_frame(all_signal_summary), width="stretch", hide_index=True
         )
 
-        st.subheader("强势、中性、弱势分支表现")
+        st.subheader("内部稳健性检查")
         st.dataframe(
-            _format_report_frame(branch_summary),
-            width="stretch",
-            hide_index=True,
+            _format_report_frame(robustness), width="stretch", hide_index=True
+        )
+        st.caption(
+            "这些项目只能发现样本过少、利润集中、分支失效或统计区间不稳定；"
+            "即使全部通过，也必须再用冻结后未见样本或前向记录验证。"
         )
 
-        if risk_summary.empty:
-            st.warning(
-                "每日净值尚未完整，不能用单笔MAE代替账户最大回撤。"
-                "完成R19.1补扫前只参考交易与资金调度结果。"
-            )
+        st.subheader("利润集中度")
+        st.dataframe(
+            _format_report_frame(concentration), width="stretch", hide_index=True
+        )
+
+        st.subheader("强势、中性、弱势分支稳定性")
+        st.dataframe(
+            _format_report_frame(branch_summary), width="stretch", hide_index=True
+        )
+
+        st.subheader("年度与半年时间稳定性")
+        st.dataframe(
+            _format_report_frame(year_summary), width="stretch", hide_index=True
+        )
+        st.dataframe(
+            _format_report_frame(halfyear_summary), width="stretch", hide_index=True
+        )
+
+        st.subheader("第一名、第二名稳定性")
+        st.dataframe(
+            _format_report_frame(rank_summary), width="stretch", hide_index=True
+        )
+
+        st.subheader("连续26个扫描周滚动稳定性")
+        if rolling_summary.empty:
+            st.info("扫描周不足26周，暂时不能生成滚动稳定性。")
         else:
-            st.subheader("账户风险摘要")
             st.dataframe(
-                _format_report_frame(risk_summary),
-                width="stretch",
-                hide_index=True,
+                _format_report_frame(rolling_summary), width="stretch", hide_index=True
             )
-            chart_frame = daily_equity.copy()
-            chart_frame["日期"] = pd.to_datetime(
-                chart_frame["日期"], format="%Y%m%d", errors="coerce"
-            )
-            chart_frame = chart_frame.dropna(subset=["日期"]).set_index("日期")
-            st.subheader("每日账户净值")
-            st.line_chart(chart_frame[["净值"]])
-            st.subheader("账户回撤")
-            st.line_chart(chart_frame[["回撤%"]])
-            st.subheader("月度收益")
-            st.dataframe(
-                _format_report_frame(monthly_returns),
-                width="stretch",
-                hide_index=True,
-            )
-            with st.expander("查看每日现金、持仓市值与资金暴露"):
-                st.dataframe(
-                    _format_report_frame(daily_equity),
-                    width="stretch",
-                    hide_index=True,
-                )
 
-        with st.expander("查看三仓逐笔买入、跳过与复投明细"):
+        st.subheader("4周区组自助置信区间")
+        st.dataframe(
+            _format_report_frame(bootstrap), width="stretch", hide_index=True
+        )
+        st.caption(
+            "按连续4个扫描周成块重采样2000次，保留同周股票及W3持有期重叠的相关性。"
+            "它衡量当前样本内部不确定性，不是未见年份测试。"
+        )
+
+        with st.expander("查看每个信号周的等权表现"):
             st.dataframe(
-                _format_report_frame(portfolio_ledger),
-                width="stretch",
-                hide_index=True,
+                _format_report_frame(weekly_summary), width="stretch", hide_index=True
+            )
+
+        with st.expander("查看全部等额独立交易"):
+            st.dataframe(
+                _format_report_frame(all_signal_ledger), width="stretch", hide_index=True
             )
 
         selected_detail = _r19_selected(history, require_complete=False)
@@ -4463,22 +4860,28 @@ def main():
                 hide_index=True,
             )
 
-        export_bytes = build_export_zip(
+        export_bytes = build_r20_export_zip(
             history.drop(columns=["Config_ID"], errors="ignore"),
             ledger.drop(columns=["Config_ID"], errors="ignore"),
             data_gap_rows,
+            all_signal_summary,
+            all_signal_ledger,
             branch_summary,
-            portfolio_summary,
-            portfolio_ledger,
-            daily_equity,
-            monthly_returns,
-            risk_summary,
+            year_summary,
+            halfyear_summary,
+            rank_summary,
+            weekly_summary,
+            rolling_summary,
+            concentration,
+            bootstrap,
+            robustness,
             integrity_gates,
+            audit_metadata,
         )
         st.download_button(
-            "下载R19.1三仓W3组合风险审计结果",
+            "下载R20全信号等权过拟合审计结果",
             data=export_bytes,
-            file_name="r19_1_same_scale_three_slot_w3_portfolio_risk_audit_results.zip",
+            file_name="r20_all_signal_equal_notional_overfit_audit_results.zip",
             mime="application/zip",
         )
 
