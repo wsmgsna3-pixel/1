@@ -1,26 +1,25 @@
 # -*- coding: utf-8 -*-
-"""三仓约束下的排序层验证器（单文件独立版，直接覆盖 app.py 运行）。
+"""持有期对比验证器（单文件独立版，直接覆盖 app.py 运行）。
 
-上一轮（无资金约束）结论：十个候选排序变量中，只有流通市值（越大越优先）
-三关全过——正向+1.31%/t=1.97、反向-2.02%、四年全部为正且逐年增强
-（+0.26/+0.83/+3.15/+3.84）、TopN衰减平滑（Top3 7.85% → 全部 4.57%）。
-而横盘区间宽度、距40周均线全期看着更好（+2.14/+1.64），
-但一分年度就露馅：优势全部来自2026一年，2023-2025三年均为负。
+上一轮的死结：26周持有 + 3仓，四年只买了46笔（信号共1277个），
+运气区间宽达152个百分点，各仓位数的优选分位在32%~96%之间乱跳
+——说明三仓下80%的分位只是噪声，不是排序能力。
 
-但那是无资金约束下测的。SKDJ阶段的教训很清楚：
-K值排序在无约束时看着可以，一加三仓就失效（蒙特卡洛分位仅45%，不如随机）。
+根本原因是交易频率：3仓 × 平均持有13周，一年最多11-12笔。
+46笔样本量下，任何排序规则的优势都无法从运气中分离出来。
 
-因此本轮验证：市值排序在三仓约束下能否明显跑赢随机选股。
-方法是蒙特卡洛——保持完全相同的资金约束与路径依赖结构，
-只把"选哪只"换成随机，重复数百次得到运气分布，
-再看真实规则落在这个分布的哪个分位。
+本轮唯一改变最长持有周数（8/10/12/13/26周），信号规则与市值排序完全不动。
+要看两件事：
+  1. 交易笔数能增加到多少
+  2. 优选分位是否变稳定——这比单次收益数字重要得多
 
-判断标准：分位 > 80% 才算排序层在真实约束下真正有效。
+同时量化代价：缩短持有期会砍掉多少还在上涨的仓位，
+用"买到的票在26周内本来能涨到多少"来衡量捕获率。
 
-信号规则与排序规则全部锁死为模块级常量，本轮不做任何修改。
-内存优化：边构建周线边释放日线。
+所有持有期在一次遍历中算出，避免重复扫描。移动止损15%始终生效，
+最长持有周数只决定强制退出时点。
 
-行情缓存与之前共用。
+内存优化：边构建周线边释放日线。行情缓存与之前共用。
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_TITLE = "三仓约束下的市值排序验证"
+APP_TITLE = "持有期对比：8-26周"
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 CACHE_SCHEMA_VERSION = 3
 DOWNLOAD_WORKERS = 4
@@ -684,19 +683,17 @@ def build_weekly_bars(daily_indexed: pd.DataFrame) -> pd.DataFrame:
 
 
 
+
 # =============================================================================
-# 冻结规则（信号+排序，全部锁死）
-# 信号规则来自样本外测试；排序规则来自上一轮验证：
-#   流通市值是十个候选里唯一三关全过的（正向+1.31%/t=1.97、反向-2.02%、
-#   四年全部为正且逐年增强、TopN衰减平滑），且与市值分层发现互相印证。
+# 冻结规则（信号与排序不变，本轮唯一变量是最长持有周数）
 # =============================================================================
 FROZEN_BREAKOUT_WEEKS = 26
 FROZEN_POSITION_QUANTILE = 0.33
 FROZEN_VOL_CONTRACTION_MAX = 0.8
-FROZEN_FORWARD_WEEKS = 26
 FROZEN_STOP_PCT = 15.0
 FROZEN_RANK_COLUMN = "MV_Billion"
-FROZEN_RANK_ASCENDING = False  # 市值越大越优先
+
+HOLD_OPTIONS = [8, 10, 12, 13, 26]
 
 
 def compute_features(weekly: pd.DataFrame):
@@ -713,9 +710,11 @@ def compute_features(weekly: pd.DataFrame):
 
 
 def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float):
-    """输出符合冻结信号的周，含入场/退出所需的全部信息。
+    """一次遍历算出所有持有期的结果，避免重复扫描。
 
-    退出用移动止损，并记录实际持有周数——三仓调度需要知道仓位何时释放。
+    移动止损始终生效；最长持有周数只决定强制退出的时点。
+    因此同一个信号在不同持有期下，若止损先触发则结果完全相同——
+    这正是我们要观察的：缩短持有期到底砍掉了多少还在上涨的仓位。
     """
     if len(weekly) < 140:
         return pd.DataFrame()
@@ -729,6 +728,7 @@ def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float
     breakout = features["breakout"].fillna(False).to_numpy()
     position = features["position_2y"].to_numpy()
     contraction = features["vol_contraction"].to_numpy()
+    max_hold = max(HOLD_OPTIONS)
 
     rows = []
     for i in range(n - 1):
@@ -743,65 +743,73 @@ def evaluate_stock(weekly: pd.DataFrame, ts_code: str, position_threshold: float
         entry_price = open_values[i + 1]
         if not math.isfinite(entry_price) or entry_price <= 0:
             continue
-        stop_index = min(i + FROZEN_FORWARD_WEEKS, n - 1)
-        if stop_index <= i + 1:
+        if i + 1 >= n:
             continue
-        window_high = high_values[i + 1 : stop_index + 1]
+
+        row = {
+            "ts_code": ts_code,
+            "Signal_Week": dates[i],
+            "Entry_Week": dates[i + 1],
+            "Entry_Price": entry_price,
+        }
+        # 最长窗口内的理论最大涨幅（用于统计抓到多少翻倍股）
+        long_stop = min(i + max_hold, n - 1)
+        window_high = high_values[i + 1 : long_stop + 1]
         finite_high = window_high[np.isfinite(window_high)]
-        if not finite_high.size:
-            continue
-        max_gain = (finite_high.max() / entry_price - 1.0) * 100.0
-
-        peak = entry_price
-        exit_price = None
-        exit_index = stop_index
-        for j in range(i + 1, stop_index + 1):
-            current = close_values[j]
-            if not math.isfinite(current):
-                continue
-            peak = max(peak, current)
-            if current <= peak * (1.0 - FROZEN_STOP_PCT / 100.0):
-                exit_price = current
-                exit_index = j
-                break
-        if exit_price is None:
-            exit_price = close_values[stop_index]
-        if not math.isfinite(exit_price):
-            continue
-
-        rows.append(
-            {
-                "ts_code": ts_code,
-                "Signal_Week": dates[i],
-                "Entry_Week": dates[i + 1],
-                "Exit_Week": dates[exit_index],
-                "Entry_Price": entry_price,
-                "Max_Gain_pct": max_gain,
-                "Return_pct": (exit_price / entry_price - 1.0) * 100.0,
-                "Hold_Weeks": exit_index - (i + 1) + 1,
-            }
+        row["Max_Gain_26W"] = (
+            (finite_high.max() / entry_price - 1.0) * 100.0 if finite_high.size else np.nan
         )
+
+        ok = False
+        for hold in HOLD_OPTIONS:
+            stop_index = min(i + hold, n - 1)
+            if stop_index <= i + 1:
+                continue
+            peak = entry_price
+            exit_price = None
+            exit_index = stop_index
+            for j in range(i + 1, stop_index + 1):
+                current = close_values[j]
+                if not math.isfinite(current):
+                    continue
+                peak = max(peak, current)
+                if current <= peak * (1.0 - FROZEN_STOP_PCT / 100.0):
+                    exit_price = current
+                    exit_index = j
+                    break
+            if exit_price is None:
+                exit_price = close_values[stop_index]
+            if not math.isfinite(exit_price):
+                continue
+            window = high_values[i + 1 : exit_index + 1]
+            finite_window = window[np.isfinite(window)]
+            row[f"Exit_Week_{hold}"] = dates[exit_index]
+            row[f"Return_{hold}"] = (exit_price / entry_price - 1.0) * 100.0
+            row[f"MaxGain_{hold}"] = (
+                (finite_window.max() / entry_price - 1.0) * 100.0
+                if finite_window.size
+                else np.nan
+            )
+            row[f"Hold_{hold}"] = exit_index - i
+            ok = True
+        if ok:
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
-# 三仓调度
+# 仓位调度
 # -----------------------------------------------------------------------------
 def simulate_slots(
-    signals: pd.DataFrame, week_index: dict, slot_count: int, cost_pct: float,
-    order_mode: str = "rank", seed: int = 0, keep_ledger: bool = True,
+    signals, week_index, hold, slot_count, cost_pct,
+    order_mode="rank", seed=0, keep_ledger=True,
 ):
-    """固定仓位调度。order_mode='rank'按冻结排序优选，'random'随机取。
-
-    随机模式用于蒙特卡洛：保持完全相同的资金约束与路径依赖结构，
-    只把"选哪只"变成随机，从而分离排序规则的贡献与运气的贡献。
-    """
-    if signals.empty:
+    exit_col, ret_col = f"Exit_Week_{hold}", f"Return_{hold}"
+    if exit_col not in signals.columns:
         return pd.DataFrame(), 0.0
-
-    work = signals.copy()
+    work = signals.dropna(subset=[exit_col, ret_col]).copy()
     work["Entry_Index"] = work["Entry_Week"].map(week_index)
-    work["Exit_Index"] = work["Exit_Week"].map(week_index)
+    work["Exit_Index"] = work[exit_col].map(week_index)
     work = work.dropna(subset=["Entry_Index", "Exit_Index"])
     if work.empty:
         return pd.DataFrame(), 0.0
@@ -812,8 +820,9 @@ def simulate_slots(
     if order_mode == "random":
         work["_order"] = rng.random(len(work))
     else:
-        values = pd.to_numeric(work[FROZEN_RANK_COLUMN], errors="coerce")
-        work["_order"] = (-values).fillna(np.inf) if not FROZEN_RANK_ASCENDING else values.fillna(np.inf)
+        work["_order"] = (
+            -pd.to_numeric(work[FROZEN_RANK_COLUMN], errors="coerce")
+        ).fillna(np.inf)
 
     work = work.sort_values(["Entry_Index", "_order", "ts_code"], kind="mergesort")
     records = work.to_dict("records")
@@ -822,108 +831,130 @@ def simulate_slots(
     slot_free_at = [0] * slot_count
     slot_code = [None] * slot_count
     trades = []
-
     for row in records:
         entry_index = int(row["Entry_Index"])
-        free_slots = [i for i in range(slot_count) if slot_free_at[i] <= entry_index]
+        free = [i for i in range(slot_count) if slot_free_at[i] <= entry_index]
         held = {
             slot_code[i]
             for i in range(slot_count)
             if slot_free_at[i] > entry_index and slot_code[i] is not None
         }
-        if str(row["ts_code"]) in held:
-            if keep_ledger:
-                trades.append({**row, "执行": "跳过", "原因": "已持有同股"})
+        if str(row["ts_code"]) in held or not free:
             continue
-        if not free_slots:
-            if keep_ledger:
-                trades.append({**row, "执行": "跳过", "原因": "仓位已满"})
-            continue
-        slot = free_slots[0]
-        net = float(row["Return_pct"]) - cost_pct
+        slot = free[0]
+        net = float(row[ret_col]) - cost_pct
         slot_value[slot] *= 1.0 + net / 100.0
         slot_free_at[slot] = int(row["Exit_Index"]) + 1
         slot_code[slot] = str(row["ts_code"])
         if keep_ledger:
-            trades.append({**row, "执行": "买入", "原因": "", "仓位": slot + 1, "净收益%": net})
+            trades.append(
+                {
+                    "Signal_Week": row["Signal_Week"],
+                    "ts_code": row["ts_code"],
+                    "MV_Billion": row.get("MV_Billion"),
+                    "净收益%": net,
+                    "Max_Gain_26W": row.get("Max_Gain_26W"),
+                    "持有周数": row.get(f"Hold_{hold}"),
+                }
+            )
         else:
-            trades.append({"执行": "买入", "净收益%": net, "Max_Gain_pct": row["Max_Gain_pct"]})
-
-    ledger = pd.DataFrame(trades)
-    return ledger, (sum(slot_value) - 1.0) * 100.0
+            trades.append({"净收益%": net, "Max_Gain_26W": row.get("Max_Gain_26W")})
+    return pd.DataFrame(trades), (sum(slot_value) - 1.0) * 100.0
 
 
-def monte_carlo(signals, week_index, slot_count, cost_pct, runs, progress_callback=None):
+def monte_carlo(signals, week_index, hold, slot_count, cost_pct, runs):
     outcomes = []
     for run in range(runs):
         _, total = simulate_slots(
-            signals, week_index, slot_count, cost_pct,
+            signals, week_index, hold, slot_count, cost_pct,
             order_mode="random", seed=run + 1, keep_ledger=False,
         )
         outcomes.append(total)
-        if progress_callback and (run % 10 == 0 or run == runs - 1):
-            progress_callback((run + 1) / runs)
     return np.array(outcomes, dtype=float)
 
 
-def slot_sweep(signals, week_index, cost_pct, slot_values, mc_runs, progress_callback=None):
+def hold_comparison(signals, week_index, slot_count, cost_pct, mc_runs, progress_callback=None):
+    """核心表：不同持有期在三仓约束下的交易频率与统计可靠性。"""
     rows = []
-    for step, slots in enumerate(slot_values):
+    for step, hold in enumerate(HOLD_OPTIONS):
         ledger, total = simulate_slots(
-            signals, week_index, int(slots), cost_pct, order_mode="rank", keep_ledger=False
+            signals, week_index, hold, slot_count, cost_pct, order_mode="rank"
         )
-        outcomes = monte_carlo(signals, week_index, int(slots), cost_pct, int(mc_runs))
-        bought = ledger[ledger["执行"] == "买入"] if not ledger.empty else pd.DataFrame()
-        net = (
-            pd.to_numeric(bought["净收益%"], errors="coerce").dropna()
-            if not bought.empty
-            else pd.Series(dtype=float)
-        )
-        gain = (
-            pd.to_numeric(bought["Max_Gain_pct"], errors="coerce").dropna()
-            if not bought.empty
-            else pd.Series(dtype=float)
-        )
-        low, high = float(np.percentile(outcomes, 5)), float(np.percentile(outcomes, 95))
+        if ledger.empty:
+            continue
+        outcomes = monte_carlo(signals, week_index, hold, slot_count, cost_pct, mc_runs)
+        net = pd.to_numeric(ledger["净收益%"], errors="coerce").dropna()
+        gain26 = pd.to_numeric(ledger["Max_Gain_26W"], errors="coerce").dropna()
+        held = pd.to_numeric(ledger["持有周数"], errors="coerce").dropna()
+        low, high = np.percentile(outcomes, 5), np.percentile(outcomes, 95)
         rows.append(
             {
-                "仓位数": int(slots),
-                "实际买入": int(len(net)),
-                "单笔平均%": float(net.mean()) if len(net) else np.nan,
-                "单笔胜率%": float((net > 0).mean() * 100.0) if len(net) else np.nan,
-                "翻倍股数": int((gain > 100).sum()) if len(gain) else 0,
-                "按市值优选总收益%": total,
-                "随机中位数%": float(np.median(outcomes)),
-                "运气区间宽度pp": high - low,
-                "优选所处分位%": float((outcomes < total).mean() * 100.0),
+                "最长持有周数": hold,
+                "四年买入笔数": int(len(net)),
+                "年均笔数": round(len(net) / 4.0, 1),
+                "平均实际持有周": float(held.mean()) if len(held) else np.nan,
+                "单笔平均%": float(net.mean()),
+                "单笔中位%": float(net.median()),
+                "胜率%": float((net > 0).mean() * 100.0),
+                "买到的票26周内翻倍数": int((gain26 > 100).sum()),
+                "总收益%": total,
+                "随机中位%": float(np.median(outcomes)),
+                "运气区间宽度pp": float(high - low),
+                "优选分位%": float((outcomes < total).mean() * 100.0),
             }
         )
         if progress_callback:
-            progress_callback((step + 1) / max(len(slot_values), 1))
+            progress_callback((step + 1) / len(HOLD_OPTIONS))
     return pd.DataFrame(rows)
 
 
-def yearly_slots(ledger: pd.DataFrame):
+def slot_stability(signals, week_index, hold, cost_pct, mc_runs, slot_values):
+    """在选定持有期下，检验分位是否在各仓位数上稳定。
+
+    上一轮26周持有时分位在32%~96%之间乱跳，正是这个不稳定暴露了
+    "80%只是噪声"。交易笔数增加后，分位应当变得稳定才可信。
+    """
+    rows = []
+    for slots in slot_values:
+        _, total = simulate_slots(
+            signals, week_index, hold, int(slots), cost_pct,
+            order_mode="rank", keep_ledger=False,
+        )
+        outcomes = monte_carlo(signals, week_index, hold, int(slots), cost_pct, mc_runs)
+        low, high = np.percentile(outcomes, 5), np.percentile(outcomes, 95)
+        rows.append(
+            {
+                "仓位数": int(slots),
+                "总收益%": total,
+                "随机中位%": float(np.median(outcomes)),
+                "运气区间宽度pp": float(high - low),
+                "优选分位%": float((outcomes < total).mean() * 100.0),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def yearly_by_hold(signals, week_index, hold, slot_count, cost_pct):
+    ledger, _ = simulate_slots(
+        signals, week_index, hold, slot_count, cost_pct, order_mode="rank"
+    )
     if ledger.empty:
         return pd.DataFrame()
-    bought = ledger[ledger["执行"] == "买入"].copy()
-    if bought.empty:
-        return pd.DataFrame()
-    bought["年份"] = bought["Signal_Week"].astype(str).str[:4]
+    ledger["年份"] = ledger["Signal_Week"].astype(str).str[:4]
     rows = []
-    for year, group in bought.groupby("年份"):
+    for year, group in ledger.groupby("年份"):
         net = pd.to_numeric(group["净收益%"], errors="coerce").dropna()
-        gain = pd.to_numeric(group["Max_Gain_pct"], errors="coerce").dropna()
+        gain = pd.to_numeric(group["Max_Gain_26W"], errors="coerce").dropna()
         rows.append(
             {
                 "年份": year,
                 "买入笔数": int(len(net)),
-                "单笔平均%": float(net.mean()) if len(net) else np.nan,
-                "单笔中位%": float(net.median()) if len(net) else np.nan,
-                "胜率%": float((net > 0).mean() * 100.0) if len(net) else np.nan,
-                "翻倍股数": int((gain > 100).sum()),
-                "最大单笔%": float(net.max()) if len(net) else np.nan,
-                "最差单笔%": float(net.min()) if len(net) else np.nan,
+                "单笔平均%": float(net.mean()),
+                "单笔中位%": float(net.median()),
+                "胜率%": float((net > 0).mean() * 100.0),
+                "买到的票26周内翻倍数": int((gain > 100).sum()),
+                "最大单笔%": float(net.max()),
+                "最差单笔%": float(net.min()),
             }
         )
     return pd.DataFrame(rows)
@@ -945,15 +976,17 @@ def _memory_usage_mb():
 # -----------------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(f"🎰 {APP_TITLE}")
-    st.caption("市值排序在真实资金约束下还成立吗？——用蒙特卡洛分离能力与运气。")
+    st.title(f"⏱ {APP_TITLE}")
+    st.caption("缩短持有期换来更多交易笔数，能不能让排序规则的优势真正显现？")
     st.info(
-        "**上一轮结论**：十个候选排序变量里，只有**流通市值（越大越优先）**三关全过——"
-        "正向+1.31%/t=1.97、反向-2.02%、四年全部为正且逐年增强、TopN衰减平滑。"
-        "而横盘区间宽度、距40周均线全期看着更好，一分年度就露馅（优势全部来自2026一年）。\n\n"
-        "**但那是无资金约束下测的。** SKDJ阶段的教训：K值排序在无约束时看着可以，"
-        "一加三仓就失效（蒙特卡洛分位仅45%，还不如随机）。\n\n"
-        "**所以本轮必须验证**：市值排序在三仓约束下，能否明显跑赢随机选股。"
+        "**上一轮的死结**：26周持有 + 3仓，四年只买了46笔（信号有1277个），"
+        "运气区间宽达152个百分点，各仓位数的分位在32%~96%之间乱跳——"
+        "**说明3仓下80%的分位只是噪声，不是能力**。\n\n"
+        "**本轮唯一改变的是最长持有周数**（8/10/12/13/26周），"
+        "信号规则和市值排序完全不动。要看两件事：\n\n"
+        "1. 交易笔数能增加到多少（笔数越多，优势才越可能显现）\n"
+        "2. **分位是否变稳定**——这是判断排序规则是否真的有效的关键，"
+        "比单次收益数字重要得多"
     )
 
     with st.sidebar:
@@ -968,16 +1001,19 @@ def main():
         end_input = st.date_input("结束日期", value=today)
 
         st.markdown("---")
-        st.subheader("资金设置")
         slot_count = st.number_input("仓位数", value=3, min_value=1, max_value=20, step=1)
-        mc_runs = st.number_input(
-            "蒙特卡洛次数", value=200, min_value=20, max_value=1000, step=20
+        detail_hold = st.selectbox(
+            "详细分析哪个持有期", HOLD_OPTIONS, index=2,
+            help="表3和表4会针对这个持有期展开。",
         )
-        do_sweep = st.checkbox("同时扫描 1-10 仓（较慢）", value=True)
+        mc_runs = st.number_input(
+            "蒙特卡洛次数", value=150, min_value=20, max_value=600, step=10,
+            help="要跑5个持有期，次数太多会很慢。",
+        )
         cost_pct = st.number_input("往返成本%", value=0.20, min_value=0.0, max_value=2.0, step=0.05)
 
         st.markdown("---")
-        st.caption("信号与排序规则已锁死，不可修改。")
+        st.caption("信号与排序规则已锁死。")
         min_price = st.number_input("最低股价（元）", value=10.0, min_value=0.0, step=1.0)
         min_mv = st.number_input("最低流通市值（亿元）", value=100.0, min_value=0.0, step=10.0)
         max_mv = st.number_input("最高流通市值（亿元）", value=1000.0, min_value=100.0, step=100.0)
@@ -992,37 +1028,30 @@ def main():
         st.success("行情缓存已清空。")
 
     if not run_clicked:
-        if st.session_state.get("slot_result"):
+        if st.session_state.get("hold_result"):
             return
         st.markdown(
             """
-### 冻结的完整策略
-
-```
-信号：突破26周新高 + 接近两年高点前33% + 波动率压缩≤0.8
-排序：同一周多个信号时，按流通市值从大到小
-入场：突破次周开盘买入
-退出：移动止损15%，最长持有26周
-```
-
 ### 四张表
 
-**表1 · 三仓结果 vs 蒙特卡洛**　核心是「优选所处分位」：
-- 接近50% → 市值排序在资金约束下没用，和随机一样
-- 高于80% → 排序真正起作用，可以定下来
-- 「运气区间宽度」反映单次回测结果有多不可信
+**表1 · 持有期对比**（核心）　8/10/12/13/26周各自的交易笔数、收益、
+运气区间宽度、优选分位。重点看**笔数增加后运气区间有没有收窄**。
 
-**表2 · 仓位数扫描**　1到10仓的收益、运气区间、分位。
-你只能开3仓，但看趋势能判断3仓是否已经太少。
+**表2 · 你要付出的代价**　缩短持有期会砍掉多少还在上涨的仓位——
+用"买到的票在26周内本来能涨到多少"来衡量。
 
-**表3 · 分年度**　三仓约束下每年买了几笔、抓到几只翻倍股、
-最大和最差单笔各是多少——这是你实盘会真实经历的。
+**表3 · 分位稳定性**　选定持有期下，1到10仓的分位是否稳定在高位。
+上一轮26周时是32%~96%乱跳，这次如果稳定在70%以上，才说明排序真的有效。
 
-**表4 · 逐笔台账**　可下载，看具体买了什么。
+**表4 · 分年度**　实盘会经历的样子。
 
 ---
-**判断标准**：分位>80% 且 三仓年度表现不比无约束差太多，
-才算这个排序层真的可用。
+**判断标准**：
+- 笔数至少翻倍（46 → 90以上）
+- 运气区间明显收窄（152pp → 100pp以内）
+- **各仓位分位稳定在60%以上，不再乱跳**
+
+三条都满足，这套东西才算可用。
             """
         )
         return
@@ -1071,7 +1100,7 @@ def main():
         ).astype("float32")
         mv_lookup = mv_lookup.drop_duplicates(["Signal_Week", "ts_code"])
     else:
-        st.error("缺少市值数据，排序规则依赖它。")
+        st.error("缺少市值数据。")
         return
     del basic_indexed
     gc.collect()
@@ -1092,14 +1121,14 @@ def main():
         weekly = weekly[keep].copy()
         for column in ("open", "high", "low", "close"):
             if column in weekly.columns:
-                weekly[column] = pd.to_numeric(
-                    weekly[column], errors="coerce"
-                ).astype("float32")
+                weekly[column] = pd.to_numeric(weekly[column], errors="coerce").astype("float32")
         weekly_cache[ts_code] = weekly
         all_weeks.update(weekly["trade_date_str"].astype(str).tolist())
         features = compute_features(weekly)
-        values = features.loc[features["breakout"].fillna(False), "position_2y"]
-        position_samples.append(values.dropna().astype("float32"))
+        position_samples.append(
+            features.loc[features["breakout"].fillna(False), "position_2y"]
+            .dropna().astype("float32")
+        )
         del features
         if idx % 60 == 0:
             prep.progress(min((idx + 1) / len(codes), 1.0))
@@ -1117,7 +1146,7 @@ def main():
     del all_positions
     gc.collect()
 
-    progress = st.progress(0.0, text="生成信号……")
+    progress = st.progress(0.0, text="生成信号（一次算出全部持有期）……")
     parts = []
     cached = list(weekly_cache.keys())
     for idx, ts_code in enumerate(cached):
@@ -1147,104 +1176,74 @@ def main():
     del mv_lookup
     gc.collect()
     signals["MV_Billion"] = pd.to_numeric(signals["circ_mv"], errors="coerce") / 10000.0
-    signals = signals[signals["MV_Billion"].between(min_mv, max_mv)]
-    signals = signals.reset_index(drop=True)
+    signals = signals[signals["MV_Billion"].between(min_mv, max_mv)].reset_index(drop=True)
     if signals.empty:
         st.error("过滤后无信号。")
         return
 
     week_index = {week: i for i, week in enumerate(sorted(all_weeks))}
 
-    ledger, total = simulate_slots(
-        signals, week_index, int(slot_count), float(cost_pct), order_mode="rank"
-    )
-    mc_progress = st.progress(0.0, text="蒙特卡洛：随机选股重复回测……")
-    outcomes = monte_carlo(
+    cmp_progress = st.progress(0.0, text="对比各持有期……")
+    comparison = hold_comparison(
         signals, week_index, int(slot_count), float(cost_pct), int(mc_runs),
-        progress_callback=lambda p: mc_progress.progress(p),
+        progress_callback=lambda p: cmp_progress.progress(p),
     )
-    mc_progress.empty()
+    cmp_progress.empty()
 
-    sweep = pd.DataFrame()
-    if do_sweep:
-        sweep_progress = st.progress(0.0, text="扫描不同仓位数……")
-        sweep = slot_sweep(
-            signals, week_index, float(cost_pct), [1, 2, 3, 4, 5, 6, 8, 10],
-            max(30, int(mc_runs) // 4),
-            progress_callback=lambda p: sweep_progress.progress(p),
+    stability = slot_stability(
+        signals, week_index, int(detail_hold), float(cost_pct),
+        max(30, int(mc_runs) // 3), [1, 2, 3, 4, 5, 6, 8, 10],
+    )
+    yearly = yearly_by_hold(
+        signals, week_index, int(detail_hold), int(slot_count), float(cost_pct)
+    )
+
+    # 缩短持有期的代价：买到的票原本能涨多少 vs 实际拿到多少
+    cost_rows = []
+    for hold in HOLD_OPTIONS:
+        ledger, _ = simulate_slots(
+            signals, week_index, hold, int(slot_count), float(cost_pct), order_mode="rank"
         )
-        sweep_progress.empty()
-
-    bought = ledger[ledger["执行"] == "买入"] if not ledger.empty else pd.DataFrame()
-    net = (
-        pd.to_numeric(bought["净收益%"], errors="coerce").dropna()
-        if not bought.empty
-        else pd.Series(dtype=float)
-    )
-    gain_all = pd.to_numeric(signals["Return_pct"], errors="coerce") - float(cost_pct)
-
-    summary = pd.DataFrame(
-        [
+        if ledger.empty:
+            continue
+        net = pd.to_numeric(ledger["净收益%"], errors="coerce")
+        gain26 = pd.to_numeric(ledger["Max_Gain_26W"], errors="coerce")
+        valid = net.notna() & gain26.notna() & (gain26 > 0)
+        cost_rows.append(
             {
-                "口径": "信号层（无资金约束，全部信号）",
-                "笔数": int(len(gain_all.dropna())),
-                "单笔平均%": float(gain_all.mean()),
-                "单笔胜率%": float((gain_all > 0).mean() * 100.0),
-                "翻倍股数": int(
-                    (pd.to_numeric(signals["Max_Gain_pct"], errors="coerce") > 100).sum()
-                ),
-                "总收益%": np.nan,
-            },
-            {
-                "口径": f"{int(slot_count)}仓（按市值优选）",
-                "笔数": int(len(net)),
-                "单笔平均%": float(net.mean()) if len(net) else np.nan,
-                "单笔胜率%": float((net > 0).mean() * 100.0) if len(net) else np.nan,
-                "翻倍股数": int(
-                    (pd.to_numeric(bought["Max_Gain_pct"], errors="coerce") > 100).sum()
-                )
-                if not bought.empty
-                else 0,
-                "总收益%": total,
-            },
-        ]
-    )
+                "最长持有周数": hold,
+                "买入笔数": int(len(net.dropna())),
+                "买到的票26周理论涨幅均值%": float(gain26[valid].mean()),
+                "实际到手均值%": float(net[valid].mean()),
+                "捕获率%": float((net[valid] / gain26[valid]).clip(-2, 2).mean() * 100.0),
+                "26周内本可翻倍的票数": int((gain26 > 100).sum()),
+                "其中实际赚超50%的": int(((gain26 > 100) & (net > 50)).sum()),
+            }
+        )
 
-    mc_table = pd.DataFrame(
-        [
-            {"指标": "随机选股 最差5%", "总收益率%": float(np.percentile(outcomes, 5))},
-            {"指标": "随机选股 中位数", "总收益率%": float(np.median(outcomes))},
-            {"指标": "随机选股 最好5%", "总收益率%": float(np.percentile(outcomes, 95))},
-            {"指标": "▶ 按市值优选（真实规则）", "总收益率%": total},
-        ]
-    )
-
-    st.session_state["slot_result"] = {
+    st.session_state["hold_result"] = {
         "signal_count": len(signals),
-        "summary": summary,
-        "mc_table": mc_table,
-        "percentile": float((outcomes < total).mean() * 100.0),
-        "spread": float(np.percentile(outcomes, 95) - np.percentile(outcomes, 5)),
-        "sweep": sweep,
-        "yearly": yearly_slots(ledger),
-        "ledger": ledger,
+        "comparison": comparison,
+        "capture": pd.DataFrame(cost_rows),
+        "stability": stability,
+        "yearly": yearly,
         "slot_count": int(slot_count),
-        "mc_runs": int(mc_runs),
+        "detail_hold": int(detail_hold),
         "period": f"{start_date} — {end_date}",
         "memory_mb": _memory_usage_mb(),
     }
 
 
 def render_results():
-    result = st.session_state.get("slot_result")
+    result = st.session_state.get("hold_result")
     if not result:
         return False
 
     st.markdown("---")
-    st.header("三仓约束下的排序层验证")
+    st.header("持有期对比结果")
     st.caption(
         f"突破信号 {result['signal_count']:,} 个　|　区间 {result['period']}　|　"
-        f"{result['slot_count']}仓，蒙特卡洛{result['mc_runs']}次"
+        f"{result['slot_count']}仓"
         + (
             f"　|　内存 {result['memory_mb']:.0f} MB"
             if math.isfinite(result.get("memory_mb", float("nan")))
@@ -1252,68 +1251,62 @@ def render_results():
         )
     )
 
-    st.subheader("表1 · 信号层 vs 三仓层")
-    st.dataframe(result["summary"].round(2), width="stretch", hide_index=True)
-    st.caption("两者之差 = 资金约束的代价。重点看翻倍股数量被砍掉多少。")
-
-    st.subheader("表2 · 蒙特卡洛：排序规则是真本事还是运气？")
-    st.dataframe(result["mc_table"].round(2), width="stretch", hide_index=True)
-    st.markdown(
-        f"""
-**按市值优选的结果落在随机分布的 {result['percentile']:.0f}% 分位**，
-随机选股的90%区间宽度为 **{result['spread']:.1f} 个百分点**。
-
-- 分位接近50% → 市值排序在资金约束下没用（K值排序当年就是45%）
-- **分位高于80% → 排序真正起作用**
-- 区间越宽，说明单次回测结果越不可信，运气成分越大
-"""
+    st.subheader("表1 · 各持有期在三仓约束下的表现")
+    st.dataframe(result["comparison"].round(2), width="stretch", hide_index=True)
+    st.caption(
+        "**最该看的不是「总收益%」，而是「运气区间宽度」和「优选分位%」。**\n\n"
+        "26周那行是上一轮的结果（46笔、区间152pp）。如果缩短持有期后笔数明显增加、"
+        "区间明显收窄，说明这条路走通了；如果区间依然很宽，"
+        "说明3仓的样本量问题不是靠缩短持有期能解决的。"
     )
 
-    if not result["sweep"].empty:
-        st.subheader("表3 · 仓位数扫描")
-        st.dataframe(result["sweep"].round(2), width="stretch", hide_index=True)
+    if not result["capture"].empty:
+        st.subheader("表2 · 缩短持有期的代价")
+        st.dataframe(result["capture"].round(2), width="stretch", hide_index=True)
         st.caption(
-            "你只能开3仓，但看趋势能判断3仓是否已经太少："
-            "如果分位随仓位增加而明显上升、运气区间明显收窄，"
-            "说明3仓的噪声仍然偏大，可考虑降低单仓占比而非增加仓位数。"
+            "「捕获率%」= 实际到手 ÷ 该票26周内的理论涨幅。"
+            "最后两列尤其重要：**买到的票里本来能翻倍的有几只，实际赚超50%的有几只**——"
+            "这直接量化了你为提高交易频率放弃了多少大波段。"
+        )
+
+    if not result["stability"].empty:
+        st.subheader(f"表3 · 分位稳定性（持有{result['detail_hold']}周）")
+        st.dataframe(result["stability"].round(2), width="stretch", hide_index=True)
+        st.caption(
+            "**这是判断排序规则是否真有效的关键。**上一轮26周持有时，"
+            "各仓位的分位在32%~96%之间乱跳，暴露了那个80%只是噪声。"
+            "这次如果各仓位分位稳定在60%以上，才说明市值排序真的站得住。"
         )
 
     if not result["yearly"].empty:
-        st.subheader("表4 · 三仓约束下的分年度（你实盘会经历的）")
+        st.subheader(f"表4 · 分年度（持有{result['detail_hold']}周，{result['slot_count']}仓）")
         st.dataframe(result["yearly"].round(2), width="stretch", hide_index=True)
-        st.caption(
-            "**这张表最接近实盘感受**：每年买几笔、抓到几只翻倍股、"
-            "最大和最差单笔各是多少。注意亏损年份的买入笔数和最差单笔。"
-        )
-
-    if not result["ledger"].empty:
-        with st.expander("查看逐笔台账"):
-            st.dataframe(result["ledger"], width="stretch", hide_index=True)
+        st.caption("实盘会经历的样子，注意亏损年份的胜率和最差单笔。")
 
     st.markdown("---")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "01_summary.csv", result["summary"].to_csv(index=False, encoding="utf-8-sig")
+            "01_hold_comparison.csv",
+            result["comparison"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "02_monte_carlo.csv", result["mc_table"].to_csv(index=False, encoding="utf-8-sig")
+            "02_capture_cost.csv",
+            result["capture"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
-            "03_slot_sweep.csv", result["sweep"].to_csv(index=False, encoding="utf-8-sig")
+            "03_slot_stability.csv",
+            result["stability"].to_csv(index=False, encoding="utf-8-sig"),
         )
         archive.writestr(
             "04_yearly.csv", result["yearly"].to_csv(index=False, encoding="utf-8-sig")
         )
-        archive.writestr(
-            "05_ledger.csv", result["ledger"].to_csv(index=False, encoding="utf-8-sig")
-        )
     st.download_button(
         "下载验证结果",
         data=output.getvalue(),
-        file_name="slot_ranking_validation.zip",
+        file_name="hold_period_validation.zip",
         mime="application/zip",
-        key="download_slot",
+        key="download_hold",
     )
     return True
 
