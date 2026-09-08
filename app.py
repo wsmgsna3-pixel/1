@@ -70,6 +70,17 @@ FACTOR_DEF = {
 }
 FACTOR_KEYS = list(FACTOR_DEF.keys())
 
+# 诊断因子：不参与打分，只用来排除混淆。市值是最关键的一个——
+# 池子有 50-1000 亿的上下限，动量排名高的股票平均更靠近上沿，
+# 所以"动量为负"很可能只是"小市值跑赢大市值"的伪装。
+DIAG_DEF = {
+    "logsize": ("对数流通市值（诊断用）", 0.0),
+    "amihud":  ("非流动性(|收益|/成交额，诊断用)", 0.0),
+}
+DIAG_KEYS = list(DIAG_DEF.keys())
+ALL_DEF = {**FACTOR_DEF, **DIAG_DEF}
+TEST_KEYS = FACTOR_KEYS + DIAG_KEYS
+
 
 # ======================================================================
 # 一、Tushare 数据层
@@ -366,7 +377,8 @@ def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
 # ======================================================================
 # 二、因子计算
 # ======================================================================
-def compute_factors(adj_close: pd.DataFrame, amount: pd.DataFrame, win: int = 60) -> Dict[str, pd.DataFrame]:
+def compute_factors(adj_close: pd.DataFrame, amount: pd.DataFrame, win: int = 60,
+                    circ_mv: Optional[pd.DataFrame] = None) -> Dict[str, pd.DataFrame]:
     """全部因子一次性向量化算完，返回 {因子名: 宽表}。"""
     A = adj_close
     out: Dict[str, pd.DataFrame] = {}
@@ -399,6 +411,13 @@ def compute_factors(adj_close: pd.DataFrame, amount: pd.DataFrame, win: int = 60
 
     out["dist_hi"] = A / A.rolling(win).max() - 1.0
     out["rev5"] = A / A.shift(5) - 1.0
+
+    # 诊断因子
+    if circ_mv is not None:
+        out["logsize"] = np.log(circ_mv.where(circ_mv > 0))
+    ar = (A / A.shift(1) - 1.0).abs()
+    out["amihud"] = (ar / amount.where(amount > 1e-9)).rolling(20).mean() * 1e6
+    del ar
 
     for k in list(out):
         out[k] = out[k].astype(np.float32)
@@ -459,6 +478,20 @@ def build_eligibility(panel: dict, basic: pd.DataFrame, uni: pd.DataFrame,
     return ok.fillna(False)
 
 
+def size_neutralize(f: pd.DataFrame, logsize: pd.DataFrame, mask: pd.DataFrame) -> pd.DataFrame:
+    """
+    截面上把因子对 log 市值做回归，取残差。
+    用来回答：剥掉市值这层之后，这个因子还剩下什么。
+    """
+    x = logsize.where(mask).astype(np.float64)
+    y = f.where(mask).astype(np.float64)
+    xc = x.sub(x.mean(axis=1), axis=0)
+    yc = y.sub(y.mean(axis=1), axis=0)
+    sxx = (xc ** 2).sum(axis=1)
+    beta = (xc * yc).sum(axis=1) / sxx.where(sxx > 1e-12)
+    return yc.sub(xc.mul(beta, axis=0)).astype(np.float32)
+
+
 def cs_zscore(df: pd.DataFrame, mask: pd.DataFrame, wins: float = 0.01) -> pd.DataFrame:
     """截面去极值 + 标准化，只在 mask 为真的样本上做。"""
     x = df.where(mask)
@@ -508,6 +541,27 @@ def _spearman(a: np.ndarray, b: np.ndarray, min_n: int = 20) -> float:
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def newey_west_t(x: pd.Series, lag: int) -> float:
+    """
+    IC 序列的 Newey-West 修正 t 值。
+    周频调仓 + H 周持有期时，相邻 H-1 期的样本是重叠的，IC 序列有自相关，
+    直接用 ICIR×√n 会把显著性高估约 √H 倍。这里按 lag=H-1 做 HAC 修正。
+    """
+    v = x.dropna().to_numpy(dtype=np.float64)
+    n = len(v)
+    if n < 12:
+        return np.nan
+    mu = v.mean()
+    e = v - mu
+    var = float(e @ e) / n                       # γ0
+    for k in range(1, min(int(lag), n - 1) + 1):
+        gk = float(e[k:] @ e[:-k]) / n
+        var += 2.0 * (1.0 - k / (lag + 1.0)) * gk
+    if var <= 0:
+        return np.nan
+    return float(mu / np.sqrt(var / n))
+
+
 def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
                  rebal: List[pd.Timestamp], horizon_weeks: int = 4,
                  n_group: int = 10) -> dict:
@@ -550,15 +604,74 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
     ic_std = float(ic.std()) if len(ic) else np.nan
     icir = ic_mean / ic_std if ic_std and ic_std > 1e-12 else np.nan
     tstat = icir * np.sqrt(len(ic)) if np.isfinite(icir) else np.nan
+    t_nw = newey_west_t(ic, lag=max(0, horizon_weeks - 1))      # 重叠窗口修正后
+    ic_year = ic.groupby(ic.index.year).mean() if len(ic) else pd.Series(dtype=float)
+    ic_pos = float((ic > 0).mean()) if len(ic) else np.nan
     top, bot = grp_df.columns[-1], grp_df.columns[0]
     # 单调性: 各组均值与组序号的秩相关
     ordered = grp_df.mean(axis=0).to_numpy()
     mono = _spearman(np.arange(len(ordered), dtype=float), ordered, min_n=4)
 
     return {"ok": True, "group_mean": grp_df.mean(axis=0), "curve": curve, "ic": ic,
-            "ic_mean": ic_mean, "icir": icir, "tstat": tstat,
+            "ic_mean": ic_mean, "icir": icir, "tstat": tstat, "t_nw": t_nw,
+            "ic_year": ic_year, "ic_pos": ic_pos,
             "spread": float(grp_df[top].mean() - grp_df[bot].mean()),
             "monotonic": mono, "n_period": len(grp_df)}
+
+
+def scan_all_factors(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
+                     elig: pd.DataFrame, rebal: List[pd.Timestamp], horizon_weeks: int,
+                     keys: List[str], neutralize: bool = False,
+                     progress=None) -> tuple:
+    """一次跑完所有因子，返回 (汇总表, 分年度IC表)。"""
+    rows, years = [], {}
+    ls = factors.get("logsize")
+    for n, k in enumerate(keys):
+        if k not in factors:
+            continue
+        f = factors[k]
+        if neutralize and ls is not None and k != "logsize":
+            f = size_neutralize(f, ls, elig)
+        r = layered_test(f, adj_close, elig, rebal, horizon_weeks, 10)
+        if progress:
+            progress((n + 1) / len(keys), ALL_DEF.get(k, (k,))[0])
+        if not r.get("ok"):
+            continue
+        rows.append({"因子": ALL_DEF.get(k, (k, 0))[0], "key": k,
+                     "IC均值": r["ic_mean"], "ICIR": r["icir"],
+                     "t(朴素)": r["tstat"], "t(重叠修正)": r["t_nw"],
+                     "IC>0占比": r["ic_pos"], "单调性": r["monotonic"],
+                     "多空价差": r["spread"], "期数": r["n_period"]})
+        years[ALL_DEF.get(k, (k, 0))[0]] = r["ic_year"]
+    summ = pd.DataFrame(rows)
+    ydf = pd.DataFrame(years).T if years else pd.DataFrame()
+    return summ, ydf
+
+
+def factor_corr(factors: Dict[str, pd.DataFrame], elig: pd.DataFrame,
+                rebal: List[pd.Timestamp], keys: List[str]) -> pd.DataFrame:
+    """调仓日截面秩相关的平均值。用来看这些因子到底是几个独立的赌注。"""
+    ks = [k for k in keys if k in factors]
+    dates = rebal[::4]                      # 抽样即可，够稳定
+    acc = np.zeros((len(ks), len(ks)))
+    cnt = 0
+    for d in dates:
+        if d not in elig.index:
+            continue
+        m = elig.loc[d]
+        cols = []
+        for k in ks:
+            v = factors[k].loc[d].where(m)
+            cols.append(v.rank())
+        M = pd.concat(cols, axis=1, keys=ks).dropna()
+        if len(M) < 30:
+            continue
+        acc += M.corr().to_numpy()
+        cnt += 1
+    if cnt == 0:
+        return pd.DataFrame()
+    return pd.DataFrame(acc / cnt, index=[ALL_DEF[k][0] for k in ks],
+                        columns=[ALL_DEF[k][0] for k in ks])
 
 
 # ======================================================================
@@ -931,7 +1044,7 @@ def main():
             px.clear()
             del px
             gc.collect()
-            factors = compute_factors(panel["adj_close"], panel["amount"])
+            factors = compute_factors(panel["adj_close"], panel["amount"], circ_mv=panel["circ_mv"])
 
             ss["panel"] = panel
             ss["basic"] = basic
@@ -975,35 +1088,121 @@ def main():
 
     # ---------------- 因子分层检验 ----------------
     with t2:
-        st.subheader("先回答一个问题：这个打分有没有排序能力？")
-        st.markdown("**如果第1组打不过第10组、或者没有单调性，这个因子就是废的**——"
-                    "后面加止损、加仓位管理都救不回来。这一步不涉及任何买卖逻辑。")
-        cc = st.columns(3)
-        fkey = cc[0].selectbox("因子", FACTOR_KEYS, format_func=lambda k: FACTOR_DEF[k][0])
-        hz = cc[1].select_slider("持有期（周）", [1, 2, 4, 6, 8], 4)
-        ng = cc[2].slider("分组数", 5, 10, 10)
-        sp = st.columns(2)
-        ls = sp[0].date_input("样本起", dt.date(2018, 1, 1), key="ls")
-        le = sp[1].date_input("样本止", dt.date.today(), key="le")
+        st.subheader("先回答一个问题：这些打分有没有排序能力？")
+        st.markdown(
+            "**t 的符号只说明方向，门槛是 |t| > 2。** t 为负不是失败，是因子要反过来用。\n\n"
+            "但看结果之前先记住两件事：① 动量、趋势质量、相对强度、距高点、5日反转"
+            "本质都是「近期价格强弱」的变体，彼此高度相关，**六个因子大约只是两个独立赌注**；"
+            "② 池子有 50-1000 亿的市值上下限，动量高的股票平均更靠近上沿，"
+            "所以「动量为负」可能只是「小市值跑赢」的伪装——下面的市值诊断就是查这个的。")
 
-        if st.button("运行分层检验", type="primary"):
-            rb = [d for d in rebal_all if pd.Timestamp(ls) <= d <= pd.Timestamp(le)]
-            res = layered_test(factors[fkey], panel["adj_close"], elig, rb, int(hz), int(ng))
+        c0 = st.columns(4)
+        hz = c0[0].select_slider("持有期（周）", [1, 2, 4, 6, 8], 4)
+        ls_ = c0[1].date_input("样本起", dt.date(2018, 1, 1), key="ls")
+        le_ = c0[2].date_input("样本止", dt.date.today(), key="le")
+        neu = c0[3].checkbox("市值中性化", False,
+                             help="截面上把因子对 log 流通市值回归取残差。"
+                                  "勾选后再看一遍 IC：如果因子显著性大幅塌掉，"
+                                  "说明它原本的效果主要来自市值暴露，不是因子本身。")
+        rb = [d for d in rebal_all if pd.Timestamp(ls_) <= d <= pd.Timestamp(le_)]
+
+        if st.button("扫描全部因子（含市值诊断）", type="primary"):
+            bar = st.progress(0.0)
+            summ, ydf = scan_all_factors(factors, panel["adj_close"], elig, rb,
+                                         int(hz), TEST_KEYS, neu,
+                                         lambda p, n: bar.progress(p, text=n))
+            ss["scan"] = (summ, ydf, factor_corr(factors, elig, rb, TEST_KEYS), int(hz), neu)
+            bar.empty()
+
+        if ss.get("scan"):
+            summ, ydf, corr, hz_done, neu_done = ss["scan"]
+            tag = "（已市值中性化）" if neu_done else ""
+            st.markdown(f"**汇总{tag}　持有期 {hz_done} 周**")
+            show = summ.drop(columns=["key"]).copy()
+            st.dataframe(
+                show.style.format({"IC均值": "{:.4f}", "ICIR": "{:.3f}", "t(朴素)": "{:.2f}",
+                                   "t(重叠修正)": "{:.2f}", "IC>0占比": "{:.1%}",
+                                   "单调性": "{:.2f}", "多空价差": "{:.2%}"})
+                    .background_gradient(subset=["t(重叠修正)"], cmap="RdYlGn", vmin=-4, vmax=4),
+                use_container_width=True)
+            st.caption("重叠窗口会把朴素 t 高估约 √持有期 倍，请以「t(重叠修正)」为准。"
+                       "「IC>0占比」偏离 50% 越多越稳定；接近 50% 但均值不为零，"
+                       "说明效果集中在少数极端时段。")
+
+            diag = summ[summ["key"] == "logsize"]
+            if len(diag):
+                d0 = diag.iloc[0]
+                st.markdown("**市值诊断**")
+                if abs(d0["t(重叠修正)"]) >= 2:
+                    direc = "小市值跑赢大市值" if d0["IC均值"] < 0 else "大市值跑赢小市值"
+                    st.warning(
+                        f"流通市值本身就是个显著因子（IC {d0['IC均值']:.4f}，"
+                        f"修正 t {d0['t(重叠修正)']:.2f}），方向是**{direc}**。"
+                        "请务必勾选「市值中性化」再扫一遍：如果价格类因子的显著性"
+                        "在中性化后大幅塌掉，那它们原本测出来的效果主要是市值暴露，"
+                        "照着这个结果去建仓等于在赌市值风格，不是在赌你想赌的东西。")
+                else:
+                    st.success(f"流通市值本身不显著（修正 t {d0['t(重叠修正)']:.2f}），"
+                               "价格类因子的结果没有被市值污染。")
+
+            st.markdown("**分年度 IC**")
+            if len(ydf):
+                st.dataframe(ydf.style.format("{:.4f}")
+                             .background_gradient(cmap="RdYlGn", vmin=-0.08, vmax=0.08),
+                             use_container_width=True)
+                st.caption("这张表比总均值重要得多。如果某因子在 2019-2021 是一个符号、"
+                           "2023 年之后翻成另一个符号，那它的总均值只是两段相反行情的平均数，"
+                           "拿去做实盘等于赌行情会退回从前。逐年同号才叫稳定。")
+
+            if len(corr):
+                st.markdown("**因子截面相关性**")
+                st.dataframe(corr.style.format("{:.2f}")
+                             .background_gradient(cmap="coolwarm", vmin=-1, vmax=1),
+                             use_container_width=True)
+                st.caption("相关性 0.7 以上的因子之间几乎没有增量信息，"
+                           "把它们一起加进打分只是把同一个赌注下三遍，并不会分散风险。")
+
+            tradable = summ[summ["key"].isin(FACTOR_KEYS)]
+            passed = tradable[tradable["t(重叠修正)"].abs() >= 2.0]
+            st.markdown(f"**修正后通过 |t|>2 的可交易因子：{len(passed)} / {len(tradable)}**")
+            if len(passed) == 0:
+                st.error("一个都没过。不要去调仓位和止损，那救不回来——"
+                         "问题在因子本身，需要换一批因子重来。")
+            else:
+                sug = {}
+                for _, r in tradable.iterrows():
+                    t_ = r["t(重叠修正)"]
+                    w = 0.0 if not np.isfinite(t_) or abs(t_) < 2.0 else \
+                        float(np.clip(round(np.sign(t_) * min(2.0, abs(t_) / 2.0), 1), -2.0, 2.0))
+                    sug[r["key"]] = w
+                st.write("建议权重（按修正 t 的符号与大小，未过门槛的置 0）：",
+                         {ALL_DEF[k][0]: v for k, v in sug.items()})
+                if st.button("把建议权重写入回测页"):
+                    for k, v in sug.items():
+                        ss["w_" + k] = v
+                    ss.pop("last_bt", None)
+                    st.rerun()
+
+        st.divider()
+        st.markdown("**单因子细看**")
+        fkey = st.selectbox("因子", TEST_KEYS, format_func=lambda k: ALL_DEF[k][0])
+        if st.button("画分层曲线"):
+            f = factors[fkey]
+            if neu and "logsize" in factors and fkey != "logsize":
+                f = size_neutralize(f, factors["logsize"], elig)
+            res = layered_test(f, panel["adj_close"], elig, rb, int(hz), 10)
             if not res.get("ok"):
                 st.error("样本不足，放宽日期或降低门槛。")
             else:
                 m = st.columns(5)
                 m[0].metric("多空价差", f"{res['spread']:.2%}")
                 m[1].metric("IC 均值", f"{res['ic_mean']:.4f}")
-                m[2].metric("ICIR", f"{res['icir']:.3f}")
-                m[3].metric("t 统计量", f"{res['tstat']:.2f}")
-                m[4].metric("单调性", f"{res['monotonic']:.2f}")
+                m[2].metric("t(重叠修正)", f"{res['t_nw']:.2f}")
+                m[3].metric("单调性", f"{res['monotonic']:.2f}")
+                m[4].metric("IC>0 占比", f"{res['ic_pos']:.1%}")
                 st.bar_chart(res["group_mean"].rename(f"未来{hz}周平均收益"))
                 st.line_chart(res["curve"])
                 st.line_chart(res["ic"].rolling(12).mean().rename("IC(12期均线)"))
-                st.markdown(
-                    "**怎么看**：单调性接近 +1 或 -1、|IC均值| > 0.03、|t| > 2，才算这个因子有话说。"
-                    "单调性接近 0 意味着分组收益是噪音。IC 均线长期在 0 附近来回穿，说明因子只在个别时段有效。")
 
     # ---------------- 策略回测 ----------------
     with t3:
