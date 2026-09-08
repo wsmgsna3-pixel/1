@@ -564,10 +564,15 @@ def newey_west_t(x: pd.Series, lag: int) -> float:
 
 def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
                  rebal: List[pd.Timestamp], horizon_weeks: int = 4,
-                 n_group: int = 10) -> dict:
+                 n_group: int = 10, gap: int = 1) -> dict:
     """
     分层检验：每个调仓日按因子值分 n_group 组，看未来 horizon_weeks 周收益是否单调。
-    同时输出 IC 序列。累计曲线用不重叠窗口，避免重叠样本夸大统计量。
+
+    gap = 入场延迟的交易日数，是这里最重要的参数。
+    gap=0 时，因子的分子和未来收益的分母共用排名当日的价格 A[i]。A[i] 里任何
+    噪音（买卖价差跳动、单日过度反应）都会同时抬高因子、压低未来收益，凭空造出
+    负相关——反转研究里的经典陷阱。真实的反转效应能扛住延迟入场，微观结构噪音
+    扛不住。默认 gap=1，与回测「次日开盘成交」的口径一致。
     """
     cal = adj_close.index
     pos = {d: i for i, d in enumerate(cal)}
@@ -576,10 +581,11 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
 
     for d in rebal:
         i = pos.get(d)
-        if i is None or i + step >= len(cal):
+        if i is None or i + gap + step >= len(cal):
             continue
         f = fac.iloc[i].where(elig.iloc[i]).to_numpy(dtype=float)
-        fwd = (adj_close.iloc[i + step] / adj_close.iloc[i] - 1.0).to_numpy(dtype=float)
+        j = i + gap                                    # 延迟 gap 个交易日才入场
+        fwd = (adj_close.iloc[j + step] / adj_close.iloc[j] - 1.0).to_numpy(dtype=float)
         m = np.isfinite(f) & np.isfinite(fwd)
         if m.sum() < n_group * 3:
             continue
@@ -622,7 +628,7 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
 def scan_all_factors(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
                      elig: pd.DataFrame, rebal: List[pd.Timestamp], horizon_weeks: int,
                      keys: List[str], neutralize: bool = False,
-                     progress=None) -> tuple:
+                     progress=None, gap: int = 1) -> tuple:
     """一次跑完所有因子，返回 (汇总表, 分年度IC表)。"""
     rows, years = [], {}
     ls = factors.get("logsize")
@@ -632,20 +638,52 @@ def scan_all_factors(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
         f = factors[k]
         if neutralize and ls is not None and k != "logsize":
             f = size_neutralize(f, ls, elig)
-        r = layered_test(f, adj_close, elig, rebal, horizon_weeks, 10)
+        r = layered_test(f, adj_close, elig, rebal, horizon_weeks, 10, gap=gap)
         if progress:
             progress((n + 1) / len(keys), ALL_DEF.get(k, (k,))[0])
         if not r.get("ok"):
             continue
+        yr = r["ic_year"]
+        same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum()) if len(yr) else 0
+        # 三条证据方向是否一致: IC、分组单调性、多空价差
+        agree = bool(np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
+                     and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
         rows.append({"因子": ALL_DEF.get(k, (k, 0))[0], "key": k,
-                     "IC均值": r["ic_mean"], "ICIR": r["icir"],
-                     "t(朴素)": r["tstat"], "t(重叠修正)": r["t_nw"],
-                     "IC>0占比": r["ic_pos"], "单调性": r["monotonic"],
-                     "多空价差": r["spread"], "期数": r["n_period"]})
+                     "IC均值": r["ic_mean"], "t(重叠修正)": r["t_nw"],
+                     "单调性": r["monotonic"], "多空价差": r["spread"],
+                     "方向一致": "是" if agree else "否",
+                     "同号年数": f"{same}/{len(yr)}", "_same": same, "_ny": len(yr),
+                     "_agree": agree, "IC>0占比": r["ic_pos"], "期数": r["n_period"]})
         years[ALL_DEF.get(k, (k, 0))[0]] = r["ic_year"]
     summ = pd.DataFrame(rows)
     ydf = pd.DataFrame(years).T if years else pd.DataFrame()
     return summ, ydf
+
+
+def gap_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
+             elig: pd.DataFrame, rebal: List[pd.Timestamp], horizon_weeks: int,
+             keys: List[str], gaps=(0, 1, 3, 5, 10), progress=None) -> pd.DataFrame:
+    """
+    入场延迟扫描 —— 区分真实反转与微观结构噪音的决定性检验。
+    真实的定价效应能扛住推迟几天入场；买卖价差跳动造出来的假反转，
+    在 gap 从 0 加到 1-3 天时就会大幅衰减，因为噪音只存在于那一天的价格里。
+    """
+    rows = []
+    for n, k in enumerate(keys):
+        if k not in factors:
+            continue
+        row = {"因子": ALL_DEF.get(k, (k, 0))[0], "key": k}
+        for g in gaps:
+            r = layered_test(factors[k], adj_close, elig, rebal, horizon_weeks, 10, gap=g)
+            row[f"t@延迟{g}日"] = r.get("t_nw", np.nan) if r.get("ok") else np.nan
+        base = row.get("t@延迟0日", np.nan)
+        far = row.get(f"t@延迟{gaps[-1]}日", np.nan)
+        row["残留比例"] = (abs(far) / abs(base)) if (np.isfinite(base) and abs(base) > 1e-9
+                                                and np.isfinite(far)) else np.nan
+        rows.append(row)
+        if progress:
+            progress((n + 1) / len(keys), row["因子"])
+    return pd.DataFrame(rows)
 
 
 def factor_corr(factors: Dict[str, pd.DataFrame], elig: pd.DataFrame,
@@ -1096,11 +1134,15 @@ def main():
             "② 池子有 50-1000 亿的市值上下限，动量高的股票平均更靠近上沿，"
             "所以「动量为负」可能只是「小市值跑赢」的伪装——下面的市值诊断就是查这个的。")
 
-        c0 = st.columns(4)
+        c0 = st.columns(5)
         hz = c0[0].select_slider("持有期（周）", [1, 2, 4, 6, 8], 4)
-        ls_ = c0[1].date_input("样本起", dt.date(2018, 1, 1), key="ls")
-        le_ = c0[2].date_input("样本止", dt.date.today(), key="le")
-        neu = c0[3].checkbox("市值中性化", False,
+        gap = c0[1].select_slider("入场延迟（交易日）", [0, 1, 3, 5, 10], 1,
+                                  help="0 = 用排名当日收盘价入场。这会让因子的分子和"
+                                       "未来收益的分母共用同一个价格，噪音会凭空造出负相关。"
+                                       "回测是次日开盘成交，所以 1 才是与回测一致的口径。")
+        ls_ = c0[2].date_input("样本起", dt.date(2018, 1, 1), key="ls")
+        le_ = c0[3].date_input("样本止", dt.date.today(), key="le")
+        neu = c0[4].checkbox("市值中性化", False,
                              help="截面上把因子对 log 流通市值回归取残差。"
                                   "勾选后再看一遍 IC：如果因子显著性大幅塌掉，"
                                   "说明它原本的效果主要来自市值暴露，不是因子本身。")
@@ -1110,24 +1152,28 @@ def main():
             bar = st.progress(0.0)
             summ, ydf = scan_all_factors(factors, panel["adj_close"], elig, rb,
                                          int(hz), TEST_KEYS, neu,
-                                         lambda p, n: bar.progress(p, text=n))
-            ss["scan"] = (summ, ydf, factor_corr(factors, elig, rb, TEST_KEYS), int(hz), neu)
+                                         lambda p, n: bar.progress(p, text=n), gap=int(gap))
+            ss["scan"] = (summ, ydf, factor_corr(factors, elig, rb, TEST_KEYS),
+                          int(hz), neu, int(gap))
             bar.empty()
 
         if ss.get("scan"):
-            summ, ydf, corr, hz_done, neu_done = ss["scan"]
+            summ, ydf, corr, hz_done, neu_done, gap_done = ss["scan"]
             tag = "（已市值中性化）" if neu_done else ""
-            st.markdown(f"**汇总{tag}　持有期 {hz_done} 周**")
-            show = summ.drop(columns=["key"]).copy()
+            st.markdown(f"**汇总{tag}　持有期 {hz_done} 周　入场延迟 {gap_done} 日**")
+            show = summ.drop(columns=[c for c in summ.columns
+                                      if c == "key" or c.startswith("_")]).copy()
             st.dataframe(
-                show.style.format({"IC均值": "{:.4f}", "ICIR": "{:.3f}", "t(朴素)": "{:.2f}",
-                                   "t(重叠修正)": "{:.2f}", "IC>0占比": "{:.1%}",
-                                   "单调性": "{:.2f}", "多空价差": "{:.2%}"})
+                show.style.format({"IC均值": "{:.4f}", "t(重叠修正)": "{:.2f}",
+                                   "单调性": "{:.2f}", "多空价差": "{:.2%}",
+                                   "IC>0占比": "{:.1%}"})
                     .background_gradient(subset=["t(重叠修正)"], cmap="RdYlGn", vmin=-4, vmax=4),
                 use_container_width=True)
-            st.caption("重叠窗口会把朴素 t 高估约 √持有期 倍，请以「t(重叠修正)」为准。"
-                       "「IC>0占比」偏离 50% 越多越稳定；接近 50% 但均值不为零，"
-                       "说明效果集中在少数极端时段。")
+            st.caption(
+                "**「方向一致」是这张表里最该先看的一列。** IC、分组单调性、多空价差"
+                "是同一件事的三种量法，方向不一致说明因子的效果集中在少数高波动时段，"
+                "总均值和分组结果各说各话——这种因子不能用。"
+                "「同号年数」低于 8/9 的同样不能用：总均值只是两段相反行情的平均数。")
 
             diag = summ[summ["key"] == "logsize"]
             if len(diag):
@@ -1162,26 +1208,80 @@ def main():
                 st.caption("相关性 0.7 以上的因子之间几乎没有增量信息，"
                            "把它们一起加进打分只是把同一个赌注下三遍，并不会分散风险。")
 
-            tradable = summ[summ["key"].isin(FACTOR_KEYS)]
-            passed = tradable[tradable["t(重叠修正)"].abs() >= 2.0]
-            st.markdown(f"**修正后通过 |t|>2 的可交易因子：{len(passed)} / {len(tradable)}**")
+            tradable = summ[summ["key"].isin(FACTOR_KEYS)].copy()
+            # 三道门槛全过才给权重。只看 t 会把"效果集中在少数时段"和
+            # "两段相反行情的平均数"这两类因子放进来，那是在拟合过去。
+            def _pass(r):
+                return (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0
+                        and r["_agree"] and r["_ny"] > 0 and r["_same"] / r["_ny"] >= 8 / 9)
+            tradable["通过"] = tradable.apply(_pass, axis=1)
+            passed = tradable[tradable["通过"]]
+            st.markdown(f"**三道门槛全过的可交易因子：{len(passed)} / {len(tradable)}**")
+            st.caption("门槛：|修正 t| ≥ 2　且　IC/单调性/价差方向一致　且　同号年数 ≥ 8/9")
+            for _, r in tradable.iterrows():
+                why = []
+                if not (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0):
+                    why.append("不显著")
+                if not r["_agree"]:
+                    why.append("三条证据方向打架")
+                if r["_ny"] and r["_same"] / r["_ny"] < 8 / 9:
+                    why.append(f"逐年符号不稳({r['同号年数']})")
+                st.write(("✅ " if r["通过"] else "❌ ") + r["因子"]
+                         + ("" if r["通过"] else "　— " + "、".join(why)))
+
             if len(passed) == 0:
                 st.error("一个都没过。不要去调仓位和止损，那救不回来——"
                          "问题在因子本身，需要换一批因子重来。")
             else:
-                sug = {}
-                for _, r in tradable.iterrows():
-                    t_ = r["t(重叠修正)"]
-                    w = 0.0 if not np.isfinite(t_) or abs(t_) < 2.0 else \
-                        float(np.clip(round(np.sign(t_) * min(2.0, abs(t_) / 2.0), 1), -2.0, 2.0))
-                    sug[r["key"]] = w
-                st.write("建议权重（按修正 t 的符号与大小，未过门槛的置 0）：",
-                         {ALL_DEF[k][0]: v for k, v in sug.items()})
+                # 等权 + 符号，不按 t 的大小定权重：t 越大权重越大等于对
+                # 样本内的显著性做二次拟合，样本外通常更差。
+                sug = {k: 0.0 for k in FACTOR_KEYS}
+                for _, r in passed.iterrows():
+                    sug[r["key"]] = float(np.sign(r["t(重叠修正)"]))
+                st.write("建议权重（通过的等权取符号，未通过置 0）：",
+                         {ALL_DEF[k][0]: v for k, v in sug.items() if v != 0})
+                st.caption("刻意不按 t 的大小分配权重——那等于对样本内显著性再拟合一次，"
+                           "样本外通常更差。等权更稳。")
                 if st.button("把建议权重写入回测页"):
                     for k, v in sug.items():
                         ss["w_" + k] = v
                     ss.pop("last_bt", None)
                     st.rerun()
+
+        st.divider()
+        st.markdown("### 入场延迟扫描 —— 区分真反转与噪音")
+        st.markdown(
+            "反转类因子的分子用的是排名当日的收盘价，而未来收益的分母也是它。"
+            "这一天价格里的买卖价差跳动会同时抬高因子、压低未来收益，**凭空造出负相关**。"
+            "真实的定价效应扛得住推迟几天入场，价差跳动扛不住。\n\n"
+            "**看 0 日到 1 日那一步的落差**：崩塌就是噪音，稳住就是真效应。")
+        if st.button("运行延迟扫描"):
+            bar2 = st.progress(0.0)
+            gs = gap_scan(factors, panel["adj_close"], elig, rb, int(hz), FACTOR_KEYS,
+                          gaps=(0, 1, 3, 5, 10),
+                          progress=lambda p, n: bar2.progress(p, text=n))
+            ss["gapscan"] = gs
+            bar2.empty()
+        if ss.get("gapscan") is not None:
+            gs = ss["gapscan"]
+            gcols = [c for c in gs.columns if c.startswith("t@")]
+            st.dataframe(
+                gs.drop(columns=["key"]).style
+                  .format({**{c: "{:.2f}" for c in gcols}, "残留比例": "{:.0%}"})
+                  .background_gradient(subset=gcols, cmap="RdYlGn", vmin=-5, vmax=5),
+                use_container_width=True)
+            drops = []
+            for _, r in gs.iterrows():
+                t0, t1 = r.get("t@延迟0日"), r.get("t@延迟1日")
+                if np.isfinite(t0) and abs(t0) >= 2 and np.isfinite(t1):
+                    if abs(t1) < abs(t0) * 0.6:
+                        drops.append(r["因子"])
+            if drops:
+                st.error("以下因子在延迟 1 天后显著性就崩掉了一半以上，"
+                         "**它们测出来的效应主要是微观结构噪音，不可交易**：\n\n"
+                         + "、".join(drops))
+            else:
+                st.success("没有因子在延迟 1 天时崩塌，反转效应扛得住延迟入场。")
 
         st.divider()
         st.markdown("**单因子细看**")
@@ -1190,7 +1290,7 @@ def main():
             f = factors[fkey]
             if neu and "logsize" in factors and fkey != "logsize":
                 f = size_neutralize(f, factors["logsize"], elig)
-            res = layered_test(f, panel["adj_close"], elig, rb, int(hz), 10)
+            res = layered_test(f, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
             if not res.get("ok"):
                 st.error("样本不足，放宽日期或降低门槛。")
             else:
