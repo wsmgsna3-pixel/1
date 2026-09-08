@@ -23,10 +23,14 @@
 from __future__ import annotations
 
 import os
+import gc
 import time
 import pickle
+import threading
 import datetime as dt
-from typing import Dict, List, Optional
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Callable
 
 import numpy as np
 import pandas as pd
@@ -71,26 +75,36 @@ FACTOR_KEYS = list(FACTOR_DEF.keys())
 # 一、Tushare 数据层
 # ======================================================================
 class Limiter:
-    """简单的每分钟请求数限流器。"""
+    """
+    线程安全的每分钟请求数限流器。
+    Tushare 的频次限制是按账号算的，不是按连接算的，所以多线程必须共用同一个
+    限流器，否则 4 条线程各跑各的会直接把账号打到限频。
+    """
 
     def __init__(self, per_min: int = 400):
         self.per_min = max(1, int(per_min))
-        self.calls: List[float] = []
+        self.calls: deque = deque()
+        self.lock = threading.Lock()
 
     def wait(self):
-        now = time.time()
-        self.calls = [c for c in self.calls if now - c < 60.0]
-        if len(self.calls) >= self.per_min:
-            sleep_s = 60.0 - (now - self.calls[0]) + 0.3
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-            now = time.time()
-            self.calls = [c for c in self.calls if now - c < 60.0]
-        self.calls.append(time.time())
+        while True:
+            with self.lock:
+                now = time.time()
+                while self.calls and now - self.calls[0] >= 60.0:
+                    self.calls.popleft()
+                if len(self.calls) < self.per_min:
+                    self.calls.append(now)
+                    return
+                sleep_s = 60.0 - (now - self.calls[0]) + 0.05
+            time.sleep(min(max(sleep_s, 0.01), 5.0))   # 必须在锁外面睡
+
+
+_ERR_LOCK = threading.Lock()
+API_ERRORS: List[str] = []
 
 
 def api_call(fn, lim: Limiter, retries: int = 3, **kwargs):
-    """带限流与重试的 Tushare 调用。失败返回 None。"""
+    """带限流与重试的 Tushare 调用。失败返回 None。可在工作线程中安全调用。"""
     last = None
     for k in range(retries):
         try:
@@ -99,8 +113,10 @@ def api_call(fn, lim: Limiter, retries: int = 3, **kwargs):
         except Exception as e:  # 网络抖动 / 限频
             last = e
             time.sleep(2.0 * (k + 1))
-    if st is not None:
-        st.session_state.setdefault("api_errors", []).append(f"{getattr(fn,'__name__','api')}: {last}")
+    # 注意: 工作线程里不能碰 st.session_state（没有 ScriptRunContext）
+    with _ERR_LOCK:
+        if len(API_ERRORS) < 500:
+            API_ERRORS.append(f"{getattr(fn, '__name__', 'api')} {kwargs.get('ts_code', '')}: {last}")
     return None
 
 
@@ -176,44 +192,124 @@ def _px_path(ts_code: str) -> str:
     return os.path.join(PX_DIR, ts_code.replace(".", "_") + ".pkl")
 
 
-def fetch_one_stock(pro, lim: Limiter, ts_code: str, start: str, end: str,
+PX_COLS = ["trade_date", "open", "close", "pre_close", "pct_chg", "amount", "circ_mv"]
+
+
+def fetch_one_stock(pro_get: Callable, lim: Limiter, ts_code: str, start: str, end: str,
                     use_cache: bool = True) -> Optional[pd.DataFrame]:
     """
-    单只股票的日线 + 每日指标，落地磁盘缓存。
-    返回列: trade_date, open, high, low, close, pre_close, pct_chg, amount, circ_mv
-    注意 Tushare 的 pre_close 已做除权处理，pct_chg 因此是正确的复权收益率。
+    单只股票的日线 + 每日指标，落地磁盘缓存（每股一个文件，中途崩溃可续传）。
+    注意 Tushare 的 pre_close 已做除权处理，pct_chg 因此是正确的复权收益率，
+    所以不需要额外拉 adj_factor。high/low 本系统用不到，不下载也不保存。
     """
     path = _px_path(ts_code)
     if use_cache and os.path.exists(path):
         try:
             with open(path, "rb") as f:
-                cached = pickle.load(f)
-            if cached is not None and len(cached):
-                lo, hi = cached["trade_date"].min(), cached["trade_date"].max()
-                if lo <= pd.Timestamp(start) and hi >= pd.Timestamp(end) - pd.Timedelta(days=12):
-                    return cached
+                blob = pickle.load(f)
+            # 必须比对「请求区间」而不是「数据区间」：股票首个交易日几乎不会
+            # 正好等于请求起始日（节假日、上市较晚、已退市），拿数据区间去比会
+            # 导致永远未命中、每次全量重下。
+            if isinstance(blob, dict) and "df" in blob:
+                if (blob.get("start", "99999999") <= start
+                        and blob.get("end", "0") >= end):
+                    return blob["df"]
         except Exception:
             pass
 
+    pro = pro_get()
     d = api_call(pro.daily, lim, ts_code=ts_code, start_date=start, end_date=end)
     if d is None or len(d) == 0:
         return None
     b = api_call(pro.daily_basic, lim, ts_code=ts_code, start_date=start, end_date=end,
-                 fields="ts_code,trade_date,circ_mv,total_mv,turnover_rate")
-    keep = ["trade_date", "open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
-    d = d[[c for c in keep if c in d.columns]].copy()
+                 fields="trade_date,circ_mv")
+    d = d[[c for c in PX_COLS if c in d.columns]].copy()
     if b is not None and len(b):
         d = d.merge(b[["trade_date", "circ_mv"]], on="trade_date", how="left")
     else:
         d["circ_mv"] = np.nan
     d["trade_date"] = pd.to_datetime(d["trade_date"], format="%Y%m%d")
+    for c in d.columns:
+        if c != "trade_date":
+            d[c] = pd.to_numeric(d[c], errors="coerce").astype(np.float32)   # 内存减半
     d = d.sort_values("trade_date").reset_index(drop=True)
     try:
         with open(path, "wb") as f:
-            pickle.dump(d, f)
+            pickle.dump({"start": start, "end": end, "df": d}, f, protocol=4)
     except Exception:
         pass
     return d
+
+
+def download_all(token: str, codes: List[str], start: str, end: str, lim: Limiter,
+                 use_cache: bool, workers: int,
+                 progress_cb: Optional[Callable] = None) -> Dict[str, pd.DataFrame]:
+    """
+    多线程下载。瓶颈是单次请求的网络往返（约 0.5-1 秒），不是频次上限，
+    所以并发能把吞吐从「延迟受限」拉到「频次受限」，4 线程通常快 3-4 倍。
+    限流器全局共享，账号层面的频次不会被突破。
+    """
+    import tushare as ts
+
+    local = threading.local()
+
+    def pro_get():
+        if not hasattr(local, "pro"):
+            local.pro = ts.pro_api(token)     # 每线程一个客户端，不共享连接
+        return local.pro
+
+    out: Dict[str, pd.DataFrame] = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+        futs = {ex.submit(fetch_one_stock, pro_get, lim, c, start, end, use_cache): c
+                for c in codes}
+        for fut in as_completed(futs):
+            c = futs[fut]
+            try:
+                d = fut.result()
+            except Exception as e:
+                d = None
+                with _ERR_LOCK:
+                    API_ERRORS.append(f"{c}: {e}")
+            if d is not None and len(d) > 30:
+                out[c] = d
+            done += 1
+            if progress_cb is not None and (done % 10 == 0 or done == len(codes)):
+                progress_cb(done, len(codes), len(out))   # 回调只在主线程消费
+    return out
+
+
+def prescreen_by_mv(pro, lim: Limiter, codes: List[str], start: str, end: str,
+                    mv_lo: float, mv_hi: float, n_samples: int = 16) -> List[str]:
+    """
+    用全市场快照做市值预筛：只保留「历史上曾经落在市值区间（放宽后）」的股票。
+    每个采样日一次全市场 daily_basic，16 次调用就能砍掉三分之一以上的下载量。
+    用的是各采样日的当期市值，不是今天的市值，所以不引入前视偏差；
+    代价是两个采样点之间短暂进出区间的极少数股票会被漏掉。
+    """
+    cal = api_call(pro.trade_cal, lim, exchange="SSE", start_date=start,
+                   end_date=end, is_open="1")
+    if cal is None or len(cal) == 0:
+        return codes
+    days = sorted(cal["cal_date"].astype(str).tolist())
+    if len(days) <= n_samples:
+        picks = days
+    else:
+        idx = np.linspace(0, len(days) - 1, n_samples).astype(int)
+        picks = [days[i] for i in idx]
+
+    ever = set()
+    lo_g, hi_g = mv_lo * 1e4 * 0.6, mv_hi * 1e4 * 1.5     # 上下各留足余量
+    for d in picks:
+        df = api_call(pro.daily_basic, lim, trade_date=d, fields="ts_code,circ_mv")
+        if df is None or len(df) == 0:
+            continue
+        m = (df["circ_mv"] >= lo_g) & (df["circ_mv"] <= hi_g)
+        ever |= set(df.loc[m, "ts_code"].tolist())
+    if not ever:
+        return codes
+    kept = [c for c in codes if c in ever]
+    return kept if len(kept) >= 50 else codes
 
 
 def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -222,41 +318,47 @@ def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     adj_close[t] = adj_close[t-1] * (1 + pct_chg/100)
     adj_open[t]  = adj_close[t-1] * open[t] / pre_close[t]
     """
-    codes = [c for c, d in px.items() if d is not None and len(d) > 30]
+    codes = sorted([c for c, d in px.items() if d is not None and len(d) > 30])
     if not codes:
         raise ValueError("没有可用的价格数据")
 
+    idxed = {c: px[c].set_index("trade_date") for c in codes}
+
     def wide(col: str) -> pd.DataFrame:
-        s = {c: px[c].set_index("trade_date")[col] for c in codes if col in px[c].columns}
-        return pd.DataFrame(s).sort_index()
+        cols = [idxed[c][col] if col in idxed[c].columns
+                else pd.Series(dtype=np.float32) for c in codes]
+        w = pd.concat(cols, axis=1, keys=codes).sort_index()
+        return w.astype(np.float32)
 
     raw_close = wide("close")
-    raw_open = wide("open")
-    pre_close = wide("pre_close")
-    pct = wide("pct_chg")
     amount = wide("amount")            # 单位: 千元
     circ_mv = wide("circ_mv")          # 单位: 万元
 
     cal = raw_close.index
     tradable = raw_close.notna()       # 有行情=可交易，NaN 视为停牌
 
-    adj_close = (1.0 + pct.fillna(0.0) / 100.0).cumprod()
+    # 复权价：cumprod 用 float64 累乘 2000 步以免误差累积，存回 float32
+    pct = wide("pct_chg")
+    adj_close = (1.0 + pct.astype(np.float64).fillna(0.0) / 100.0).cumprod()
     adj_close = adj_close.where(tradable).ffill()
-    prev_adj = adj_close.shift(1)
-    ratio_o = (raw_open / pre_close).where(pre_close > 0)
-    adj_open = prev_adj * ratio_o
+    del pct
+
+    raw_open = wide("open")
+    pre_close = wide("pre_close")
+    # adj_open 只用来当成交价，不参与链式累乘，降到 float32 无妨；
+    # adj_close 逐日累乘且要反复做 pct_change（相近数相减会放大误差），保持 float64。
+    adj_open = (adj_close.shift(1) * (raw_open / pre_close).where(pre_close > 0)).astype(np.float32)
 
     # 涨跌停判定（创业板/科创板 20%，其余 10%）
-    lim_pct = pd.Series(
-        [0.20 if (c.startswith("30") or c.startswith("688")) else 0.10 for c in raw_close.columns],
-        index=raw_close.columns, dtype=float)
-    up_gate = pre_close.mul(1.0 + lim_pct, axis=1) - 0.004
-    dn_gate = pre_close.mul(1.0 - lim_pct, axis=1) + 0.004
-    limit_up_open = (raw_open >= up_gate) & tradable
-    limit_dn_open = (raw_open <= dn_gate) & tradable
+    lim_pct = pd.Series([0.20 if (c.startswith("30") or c.startswith("688")) else 0.10
+                         for c in codes], index=codes, dtype=np.float32)
+    limit_up_open = (raw_open >= pre_close.mul(1.0 + lim_pct, axis=1) - 0.004) & tradable
+    limit_dn_open = (raw_open <= pre_close.mul(1.0 - lim_pct, axis=1) + 0.004) & tradable
+    del raw_open, pre_close, idxed      # 之后再也用不到，立刻释放
+    gc.collect()
 
-    return dict(cal=cal, codes=list(raw_close.columns),
-                raw_close=raw_close, raw_open=raw_open, amount=amount, circ_mv=circ_mv,
+    return dict(cal=cal, codes=codes,
+                raw_close=raw_close, amount=amount, circ_mv=circ_mv,
                 adj_close=adj_close, adj_open=adj_open, tradable=tradable,
                 limit_up_open=limit_up_open, limit_dn_open=limit_dn_open)
 
@@ -267,37 +369,41 @@ def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
 def compute_factors(adj_close: pd.DataFrame, amount: pd.DataFrame, win: int = 60) -> Dict[str, pd.DataFrame]:
     """全部因子一次性向量化算完，返回 {因子名: 宽表}。"""
     A = adj_close
-    logp = np.log(A.where(A > 0))
-    ret = A.pct_change()
+    out: Dict[str, pd.DataFrame] = {}
 
-    mom = A.shift(5) / A.shift(win + 5) - 1.0
+    ret = A.pct_change()
     vol = ret.rolling(win).std() * np.sqrt(252.0)
-    mom_ra = mom / vol.where(vol > 1e-9)
+    out["mom_ra"] = ((A.shift(5) / A.shift(win + 5) - 1.0) / vol.where(vol > 1e-9))
+    del ret, vol
 
     # 滚动线性回归: 斜率与 R²。窗口内自变量取全局序号，相关性对平移不变。
-    t = pd.Series(np.arange(len(A.index), dtype=float), index=A.index)
+    # 方差用 E[y²]-E[y]² 会有抵消误差，float32 精度不够，这一段必须走 float64。
+    logp = np.log(A.where(A > 0)).astype(np.float64)
+    t = pd.Series(np.arange(len(A.index), dtype=np.float64), index=A.index)
     my = logp.rolling(win).mean()
     mt = t.rolling(win).mean()
-    mty = logp.mul(t, axis=0).rolling(win).mean()
-    cov_ty = mty.sub(my.mul(mt, axis=0))
+    cov_ty = logp.mul(t, axis=0).rolling(win).mean().sub(my.mul(mt, axis=0))
     var_t = (win * win - 1.0) / 12.0
     var_y = (logp ** 2).rolling(win).mean() - my ** 2
-    slope = cov_ty / var_t
     r2 = (cov_ty ** 2) / (var_t * var_y.where(var_y > 1e-12))
-    trend_q = slope * 252.0 * r2.clip(0.0, 1.0)
+    out["trend_q"] = (cov_ty / var_t) * 252.0 * r2.clip(0.0, 1.0)
+    del logp, my, mt, cov_ty, var_y, r2, t
 
     r60 = A / A.shift(win) - 1.0
-    rel_str = r60.sub(r60.mean(axis=1), axis=0)
+    out["rel_str"] = r60.sub(r60.mean(axis=1), axis=0)
+    del r60
 
-    a5 = amount.rolling(5).mean()
     a60 = amount.rolling(win).mean()
-    vol_exp = a5 / a60.where(a60 > 1e-9)
+    out["vol_exp"] = amount.rolling(5).mean() / a60.where(a60 > 1e-9)
+    del a60
 
-    dist_hi = A / A.rolling(win).max() - 1.0
-    rev5 = A / A.shift(5) - 1.0
+    out["dist_hi"] = A / A.rolling(win).max() - 1.0
+    out["rev5"] = A / A.shift(5) - 1.0
 
-    return {"mom_ra": mom_ra, "trend_q": trend_q, "rel_str": rel_str,
-            "vol_exp": vol_exp, "dist_hi": dist_hi, "rev5": rev5}
+    for k in list(out):
+        out[k] = out[k].astype(np.float32)
+    gc.collect()
+    return out
 
 
 def build_eligibility(panel: dict, basic: pd.DataFrame, uni: pd.DataFrame,
@@ -318,38 +424,38 @@ def build_eligibility(panel: dict, basic: pd.DataFrame, uni: pd.DataFrame,
     ok &= rc >= min_price
     ok &= amt.rolling(20).mean() >= min_amt_yi * 1e5
 
-    # 上市满 N 天 + 未退市 + 非 ST
-    bmap = basic.set_index("ts_code") if len(basic) else pd.DataFrame()
-    listed = pd.DataFrame(True, index=cal, columns=codes)
-    for c in codes:
-        if c in bmap.index:
-            row = bmap.loc[c]
-            row = row.iloc[0] if isinstance(row, pd.DataFrame) else row
-            ld = pd.to_datetime(str(row.get("list_date")), format="%Y%m%d", errors="coerce")
-            if pd.notna(ld):
-                listed[c] &= (cal >= ld + pd.Timedelta(days=min_list_days))
-            dd = pd.to_datetime(str(row.get("delist_date")), format="%Y%m%d", errors="coerce")
-            if pd.notna(dd):
-                listed[c] &= (cal < dd - pd.Timedelta(days=5))
-            nm = str(row.get("name", ""))
-            if "ST" in nm.upper() or "退" in nm:
-                listed[c] = False
-    ok &= listed
+    # ---- 以下全部按整块广播计算，不逐只股票循环 ----
+    cal_col = cal.to_numpy(dtype="datetime64[ns]").reshape(-1, 1)
+    FAR_PAST = np.datetime64("1990-01-01")
+    FAR_FUTURE = np.datetime64("2099-01-01")
 
-    # 申万成分进出日期（有则用，做时点行业归属）
-    if len(uni) and "in_date" in uni.columns:
-        um = uni.set_index("ts_code")
-        for c in codes:
-            if c not in um.index:
-                continue
-            r = um.loc[c]
-            r = r.iloc[0] if isinstance(r, pd.DataFrame) else r
-            idt = pd.to_datetime(str(r.get("in_date")), format="%Y%m%d", errors="coerce")
-            odt = pd.to_datetime(str(r.get("out_date")), format="%Y%m%d", errors="coerce")
-            if pd.notna(idt):
-                ok[c] &= (cal >= idt)
-            if pd.notna(odt):
-                ok[c] &= (cal < odt)
+    def _dates(df: pd.DataFrame, col: str, fill) -> np.ndarray:
+        """按 codes 顺序取一列日期，缺失填 fill，返回 (1, N) 便于广播。"""
+        if not len(df) or col not in df.columns:
+            return np.full((1, len(codes)), fill, dtype="datetime64[ns]")
+        s = df.drop_duplicates("ts_code").set_index("ts_code")[col]
+        s = pd.to_datetime(s.reindex(codes).astype(str), format="%Y%m%d", errors="coerce")
+        return s.fillna(pd.Timestamp(fill)).to_numpy(dtype="datetime64[ns]").reshape(1, -1)
+
+    # 上市满 N 天 + 未退市
+    ld = _dates(basic, "list_date", FAR_PAST) + np.timedelta64(int(min_list_days), "D")
+    dd = _dates(basic, "delist_date", FAR_FUTURE) - np.timedelta64(5, "D")
+    mask = (cal_col >= ld) & (cal_col < dd)
+
+    # 申万成分进出日期（时点行业归属）
+    if len(uni):
+        mask &= (cal_col >= _dates(uni, "in_date", FAR_PAST))
+        mask &= (cal_col < _dates(uni, "out_date", FAR_FUTURE))
+
+    ok &= pd.DataFrame(mask, index=cal, columns=codes)
+
+    # 非 ST / 非退市整理股（按当前名称判断，见界面说明）
+    if len(basic) and "name" in basic.columns:
+        nm = basic.drop_duplicates("ts_code").set_index("ts_code")["name"].reindex(codes).fillna("")
+        bad = nm.str.upper().str.contains("ST") | nm.str.contains("退")
+        if bad.any():
+            ok.loc[:, bad.to_numpy()] = False
+
     return ok.fillna(False)
 
 
@@ -467,12 +573,12 @@ def run_backtest(panel: dict, score: pd.DataFrame, elig: pd.DataFrame,
     codes = panel["codes"]
     cidx = {c: j for j, c in enumerate(codes)}
 
-    AC = panel["adj_close"].to_numpy(dtype=float)
-    AO = panel["adj_open"].to_numpy(dtype=float)
+    AC = panel["adj_close"].to_numpy(dtype=np.float64)
+    AO = panel["adj_open"].to_numpy(dtype=np.float32)
     TRD = panel["tradable"].to_numpy(dtype=bool)
     LU = panel["limit_up_open"].to_numpy(dtype=bool)
     LD = panel["limit_dn_open"].to_numpy(dtype=bool)
-    SC = score.reindex(index=cal, columns=codes).to_numpy(dtype=float)
+    SC = score.reindex(index=cal, columns=codes).to_numpy(dtype=np.float32)
     EL = elig.reindex(index=cal, columns=codes).fillna(False).to_numpy(dtype=bool)
 
     # 市场宽度 -> 目标仓位
@@ -686,6 +792,36 @@ def perf_stats(eq: pd.Series, trades: pd.DataFrame, npos: pd.Series,
 # ======================================================================
 # 五、Streamlit 界面
 # ======================================================================
+def _mem_mb(panel: dict, factors: Optional[dict] = None) -> float:
+    tot = 0
+    for k, v in panel.items():
+        if isinstance(v, pd.DataFrame):
+            tot += v.memory_usage(deep=False).sum()
+    if factors:
+        for v in factors.values():
+            tot += v.memory_usage(deep=False).sum()
+    return tot / 1e6
+
+
+# Streamlit 每动一次控件就重跑整个脚本。1500 只股票时，不加缓存的话
+# build_eligibility + composite_score 会在每次拖动滑块时重算一遍全量矩阵，
+# 几秒钟的卡顿加上反复分配大数组，是这个应用最现实的崩溃来源。
+if st is not None:
+    @st.cache_data(show_spinner=False, max_entries=2)
+    def cached_elig(_panel, _basic, _uni, key: str, mv_lo, mv_hi, min_price, min_amt, min_days):
+        return build_eligibility(_panel, _basic, _uni, mv_lo, mv_hi, min_price, min_amt, int(min_days))
+
+    @st.cache_data(show_spinner=False, max_entries=2)
+    def cached_score(_factors, _elig, key: str, wkey: tuple):
+        return composite_score(_factors, _elig, dict(wkey))
+else:                                              # 无 streamlit 时直通
+    def cached_elig(_panel, _basic, _uni, key, mv_lo, mv_hi, min_price, min_amt, min_days):
+        return build_eligibility(_panel, _basic, _uni, mv_lo, mv_hi, min_price, min_amt, int(min_days))
+
+    def cached_score(_factors, _elig, key, wkey):
+        return composite_score(_factors, _elig, dict(wkey))
+
+
 def _fmt(v) -> str:
     if isinstance(v, (int, np.integer)):
         return str(int(v))
@@ -712,8 +848,15 @@ def main():
         end = c2.date_input("结束", dt.date.today())
         l1 = st.multiselect("申万一级行业（整体纳入）", SW_L1_ALL, SW_L1_DEFAULT)
         l2 = st.multiselect("申万二级行业（子行业纳入）", SW_L2_ALL, SW_L2_DEFAULT)
-        per_min = st.slider("每分钟请求上限", 60, 800, 400, 20)
-        use_cache = st.checkbox("使用本地缓存", True)
+        d1, d2 = st.columns(2)
+        workers = d1.slider("并发线程数", 1, 8, 4)
+        per_min = d2.slider("每分钟请求上限", 60, 800, 400, 20)
+        st.caption("频次限制按账号算，线程共用一个限流器，不会因并发被封。"
+                   "上限按你的 Tushare 积分设：2000 积分对应 500/分钟。")
+        use_cache = st.checkbox("使用本地缓存（中断可续传）", True)
+        prescreen = st.checkbox("下载前先做市值预筛", True,
+                                help="用 16 次全市场快照，只保留历史上曾进入市值区间的股票。"
+                                     "用的是各采样日的当期市值，无前视偏差，通常能砍掉 1/3 下载量。")
         max_stk = st.number_input("最多下载股票数（0=不限）", 0, 3000, 0, 50)
         dl = st.button("下载 / 更新数据", type="primary", use_container_width=True)
 
@@ -734,42 +877,73 @@ def main():
             st.error("未安装 tushare：pip install tushare")
             st.stop()
         ts.set_token(token)
-        pro = ts.pro_api()
+        pro = ts.pro_api(token)
         lim = Limiter(per_min)
+        API_ERRORS.clear()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
+        # 重新下载前先释放上一份数据，否则新旧两份同时在内存里
+        for k in ("panel", "factors", "last_bt"):
+            ss.pop(k, None)
+        gc.collect()
+
         with st.status("正在获取数据…", expanded=True) as status:
-            st.write("1/3 取申万成分股…")
+            st.write("1/4 取申万成分股…")
             uni = fetch_universe(pro, lim, l1, l2)
             if not len(uni):
                 st.error("行业成分股为空。可能是 Tushare 积分不足，无法调用申万接口。")
                 st.stop()
-            st.write(f"   候选 {len(uni)} 只")
+            codes = list(uni["ts_code"])
+            st.write(f"   候选 {len(codes)} 只")
 
-            st.write("2/3 取股票基础信息（含退市）…")
+            st.write("2/4 取股票基础信息（含退市）…")
             basic = fetch_stock_basic(pro, lim)
 
-            st.write("3/3 下载日线与每日指标…")
-            codes = list(uni["ts_code"])
+            if prescreen:
+                st.write("3/4 市值预筛…")
+                n0 = len(codes)
+                codes = prescreen_by_mv(pro, lim, codes, s_str, e_str, mv_lo, mv_hi)
+                st.write(f"   {n0} → {len(codes)} 只（剔除 {n0-len(codes)} 只从未进入市值区间的）")
+            else:
+                st.write("3/4 跳过预筛")
+
             if max_stk:
                 codes = codes[: int(max_stk)]
-            bar = st.progress(0.0)
-            px, fail = {}, 0
-            for k, c in enumerate(codes):
-                d = fetch_one_stock(pro, lim, c, s_str, e_str, use_cache)
-                if d is not None:
-                    px[c] = d
-                else:
-                    fail += 1
-                if k % 5 == 0 or k == len(codes) - 1:
-                    bar.progress((k + 1) / len(codes), text=f"{k+1}/{len(codes)}  失败 {fail}")
+            est_mb = len(codes) * 1950 * 4 * 14 / 1e6
+            st.write(f"4/4 并发下载 {len(codes)} 只（{workers} 线程，预计常驻内存 ~{est_mb:.0f} MB）…")
 
+            bar = st.progress(0.0)
+            t0 = time.time()
+
+            def _cb(done, total, ok):
+                el = time.time() - t0
+                eta = el / max(done, 1) * (total - done)
+                bar.progress(done / total,
+                             text=f"{done}/{total}  成功 {ok}  已用 {el/60:.1f} 分  剩余约 {eta/60:.1f} 分")
+
+            px = download_all(token, codes, s_str, e_str, lim, use_cache, workers, _cb)
+            if not px:
+                st.error("一只股票都没下到。检查 Token、积分权限和网络。")
+                st.stop()
+
+            st.write("构建面板与因子…")
             panel = build_panel(px)
+            px.clear()
+            del px
+            gc.collect()
+            factors = compute_factors(panel["adj_close"], panel["amount"])
+
             ss["panel"] = panel
             ss["basic"] = basic
             ss["uni"] = uni
-            ss["factors"] = compute_factors(panel["adj_close"], panel["amount"])
-            status.update(label=f"完成：{len(panel['codes'])} 只，{len(panel['cal'])} 个交易日", state="complete")
+            ss["factors"] = factors
+            ss["data_key"] = f"{len(panel['codes'])}|{panel['cal'][0]:%Y%m%d}|{panel['cal'][-1]:%Y%m%d}"
+            ss["api_errors"] = list(API_ERRORS)
+            st.cache_data.clear()
+            status.update(
+                label=f"完成：{len(panel['codes'])} 只 × {len(panel['cal'])} 个交易日，"
+                      f"实占内存 {_mem_mb(panel, factors):.0f} MB，耗时 {(time.time()-t0)/60:.1f} 分钟",
+                state="complete")
 
     if ss.get("panel") is None:
         st.info("左侧填入 Tushare Token 后点「下载 / 更新数据」。首次全量下载约需 5-15 分钟，之后走本地缓存。")
@@ -777,8 +951,8 @@ def main():
 
     panel, basic, uni, factors = ss["panel"], ss["basic"], ss["uni"], ss["factors"]
 
-    elig = build_eligibility(panel, basic, uni, mv_lo, mv_hi, min_price, min_amt, int(min_days))
-    ss["elig"] = elig
+    dkey = ss.get("data_key", "na")
+    elig = cached_elig(panel, basic, uni, dkey, mv_lo, mv_hi, min_price, min_amt, int(min_days))
     rebal_all = weekly_rebal_dates(panel["cal"])
 
     t1, t2, t3, t4 = st.tabs(["数据总览", "因子分层检验", "策略回测", "当前选股"])
@@ -790,7 +964,8 @@ def main():
         a.metric("下载股票数", len(panel["codes"]))
         b.metric("交易日数", len(panel["cal"]))
         c.metric("当前合格数", int(cnt.iloc[-1]))
-        d.metric("历史平均合格数", f"{cnt.mean():.0f}")
+        d.metric("数据占用内存", f"{_mem_mb(panel, factors):.0f} MB")
+        st.caption(f"历史平均合格数 {cnt.mean():.0f} 只")
         st.subheader("每日合格股票数量")
         st.line_chart(cnt.rename("合格数"))
         st.caption("若某段时间合格数长期低于 30，说明市值/股价门槛在那个阶段过严，排名的区分度会下降。")
@@ -854,7 +1029,7 @@ def main():
             st.caption("建议：2018-2022 作为样本内调参，2023 年之后只跑一次，不回头改。")
 
         if st.button("运行回测", type="primary"):
-            score = composite_score(factors, elig, weights)
+            score = cached_score(factors, elig, dkey, tuple(sorted(weights.items())))
             rb = [d for d in rebal_all if pd.Timestamp(bt_s) <= d <= pd.Timestamp(bt_e)]
             prm = dict(capital=1_000_000.0, top_n=top_n, buffer_rank=buf,
                        min_hold_w=min_hw, max_hold_w=max_hw,
@@ -906,7 +1081,7 @@ def main():
     with t4:
         st.subheader("最新一期选股")
         weights_now = {k: st.session_state.get("w_" + k, FACTOR_DEF[k][1]) for k in FACTOR_KEYS}
-        score = composite_score(factors, elig, weights_now)
+        score = cached_score(factors, elig, dkey, tuple(sorted(weights_now.items())))
         d = panel["cal"][-1]
         s = score.loc[d].dropna().sort_values(ascending=False)
         if not len(s):
