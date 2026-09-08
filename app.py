@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""R27.1 固定信号日历史窗口、保留13周市场分类的可重复性审计。
+"""R28 冻结R27.1规则的分层与随机基准诊断，不优化策略。
 
 R3中性Top2和市场三分法保持不变；R6正式Top1，第二名保留影子。
 强市完整整理再启动池先筛ATR3/ATR13在0.70—0.90，再按ATR升序取Top1。
 R7与R11第二名只做影子观察；所有正式信号采用无限资金等额独立成交。
-正式结果保留R24基准；仅比较两个提前退出假设，不自动选优。
+正式结果保持不变；增加全基础池B10标签、同日分层及随机对照，不自动选优。
 """
 
 from __future__ import annotations
@@ -36,16 +36,16 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R27.1-SIGNAL-DATE-DETERMINISTIC"
-APP_TITLE = "R27.1 历史信号可重复性审计"
+APP_VERSION = "R28-FROZEN-EDGE-DIAGNOSTIC"
+APP_TITLE = "R28 同条件选股增益诊断"
 ENGINE_PATCH = "R27.1-FIXED-WEEK-WINDOW"
 # R11正式强市入口与R22不同，必须使用新的配置身份和结果文件；行情缓存继续复用。
 STRATEGY_CONFIG_VERSION = "R27.1-FROZEN13-FIXED60W-FLOAT64"
 
-CHECKPOINT_FILE = "r27_1_reproducible_candidates.csv"
-SCAN_LEDGER_FILE = "r27_1_reproducible_scanned_dates.csv"
-RUN_TASK_FILE = "r27_1_reproducible_running_task.json"
-RESULT_STATE_GUARD_FILE = "r27_1_reproducible_result_state.guard"
+CHECKPOINT_FILE = "r28_candidates.csv"
+SCAN_LEDGER_FILE = "r28_scanned_dates.csv"
+RUN_TASK_FILE = "r28_running_task.json"
+RESULT_STATE_GUARD_FILE = "r28_result_state.guard"
 FROZEN_POOL_FILE = "r27_1_frozen_tech_pool.json"
 SIGNAL_WINDOW_WEEKS = 60
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
@@ -94,6 +94,9 @@ R27_EXIT_SCHEMES = {
     "L5": "收盘跌破买价5%→次日开盘退出",
     "W1": "第5交易日收盘未盈利→次日开盘退出",
 }
+R28_SCHEMA = "R28-EDGE-1"
+R28_RANDOM_SEED = 280901
+R28_RANDOM_REPETITIONS = 2000
 
 # -----------------------------------------------------------------------------
 # 通用安全读写
@@ -2243,6 +2246,7 @@ def mark_scan_complete(
     data_gap_dates=None,
     candidate_row_count: int | None = None,
     market_regime: str = "未知",
+    r28_audit_json: str = "",
 ):
     gap_dates = sorted(set(str(item) for item in (data_gap_dates or []) if item))
     ledger = read_csv_safe(SCAN_LEDGER_FILE)
@@ -2265,6 +2269,7 @@ def mark_scan_complete(
                 "Market_Data_Gap_Dates": ",".join(gap_dates),
                 "Config_ID": config_id,
                 "Updated_At": datetime.now().isoformat(timespec="seconds"),
+                "R28_Audit_JSON": r28_audit_json,
             }
         ]
     )
@@ -2283,7 +2288,12 @@ def completed_scan_dates(config_id: str):
             {"COMPLETED", "COMPLETED_WITH_GAPS", "SKIPPED_DATA_GAP"}
         )
     ]
-    return set(filter(None, (parse_yyyymmdd(value) for value in match["Signal_Date"])))
+    # 旧包仍可查看原报告，但没有全池对照，不能冒充R28已完成。
+    available = match.get("R28_Audit_JSON", pd.Series("", index=match.index)).map(r28_payload_valid)
+    # 本轮已记录的行情缺口必须允许任务走完；下次主动启动由原机制重试。
+    # 否则缺失扫描日永远没有审计JSON，会在同一运行中无限循环。
+    available |= match["Scan_Status"].isin({"SKIPPED_DATA_GAP", "COMPLETED_WITH_GAPS"})
+    return set(filter(None, (parse_yyyymmdd(value) for value in match.loc[available, "Signal_Date"])))
 
 def invalidate_recent_ledger_once(config_id: str, start_date: str, end_date: str):
     """新任务重算最近10周，并重试此前因数据缺口降级或跳过的所有周。"""
@@ -2483,9 +2493,12 @@ def scan_one_date(
     roundtrip_cost_pct: float,
     is_preview_mode: bool,
     weekly_data_mode: str,
+    lease_heartbeat=None,
 ):
     pool_records: list[dict[str, Any]] = []
-    for ts_code in whitelist_keys:
+    for pool_index, ts_code in enumerate(whitelist_keys):
+        if pool_index % 32 == 0:
+            r28_heartbeat(lease_heartbeat)
         stock = stock_qfq_dict.get(ts_code)
         if stock is None or signal_date not in stock.index:
             continue
@@ -2527,7 +2540,10 @@ def scan_one_date(
         pool_records.append(snapshot)
 
     if not pool_records:
-        return pd.DataFrame(), 0, 0
+        empty = pd.DataFrame()
+        if not is_preview_mode:
+            empty.attrs["R28_Audit_JSON"] = r28_pack(pd.DataFrame(), signal_date, "未知", 0)
+        return empty, 0, 0
     pool = pd.DataFrame(pool_records)
     candidates, raw_count, eligible_count = score_frozen_candidates(pool)
     if not candidates.empty:
@@ -2586,7 +2602,297 @@ def scan_one_date(
                 [candidates.reset_index(drop=True), pd.DataFrame(outcome_rows)],
                 axis=1,
             )
+    if not is_preview_mode:
+        candidates.attrs["R28_Audit_JSON"] = r28_scan_pool(
+            pool, candidates, signal_date, stock_qfq_dict, roundtrip_cost_pct,
+            market_dates, lease_heartbeat,
+        )
     return candidates, raw_count, eligible_count
+
+
+def r28_heartbeat(callback):
+    if callback is not None and callback() is False:
+        raise RuntimeError("任务租约已转移，R28停止计算；已完成周仍保留。")
+
+
+def r28_track_baseline(code, signal_date, raw_close, stocks, cost, market_dates):
+    """只算冻结B10，省去全池8周分级和两个已失败的软退出实验。
+
+    买入检查和JSON价格精度与track_w3_future_path保持一致；退出直接调用
+    原r27_exit_simulation，不另造一套成交规则。回归测试对照原完整函数。
+    """
+    out = dict(Entry_Tradable=False, Entry_Date=None, Entry_Status="无行情",
+               Status="未成交", Return_pct=np.nan, Exit_Date=None, Exit_Day=np.nan,
+               Reason="", Buy_Price=np.nan, Input_Path_Hash="")
+    stock = stocks.get(code)
+    if stock is None:
+        return out
+    stock = canonical_signal_stock(stock, signal_date)
+    calendar = stock.index if market_dates is None else market_dates
+    days = [str(d) for d in calendar if str(d) > signal_date][:HOLD_WEEKS * MARKET_DAYS_PER_WEEK]
+    if not days:
+        out.update(Entry_Status="等待下一交易日", Status="待完成")
+        return out
+    out["Entry_Date"] = days[0]
+    if days[0] not in stock.index:
+        out["Entry_Status"] = "下一交易日停牌或无行情，无法成交"
+        return out
+    future = stock.reindex(days)
+    first = future.iloc[0]
+    buy = _safe_float(first.get("open"))
+    if not math.isfinite(buy) or buy <= 0:
+        out["Entry_Status"] = "下一交易日开盘价缺失"
+        return out
+    ro, rh, rl, rc = [_safe_float(first.get("raw_" + c), _safe_float(first.get(c)))
+                      for c in ("open", "high", "low", "close")]
+    threshold = .195 if code.startswith(("300", "301", "688", "689")) else .095
+    if (all(math.isfinite(v) for v in (rh, rl, rc))
+            and np.isclose(rh, rl, rtol=0, atol=max(.001, ro * 1e-5))
+            and rc / raw_close - 1 >= threshold):
+        out["Entry_Status"] = "下一交易日一字涨停，无法成交"
+        return out
+    cols = [c for c in ("open", "high", "low", "close", "raw_open", "raw_high",
+                        "raw_low", "raw_close", "vol") if c in future]
+    bars = future[cols].copy()
+    bars.insert(0, "date", future.index.astype(str))
+    encoded = bars.to_json(orient="records", double_precision=10)
+    out.update(Entry_Tradable=True, Entry_Status="可成交", Buy_Price=buy,
+               Input_Path_Hash=hashlib.sha256(encoded.encode()).hexdigest())
+    out.update(r27_exit_simulation(json.loads(encoded), buy, cost, code, "B10"))
+    return out
+
+
+def r28_pack(frame, signal_date, regime, future_days, cost=None):
+    data = frame.to_json(orient="split", index=False, double_precision=15)
+    return json.dumps(dict(schema=R28_SCHEMA, signal_date=str(signal_date),
+                           regime=regime, future_days=int(future_days), cost=cost,
+                           count=len(frame), data=data,
+                           sha256=hashlib.sha256(data.encode()).hexdigest()),
+                      ensure_ascii=False, separators=(",", ":"))
+
+
+def r28_unpack(raw):
+    obj = json.loads(str(raw))
+    if not isinstance(obj, dict) or obj.get("schema") != R28_SCHEMA:
+        raise ValueError("缺少R28全池对照，需补扫")
+    if hashlib.sha256(obj["data"].encode()).hexdigest() != obj["sha256"]:
+        raise ValueError("R28全池对照校验和不一致")
+    data = json.loads(obj["data"])
+    frame = pd.DataFrame(data["data"], columns=data["columns"])
+    if len(frame) != obj["count"]:
+        raise ValueError("R28全池行数不一致")
+    if len(frame):
+        required = {"ts_code", "Candidate", "Selected", "Entry_Tradable", "Status", "Return_pct"}
+        if not required.issubset(frame) or frame.ts_code.duplicated().any():
+            raise ValueError("R28缺少字段或重复股票")
+        if (_bool_series(frame, "Selected") & ~_bool_series(frame, "Candidate")).any():
+            raise ValueError("正式入选不在分支候选池")
+        exited = frame.Status.eq("已退出")
+        if not np.isfinite(pd.to_numeric(frame.loc[exited, "Return_pct"], errors="coerce")).all():
+            raise ValueError("R28退出收益无效")
+    return obj, frame
+
+
+def r28_payload_valid(raw):
+    try:
+        r28_unpack(raw)
+        return True
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+def r28_scan_pool(pool, candidates, signal_date, stocks, cost, market_dates, heartbeat=None):
+    """成员资格只来自已冻结的信号字段；未来路径只作标签，不参与筛选。"""
+    scored = candidates.set_index("ts_code") if not candidates.empty else pd.DataFrame()
+    regime = _market_state_metrics(pool)["Market_Regime"]
+    rows = []
+    for i, (_, row) in enumerate(pool.sort_values("ts_code").iterrows()):
+        if i % 16 == 0:
+            r28_heartbeat(heartbeat)
+        code = str(row.ts_code)
+        candidate = selected = False
+        rank = np.nan
+        if code in scored.index:
+            s = scored.loc[code]
+            candidate = bool(s.get("Entry_Eligible", False))
+            # 强市ATR区间是资格，不把区间外股票混进排名对照。
+            if regime == "强势":
+                candidate = candidate and bool(s.get("R11_ATR_Band_Pass", False))
+            selected = bool(s.get("R19_Selected", False))
+            rank = _safe_float(s.get("Rank"))
+        record = {k: row.get(k) for k in ("ts_code", "name", "Industry", "Raw_Close",
+                                          "Circ_MV_Billion", "R271_Input_Hash")}
+        record.update(Candidate=candidate, Selected=selected, Rank=rank)
+        record.update(r28_track_baseline(code, signal_date, float(row.Raw_Close), stocks, cost, market_dates))
+        rows.append(record)
+    future_days = sum(str(d) > signal_date for d in market_dates) if market_dates is not None else 0
+    return r28_pack(pd.DataFrame(rows), signal_date, regime, future_days, float(cost))
+
+
+def r28_paired_interval(weekly, numerator, denominator):
+    """固定4个扫描周区组；无信号周仍占位置，不能把相邻交易当独立样本。"""
+    if np.count_nonzero(denominator) < 8 or len(weekly) < 4:
+        return np.nan, np.nan
+    n = len(weekly)
+    rng = np.random.default_rng(R28_RANDOM_SEED + 4)
+    starts = rng.integers(0, n - 3, size=(R28_RANDOM_REPETITIONS, math.ceil(n / 4)))
+    idx = (starts[:, :, None] + np.arange(4)).reshape(R28_RANDOM_REPETITIONS, -1)[:, :n]
+    den = denominator[idx].sum(axis=1)
+    num = numerator[idx].sum(axis=1)
+    ratios = np.divide(num, den, out=np.full_like(num, np.nan), where=den > 0)
+    return tuple(np.nanquantile(ratios, [.025, .975]))
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def r28_reports(history, ledger):
+    """主比较只用相同成熟、有正式信号且全池结果可核实的星期。
+
+    每周三组权重均为正式计划名额k；随机在全部信号日成员中无放回抽k只，
+    不成交名额按0，不补位。任何已买未退出/无效路径使整周暂不配对，
+    不把早止损股先收入样本。随机区间是条件随机分布，不是过拟合概率。
+    """
+    checks, weeks, details = [], [], []
+    blocks = []
+    selected_history = history.loc[_bool_series(history, "R19_Selected")].copy()
+    if not selected_history.empty:
+        selected_history["Signal_Date"] = selected_history.Signal_Date.map(parse_yyyymmdd)
+    ordered_ledger = ledger.sort_values("Signal_Date") if "Signal_Date" in ledger else ledger
+    for _, entry in ordered_ledger.iterrows():
+        day = parse_yyyymmdd(entry.get("Signal_Date"))
+        check = {"信号日": day, "核对": "待补算", "说明": "", "基础池": 0, "候选池": 0,
+                 "正式名额": 0, "已成交未退出": 0, "可配对": False}
+        try:
+            meta, pool = r28_unpack(entry.get("R28_Audit_JSON", ""))
+            if meta["signal_date"] != day:
+                raise ValueError("信号日期与审计账本不一致")
+            if len(pool):
+                pool = pool.sort_values("ts_code").reset_index(drop=True)
+            selected = _bool_series(pool, "Selected")
+            eligible = _bool_series(pool, "Candidate")
+            k = int(selected.sum())
+            if k != int(_safe_float(entry.get("Selected_Count"), 0)):
+                raise ValueError("正式名额与扫描账本不一致")
+            original = selected_history.loc[selected_history.Signal_Date.eq(day)] if len(selected_history) else pd.DataFrame()
+            if set(original.get("ts_code", [])) != set(pool.loc[selected, "ts_code"] if len(pool) else []):
+                raise ValueError("全池对照改变了正式名单")
+            for _, old in original.iterrows():
+                new = pool.loc[pool.ts_code.eq(old.ts_code)].iloc[0]
+                if "R271_Input_Hash" in old and "R271_Input_Hash" in new and str(old.R271_Input_Hash) != str(new.R271_Input_Hash):
+                    raise ValueError(f"{old.ts_code}信号输入指纹不一致")
+                if bool(new.Entry_Tradable) != bool(old.Entry_Tradable) or str(new.Status) != str(old.get("R27_B10_Status")):
+                    raise ValueError(f"{old.ts_code}正式成交状态不一致")
+                if new.Status == "已退出":
+                    if (parse_yyyymmdd(new.Exit_Date) != parse_yyyymmdd(old.get("R27_B10_Exit_Date"))
+                            or not math.isclose(float(new.Return_pct), float(old.R27_B10_Return_pct), abs_tol=1e-8, rel_tol=1e-9)):
+                        raise ValueError(f"{old.ts_code}正式B10收益或退出日期不一致")
+            tradable = _bool_series(pool, "Entry_Tradable")
+            complete = pool.get("Status", pd.Series(dtype=str)).eq("已退出")
+            pending = tradable & ~complete
+            check.update(基础池=len(pool), 候选池=int(eligible.sum()), 正式名额=k,
+                         已成交未退出=int(pending.sum()), 核对="通过")
+            if len(pool):
+                detail = pool.copy()
+                detail.insert(0, "Signal_Date", day)
+                detail.insert(1, "Market_Regime", meta["regime"])
+                details.append(detail)
+            clean = str(entry.get("Scan_Status")) == "COMPLETED" and _safe_float(entry.get("Market_Data_Gap_Count"), 0) == 0
+            valid = clean and len(pool) > 0 and meta["future_days"] >= 15 and not pending.any()
+            if not clean:
+                check["说明"] = "扫描存在行情缺口，整周不参与比较"
+            elif meta["future_days"] < 15:
+                check["说明"] = "未满15个市场交易日，整周等待成熟"
+            elif pending.any():
+                check["说明"] = "有买入后未完成/无效路径，整周不参与比较"
+            elif not k:
+                check["说明"] = "没有正式信号，仅保留全池明细，不纳入主配对"
+            if valid and k:
+                ret = pd.to_numeric(pool.Return_pct, errors="coerce").where(tradable, 0).to_numpy(float)
+                if not np.isfinite(ret).all() or int(eligible.sum()) < k:
+                    raise ValueError("可配对收益无效或候选数不足")
+                formal = ret[selected.to_numpy()]
+                branch = ret[eligible.to_numpy()]
+                week = dict(信号日=day, 市场=meta["regime"], 年份=day[:4], 名额=k,
+                            基础池均益=float(ret.mean()), 候选池均益=float(branch.mean()),
+                            正式均益=float(formal.mean()), 正式成交=int(tradable[selected].sum()))
+                for label, values, count in (("基础池", ret, int(tradable.sum())),
+                                              ("候选池", branch, int(tradable[eligible].sum())),
+                                              ("正式", formal, int(tradable[selected].sum()))):
+                    week[label + "名额胜率"] = float((values > 0).mean() * 100)
+                    week[label + "成交胜率"] = float((values > 0).sum() / count * 100) if count else np.nan
+                    week[label + "成交均益"] = float(values.sum() / count) if count else np.nan
+                random_week = {}
+                for label, values in (("基础池", ret), ("候选池", branch)):
+                    seed = int(hashlib.sha256(f"{R28_RANDOM_SEED}:{day}:{label}".encode()).hexdigest()[:16], 16)
+                    rng = np.random.default_rng(seed)
+                    # 成员按代码排序，抽样索引不依赖任何未来标签。
+                    draw = np.array([rng.choice(len(values), size=k, replace=False)
+                                     for _ in range(R28_RANDOM_REPETITIONS)])
+                    random_week[label] = values[draw].mean(axis=1)
+                check["可配对"] = True
+                weeks.append(week)
+                blocks.append(random_week)
+        except (ValueError, TypeError, KeyError, IndexError) as exc:
+            check.update(核对="需补算或核查", 说明=str(exc))
+        checks.append(check)
+    weekly = pd.DataFrame(weeks)
+    summary, random_summary, increments = [], [], []
+    if len(weekly):
+        scopes = [("全部", np.ones(len(weekly), dtype=bool))]
+        scopes += [(r, weekly.市场.eq(r).to_numpy()) for r in ("强势", "中性", "弱势")]
+        scopes += [(y, weekly.年份.eq(y).to_numpy()) for y in sorted(weekly.年份.unique())]
+        scopes += [(y + "·" + r, (weekly.年份.eq(y) & weekly.市场.eq(r)).to_numpy())
+                   for y in sorted(weekly.年份.unique()) for r in ("强势", "中性", "弱势")]
+        for scope, mask in scopes:
+            if not mask.any():
+                continue
+            weights = weekly.名额.to_numpy(float) * mask
+            total = weights.sum()
+            formal = np.average(weekly.正式均益, weights=weights)
+            for label in ("基础池", "候选池", "正式"):
+                summary.append({"范围": scope, "层级": label, "配对周数": int(mask.sum()),
+                                "相同计划名额": int(total),
+                                "名额加权净收益_pct": np.average(weekly[label + "均益"], weights=weights),
+                                "名额加权胜率_pct": np.average(weekly[label + "名额胜率"], weights=weights)})
+            for label in ("基础池", "候选池"):
+                draws = np.array([b[label] for b in blocks])
+                random_values = np.average(draws, axis=0, weights=weights)
+                lo, med, hi = np.quantile(random_values, [.025, .5, .975])
+                random_summary.append({"范围": scope, "随机来源": label, "重复次数": R28_RANDOM_REPETITIONS,
+                                       "配对周数": int(mask.sum()), "正式均益_pct": formal,
+                                       "随机均益P2.5_pct": lo, "随机均益P50_pct": med,
+                                       "随机均益P97.5_pct": hi,
+                                       "正式超过随机比例_pct": float((random_values < formal).mean() * 100)})
+            # 完整扫描周索引保留无信号/其他分支周，按日期映射后做配对区组。
+            scan_days = [parse_yyyymmdd(c["信号日"]) for c in checks]
+            positions = {day: i for i, day in enumerate(scan_days)}
+            for label, a, b in (("形态筛选增益", "候选池均益", "基础池均益"),
+                                ("排名增益", "正式均益", "候选池均益"),
+                                ("总选股增益", "正式均益", "基础池均益")):
+                delta = (weekly[a] - weekly[b]).to_numpy(float)
+                num, den = np.zeros(len(scan_days)), np.zeros(len(scan_days))
+                for i, day in enumerate(weekly.信号日):
+                    pos = positions[day]
+                    num[pos], den[pos] = delta[i] * weights[i], weights[i]
+                lo, hi = r28_paired_interval(scan_days, num, den)
+                increments.append({"范围": scope, "比较": label, "配对周数": int(mask.sum()),
+                                   "增益_百分点": float(np.average(delta, weights=weights)),
+                                   "4周区组区间下限": lo, "4周区组区间上限": hi,
+                                   "解释": "描述性诊断，未校正历次策略搜索，不判定通过；少于8周不估区间"})
+    return {"31_r28_pool_outcomes.csv": pd.concat(details, ignore_index=True) if details else pd.DataFrame(),
+            "32_r28_week_integrity.csv": pd.DataFrame(checks),
+            "33_r28_matched_weekly.csv": weekly,
+            "34_r28_layer_comparison.csv": pd.DataFrame(summary),
+            "35_r28_random_comparison.csv": pd.DataFrame(random_summary),
+            "36_r28_paired_increment.csv": pd.DataFrame(increments),
+            "37_r28_protocol.csv": pd.DataFrame([{
+                "版本": R28_SCHEMA, "冻结策略": STRATEGY_CONFIG_VERSION,
+                "随机种子": R28_RANDOM_SEED, "随机次数": R28_RANDOM_REPETITIONS,
+                "主口径": "同信号周、同正式计划名额加权；无法买入名额0收益且不补位；非账户收益",
+                "候选定义": "当前分支全部合格股票；强市含原ATR0.70—0.90资格，未应用排名和最少候选数门槛",
+                "成熟口径": "至少15市场交易日，全基础池所有已买股票B10已退出，行情无缺口，否则整周暂不配对",
+                "随机解释": "固定已实现路径条件下的随机分布；非过拟合概率、非未来盈利置信度",
+                "数据边界": "当前冻结科技名单及行业分类，不是完整历史时点股票池；价格/市值为信号日数据",
+                "决策边界": "不自动调参、不自动停用分支、不授予实盘合格；先比较筛选与排名增益"}])}
 
 
 def r19_backfill_frozen_daily_paths(
@@ -4565,6 +4871,14 @@ def import_prior_results_zip(
         if ledger.empty or ledger.duplicated(["Signal_Date"]).any():
             raise ValueError("扫描账本为空或存在重复日期。")
         ledger["Config_ID"] = str(config_id)
+        for _, imported_week in ledger.iterrows():
+            raw_audit = imported_week.get("R28_Audit_JSON", "")
+            if pd.notna(raw_audit) and str(raw_audit).strip():
+                meta, _ = r28_unpack(raw_audit)
+                if meta["signal_date"] != imported_week.Signal_Date:
+                    raise ValueError("R28诊断日期不一致，未写入任何结果。")
+                if meta.get("cost") is not None and not math.isclose(float(meta["cost"]), roundtrip_cost_pct):
+                    raise ValueError("R28结果的交易成本与当前配置不同，请先恢复原配置。")
 
         selected = candidates[_bool_series(candidates, "R19_Selected")].copy()
         # R27只使用每笔实际退出收益，不构造三仓每日净值。
@@ -4835,6 +5149,7 @@ def build_r27_export_zip(
     holding_coverage: pd.DataFrame,
     integrity: pd.DataFrame,
     audit_metadata: pd.DataFrame,
+    r28_diagnostics=None,
 ):
     """R27导出正式全信号、强市影子和空窗审计，不含三仓或复投。"""
     files = {
@@ -4871,6 +5186,7 @@ def build_r27_export_zip(
     ], reports):
         files[name] = report
     files["30_signal_input_fingerprints.csv"] = r271_input_manifest(history, ledger)
+    files.update(r28_diagnostics if isinstance(r28_diagnostics, dict) else r28_reports(history, ledger))
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, frame in files.items():
@@ -4897,14 +5213,17 @@ def main():
     st.title(f"🔬 {APP_TITLE}")
     st.caption(
         "R3与市场三分法冻结；R6正式Top1及第二名影子；R11先筛ATR区间再取Top1；"
-        "原T+1日内-10%止损和W3报表保留，新增买入后失败退出对照；"
+        "原T+1日内-10%止损和W3报表保留，新增全池、合格候选和正式排名的同条件对照；"
         "所有完整入选信号等额独立成交，不设仓位上限、不复投。"
     )
     st.caption(f"运行引擎修订：{ENGINE_PATCH}")
     st.warning(
-        "本版衡量选股信号本身，不计算账户年收益或三仓最大回撤；"
-        "内部稳健性通过也不能替代未见样本和冻结后的前向验证。"
+        "R27.1在2022—2024留出区间未通过验证。R28不优化任何入场或退出条件，"
+        "不计算三仓账户收益，不自动颁发实盘合格结论。已看过的年份属于研发数据。"
     )
+    st.info("R28首次需补算基础股票池的B10结果，复用原行情缓存，不需新增依赖。"
+            "旧R27.1包只能恢复原报告；启动相同区间后会补扫缺少全池对照的周。"
+            "R28完整包可恢复新增诊断断点。建议分别运行2022—2024和2024—2026，参数与原测试完全一致。")
     with st.expander("查看冻结交易规则"):
         st.markdown(
             """
@@ -4930,11 +5249,11 @@ def main():
         st.header("研究配置")
         mode = st.radio(
             "运行模式",
-            ["历史R27全信号与空窗审计", "最新选股预览"],
+            ["历史R28同条件增益诊断", "最新选股预览"],
             index=0,
             help="历史模式只使用完整周线；最新预览允许使用本周未完成周线且不写入回测。",
         )
-        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R27全信号与空窗审计")
+        start_input = st.date_input("验证开始日期", value=default_start, disabled=mode != "历史R28同条件增益诊断")
         end_input = st.date_input("验证截止日期", value=today)
 
         st.markdown("---")
@@ -4974,11 +5293,11 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R27.1历史结果（保留行情缓存和研究池）")
+        clear_history_clicked = st.button("清除R28历史结果（保留行情缓存和研究池）")
         imported_results = st.file_uploader(
-            "恢复R27.1结果包",
+            "恢复R27.1或R28结果包",
             type=["zip"],
-            help="仅恢复相同计算口径的R27.1。旧版请用报告中的只读对比；行情缓存继续复用。",
+            help="R27.1包恢复正式报告，仍须补算全池；R28包恢复全池诊断。两者都复用已有行情缓存。",
         )
         import_results_clicked = st.button(
             "恢复结果包中的断点",
@@ -4988,7 +5307,7 @@ def main():
     if max_mv <= min_mv:
         st.error("最高流通市值必须大于最低流通市值。")
         return
-    if start_input > end_input and mode == "历史R27全信号与空窗审计":
+    if start_input > end_input and mode == "历史R28同条件增益诊断":
         st.error("验证开始日期不能晚于截止日期。")
         return
 
@@ -5023,7 +5342,7 @@ def main():
                 f"已恢复{import_stats['candidate_rows']}条候选、"
                 f"{import_stats['known_weeks']}个扫描周、"
                 f"{import_stats['selected_rows']}笔冻结信号。"
-                "R27只审计正式信号与隔离影子，无需补算三仓每日净值。"
+                "如旧包缺少R28全池对照，请启动相同区间补扫；已有行情缓存继续复用。"
             )
         except Exception as exc:
             st.error(f"结果包恢复失败：{exc}")
@@ -5054,7 +5373,7 @@ def main():
         if not resume_paused_task(worker_id):
             st.warning("任务状态已经变化，请刷新页面后再操作。")
 
-    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R27全信号与空窗审计"
+    start_label = "运行最新选股预览" if is_preview_mode else "启动历史R28同条件增益诊断"
     start_clicked = st.button(start_label, type="primary")
     start_precheck_valid = False
     if start_clicked:
@@ -5384,6 +5703,7 @@ def main():
                                 run_cost,
                                 run_preview,
                                 weekly_mode,
+                                lease_heartbeat=lease_heartbeat,
                             )
                         if not candidates.empty:
                             candidates["Market_Data_Gap_Count"] = len(batch_gap_dates)
@@ -5432,6 +5752,7 @@ def main():
                                     ),
                                     data_gap_dates=batch_gap_dates,
                                     candidate_row_count=len(candidates),
+                                    r28_audit_json=candidates.attrs.get("R28_Audit_JSON", ""),
                                     market_regime=(
                                         str(candidates["Market_Regime"].iloc[0])
                                         if not candidates.empty and "Market_Regime" in candidates.columns
@@ -5465,7 +5786,7 @@ def main():
                             rerun_needed = True
                         else:
                             remove_with_backup(RUN_TASK_FILE)
-                            st.success("历史R27全信号与空窗审计扫描完成。")
+                            st.success("历史R28同条件增益诊断扫描完成。")
             except Exception as exc:
                 gc.collect()
                 if run_history:
@@ -5694,7 +6015,28 @@ def main():
                         st.caption(f"共同{len(reproducibility)}周；核对通过{int(reproducibility['核对结果'].eq('通过').sum())}周。旧版缺少指纹时，仅比较名单和指标，不宣称输入完全一致。")
                 except (ValueError, KeyError, zipfile.BadZipFile) as exc:
                     st.error(f"无法比较：{exc}")
-        st.header("R27.1 买入后失败退出对照审计")
+        st.header("R28 同条件选股增益诊断")
+        st.caption("基础池是当周满足原价格、市值和至少45根周线要求的冻结科技池。"
+                   "强市候选包含原ATR区间资格；三个层级只比较相同的正式信号周。"
+                   "主表按正式计划名额加权，无法成交名额记0、不补位；成交均益/胜率在逐周表单列。"
+                   "这不是三仓收益，也不等于预测未来的胜率。")
+        with st.spinner("生成固定种子的分层、随机和配对区组诊断……"):
+            r28_diagnostics = r28_reports(history, ledger)
+        r28_checks = r28_diagnostics["32_r28_week_integrity.csv"]
+        if len(r28_checks):
+            st.write(f"扫描{len(r28_checks)}周；可配对{int(r28_checks['可配对'].sum())}周。")
+            if not r28_checks["核对"].eq("通过").all():
+                st.warning("部分周缺少R28对照或核对失败，当前只显示完整周的阶段性结果，不能代表整个区间。请补扫并查看完整性说明。")
+        st.dataframe(_format_report_frame(r28_diagnostics["34_r28_layer_comparison.csv"]), width="stretch", hide_index=True)
+        st.dataframe(_format_report_frame(r28_diagnostics["36_r28_paired_increment.csv"]), width="stretch", hide_index=True)
+        with st.expander("随机基准、逐周明细与审计边界"):
+            st.caption("2000次固定种子、同周无放回抽取相同名额；不成交不换股。正式超过随机的比例不是过拟合概率。"
+                       "4周区组区间未校正过去多轮策略搜索；年份与分支小样本只作诊断，不自动判定通过。"
+                       "当前冻结名单不等于历史时点名单，不能宣称已排除幸存者或行业归属偏差。")
+            for key in ("35_r28_random_comparison.csv", "33_r28_matched_weekly.csv", "32_r28_week_integrity.csv", "37_r28_protocol.csv"):
+                st.dataframe(_format_report_frame(r28_diagnostics[key]), width="stretch", hide_index=True)
+
+        st.header("保留：R27.1 买入后失败退出对照审计")
         st.info("选股保留R24的13周规则。两个提前退出方案只作研究，不改变入选股票，不自动升级为正式退出。")
         comparison_summary, comparison_trades, comparison_weeks, comparison_coverage, comparison_checks, execution_reconciliation = r27_exit_reports(history, ledger)
         st.subheader("10%硬止损＋W3，与两种提前退出对照")
@@ -5917,11 +6259,12 @@ def main():
             holding_coverage,
             integrity_gates,
             audit_metadata,
+            r28_diagnostics=r28_diagnostics,
         )
         st.download_button(
-            "下载R27.1完整审计结果",
+            "下载R28完整审计结果",
             data=export_bytes,
-            file_name="r27_1_reproducible_audit_results.zip",
+            file_name="r28_frozen_edge_diagnostic_audit_results.zip",
             mime="application/zip",
         )
 
