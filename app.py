@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""R27 冻结13周选股、买入后失败退出对照审计版。
+"""R27.1 固定信号日历史窗口、保留13周市场分类的可重复性审计。
 
 R3中性Top2和市场三分法保持不变；R6正式Top1，第二名保留影子。
 强市完整整理再启动池先筛ATR3/ATR13在0.70—0.90，再按ATR升序取Top1。
@@ -36,16 +36,18 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "R27-ENTRY-FAILURE-EXIT-AUDIT"
-APP_TITLE = "R27 买入后失败退出审计"
-ENGINE_PATCH = "R27-ENTRY-FAILURE-EXIT"
+APP_VERSION = "R27.1-SIGNAL-DATE-DETERMINISTIC"
+APP_TITLE = "R27.1 历史信号可重复性审计"
+ENGINE_PATCH = "R27.1-FIXED-WEEK-WINDOW"
 # R11正式强市入口与R22不同，必须使用新的配置身份和结果文件；行情缓存继续复用。
-STRATEGY_CONFIG_VERSION = "R27-FROZEN13-EXIT-L5-W1"
+STRATEGY_CONFIG_VERSION = "R27.1-FROZEN13-FIXED60W-FLOAT64"
 
-CHECKPOINT_FILE = "r27_entry_failure_exit_candidates.csv"
-SCAN_LEDGER_FILE = "r27_entry_failure_exit_scanned_dates.csv"
-RUN_TASK_FILE = "r27_entry_failure_exit_running_task.json"
-RESULT_STATE_GUARD_FILE = "r27_entry_failure_exit_result_state.guard"
+CHECKPOINT_FILE = "r27_1_reproducible_candidates.csv"
+SCAN_LEDGER_FILE = "r27_1_reproducible_scanned_dates.csv"
+RUN_TASK_FILE = "r27_1_reproducible_running_task.json"
+RESULT_STATE_GUARD_FILE = "r27_1_reproducible_result_state.guard"
+FROZEN_POOL_FILE = "r27_1_frozen_tech_pool.json"
+SIGNAL_WINDOW_WEEKS = 60
 MARKET_CACHE_ROOT = "r1_trend_entry_market_cache_v2"
 
 TOP_N = 2
@@ -177,7 +179,7 @@ def read_csv_safe(path: str):
         if not os.path.exists(candidate):
             continue
         try:
-            return pd.read_csv(candidate, encoding="utf-8-sig", low_memory=False)
+            return pd.read_csv(candidate, encoding="utf-8-sig", low_memory=False, float_precision="round_trip")
         except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError, OSError):
             continue
     return pd.DataFrame()
@@ -388,6 +390,26 @@ def load_custom_tech_whitelist(token: str):
 # -----------------------------------------------------------------------------
 # 行情分片缓存
 # -----------------------------------------------------------------------------
+def load_frozen_tech_whitelist(token):
+    """冻结首次取得的研究池与行业映射。清除回测结果不删除该文件。"""
+    payload = read_json_safe(FROZEN_POOL_FILE)
+    if payload:
+        codes = payload.get("codes", [])
+        names, industries = payload.get("names", {}), payload.get("industries", {})
+        if not codes or set(codes) != set(names) or set(codes) != set(industries):
+            raise RuntimeError("冻结股票池文件不完整，不能静默替换研究池。")
+        expected = hashlib.sha256(json.dumps([sorted(codes), names, industries], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        if payload.get("hash") != expected:
+            raise RuntimeError("冻结股票池校验失败，停止混用股票池。")
+        return set(codes), names, industries
+    codes, names, industries = load_custom_tech_whitelist(token)
+    if codes:
+        payload = {"codes": sorted(codes), "names": names, "industries": industries}
+        payload["hash"] = hashlib.sha256(json.dumps([sorted(codes), names, industries], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        atomic_write_json(payload, FROZEN_POOL_FILE)
+    return codes, names, industries
+
+
 def _pool_cache_dir(whitelist_set: set[str]):
     pool_hash = hashlib.sha1("|".join(sorted(whitelist_set)).encode("utf-8")).hexdigest()[:12]
     cache_dir = os.path.join(MARKET_CACHE_ROOT, pool_hash)
@@ -690,6 +712,9 @@ def _build_market_index_from_partitions(
     stock_qfq_dict: dict[str, pd.DataFrame] = {}
     for ts_code, group in merged.groupby("ts_code", sort=False):
         stock = group.copy().sort_values("trade_date_str")
+        # 保存真实输入；以后每个信号日自行补换手率，不使用批次范围内的填充值。
+        for column in ("turnover_rate", "circ_mv"):
+            stock["source_" + column] = pd.to_numeric(stock.get(column, pd.Series(np.nan, index=stock.index)), errors="coerce")
         for column in ("open", "high", "low", "close", "pre_close"):
             if column in stock.columns:
                 stock[f"raw_{column}"] = pd.to_numeric(stock[column], errors="coerce")
@@ -761,7 +786,7 @@ def _build_market_index_from_partitions(
             "raw_pre_close",
         ):
             if column in stock.columns:
-                stock[column] = pd.to_numeric(stock[column], errors="coerce").astype("float32")
+                stock[column] = pd.to_numeric(stock[column], errors="coerce").astype("float64")
         stock_qfq_dict[str(ts_code)] = stock.set_index("trade_date_str")
     del merged
     gc.collect()
@@ -779,6 +804,8 @@ def load_optimized_market_data(
     stocks, basic, available_dates = _build_market_index_from_partitions(
         tuple(valid_dates), cache_dir, pool_hash
     )
+    for stock in stocks.values():
+        stock.attrs["Requested_Start"] = str(start_date)
     return stocks, basic, valid_dates, available_dates, failed_dates, sync_stats
 
 # -----------------------------------------------------------------------------
@@ -791,8 +818,55 @@ def _safe_float(value: Any, default: float = np.nan):
     except (TypeError, ValueError):
         return default
 
+def signal_window_start(signal_date):
+    day = datetime.strptime(str(signal_date), "%Y%m%d")
+    monday = day - timedelta(days=day.weekday())
+    return (monday - timedelta(weeks=SIGNAL_WINDOW_WEEKS - 1)).strftime("%Y%m%d")
+
+
+def canonical_signal_stock(stock, signal_date):
+    """固定60个日历周；只用该信号日及以前数据确定指标与价格锚点。
+
+    批次先前计算的连续价格、换手率不得用作输入。信号日之后的路径
+    只向前递推，不参与历史指标的初始化。上游仍必须提供完整市场日历。
+    """
+    out = stock.loc[stock.index >= signal_window_start(signal_date)].copy().sort_index()
+    if out.empty:
+        return out
+    raw = {}
+    for c in ("open", "high", "low", "close"):
+        raw[c] = pd.to_numeric(out.get("raw_" + c, out[c]), errors="coerce").astype("float64")
+        out["raw_" + c] = raw[c]
+    pre = pd.to_numeric(out.get("raw_pre_close", out.get("pre_close", raw["close"].shift())), errors="coerce")
+    pct = pd.to_numeric(out.get("pct_chg", pd.Series(np.nan, index=out.index)), errors="coerce")
+    growth = (1 + pct.fillna((raw["close"] / pre - 1) * 100) / 100).where(lambda s: s > 0)
+    # 从窗口首日开始，旧批次的首个连续价格不会残留在这里。
+    continuous = raw["close"].iloc[0] * growth.fillna(1).iloc[1:].cumprod()
+    continuous = pd.concat([pd.Series([raw["close"].iloc[0]], index=out.index[:1]), continuous])
+    past = continuous.loc[continuous.index <= str(signal_date)]
+    if past.empty or not _safe_float(past.iloc[-1]) > 0:
+        return out.iloc[:0]
+    anchor_date = past.index[-1]
+    continuous = continuous * (raw["close"].loc[anchor_date] / past.iloc[-1])
+    scale = continuous / raw["close"].replace(0, np.nan)
+    for c in raw:
+        out[c] = raw[c] * scale
+    out["pre_close"] = continuous.shift()
+    # 全部历史填充局限于信号日以前，未来流通股本不能反填历史。
+    historical = out.index <= str(signal_date)
+    mv = pd.to_numeric(out.get("source_circ_mv", out.get("circ_mv", pd.Series(np.nan, index=out.index))), errors="coerce")
+    shares = (mv.loc[historical] * 10000 / raw["close"].loc[historical]).ffill().bfill()
+    turnover = pd.to_numeric(out.get("source_turnover_rate", out.get("turnover_rate", pd.Series(np.nan, index=out.index))), errors="coerce")
+    estimate = pd.to_numeric(out.loc[historical, "vol"], errors="coerce") * 10000 / shares.replace(0, np.nan)
+    out.loc[historical, "turnover_rate"] = turnover.loc[historical].fillna(estimate)
+    return out
+
+
 def _weekly_bars(stock: pd.DataFrame, end_date: str):
-    daily = stock[stock.index <= end_date].tail(420).copy()
+    if stock.attrs.get("Requested_Start", "00000000") > signal_window_start(end_date):
+        raise RuntimeError(f"{end_date}指标预热数据不足，需从{signal_window_start(end_date)}加载；不能沿用短批次起点。")
+    stock = canonical_signal_stock(stock, end_date)
+    daily = stock[stock.index <= end_date].copy()
     if len(daily) < 180:
         return pd.DataFrame()
     daily = daily.reset_index()
@@ -901,6 +975,14 @@ def _weekly_bars(stock: pd.DataFrame, end_date: str):
     weekly["upper_shadow_ratio"] = (high - np.maximum(close, weekly["open"])) / price_range
     weekly["weekly_range_pct"] = price_range / close.replace(0, np.nan) * 100.0
     weekly["distance_ma20_pct"] = (close / weekly["ma20"] - 1.0) * 100.0
+    # 指纹只覆盖信号时点之前的价格/成交量/换手率输入，不包含未来收益。
+    fingerprint_cols = [c for c in ("trade_date_str", "open", "high", "low", "close", "vol", "turnover_rate") if c in daily]
+    input_bytes = daily[fingerprint_cols].to_csv(index=False, float_format="%.17g").encode()
+    weekly.attrs = {}
+    weekly.attrs["R271_Input_Hash"] = hashlib.sha256(input_bytes).hexdigest()
+    weekly.attrs["R271_Window_Start"] = signal_window_start(end_date)
+    weekly.attrs["R271_First_Price_Date"] = str(daily["trade_date_str"].iloc[0])
+    weekly.attrs["R271_History_Days"] = len(daily)
     return weekly
 
 def compute_signal_snapshot(
@@ -1174,6 +1256,7 @@ def compute_signal_snapshot(
     )
 
     snapshot = {
+        **weekly.attrs,
         "Is_First_Red": bool(is_first_red),
         "R3_Setup_Candidate": bool(setup_candidate),
         "R3_Setup_Type": setup_type,
@@ -1882,6 +1965,8 @@ def track_w3_future_path(
         result["Entry_Status"] = "无行情"
         return result
 
+    stock = canonical_signal_stock(stock, signal_date)
+
     if market_dates is None:
         future_dates = stock.index[stock.index > signal_date].tolist()[
             : HOLD_WEEKS * MARKET_DAYS_PER_WEEK
@@ -2445,6 +2530,11 @@ def scan_one_date(
         return pd.DataFrame(), 0, 0
     pool = pd.DataFrame(pool_records)
     candidates, raw_count, eligible_count = score_frozen_candidates(pool)
+    if not candidates.empty:
+        pool_payload = pool[["ts_code", "Industry", "Raw_Close", "Circ_MV_Billion", "R271_Input_Hash"]].sort_values("ts_code")
+        candidates["R271_Full_Pool_Hash"] = hashlib.sha256(pool_payload.to_csv(index=False, float_format="%.17g").encode()).hexdigest()
+        candidates["R271_Pool_Size"] = len(pool)
+        candidates["R271_Whitelist_Hash"] = hashlib.sha256(json.dumps([sorted(whitelist_keys), basic_name_map, industry_map], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     if is_preview_mode:
         if not candidates.empty:
@@ -4357,11 +4447,11 @@ def import_prior_results_zip(
         candidate_names = [
             name
             for name in infos
-            if name.startswith("01_all_r27_")
+            if name.startswith("01_all_r27_1_")
             and name.endswith("_candidates.csv")
         ]
         if len(candidate_names) != 1:
-            raise ValueError("结果包中未找到唯一的R27候选明细；旧版结果不能转换为R27。")
+            raise ValueError("只可恢复R27.1结果。R27使用不同的指标初始化口径，请重新扫描；旧包可用页面的历史结果对比功能查看。")
         info = infos[candidate_names[0]]
         if info.file_size > 200 * 1024 * 1024:
             raise ValueError("候选明细超过200MB，拒绝导入。")
@@ -4369,6 +4459,7 @@ def import_prior_results_zip(
             io.BytesIO(archive.read(info)),
             encoding="utf-8-sig",
             low_memory=False,
+            float_precision="round_trip",
         )
         required = {
             "Signal_Date",
@@ -4396,6 +4487,7 @@ def import_prior_results_zip(
             "ATR_Contraction",
         }
         missing = sorted(required.difference(candidates.columns))
+        missing += sorted({"R271_Window_Start", "R271_Input_Hash", "R271_Full_Pool_Hash", "R271_Whitelist_Hash"}.difference(candidates.columns))
         missing += sorted({"R27_Exit_Path_JSON", "R27_Exit_Path_Version"}.difference(candidates.columns))
         missing += sorted({f"R27_{k}_{suffix}" for k in R27_EXIT_SCHEMES for suffix in
                            ["Status", "Exit_Date", "Exit_Day", "Return_pct", "Reason", "Trigger_Date", "Blocked_Days", "Exit_Price"]}.difference(candidates.columns))
@@ -4503,6 +4595,10 @@ def import_prior_results_zip(
         )
 
         existing_candidates = read_csv_safe(CHECKPOINT_FILE)
+        if not existing_candidates.empty and "R271_Whitelist_Hash" in existing_candidates:
+            hashes = set(existing_candidates["R271_Whitelist_Hash"].dropna()) | set(candidates["R271_Whitelist_Hash"].dropna())
+            if len(hashes) > 1:
+                raise ValueError("两份结果使用不同研究池，不能合并恢复；请使用只读对比。")
         combined_candidates = (
             pd.concat(
                 [existing_candidates, candidates],
@@ -4658,6 +4754,65 @@ def build_export_zip(
     return output.getvalue()
 
 
+def r271_input_manifest(history, ledger):
+    rows = []
+    groups = {parse_yyyymmdd(d): g for d, g in history.groupby("Signal_Date")} if "Signal_Date" in history else {}
+    for d in ledger.get("Signal_Date", pd.Series(dtype=str)).map(parse_yyyymmdd):
+        g = groups.get(d, pd.DataFrame())
+        rows.append({"Signal_Date": d, "Window_Start": signal_window_start(d),
+                     "Candidate_Count": len(g), "Selected_Count": int(_bool_series(g, "R19_Selected").sum()),
+                     **{key: g[key].iloc[0] if key in g and len(g) else "无候选：需原始输入进一步核对" for key in
+                        ("R271_Full_Pool_Hash", "R271_Whitelist_Hash", "R271_Pool_Size")}})
+    return pd.DataFrame(rows)
+
+
+def r271_compare_results(history, ledger, zip_bytes):
+    """只读对照，不导入、不覆盖当前断点；只比较共同信号日的买入前结果。"""
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+        names = [i for i in archive.infolist() if i.filename.startswith("01_all_") and i.filename.endswith("_candidates.csv")]
+        if len(names) != 1 or names[0].file_size > 200 * 1024 * 1024:
+            raise ValueError("需要唯一且不超过200MB的候选表。")
+        other = pd.read_csv(archive.open(names[0]), low_memory=False, float_precision="round_trip")
+        info = archive.getinfo("02_scan_ledger.csv")
+        if info.file_size > 10 * 1024 * 1024:
+            raise ValueError("扫描账本超过大小限制。")
+        old_ledger = pd.read_csv(archive.open(info))
+    if not {"Signal_Date", "ts_code", "R19_Selected"}.issubset(other):
+        raise ValueError("旧包缺少信号日期、股票代码或正式入选字段。")
+    left, right = history.copy(), other.copy()
+    for frame in (left, right):
+        frame["Signal_Date"] = frame["Signal_Date"].map(parse_yyyymmdd)
+        if frame.duplicated(["Signal_Date", "ts_code"]).any():
+            raise ValueError("候选有重复键，不能完成对照。")
+    common_dates = sorted(set(ledger.Signal_Date.map(parse_yyyymmdd)) & set(old_ledger.Signal_Date.map(parse_yyyymmdd)))
+    lg = dict(tuple(left.groupby("Signal_Date")))
+    rg = dict(tuple(right.groupby("Signal_Date")))
+    rows = []
+    for d in common_dates:
+        a, b = lg.get(d, left.iloc[:0]), rg.get(d, right.iloc[:0])
+        ac, bc = set(a.ts_code), set(b.ts_code)
+        sa = set(a.loc[_bool_series(a, "R19_Selected"), "ts_code"])
+        sb = set(b.loc[_bool_series(b, "R19_Selected"), "ts_code"])
+        joined = a.set_index("ts_code").join(b.set_index("ts_code"), lsuffix="_now", rsuffix="_old", how="inner")
+        diffs = []
+        for col in ("MACD_DIF", "MACD_DEA", "MACD_Hist", "Previous_MACD_Hist", "Rank", "Entry_Score_100"):
+            if col + "_now" in joined and col + "_old" in joined:
+                x = pd.to_numeric(joined[col + "_now"], errors="coerce")
+                y = pd.to_numeric(joined[col + "_old"], errors="coerce")
+                diffs.append(bool((x.eq(y) | (x.isna() & y.isna())).all()))
+        fingerprint_known = len(a) > 0 and len(b) > 0 and all(k in a and k in b for k in ("R271_Full_Pool_Hash", "R271_Whitelist_Hash"))
+        inputs_equal = fingerprint_known and all(set(a[k].dropna()) == set(b[k].dropna()) and a[k].notna().all() and b[k].notna().all()
+                                                for k in ("R271_Full_Pool_Hash", "R271_Whitelist_Hash"))
+        fields_equal = bool(diffs) and all(diffs)
+        rows.append({"Signal_Date": d, "当前候选": len(a), "对照候选": len(b),
+                     "候选名单一致": ac == bc, "正式入选一致": sa == sb,
+                     "当前新增入选": ",".join(sorted(sa - sb)), "当前减少入选": ",".join(sorted(sb - sa)),
+                     "共同候选指标及排名一致": fields_equal,
+                     "输入指纹一致": inputs_equal if fingerprint_known else "旧包无指纹或无候选",
+                     "核对结果": "通过" if inputs_equal and ac == bc and sa == sb and fields_equal else "需核对"})
+    return pd.DataFrame(rows)
+
+
 def build_r27_export_zip(
     history: pd.DataFrame,
     ledger: pd.DataFrame,
@@ -4683,7 +4838,7 @@ def build_r27_export_zip(
 ):
     """R27导出正式全信号、强市影子和空窗审计，不含三仓或复投。"""
     files = {
-        "01_all_r27_entry_failure_exit_candidates.csv": history,
+        "01_all_r27_1_reproducible_candidates.csv": history,
         "02_scan_ledger.csv": ledger,
         "03_market_data_gap_audit.csv": data_gaps,
         "04_all_signal_equal_notional_summary.csv": all_signal_summary,
@@ -4715,6 +4870,7 @@ def build_r27_export_zip(
         "28_exit_sample_completeness.csv", "29_baseline_execution_reconciliation.csv"
     ], reports):
         files[name] = report
+    files["30_signal_input_fingerprints.csv"] = r271_input_manifest(history, ledger)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, frame in files.items():
@@ -4818,11 +4974,11 @@ def main():
 
         st.markdown("---")
         clear_market_clicked = st.button("清空行情缓存")
-        clear_history_clicked = st.button("清除R27历史结果")
+        clear_history_clicked = st.button("清除R27.1历史结果（保留行情缓存和研究池）")
         imported_results = st.file_uploader(
-            "导入R27结果包",
+            "恢复R27.1结果包",
             type=["zip"],
-            help="仅导入R27结果。R26及更早结果只有收盘路径，缺少提前退出必需的开盘与高低价；新回测可复用本机行情缓存。",
+            help="仅恢复相同计算口径的R27.1。旧版请用报告中的只读对比；行情缓存继续复用。",
         )
         import_results_clicked = st.button(
             "恢复结果包中的断点",
@@ -4982,10 +5138,23 @@ def main():
                 ts.set_token(token_clean)
                 pro = ts.pro_api(token_clean)
                 with st.spinner("构建固定科技股研究池……"):
-                    whitelist_set, name_map, industry_map = load_custom_tech_whitelist(token_clean)
+                    whitelist_set, name_map, industry_map = load_frozen_tech_whitelist(token_clean)
                 whitelist_keys = tuple(sorted(whitelist_set))
                 if not whitelist_keys:
                     raise RuntimeError("未取得科技股研究池，请检查Token权限或网络。")
+                if run_history:
+                    current_pool_hash = hashlib.sha256(json.dumps([sorted(whitelist_keys), name_map, industry_map], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                    expected_pool_hash = active_task.get("R271_Whitelist_Hash")
+                    if not expected_pool_hash:
+                        existing_pool_rows = read_csv_safe(CHECKPOINT_FILE)
+                        if "R271_Whitelist_Hash" in existing_pool_rows:
+                            known_hashes = set(existing_pool_rows["R271_Whitelist_Hash"].dropna())
+                            if known_hashes and known_hashes != {current_pool_hash}:
+                                raise RuntimeError("已有结果与本机冻结研究池不同，不能混合补扫；请先导出已有结果，再清除历史结果开始独立回测。")
+                    elif expected_pool_hash != current_pool_hash:
+                        raise RuntimeError("本次任务的研究池身份发生变化，暂停续跑。")
+                    active_task["R271_Whitelist_Hash"] = current_pool_hash
+                    save_owned_task(active_task, worker_id)
                 st.info(f"科技股研究池：{len(whitelist_keys)}只。")
 
                 requested_dates, pending_dates, latest_is_completed_week = build_run_dates(
@@ -5041,11 +5210,8 @@ def main():
                             + timedelta(days=30)
                         )
                     else:
-                        # 新扫描保留R1/R2稳定的420日指标预热窗口。
-                        fetch_start = (
-                            datetime.strptime(min(batch_dates), "%Y%m%d")
-                            - timedelta(days=420)
-                        ).strftime("%Y%m%d")
+                        # 下载仍分批；指标起点由每个信号日本身确定，不能由此批决定。
+                        fetch_start = signal_window_start(min(batch_dates))
                         requested_fetch_end = (
                             datetime.strptime(max(batch_dates), "%Y%m%d")
                             + timedelta(days=75)
@@ -5492,6 +5658,8 @@ def main():
             [
                 {
                     "App_Version": APP_VERSION,
+                    "指标预热": "固定信号日所在周及此前59周；周一开始；60周完整范围；不以扫描批次为起点",
+                    "价格尺度": "原始日线float64重建连续价格，并锚定信号日原收盘；未来数据不参与指标初始化",
                     "Strategy_Config": STRATEGY_CONFIG_VERSION,
                     "区间属性": sample_status,
                     "声明": (
@@ -5512,7 +5680,21 @@ def main():
         )
 
         st.markdown("---")
-        st.header("R27 买入后失败退出对照审计")
+        st.subheader("R27.1 历史信号可重复性")
+        st.caption("同一信号日固定使用60个日历周输入。首次研究池固定保存；完整结果包包含逐周输入指纹。修改初始化口径可能改变旧版临界信号，这不代表收益改善。")
+        with st.expander("上传另一次结果，核对共同历史星期（不会覆盖当前结果）"):
+            comparison_upload = st.file_uploader("历史结果只读对比", type=["zip"], key="r271_compare_upload")
+            if comparison_upload is not None:
+                try:
+                    reproducibility = r271_compare_results(history, ledger, comparison_upload.getvalue())
+                    if reproducibility.empty:
+                        st.info("两份结果没有共同扫描周。")
+                    else:
+                        st.dataframe(reproducibility, width="stretch", hide_index=True)
+                        st.caption(f"共同{len(reproducibility)}周；核对通过{int(reproducibility['核对结果'].eq('通过').sum())}周。旧版缺少指纹时，仅比较名单和指标，不宣称输入完全一致。")
+                except (ValueError, KeyError, zipfile.BadZipFile) as exc:
+                    st.error(f"无法比较：{exc}")
+        st.header("R27.1 买入后失败退出对照审计")
         st.info("选股保留R24的13周规则。两个提前退出方案只作研究，不改变入选股票，不自动升级为正式退出。")
         comparison_summary, comparison_trades, comparison_weeks, comparison_coverage, comparison_checks, execution_reconciliation = r27_exit_reports(history, ledger)
         st.subheader("10%硬止损＋W3，与两种提前退出对照")
@@ -5737,9 +5919,9 @@ def main():
             audit_metadata,
         )
         st.download_button(
-            "下载R27 买入后失败退出对照结果",
+            "下载R27.1完整审计结果",
             data=export_bytes,
-            file_name="r27_entry_failure_exit_audit_results.zip",
+            file_name="r27_1_reproducible_audit_results.zip",
             mime="application/zip",
         )
 
