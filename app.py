@@ -1047,6 +1047,49 @@ def split_summary(tr: pd.DataFrame, cut: str = "2023-01-01") -> pd.DataFrame:
     return pd.DataFrame(out).T
 
 
+def yearly_summary(tr: pd.DataFrame) -> pd.DataFrame:
+    """
+    逐年表现。一个真实的效应应该多数年份同号；靠单独一年撑起来的
+    平均值，只是那一年的行情，不是可重复的能力。
+    """
+    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
+    if not len(d):
+        return pd.DataFrame()
+    rows = {}
+    for y, g in d.groupby(d["date"].dt.year):
+        if len(g) < 20:
+            continue
+        wk = g.groupby("date")["收益率"].mean().sort_index()
+        se = wk.std(ddof=1) / np.sqrt(len(wk)) if len(wk) > 2 else np.nan
+        rows[y] = {"笔数": len(g), "平均收益": g["收益率"].mean(),
+                   "中位收益": g["收益率"].median(),
+                   "胜率": (g["收益率"] > 0).mean(),
+                   "t值": wk.mean() / se if se and se > 1e-12 else np.nan}
+    return pd.DataFrame(rows).T
+
+
+def profit_concentration(tr: pd.DataFrame, ks=(1, 3, 5, 10, 20)) -> pd.DataFrame:
+    """
+    利润集中度。如果总利润的绝大部分来自极少数几笔，那不是策略是彩票——
+    你无法指望下一段时间还能碰上那几笔。
+    """
+    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
+    if len(d) < 30:
+        return pd.DataFrame()
+    v = d["收益率"].sort_values(ascending=False).to_numpy()
+    tot = v.sum()
+    rows = []
+    for k in ks:
+        if k >= len(v):
+            continue
+        rows.append({"最赚的前N笔": k, "占总利润": v[:k].sum() / tot if abs(tot) > 1e-12 else np.nan,
+                     "剔除后单笔均值": v[k:].mean()})
+    out = pd.DataFrame(rows).set_index("最赚的前N笔")
+    out.attrs["原均值"] = float(v.mean())
+    out.attrs["总笔数"] = int(len(v))
+    return out
+
+
 # ======================================================================
 # 八、界面
 # ======================================================================
@@ -1207,6 +1250,36 @@ def main():
                                  "样本内好、样本外垮，通常说明样本内那部分是行情特征。")
 
             st.divider()
+            st.markdown("**逐年表现 + 利润集中度**")
+            st.caption("上一轮就是这两个诊断戳破了幻觉：平均收益漂亮，但 94% 的利润来自 "
+                       "513 笔里的 5 笔。真实的效应应该多数年份同号，且不依赖极少数暴利。")
+            ys = yearly_summary(res[m3]["tr"])
+            if len(ys):
+                st.dataframe(ys.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
+                                              "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                                              "t值": "{:.2f}"})
+                               .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
+                             use_container_width=True)
+                pos_y = int((ys["平均收益"] > 0).sum())
+                st.write(f"平均收益为正的年份：**{pos_y}/{len(ys)}**")
+            pc = profit_concentration(res[m3]["tr"])
+            if len(pc):
+                st.dataframe(pc.style.format({"占总利润": "{:.1%}",
+                                              "剔除后单笔均值": "{:+.3%}"}),
+                             use_container_width=True)
+                st.caption(f"全部 {pc.attrs['总笔数']} 笔，原始单笔均值 "
+                           f"{pc.attrs['原均值']:+.2%}。若剔除最赚的 5 笔后均值就塌到零附近，"
+                           "说明利润集中在极少数运气，不可重复。")
+                if 5 in pc.index and abs(pc.attrs["原均值"]) > 1e-9:
+                    keep = pc.loc[5, "剔除后单笔均值"] / pc.attrs["原均值"]
+                    if keep < 0.4:
+                        st.error(f"剔除最赚的 5 笔后，单笔均值只剩原来的 {keep:.0%}。"
+                                 "这是彩票式分布，不是可重复的边际。")
+                    else:
+                        st.success(f"剔除最赚的 5 笔后仍保留 {keep:.0%} 的均值，"
+                                   "利润不是靠极少数暴利撑起来的。")
+
+            st.divider()
             st.markdown("**止盈 × 止损 网格**")
             st.markdown(
                 f"当前止损 {sl:.0%}，实测止损率约 65%、平均持有仅 2.3 周——"
@@ -1232,10 +1305,15 @@ def main():
                              .background_gradient(cmap="RdYlGn", vmin=-3, vmax=3),
                              use_container_width=True)
                 bt_ = tg.stack().idxmax()
-                st.info(f"聚类 t 最高的组合：**{bt_[0]} / {bt_[1]}**，"
-                        f"t={tg.stack().max():.2f}，单笔均值 {mg.loc[bt_]:+.2%}。"
-                        "注意这是在同一份数据上挑出来的最优格子，实际会比它差；"
-                        "挑完务必回到上面看样本外。")
+                st.warning(
+                    f"聚类 t 最高的是 **{bt_[0]} / {bt_[1]}**（t={tg.stack().max():.2f}）——"
+                    "**但别拿这个数字当证据。** 25 个格子里挑最大值，即使全是噪音，"
+                    "最大 |t| 的期望也有 1.9-2.3。\n\n"
+                    "**该信的是梯度方向**：如果放宽止损后平均收益一列列单调上升，"
+                    "那说明原来的止损设在了正常波动之内，把没走完的仓位提前打掉了——"
+                    "这是一致的规律，不是幸运格子。\n\n"
+                    "**止损该设在哪，用波动定，别用网格挑。** 「本周选股」页给出了"
+                    "选出后各周的回撤分布，止损设在 25 分位之外才不会被正常波动扫出局。")
 
             st.divider()
             st.markdown("**第 1-12 周表现**（不设止盈止损，纯看持有到第 N 周）")
