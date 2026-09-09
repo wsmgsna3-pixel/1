@@ -937,12 +937,17 @@ def track_picks(picks: pd.DataFrame, panel: dict, tp: float = 0.20,
     return pd.DataFrame(out)
 
 
-def holding_week_table(picks: pd.DataFrame, panel: dict, weeks: int = 12,
-                       comm: float = 0.0003, stamp: float = 0.0005,
+def holding_week_table(picks: pd.DataFrame, panel: dict, elig: pd.DataFrame,
+                       weeks: int = 12, comm: float = 0.0003, stamp: float = 0.0005,
                        slip: float = 0.001) -> pd.DataFrame:
     """
     不设止盈止损，纯看「选出后持有到第 N 周」的表现。
-    这是判断该在第几周退出的依据：看收益率和胜率从第几周开始掉头。
+
+    关键：必须同时给出「同期股票池等权收益」和两者之差。
+    2018-2026 池子本身在涨，持有任何股票 9 周都会有正的平均收益——
+    只看绝对收益无法区分「选股能力」和「池子自己涨」。超额才是选股能力。
+
+    t 值按选出周聚类：同一周选出的 3 只共享当周大盘涨跌，不是独立样本。
     """
     cal = panel["adj_close"].index
     ci = {c: j for j, c in enumerate(panel["codes"])}
@@ -950,8 +955,28 @@ def holding_week_table(picks: pd.DataFrame, panel: dict, weeks: int = 12,
     AO = panel["adj_open"].to_numpy(dtype=np.float32)
     TRD = panel["tradable"].to_numpy(dtype=bool)
     LU = panel["limit_up_open"].to_numpy(dtype=bool)
+    EL = elig.reindex(index=cal, columns=panel["codes"]).fillna(False).to_numpy(dtype=bool)
     pos = {d: i for i, d in enumerate(cal)}
     rt = (comm + slip) + (comm + stamp + slip)
+
+    # 每个选出日、每个持有期的「池内等权收益」——基准
+    bench_cache: Dict[tuple, float] = {}
+
+    def bench(i0: int, w: int) -> float:
+        key = (i0, w)
+        if key in bench_cache:
+            return bench_cache[key]
+        b0, b1 = i0 + 1, i0 + 1 + 5 * w
+        if b1 >= len(cal):
+            bench_cache[key] = np.nan
+            return np.nan
+        m = EL[i0] & TRD[b0] & TRD[b1]
+        if m.sum() < 20:
+            bench_cache[key] = np.nan
+            return np.nan
+        v = float(np.nanmean(AC[b1, m] / AC[b0, m] - 1.0))
+        bench_cache[key] = v
+        return v
 
     acc = {w: [] for w in range(1, weeks + 1)}
     for _, p in picks.iterrows():
@@ -966,17 +991,27 @@ def holding_week_table(picks: pd.DataFrame, panel: dict, weeks: int = 12,
             k = b + 5 * w
             if k >= len(cal) or not np.isfinite(AC[k, j]):
                 continue
-            acc[w].append(AC[k, j] / entry - 1.0 - rt)
+            bm = bench(i0, w)
+            if not np.isfinite(bm):
+                continue
+            r = AC[k, j] / entry - 1.0 - rt
+            acc[w].append((p["date"], r, r - bm, bm))
 
     rows = []
     for w in range(1, weeks + 1):
-        v = np.array(acc[w], dtype=float)
-        if len(v) < 10:
+        if len(acc[w]) < 20:
             continue
-        se = v.std(ddof=1) / np.sqrt(len(v))
-        rows.append({"第N周": w, "样本数": len(v), "平均收益率": v.mean(),
-                     "中位收益率": float(np.median(v)), "胜率": float((v > 0).mean()),
-                     "标准误": se, "t值": v.mean() / se if se > 1e-12 else np.nan})
+        df = pd.DataFrame(acc[w], columns=["date", "ret", "ex", "bm"])
+        wk = df.groupby("date")["ex"].mean().sort_index()     # 按周聚类
+        se = wk.std(ddof=1) / np.sqrt(len(wk)) if len(wk) > 2 else np.nan
+        t_cl = newey_west_t(wk, lag=max(1, w))                 # 重叠持有期 -> HAC
+        rows.append({"第N周": w, "样本数": len(df),
+                     "平均收益率": df["ret"].mean(), "中位收益率": df["ret"].median(),
+                     "池均值(基准)": df["bm"].mean(),
+                     "超额": df["ex"].mean(), "超额中位": df["ex"].median(),
+                     "跑赢池比例": float((df["ex"] > 0).mean()),
+                     "胜率(绝对)": float((df["ret"] > 0).mean()),
+                     "超额t(聚类)": t_cl})
     return pd.DataFrame(rows).set_index("第N周")
 
 
@@ -1186,7 +1221,7 @@ def main():
                 if len(pk) < 30:
                     bar.progress((n + 1) / len(methods), text=nm); continue
                 tr = track_picks(pk, panel, tp, sl, maxd, **kw)
-                wt = holding_week_table(pk, panel, 12, **kw)
+                wt = holding_week_table(pk, panel, elig, 12, **kw)
                 sm = summarize_trades(tr)
                 empty = 1.0 - pk.date.nunique() / max(1, len(rebal))
                 res[nm] = {"pk": pk, "tr": tr, "wt": wt, "sm": sm, "empty": empty}
@@ -1321,16 +1356,35 @@ def main():
                                   index=list(res.keys()).index(cm.index[0]))
             wt = res[pick_m]["wt"]
             if len(wt):
-                st.dataframe(wt.style.format({"平均收益率": "{:+.2%}", "中位收益率": "{:+.2%}",
-                                              "胜率": "{:.1%}", "标准误": "{:.3%}", "t值": "{:.2f}"})
-                               .background_gradient(subset=["平均收益率"], cmap="RdYlGn"),
-                             use_container_width=True)
-                st.line_chart(wt[["平均收益率", "中位收益率"]])
-                st.line_chart(wt[["胜率"]])
-                pk_w = int(wt["平均收益率"].idxmax())
-                st.info(f"平均收益率在**第 {pk_w} 周**见顶。胜率在第 "
-                        f"{int(wt['胜率'].idxmax())} 周最高。超过这个点继续持有，"
-                        "期望不再增加而波动仍在累积。")
+                st.dataframe(wt.style.format(
+                    {"平均收益率": "{:+.2%}", "中位收益率": "{:+.2%}",
+                     "池均值(基准)": "{:+.2%}", "超额": "{:+.2%}", "超额中位": "{:+.2%}",
+                     "跑赢池比例": "{:.1%}", "胜率(绝对)": "{:.1%}", "超额t(聚类)": "{:.2f}"})
+                    .background_gradient(subset=["超额"], cmap="RdYlGn"),
+                    use_container_width=True)
+                st.warning(
+                    "**看「超额」和「超额t(聚类)」，不要看「平均收益率」。** "
+                    "2018-2026 股票池本身在涨，持有任何股票 9 周都会有正的平均收益——"
+                    "绝对收益分不清「选股能力」和「池子自己涨」。"
+                    "「池均值(基准)」就是同期在合格池里等权持有的结果，两者之差才是选股能力。")
+                st.line_chart(wt[["平均收益率", "池均值(基准)", "超额"]])
+                st.line_chart(wt[["跑赢池比例"]])
+                ex_pk = int(wt["超额"].idxmax())
+                sig = wt[wt["超额t(聚类)"] >= 2]
+                if len(sig):
+                    st.success(
+                        f"超额在**第 {ex_pk} 周**见顶（{wt.loc[ex_pk,'超额']:+.2%}，"
+                        f"聚类 t={wt.loc[ex_pk,'超额t(聚类)']:.2f}）。"
+                        f"聚类 t≥2 的持有期：第 {list(sig.index)} 周。")
+                else:
+                    st.error(
+                        f"**没有任何持有期的超额达到聚类 t≥2。** 最高为第 "
+                        f"{int(wt['超额t(聚类)'].idxmax())} 周（t="
+                        f"{wt['超额t(聚类)'].max():.2f}）。这意味着扣掉池子自身的涨幅后，"
+                        "选出的股票和随机挑还分不出区别。")
+                st.caption("中位收益率每周都为负、均值为正 —— 典型的趋势型分布："
+                           "多数标的阴跌，少数狂奔，收益全在右尾。"
+                           "**这意味着止盈不能设太窄，否则正好砍掉唯一赚钱的那条尾巴。**")
 
     # ---------------- 本周选股 ----------------
     with t2:
