@@ -486,20 +486,6 @@ def build_eligibility(panel: dict, basic: pd.DataFrame, uni: pd.DataFrame,
     return ok.fillna(False)
 
 
-def size_neutralize(f: pd.DataFrame, logsize: pd.DataFrame, mask: pd.DataFrame) -> pd.DataFrame:
-    """
-    截面上把因子对 log 市值做回归，取残差。
-    用来回答：剥掉市值这层之后，这个因子还剩下什么。
-    """
-    x = logsize.where(mask).astype(np.float64)
-    y = f.where(mask).astype(np.float64)
-    xc = x.sub(x.mean(axis=1), axis=0)
-    yc = y.sub(y.mean(axis=1), axis=0)
-    sxx = (xc ** 2).sum(axis=1)
-    beta = (xc * yc).sum(axis=1) / sxx.where(sxx > 1e-12)
-    return yc.sub(xc.mul(beta, axis=0)).astype(np.float32)
-
-
 def cs_zscore(df: pd.DataFrame, mask: pd.DataFrame, wins: float = 0.01) -> pd.DataFrame:
     """截面去极值 + 标准化，只在 mask 为真的样本上做。"""
     x = df.where(mask)
@@ -649,531 +635,156 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
             "monotonic": mono, "n_period": len(grp_df)}
 
 
-def scan_all_factors(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
-                     elig: pd.DataFrame, rebal: List[pd.Timestamp], horizon_weeks: int,
-                     keys: List[str], neutralize: bool = False,
-                     progress=None, gap: int = 1) -> tuple:
-    """一次跑完所有因子，返回 (汇总表, 分年度IC表)。"""
-    rows, years = [], {}
-    ls = factors.get("logsize")
-    for n, k in enumerate(keys):
-        if k not in factors:
-            continue
-        f = factors[k]
-        if neutralize and ls is not None and k != "logsize":
-            f = size_neutralize(f, ls, elig)
-        r = layered_test(f, adj_close, elig, rebal, horizon_weeks, 10, gap=gap)
-        if progress:
-            progress((n + 1) / len(keys), ALL_DEF.get(k, (k,))[0])
-        if not r.get("ok"):
-            continue
-        yr = r["ic_year"]
-        same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum()) if len(yr) else 0
-        # 三条证据方向是否一致: IC、分组单调性、多空价差
-        agree = bool(np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
-                     and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
-        rows.append({"因子": ALL_DEF.get(k, (k, 0))[0], "key": k,
-                     "IC均值": r["ic_mean"], "t(重叠修正)": r["t_nw"],
-                     "单调性": r["monotonic"], "多空价差": r["spread"],
-                     "方向一致": "是" if agree else "否",
-                     "同号年数": f"{same}/{len(yr)}", "_same": same, "_ny": len(yr),
-                     "_agree": agree, "IC>0占比": r["ic_pos"], "期数": r["n_period"]})
-        years[ALL_DEF.get(k, (k, 0))[0]] = r["ic_year"]
-    summ = pd.DataFrame(rows)
-    ydf = pd.DataFrame(years).T if years else pd.DataFrame()
-    return summ, ydf
-
-
-def gap_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
-             elig: pd.DataFrame, rebal: List[pd.Timestamp], horizon_weeks: int,
-             keys: List[str], gaps=(0, 1, 3, 5, 10), progress=None) -> pd.DataFrame:
-    """
-    入场延迟扫描 —— 区分真实反转与微观结构噪音的决定性检验。
-    真实的定价效应能扛住推迟几天入场；买卖价差跳动造出来的假反转，
-    在 gap 从 0 加到 1-3 天时就会大幅衰减，因为噪音只存在于那一天的价格里。
-    """
-    rows = []
-    for n, k in enumerate(keys):
-        if k not in factors:
-            continue
-        row = {"因子": ALL_DEF.get(k, (k, 0))[0], "key": k}
-        for g in gaps:
-            r = layered_test(factors[k], adj_close, elig, rebal, horizon_weeks, 10, gap=g)
-            row[f"t@延迟{g}日"] = r.get("t_nw", np.nan) if r.get("ok") else np.nan
-        base = row.get("t@延迟0日", np.nan)
-        far = row.get(f"t@延迟{gaps[-1]}日", np.nan)
-        row["残留比例"] = (abs(far) / abs(base)) if (np.isfinite(base) and abs(base) > 1e-9
-                                                and np.isfinite(far)) else np.nan
-        rows.append(row)
-        if progress:
-            progress((n + 1) / len(keys), row["因子"])
-    return pd.DataFrame(rows)
-
-
-HZ_LIST = (1, 2, 3, 4, 6, 8)
-ROUND_TRIP_COST = 0.0003 * 2 + 0.0005 + 0.001 * 2   # 佣金双边 + 印花税 + 滑点双边 = 0.31%
-
-
-def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
-                 elig: pd.DataFrame, rebal: List[pd.Timestamp], keys: List[str],
-                 horizons=(1, 2, 3, 4, 6, 8), gap: int = 1,
-                 cost: float = ROUND_TRIP_COST, progress=None) -> pd.DataFrame:
-    """
-    持有期扫描 —— 回答"该持有多久"。
-
-    信号有半衰期。持有期短于半衰期，吃到的信号浓度高但换手成本高；
-    长于半衰期，大部分持仓时间都在拿过期信号。这里把两边一起算：
-      多头超额 = 做多那一组相对当期截面均值的超额（IC为负时是D1，为正时是D10）
-      年化毛超额 = 多头超额 × (52/持有周数)
-      换手成本   = 单次往返成本 × (52/持有周数)
-      净超额     = 年化毛超额 - 换手成本
-
-    这里刻意不用"多空价差的一半"。A股融券做空不现实，如果效应全部来自
-    "涨得多的那组暴跌"，纯多头一分钱都吃不到，用价差折半会严重高估。
-    """
-    rows = []
-    for n, k in enumerate(keys):
-        if k not in factors:
-            continue
-        row = {"因子": ALL_DEF.get(k, (k, 0))[0], "key": k}
-        best, best_h = -9e9, np.nan
-        for h in horizons:
-            r = layered_test(factors[k], adj_close, elig, rebal, h, 10, gap=gap)
-            if not r.get("ok"):
-                row[f"t@{h}周"] = np.nan
-                row[f"净超额@{h}周"] = np.nan
-                continue
-            t_ = r["t_nw"]
-            turns = 52.0 / h
-            net = r["long_excess"] * turns - cost * turns
-            row[f"t@{h}周"] = t_
-            row[f"净超额@{h}周"] = net
-            row[f"_毛@{h}"] = r["long_excess"] * turns    # 不含成本，用于成本敏感性
-            if np.isfinite(t_) and abs(t_) >= 2.0 and net > best:
-                best, best_h = net, h
-                row["_ls"] = r["long_side"]
-                row["_lsh"] = r["long_share"]
-                row["_sh"] = r["short_excess"] * turns
-        # 净超额为负就不该叫"最优"。之前这里会把一个负数显示成推荐值。
-        if best > 0:
-            row["最优持有周"] = best_h
-            row["最优净超额"] = best
-            row["做多哪组"] = row.pop("_ls", "")
-            row["多头贡献占比"] = row.pop("_lsh", np.nan)
-            row["空头年化(拿不到)"] = row.pop("_sh", np.nan)
-        else:
-            row["最优持有周"] = np.nan
-            row["最优净超额"] = np.nan
-            row["做多哪组"] = "—"
-            row["多头贡献占比"] = np.nan
-            row["空头年化(拿不到)"] = np.nan
-            for kk in ("_ls", "_lsh", "_sh"):
-                row.pop(kk, None)
-        rows.append(row)
-        if progress:
-            progress((n + 1) / len(keys), row["因子"])
-    return pd.DataFrame(rows)
-
-
-def cost_grid(hs_row: pd.Series, horizons=HZ_LIST,
-              slips=(0.0010, 0.0007, 0.0005, 0.0003, 0.0002),
-              comm: float = 0.0003, stamp: float = 0.0005) -> pd.DataFrame:
-    """
-    成本 × 持有期 敏感性网格。
-    毛超额是数据给的，成本是假设。当净超额接近零时，结论几乎完全由成本假设决定，
-    所以必须把这个依赖摊开给人看，而不是塞一个数字了事。
-    """
-    out = {}
-    for sl in slips:
-        rt = comm * 2 + stamp + 2 * sl              # 佣金双边 + 印花税 + 滑点双边
-        col = {}
-        for h in horizons:
-            g = hs_row.get(f"_毛@{h}")
-            col[f"{h}周"] = (g - rt * (52.0 / h)) if pd.notna(g) else np.nan
-        out[f"单边滑点{sl:.2%}"] = col
-    return pd.DataFrame(out).T
-
-
-def eval_weights(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
-                 elig: pd.DataFrame, rebal: List[pd.Timestamp], weights: Dict[str, float],
-                 gap: int = 1, horizons=(1, 2, 3, 4, 6, 8), fixed_h: Optional[int] = None,
-                 progress=None) -> dict:
-    """把一组权重合成打分，跑完整检验，返回一行结论。"""
-    comp = composite_score(factors, elig, weights)
-    cf = {COMPOSITE_KEY: comp}
-    hs = horizon_scan(cf, adj_close, elig, rebal, [COMPOSITE_KEY],
-                      horizons=horizons, gap=gap, progress=progress)
-    row = hs.iloc[0]
-    hb = row["最优持有周"]
-    h_use = int(fixed_h) if fixed_h else (int(hb) if pd.notna(hb) else 2)
-    # 样本外必须报"样本内选定持有期"上的成绩。报各持有期里最好的那个，
-    # 等于拿样本外数据挑了参数，那就不叫样本外了。
-    if fixed_h:
-        hb = float(h_use)
-        row = row.copy()
-        row["最优净超额"] = row.get(f"净超额@{h_use}周", np.nan)
-    r = layered_test(comp, adj_close, elig, rebal, h_use, 10, gap=gap)
-    g = gap_scan(cf, adj_close, elig, rebal, h_use, [COMPOSITE_KEY], gaps=(0, 1))
-    yr = r.get("ic_year", pd.Series(dtype=float))
-    same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum()) if len(yr) else 0
-    agree = bool(np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
-                 and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
-    return {"t(重叠修正)": r["t_nw"], "同号年数": f"{same}/{len(yr)}",
-            "方向一致": "是" if agree else "否", "多头贡献占比": r["long_share"],
-            "最优持有周": hb, "年化净超额": row["最优净超额"],
-            "_same": same, "_ny": len(yr),
-            "延迟0日t": float(g.iloc[0]["t@延迟0日"]), "延迟1日t": float(g.iloc[0]["t@延迟1日"]),
-            "_ok": bool(abs(r["t_nw"]) >= 2 and agree and len(yr) and same / len(yr) >= 8 / 9
-                        and pd.notna(hb) and r["long_share"] >= 0.40),
-            "_hs": hs, "_r": r, "_h": h_use}
-
-
-def export_bundle(tables: Dict[str, pd.DataFrame]) -> bytes:
-    """把所有结果表打包成一个 zip（纯标准库，不依赖 openpyxl）。"""
-    import io
-    import zipfile
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, df in tables.items():
-            if df is None or not len(df):
-                continue
-            z.writestr(f"{name}.csv", df.to_csv().encode("utf-8-sig"))
-    return buf.getvalue()
-
-
-def factor_corr(factors: Dict[str, pd.DataFrame], elig: pd.DataFrame,
-                rebal: List[pd.Timestamp], keys: List[str]) -> pd.DataFrame:
-    """调仓日截面秩相关的平均值。用来看这些因子到底是几个独立的赌注。"""
-    ks = [k for k in keys if k in factors]
-    dates = rebal[::4]                      # 抽样即可，够稳定
-    acc = np.zeros((len(ks), len(ks)))
-    cnt = 0
-    for d in dates:
-        if d not in elig.index:
-            continue
-        m = elig.loc[d]
-        cols = []
-        for k in ks:
-            v = factors[k].loc[d].where(m)
-            cols.append(v.rank())
-        M = pd.concat(cols, axis=1, keys=ks).dropna()
-        if len(M) < 30:
-            continue
-        acc += M.corr().to_numpy()
-        cnt += 1
-    if cnt == 0:
-        return pd.DataFrame()
-    return pd.DataFrame(acc / cnt, index=[ALL_DEF[k][0] for k in ks],
-                        columns=[ALL_DEF[k][0] for k in ks])
-
-
 # ======================================================================
 # 四、回测引擎
 # ======================================================================
-def run_backtest(panel: dict, score: pd.DataFrame, elig: pd.DataFrame,
-                 rebal: List[pd.Timestamp], p: dict) -> dict:
+
+
+# ======================================================================
+# 五、名次段检验 —— 只持 1-3 只时，必须知道最极端的那几名是好是坏
+# ======================================================================
+RANK_BANDS = [(1, 3), (4, 10), (11, 20), (21, 40), (41, 80), (81, 150)]
+
+
+def rank_band_test(score: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
+                   rebal: List[pd.Timestamp], horizon_weeks: int = 4, gap: int = 1,
+                   bands=RANK_BANDS) -> pd.DataFrame:
     """
-    次日开盘成交；涨停不买、跌停不卖、停牌顺延；调仓日按目标权重再平衡（含无交易带）。
+    按名次分段看未来收益（相对当期截面均值的超额）。
+
+    分层检验测的是 D1 组（前 10%，上百只）的平均值。只买前 3 名时，买的是
+    前 0.2%，那是我们从没测过的区间。最极端的几只可能是真出事的公司，
+    不是被错杀的——这个函数就是查这件事。
     """
-    cal = panel["cal"]
-    codes = panel["codes"]
-    cidx = {c: j for j, c in enumerate(codes)}
-
-    AC = panel["adj_close"].to_numpy(dtype=np.float64)
-    AO = panel["adj_open"].to_numpy(dtype=np.float32)
-    TRD = panel["tradable"].to_numpy(dtype=bool)
-    LU = panel["limit_up_open"].to_numpy(dtype=bool)
-    LD = panel["limit_dn_open"].to_numpy(dtype=bool)
-    SC = score.reindex(index=cal, columns=codes).to_numpy(dtype=np.float32)
-    EL = elig.reindex(index=cal, columns=codes).fillna(False).to_numpy(dtype=bool)
-
-    # 市场宽度 -> 目标仓位
-    A = panel["adj_close"]
-    above = ((A > A.rolling(60).mean()) & elig).sum(axis=1)
-    base = elig.sum(axis=1)
-    breadth = (above / base.where(base > 0)).reindex(cal).ffill().fillna(0.5).to_numpy()
-    lo_b, hi_b = p["breadth_lo"], p["breadth_hi"]
-    scale = np.clip((breadth - lo_b) / max(1e-9, hi_b - lo_b), 0.0, 1.0)
-    exposure = p["min_expo"] + (1.0 - p["min_expo"]) * scale
-    if not p["use_breadth"]:
-        exposure = np.ones_like(exposure)
-
-    rebal_set = set(pd.DatetimeIndex(rebal))
-    i0 = max(70, int(np.argmax(cal >= pd.Timestamp(p["bt_start"]))) if (cal >= pd.Timestamp(p["bt_start"])).any() else 70)
-    i1 = len(cal) - 1
-
-    cash = float(p["capital"])
-    pos: Dict[int, dict] = {}          # j -> {shares, entry_px, entry_i, hw}
-    pending: List[tuple] = []          # (j, 'B'/'S', target_shares)
-    eq_hist, dates_hist, npos_hist, expo_hist = [], [], [], []
-    trades = []
-
-    comm, stamp, slip = p["commission"], p["stamp"], p["slippage"]
-    N, buf = int(p["top_n"]), int(p["buffer_rank"])
-    min_hold, max_hold = int(p["min_hold_w"]) * 5, int(p["max_hold_w"]) * 5
-
-    def equity(i: int) -> float:
-        v = cash
-        for j, ps in pos.items():
-            px = AC[i, j]
-            if not np.isfinite(px):
-                px = ps["last_px"]
-            v += ps["shares"] * px
-        return v
-
-    for i in range(i0, i1 + 1):
-        # ---- 1. 用今日开盘价执行昨日挂单 ----
-        still = []
-        for (j, side, tgt) in pending:
-            px = AO[i, j]
-            if (not TRD[i, j]) or (not np.isfinite(px)) or px <= 0:
-                still.append((j, side, tgt))                    # 停牌顺延
-                continue
-            if side == "B":
-                if LU[i, j]:
-                    still.append((j, side, tgt))                # 涨停买不到
-                    continue
-                if j not in pos and len(pos) >= N:              # 已满仓，不开新仓
-                    continue
-                fill = px * (1.0 + slip)
-                shares = int(tgt // 100) * 100
-                cost = shares * fill
-                fee = max(5.0, cost * comm)
-                if shares <= 0 or cost + fee > cash:
-                    afford = int(max(0.0, (cash - 5.0)) / (fill * 1.001) // 100) * 100
-                    shares = min(shares, afford)
-                    cost = shares * fill
-                    fee = max(5.0, cost * comm) if shares > 0 else 0.0
-                if shares <= 0:
-                    continue
-                cash -= cost + fee
-                if j in pos:
-                    old = pos[j]
-                    tot = old["shares"] + shares
-                    old["entry_px"] = (old["entry_px"] * old["shares"] + fill * shares) / tot
-                    old["shares"] = tot
-                else:
-                    pos[j] = {"shares": shares, "entry_px": fill, "entry_i": i,
-                              "hw": fill, "last_px": fill}
-                trades.append({"date": cal[i], "code": codes[j], "side": "买",
-                               "price": fill, "shares": shares, "amount": cost})
-            else:
-                if LD[i, j]:
-                    still.append((j, side, tgt))                # 跌停卖不掉
-                    continue
-                ps = pos.get(j)
-                if ps is None:
-                    continue
-                shares = int(min(ps["shares"], max(0, tgt)))
-                shares = int(shares // 100) * 100 if shares < ps["shares"] else ps["shares"]
-                if shares <= 0:
-                    continue
-                fill = px * (1.0 - slip)
-                gross = shares * fill
-                fee = max(5.0, gross * comm) + gross * stamp
-                cash += gross - fee
-                pnl = (fill - ps["entry_px"]) / ps["entry_px"]
-                trades.append({"date": cal[i], "code": codes[j], "side": "卖",
-                               "price": fill, "shares": shares, "amount": gross,
-                               "ret": pnl, "hold_days": i - ps["entry_i"]})
-                ps["shares"] -= shares
-                if ps["shares"] <= 0:
-                    pos.pop(j, None)
-        pending = still
-
-        # ---- 2. 收盘估值 ----
-        for j, ps in pos.items():
-            if np.isfinite(AC[i, j]):
-                ps["last_px"] = AC[i, j]
-                ps["hw"] = max(ps["hw"], AC[i, j])
-        eq = equity(i)
-        eq_hist.append(eq)
-        dates_hist.append(cal[i])
-        npos_hist.append(len(pos))
-        expo_hist.append(exposure[i])
-        if i == i1:
-            break
-
-        # ---- 3. 收盘生成明日订单 ----
-        forced = set()
-        for j, ps in list(pos.items()):
-            px = ps["last_px"]
-            held = i - ps["entry_i"]
-            hit_trail = px <= ps["hw"] * (1.0 - p["trail_stop"])
-            hit_hard = px <= ps["entry_px"] * (1.0 - p["hard_stop"])
-            if hit_trail or hit_hard or held >= max_hold - 1:
-                pending.append((j, "S", ps["shares"]))
-                forced.add(j)
-
-        if cal[i] in rebal_set:
-            sc = SC[i].copy()
-            sc[~EL[i]] = np.nan
-            valid = np.where(np.isfinite(sc))[0]
-            if len(valid) >= 5:
-                order = valid[np.argsort(-sc[valid])]
-                rank = {j: r + 1 for r, j in enumerate(order)}
-                target = list(order[:N])
-
-                # 缓冲带：已持仓且排名仍在 buf 内则保留
-                keep = [j for j in pos if j not in forced and rank.get(j, 10 ** 9) <= buf
-                        and (i - pos[j]["entry_i"]) >= min_hold]
-                keep += [j for j in pos if j not in forced and (i - pos[j]["entry_i"]) < min_hold]
-                keep = list(dict.fromkeys(keep))
-                final = list(dict.fromkeys(keep + [j for j in target if j not in keep]))[:N]
-
-                w = exposure[i] / max(1, N)
-                for j in list(pos):
-                    if j in forced:
-                        continue
-                    if j not in final:
-                        if (i - pos[j]["entry_i"]) >= min_hold:
-                            pending.append((j, "S", pos[j]["shares"]))
-                        continue
-                    tgt_val = eq * w
-                    cur_val = pos[j]["shares"] * pos[j]["last_px"]
-                    if cur_val > tgt_val * (1.0 + p["no_trade_band"]):
-                        cut = int((cur_val - tgt_val) / pos[j]["last_px"] // 100) * 100
-                        if cut > 0:
-                            pending.append((j, "S", cut))
-                    elif cur_val < tgt_val * (1.0 - p["no_trade_band"]):
-                        add = int((tgt_val - cur_val) / pos[j]["last_px"] // 100) * 100
-                        if add > 0:
-                            pending.append((j, "B", add))
-                for j in final:
-                    if j in pos:
-                        continue
-                    px = AC[i, j]
-                    if np.isfinite(px) and px > 0:
-                        pending.append((j, "B", int(eq * w / px // 100) * 100))
-
-    eqs = pd.Series(eq_hist, index=pd.DatetimeIndex(dates_hist), name="策略")
-    tdf = pd.DataFrame(trades)
-
-    # 基准：股票池等权（吃掉板块 beta 后才谈 alpha）
-    ret_all = panel["adj_close"].pct_change()
-    bench_r = ret_all.where(elig.shift(1).fillna(False)).mean(axis=1)
-    bench_r = bench_r.reindex(eqs.index).fillna(0.0)
-    bench = float(p["capital"]) * (1.0 + bench_r).cumprod()
-    bench.name = "股票池等权"
-
-    return {"equity": eqs, "bench": bench, "trades": tdf,
-            "npos": pd.Series(npos_hist, index=eqs.index),
-            "exposure": pd.Series(expo_hist, index=eqs.index)}
-
-
-def perf_stats(eq: pd.Series, trades: pd.DataFrame, npos: pd.Series,
-               bench: Optional[pd.Series] = None) -> dict:
-    r = eq.pct_change().dropna()
-    n = len(eq)
-    yrs = max(n / 252.0, 1e-9)
-    cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1.0 / yrs) - 1.0
-    dd = eq / eq.cummax() - 1.0
-    sharpe = r.mean() / r.std() * np.sqrt(252.0) if r.std() > 1e-12 else np.nan
-    out = {"年化收益": cagr, "最大回撤": dd.min(), "夏普": sharpe,
-           "卡玛": cagr / abs(dd.min()) if dd.min() < -1e-9 else np.nan,
-           "总收益": eq.iloc[-1] / eq.iloc[0] - 1.0, "回测年数": yrs}
-    if bench is not None and len(bench) > 5:
-        b = bench.reindex(eq.index).ffill()
-        bcagr = (b.iloc[-1] / b.iloc[0]) ** (1.0 / yrs) - 1.0
-        out["基准年化"] = bcagr
-        out["年化超额"] = cagr - bcagr
-    if trades is not None and len(trades) and "ret" in trades.columns:
-        s = trades.dropna(subset=["ret"])
-        if len(s):
-            win = s[s["ret"] > 0]["ret"]
-            los = s[s["ret"] <= 0]["ret"]
-            out["交易笔数"] = len(s)
-            out["胜率"] = len(win) / len(s)
-            out["盈亏比"] = (win.mean() / abs(los.mean())) if len(los) and abs(los.mean()) > 1e-9 else np.nan
-            out["平均持仓周"] = s["hold_days"].mean() / 5.0
-    # 空窗统计
-    empty = (npos == 0)
-    wk = empty.groupby([npos.index.isocalendar().year, npos.index.isocalendar().week]).all()
-    by_year = wk.groupby(level=0).sum()
-    out["_空窗周_按年"] = by_year
-    out["最大单年空窗周"] = int(by_year.max()) if len(by_year) else 0
+    cal = adj_close.index
+    pos = {d: i for i, d in enumerate(cal)}
+    step = horizon_weeks * 5
+    rows = []
+    for d in rebal:
+        i = pos.get(d)
+        if i is None or i + gap + step >= len(cal):
+            continue
+        sc = score.iloc[i].where(elig.iloc[i])
+        sc = sc.dropna().sort_values(ascending=False)
+        if len(sc) < max(b[1] for b in bands):
+            continue
+        j = i + gap
+        fwd = (adj_close.iloc[j + step] / adj_close.iloc[j] - 1.0)
+        mkt = float(fwd.reindex(sc.index).mean())
+        rec = {"date": d}
+        for lo, hi in bands:
+            names = sc.index[lo - 1:hi]
+            v = fwd.reindex(names).mean()
+            rec[f"第{lo}-{hi}名"] = (float(v) - mkt) if pd.notna(v) else np.nan
+        rows.append(rec)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).set_index("date")
+    out = pd.DataFrame({
+        "平均超额": df.mean(),
+        "胜率": (df > 0).mean(),
+        "标准误": df.std() / np.sqrt(df.notna().sum()),
+    })
+    out["t值"] = out["平均超额"] / out["标准误"].where(out["标准误"] > 1e-12)
     return out
 
 
+def picked_path_stats(score: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
+                      rebal: List[pd.Timestamp], top_n: int = 3, weeks: int = 8,
+                      gap: int = 1) -> pd.DataFrame:
+    """
+    选出的股票在之后每周的「最大涨幅 / 最大跌幅」分布。
+    用户自己设止盈止损，这张表就是定位的依据：止损设在历史上大多数
+    正常波动之外，才不会被噪音扫出局。
+    """
+    cal = adj_close.index
+    pos = {d: i for i, d in enumerate(cal)}
+    recs = []
+    for d in rebal:
+        i = pos.get(d)
+        if i is None or i + gap + weeks * 5 >= len(cal):
+            continue
+        sc = score.iloc[i].where(elig.iloc[i]).dropna().sort_values(ascending=False)
+        if len(sc) < top_n:
+            continue
+        names = list(sc.index[:top_n])
+        j = i + gap
+        base = adj_close.iloc[j].reindex(names)
+        for w in range(1, weeks + 1):
+            seg = adj_close.iloc[j:j + w * 5].reindex(columns=names)
+            up = (seg.max() / base - 1.0)
+            dn = (seg.min() / base - 1.0)
+            end = (adj_close.iloc[j + w * 5].reindex(names) / base - 1.0)
+            for c in names:
+                recs.append({"周": w, "最大涨幅": up.get(c), "最大跌幅": dn.get(c),
+                             "期末收益": end.get(c)})
+    if not recs:
+        return pd.DataFrame()
+    r = pd.DataFrame(recs)
+    g = r.groupby("周")
+    return pd.DataFrame({
+        "最大涨幅_中位": g["最大涨幅"].median(),
+        "最大跌幅_中位": g["最大跌幅"].median(),
+        "最大跌幅_25分位": g["最大跌幅"].quantile(0.25),
+        "期末收益_中位": g["期末收益"].median(),
+        "期末为正比例": g["期末收益"].apply(lambda x: (x > 0).mean()),
+    })
+
+
+def empty_week_stats(score: pd.DataFrame, elig: pd.DataFrame,
+                     rebal: List[pd.Timestamp], top_n: int = 3,
+                     warmup_days: int = 70) -> pd.Series:
+    """
+    每年有多少周选不满 top_n 只。排名系统理论上恒为 0，但要用数据确认。
+    前 warmup_days 个交易日是因子预热期（60日窗口尚未填满），那段没有分数
+    不是真空窗，要排除，否则会把预热期误报成系统缺陷。
+    """
+    if len(score.index) > warmup_days:
+        first_ok = score.index[warmup_days]
+        rebal = [d for d in rebal if d >= first_ok]
+    rows = []
+    for d in rebal:
+        if d not in score.index:
+            continue
+        n = int(score.loc[d].where(elig.loc[d]).notna().sum())
+        rows.append({"date": d, "不足": 1 if n < top_n else 0})
+    if not rows:
+        return pd.Series(dtype=int)
+    df = pd.DataFrame(rows).set_index("date")
+    return df.groupby(df.index.year)["不足"].sum()
+
+
 # ======================================================================
-# 五、Streamlit 界面
+# 六、界面 —— 一页，一个按钮，输出每周候选
 # ======================================================================
-def _mem_mb(panel: dict, factors: Optional[dict] = None) -> float:
-    tot = 0
-    for k, v in panel.items():
-        if isinstance(v, pd.DataFrame):
-            tot += v.memory_usage(deep=False).sum()
-    if factors:
-        for v in factors.values():
-            tot += v.memory_usage(deep=False).sum()
-    return tot / 1e6
-
-
-# Streamlit 每动一次控件就重跑整个脚本。1500 只股票时，不加缓存的话
-# build_eligibility + composite_score 会在每次拖动滑块时重算一遍全量矩阵，
-# 几秒钟的卡顿加上反复分配大数组，是这个应用最现实的崩溃来源。
-if st is not None:
-    @st.cache_data(show_spinner=False, max_entries=2)
-    def cached_elig(_panel, _basic, _uni, key: str, mv_lo, mv_hi, min_price, min_amt, min_days):
-        return build_eligibility(_panel, _basic, _uni, mv_lo, mv_hi, min_price, min_amt, int(min_days))
-
-    @st.cache_data(show_spinner=False, max_entries=2)
-    def cached_score(_factors, _elig, key: str, wkey: tuple):
-        return composite_score(_factors, _elig, dict(wkey))
-else:                                              # 无 streamlit 时直通
-    def cached_elig(_panel, _basic, _uni, key, mv_lo, mv_hi, min_price, min_amt, min_days):
-        return build_eligibility(_panel, _basic, _uni, mv_lo, mv_hi, min_price, min_amt, int(min_days))
-
-    def cached_score(_factors, _elig, key, wkey):
-        return composite_score(_factors, _elig, dict(wkey))
-
-
-def _fmt(v) -> str:
-    if isinstance(v, (int, np.integer)):
-        return str(int(v))
-    if isinstance(v, float):
-        return f"{v:.2%}" if abs(v) < 10 else f"{v:.2f}"
-    return str(v)
+WEIGHTS = {"dist_hi": -1.0, "rev5": -0.5}      # 唯一通过全部检验的两个因子
 
 
 def main():
-    st.set_page_config(page_title="科技股排名轮动选股系统", layout="wide")
-    st.title("科技 / 军工 / 新能源 / 机器人 —— 排名轮动选股系统")
-    st.caption("排名轮动，非信号触发：每周持有分数最高的 N 只，结构上不存在空窗。")
-
+    st.set_page_config(page_title="每周选股", layout="wide")
     ss = st.session_state
     ss.setdefault("panel", None)
 
-    # ---------------- 侧边栏 ----------------
+    st.title("每周选股")
+    st.caption("科技 / 军工 / 新能源 / 机器人　·　流通市值 50-1000 亿　·　股价 10 元以上")
+
     with st.sidebar:
-        st.header("① 数据")
+        st.header("设置")
         token = st.text_input("Tushare Token", type="password",
                               value=os.environ.get("TUSHARE_TOKEN", ""))
-        c1, c2 = st.columns(2)
-        start = c1.date_input("起始", dt.date(2018, 1, 1))
-        end = c2.date_input("结束", dt.date.today())
-        l1 = st.multiselect("申万一级行业（整体纳入）", SW_L1_ALL, SW_L1_DEFAULT)
-        l2 = st.multiselect("申万二级行业（子行业纳入）", SW_L2_ALL, SW_L2_DEFAULT)
-        d1, d2 = st.columns(2)
-        workers = d1.slider("并发线程数", 1, 8, 4)
-        per_min = d2.slider("每分钟请求上限", 60, 800, 400, 20)
-        st.caption("频次限制按账号算，线程共用一个限流器，不会因并发被封。"
-                   "上限按你的 Tushare 积分设：2000 积分对应 500/分钟。")
-        use_cache = st.checkbox("使用本地缓存（中断可续传）", True)
-        prescreen = st.checkbox("下载前先做市值预筛", True,
-                                help="用 16 次全市场快照，只保留历史上曾进入市值区间的股票。"
-                                     "用的是各采样日的当期市值，无前视偏差，通常能砍掉 1/3 下载量。")
-        max_stk = st.number_input("最多下载股票数（0=不限）", 0, 3000, 0, 50)
-        dl = st.button("下载 / 更新数据", type="primary", use_container_width=True)
+        top_n = st.slider("每周选几只", 1, 5, 3)
+        st.caption("下面这些一般不用改。")
+        with st.expander("数据范围"):
+            start = st.date_input("起始", dt.date(2018, 1, 1))
+            end = st.date_input("结束", dt.date.today())
+            workers = st.slider("并发线程", 1, 8, 4)
+            per_min = st.slider("每分钟请求上限", 60, 800, 400, 20)
+        run = st.button("下载数据并选股", type="primary", use_container_width=True)
+        if ss.get("panel") is not None:
+            st.success(f"已加载 {len(ss['panel']['codes'])} 只 × "
+                       f"{len(ss['panel']['cal'])} 个交易日")
 
-        st.header("② 股票池硬约束")
-        mv_lo = st.number_input("流通市值下限（亿）", 1.0, 5000.0, 50.0, 10.0)
-        mv_hi = st.number_input("流通市值上限（亿）", 10.0, 20000.0, 1000.0, 50.0)
-        min_price = st.number_input("最低股价（元）", 0.0, 200.0, 10.0, 1.0)
-        min_amt = st.number_input("20日均成交额下限（亿）", 0.0, 50.0, 2.0, 0.5)
-        min_days = st.number_input("上市满（自然日）", 0, 1500, 365, 30)
-
-    if dl:
+    if run:
         if not token:
             st.error("请先填 Tushare Token")
             st.stop()
@@ -1186,717 +797,138 @@ def main():
         pro = ts.pro_api(token)
         lim = Limiter(per_min)
         API_ERRORS.clear()
-        s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-
-        # 重新下载前先释放上一份数据，否则新旧两份同时在内存里
-        for k in ("panel", "factors", "last_bt"):
+        for k in ("panel", "factors", "result"):
             ss.pop(k, None)
         gc.collect()
+        s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
-        with st.status("正在获取数据…", expanded=True) as status:
-            st.write("1/4 取申万成分股…")
-            uni = fetch_universe(pro, lim, l1, l2)
+        with st.status("正在准备…", expanded=True) as status:
+            st.write("取行业成分股…")
+            uni = fetch_universe(pro, lim, SW_L1_DEFAULT, SW_L2_DEFAULT)
             if not len(uni):
-                st.error("行业成分股为空。可能是 Tushare 积分不足，无法调用申万接口。")
+                st.error("行业成分股为空，可能是 Tushare 积分不足。")
                 st.stop()
-            codes = list(uni["ts_code"])
-            st.write(f"   候选 {len(codes)} 只")
-
-            st.write("2/4 取股票基础信息（含退市）…")
+            st.write("取股票基础信息…")
             basic = fetch_stock_basic(pro, lim)
-
-            if prescreen:
-                st.write("3/4 市值预筛…")
-                n0 = len(codes)
-                codes = prescreen_by_mv(pro, lim, codes, s_str, e_str, mv_lo, mv_hi)
-                st.write(f"   {n0} → {len(codes)} 只（剔除 {n0-len(codes)} 只从未进入市值区间的）")
-            else:
-                st.write("3/4 跳过预筛")
-
-            if max_stk:
-                codes = codes[: int(max_stk)]
-            est_mb = len(codes) * 1950 * 4 * 14 / 1e6
-            st.write(f"4/4 并发下载 {len(codes)} 只（{workers} 线程，预计常驻内存 ~{est_mb:.0f} MB）…")
-
+            st.write("市值预筛…")
+            codes = prescreen_by_mv(pro, lim, list(uni["ts_code"]), s_str, e_str, 50, 1000)
+            st.write(f"下载 {len(codes)} 只行情…")
             bar = st.progress(0.0)
             t0 = time.time()
-
-            def _cb(done, total, ok):
-                el = time.time() - t0
-                eta = el / max(done, 1) * (total - done)
-                bar.progress(done / total,
-                             text=f"{done}/{total}  成功 {ok}  已用 {el/60:.1f} 分  剩余约 {eta/60:.1f} 分")
-
-            px = download_all(token, codes, s_str, e_str, lim, use_cache, workers, _cb)
+            px = download_all(token, codes, s_str, e_str, lim, True, workers,
+                              lambda done, tot, ok: bar.progress(
+                                  done / tot, text=f"{done}/{tot}　已用 {(time.time()-t0)/60:.1f} 分"))
             if not px:
-                st.error("一只股票都没下到。检查 Token、积分权限和网络。")
+                st.error("没下到数据，检查 Token 与积分权限。")
                 st.stop()
-
-            st.write("构建面板与因子…")
+            st.write("计算因子…")
             panel = build_panel(px)
-            px.clear()
-            del px
-            gc.collect()
-            factors = compute_factors(panel["adj_close"], panel["amount"], circ_mv=panel["circ_mv"])
-
+            px.clear(); del px; gc.collect()
             ss["panel"] = panel
             ss["basic"] = basic
             ss["uni"] = uni
-            ss["factors"] = factors
-            ss["data_key"] = f"{len(panel['codes'])}|{panel['cal'][0]:%Y%m%d}|{panel['cal'][-1]:%Y%m%d}"
-            ss["api_errors"] = list(API_ERRORS)
-            st.cache_data.clear()
-            status.update(
-                label=f"完成：{len(panel['codes'])} 只 × {len(panel['cal'])} 个交易日，"
-                      f"实占内存 {_mem_mb(panel, factors):.0f} MB，耗时 {(time.time()-t0)/60:.1f} 分钟",
-                state="complete")
+            ss["factors"] = compute_factors(panel["adj_close"], panel["amount"],
+                                            circ_mv=panel["circ_mv"])
+            status.update(label=f"完成，耗时 {(time.time()-t0)/60:.1f} 分钟", state="complete")
 
     if ss.get("panel") is None:
-        st.info("左侧填入 Tushare Token 后点「下载 / 更新数据」。首次全量下载约需 5-15 分钟，之后走本地缓存。")
+        st.info("左侧填入 Tushare Token 后点「下载数据并选股」。"
+                "首次约需 5-15 分钟，之后走本地缓存。")
         st.stop()
 
     panel, basic, uni, factors = ss["panel"], ss["basic"], ss["uni"], ss["factors"]
+    elig = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
+    score = composite_score(factors, elig, {k: WEIGHTS.get(k, 0.0) for k in FACTOR_KEYS})
+    rebal = weekly_rebal_dates(panel["cal"])
 
-    dkey = ss.get("data_key", "na")
-    elig = cached_elig(panel, basic, uni, dkey, mv_lo, mv_hi, min_price, min_amt, int(min_days))
-    rebal_all = weekly_rebal_dates(panel["cal"])
+    # ---- 一次性校准：前几名到底该取哪一段 ----
+    if ss.get("calib") is None:
+        with st.spinner("校准中（只做一次）…"):
+            bt = rank_band_test(score, panel["adj_close"], elig, rebal,
+                                horizon_weeks=4, gap=1)
+            ss["calib"] = bt
+    bt = ss["calib"]
+    best_band = bt["平均超额"].idxmax() if len(bt) else "第1-3名"
+    lo = int(best_band.replace("第", "").split("-")[0])
 
-    t1, t2, t3, t4 = st.tabs(["数据总览", "因子分层检验", "策略回测", "当前选股"])
+    # ---- 本周候选 ----
+    d = panel["cal"][-1]
+    s = score.loc[d].where(elig.loc[d]).dropna().sort_values(ascending=False)
+    st.subheader(f"本周候选　（数据截至 {d:%Y-%m-%d}，合格池 {len(s)} 只）")
 
-    # ---------------- 数据总览 ----------------
-    with t1:
-        cnt = elig.sum(axis=1)
-        a, b, c, d = st.columns(4)
-        a.metric("下载股票数", len(panel["codes"]))
-        b.metric("交易日数", len(panel["cal"]))
-        c.metric("当前合格数", int(cnt.iloc[-1]))
-        d.metric("数据占用内存", f"{_mem_mb(panel, factors):.0f} MB")
-        st.caption(f"历史平均合格数 {cnt.mean():.0f} 只")
-        st.subheader("每日合格股票数量")
-        st.line_chart(cnt.rename("合格数"))
-        st.caption("若某段时间合格数长期低于 30，说明市值/股价门槛在那个阶段过严，排名的区分度会下降。")
-        if ss.get("api_errors"):
-            with st.expander(f"接口异常 {len(ss['api_errors'])} 条"):
-                st.write(ss["api_errors"][-40:])
-
-    # ---------------- 因子分层检验 ----------------
-    with t2:
-        st.subheader("因子检验")
-        st.markdown("### 一键 A/B 对比")
-        st.markdown(
-            "**不需要设任何参数。** 这个按钮会自动做完四件事：\n\n"
-            "1. 用**样本内 2018-2022** 分别检验 A、B 两组权重\n"
-            "2. 挑出更好的一组\n"
-            "3. 用**样本外 2023 年至今**验证它（这一步只跑一次，不回头改）\n"
-            "4. 把胜出的权重写进回测页\n\n"
-            "A 组 = 只用「距60日高点」（权重 -1）　　"
-            "B 组 = 距60日高点 -1 ＋ 5日反转 -0.5")
-
-        IN_END, OUT_BEG = pd.Timestamp("2022-12-31"), pd.Timestamp("2023-01-01")
-        if st.button("开始 A/B 对比", type="primary", use_container_width=True):
-            rb_in = [d for d in rebal_all if d <= IN_END]
-            rb_out = [d for d in rebal_all if d >= OUT_BEG]
-            if len(rb_in) < 50 or len(rb_out) < 20:
-                st.error("样本内或样本外调仓次数太少，检查数据起止日期。")
-            else:
-                groups = {"A组": {"dist_hi": -1.0},
-                          "B组": {"dist_hi": -1.0, "rev5": -0.5}}
-                bar = st.progress(0.0, text="准备中…")
-                done, total = 0, len(groups) * len(HZ_LIST) + len(HZ_LIST)
-                res = {}
-                for gname, gw in groups.items():
-                    full = {k: float(gw.get(k, 0.0)) for k in FACTOR_KEYS}
-                    def _cb(p, nm, _g=gname):
-                        nonlocal done
-                        done += 1
-                        bar.progress(min(done / total, 1.0), text=f"样本内 {_g}…")
-                    res[gname] = eval_weights(factors, panel["adj_close"], elig, rb_in,
-                                              full, gap=1, horizons=HZ_LIST, progress=_cb)
-                    res[gname]["_w"] = full
-                # 样本内净超额更高者胜出（NaN 视为最差）
-                def _sc(x):
-                    v = x["年化净超额"]
-                    return v if pd.notna(v) else -9e9
-                win = max(res, key=lambda g: _sc(res[g]))
-                wres = res[win]
-                oos = None
-                if pd.notna(wres["年化净超额"]):
-                    def _cb2(p, nm):
-                        nonlocal done
-                        done += 1
-                        bar.progress(min(done / total, 1.0), text="样本外验证…")
-                    oos = eval_weights(factors, panel["adj_close"], elig, rb_out,
-                                       wres["_w"], gap=1, horizons=HZ_LIST,
-                                       fixed_h=wres["_h"], progress=_cb2)
-                bar.empty()
-                ss["ab"] = {"res": res, "win": win, "oos": oos,
-                            "h": wres["_h"], "w": wres["_w"]}
-                for k, v in wres["_w"].items():
-                    ss["w_" + k] = v
-                ss.pop("last_bt", None)
-                st.rerun()
-
-        if ss.get("ab"):
-            ab = ss["ab"]
-            cols = ["t(重叠修正)", "方向一致", "同号年数", "多头贡献占比",
-                    "最优持有周", "年化净超额", "延迟0日t", "延迟1日t"]
-            tbl = pd.DataFrame({g: {c: r[c] for c in cols} for g, r in ab["res"].items()}).T
-            if ab["oos"] is not None:
-                tbl.loc[f"{ab['win']}·样本外"] = {c: ab["oos"][c] for c in cols}
-            st.markdown("**结果**（前两行=样本内 2018-2022，末行=样本外 2023至今）")
-            st.dataframe(tbl.style.format({"t(重叠修正)": "{:.2f}", "多头贡献占比": "{:.0%}",
-                                           "最优持有周": "{:.0f}", "年化净超额": "{:+.1%}",
-                                           "延迟0日t": "{:.2f}", "延迟1日t": "{:.2f}"},
-                                          na_rep="—"),
-                         use_container_width=True)
-
-            wr = ab["res"][ab["win"]]
-            oos = ab["oos"]
-            if not pd.notna(wr["年化净超额"]):
-                st.error("**两组在样本内都没有任何持有期的净超额为正。** "
-                         "这个方向不成立，不要往下做回测。")
-            elif oos is None:
-                st.warning("样本外未能完成验证。")
-            elif oos["_ok"] and pd.notna(oos["年化净超额"]) and oos["年化净超额"] > 0:
-                st.success(
-                    f"**{ab['win']} 胜出，且通过样本外验证。**　"
-                    f"样本内净超额 {wr['年化净超额']:+.1%}，样本外 {oos['年化净超额']:+.1%}，"
-                    f"持有 {ab['h']} 周。权重已自动写入回测页。\n\n"
-                    f"下一步：去「策略回测」页，把**最长持有期设成 {ab['h']} 周**，"
-                    f"回测起止设 2023-01-01 到今天，点运行。")
-            else:
-                why = []
-                if pd.isna(oos["年化净超额"]) or oos["年化净超额"] <= 0:
-                    why.append("样本外净超额不为正")
-                if abs(oos["t(重叠修正)"]) < 2:
-                    why.append("样本外不显著")
-                if oos["方向一致"] != "是":
-                    why.append("样本外三条证据方向打架")
-                if pd.notna(oos["多头贡献占比"]) and oos["多头贡献占比"] < 0.40:
-                    why.append("样本外多头占比不足40%")
-                if oos["_ny"] and oos["_same"] / oos["_ny"] < 8 / 9:
-                    why.append(f"样本外逐年符号不稳（{oos['同号年数']}）")
-                if not why:
-                    why.append("多项指标处在临界值")
-                st.error(
-                    f"**{ab['win']} 在样本内最好（{wr['年化净超额']:+.1%}），"
-                    f"但样本外没过：" + "、".join(why) + "。**\n\n"
-                    "样本内好、样本外垮，通常意味着样本内那部分是行情特征而不是稳定效应。"
-                    "权重已写入回测页，你可以跑一次看看实际曲线，但**不要**因为样本外不好"
-                    "就回头改权重再试——那就把样本外也用掉了。")
-
-            if ab.get("oos") is not None and ab["oos"].get("_hs") is not None:
-                st.markdown("**样本外：成本 × 持有期 敏感性**")
-                st.caption(
-                    "毛超额是数据给的，成本是假设。当净超额接近零时，结论几乎完全由"
-                    "成本假设决定，所以这里把它摊开。默认用的是单边滑点 0.10%（偏保守）——"
-                    "如果你的实际成交规模小、标的流动性好，0.05% 可能更贴近现实。"
-                    "**绿色格子才是可交易的组合。**")
-                cc1, cc2 = st.columns(2)
-                comm_bp = cc1.number_input("佣金（单边，万分之）", 0.0, 10.0, 3.0, 0.1,
-                                           help="万3=3.0。券商最低可到万0.854，"
-                                                "这一项直接决定结论，按你的实际费率填。")
-                stamp_bp = cc2.number_input("印花税（卖出，千分之）", 0.0, 2.0, 0.5, 0.1)
-                cg = cost_grid(ab["oos"]["_hs"].iloc[0],
-                               comm=comm_bp / 10000.0, stamp=stamp_bp / 1000.0)
-                st.dataframe(cg.style.format("{:+.1%}", na_rep="—")
-                             .background_gradient(cmap="RdYlGn", vmin=-0.10, vmax=0.10),
-                             use_container_width=True)
-                best = cg.max().max()
-                if pd.notna(best) and best > 0.05:
-                    pos = cg.stack().idxmax()
-                    st.info(f"最好的组合是「{pos[0]}、持有{pos[1]}」，样本外净超额 {best:+.1%}。"
-                            "注意这是在样本外数据上挑出来的最优格子，实际会比它差。")
-                elif pd.notna(best) and best > 0:
-                    st.warning(f"所有组合里最高只有 {best:+.1%}。"
-                               "即使按最乐观的成本假设，这个边际也太薄，"
-                               "5 只股票的组合波动会把它完全淹没。")
-                else:
-                    st.error("在任何成本与持有期组合下，样本外净超额都不为正。")
-
-                st.markdown("**这点边际够不够用：持股数决定一切**")
-                st.caption(
-                    "边际再真，如果被组合自身的波动淹没也没意义。跟踪误差按个股特质"
-                    "波动 35%／√N 估算。**持股 5 只是我最初设的默认值，不是你的约束。**"
-                    "30 只约占合格池 8%，正好对应我们测的 D1 组；5 只是前 1.4%，属于外推。")
-                edge = float(best) if pd.notna(best) else 0.0
-                rows_ir = []
-                for N in (5, 10, 20, 30, 40):
-                    te = 0.35 / np.sqrt(N)
-                    ir = edge / te if te > 0 else np.nan
-                    yrs = (2.0 / ir) ** 2 if ir and ir > 0 else np.nan
-                    rows_ir.append({"持股数": N, "跟踪误差": te, "信息比": ir,
-                                    "证明所需年数": yrs})
-                ir_df = pd.DataFrame(rows_ir).set_index("持股数")
-                st.dataframe(ir_df.style.format({"跟踪误差": "{:.1%}", "信息比": "{:.2f}",
-                                                 "证明所需年数": "{:.0f}"}, na_rep="—"),
-                             use_container_width=True)
-                st.caption(f"按当前最优格子 {edge:+.1%} 计算。信息比 0.5 以上才算勉强可用。")
-
-        st.divider()
-        with st.expander("高级：逐因子扫描 / 自定义权重 / 导出", expanded=False):
-            st.subheader("先回答一个问题：这些打分有没有排序能力？")
-            st.markdown(
-                "**t 的符号只说明方向，门槛是 |t| > 2。** t 为负不是失败，是因子要反过来用。\n\n"
-                "但看结果之前先记住两件事：① 动量、趋势质量、相对强度、距高点、5日反转"
-                "本质都是「近期价格强弱」的变体，彼此高度相关，**六个因子大约只是两个独立赌注**；"
-                "② 池子有 50-1000 亿的市值上下限，动量高的股票平均更靠近上沿，"
-                "所以「动量为负」可能只是「小市值跑赢」的伪装——下面的市值诊断就是查这个的。")
-
-            c0 = st.columns(5)
-            hz = c0[0].select_slider("持有期（周）", [1, 2, 4, 6, 8], 4)
-            gap = c0[1].select_slider("入场延迟（交易日）", [0, 1, 3, 5, 10], 1,
-                                      help="0 = 用排名当日收盘价入场。这会让因子的分子和"
-                                           "未来收益的分母共用同一个价格，噪音会凭空造出负相关。"
-                                           "回测是次日开盘成交，所以 1 才是与回测一致的口径。")
-            ls_ = c0[2].date_input("样本起", dt.date(2018, 1, 1), key="ls")
-            le_ = c0[3].date_input("样本止", dt.date.today(), key="le")
-            neu = c0[4].checkbox("市值中性化", False,
-                                 help="截面上把因子对 log 流通市值回归取残差。"
-                                      "勾选后再看一遍 IC：如果因子显著性大幅塌掉，"
-                                      "说明它原本的效果主要来自市值暴露，不是因子本身。")
-            rb = [d for d in rebal_all if pd.Timestamp(ls_) <= d <= pd.Timestamp(le_)]
-
-            if st.button("扫描全部因子（含市值诊断）", type="primary"):
-                bar = st.progress(0.0)
-                summ, ydf = scan_all_factors(factors, panel["adj_close"], elig, rb,
-                                             int(hz), TEST_KEYS, neu,
-                                             lambda p, n: bar.progress(p, text=n), gap=int(gap))
-                ss["scan"] = (summ, ydf, factor_corr(factors, elig, rb, TEST_KEYS),
-                              int(hz), neu, int(gap))
-                bar.empty()
-
-            if ss.get("scan"):
-                summ, ydf, corr, hz_done, neu_done, gap_done = ss["scan"]
-                tag = "（已市值中性化）" if neu_done else ""
-                st.markdown(f"**汇总{tag}　持有期 {hz_done} 周　入场延迟 {gap_done} 日**")
-                show = summ.drop(columns=[c for c in summ.columns
-                                          if c == "key" or c.startswith("_")]).copy()
-                st.dataframe(
-                    show.style.format({"IC均值": "{:.4f}", "t(重叠修正)": "{:.2f}",
-                                       "单调性": "{:.2f}", "多空价差": "{:.2%}",
-                                       "IC>0占比": "{:.1%}"})
-                        .background_gradient(subset=["t(重叠修正)"], cmap="RdYlGn", vmin=-4, vmax=4),
-                    use_container_width=True)
-                st.caption(
-                    "**「方向一致」是这张表里最该先看的一列。** IC、分组单调性、多空价差"
-                    "是同一件事的三种量法，方向不一致说明因子的效果集中在少数高波动时段，"
-                    "总均值和分组结果各说各话——这种因子不能用。"
-                    "「同号年数」低于 8/9 的同样不能用：总均值只是两段相反行情的平均数。")
-
-                diag = summ[summ["key"] == "logsize"]
-                if len(diag):
-                    d0 = diag.iloc[0]
-                    st.markdown("**市值诊断**")
-                    if abs(d0["t(重叠修正)"]) >= 2:
-                        direc = "小市值跑赢大市值" if d0["IC均值"] < 0 else "大市值跑赢小市值"
-                        st.warning(
-                            f"流通市值本身就是个显著因子（IC {d0['IC均值']:.4f}，"
-                            f"修正 t {d0['t(重叠修正)']:.2f}），方向是**{direc}**。"
-                            "请务必勾选「市值中性化」再扫一遍：如果价格类因子的显著性"
-                            "在中性化后大幅塌掉，那它们原本测出来的效果主要是市值暴露，"
-                            "照着这个结果去建仓等于在赌市值风格，不是在赌你想赌的东西。")
-                    else:
-                        st.success(f"流通市值本身不显著（修正 t {d0['t(重叠修正)']:.2f}），"
-                                   "价格类因子的结果没有被市值污染。")
-
-                st.markdown("**分年度 IC**")
-                if len(ydf):
-                    st.dataframe(ydf.style.format("{:.4f}")
-                                 .background_gradient(cmap="RdYlGn", vmin=-0.08, vmax=0.08),
-                                 use_container_width=True)
-                    st.caption("这张表比总均值重要得多。如果某因子在 2019-2021 是一个符号、"
-                               "2023 年之后翻成另一个符号，那它的总均值只是两段相反行情的平均数，"
-                               "拿去做实盘等于赌行情会退回从前。逐年同号才叫稳定。")
-
-                if len(corr):
-                    st.markdown("**因子截面相关性**")
-                    st.dataframe(corr.style.format("{:.2f}")
-                                 .background_gradient(cmap="coolwarm", vmin=-1, vmax=1),
-                                 use_container_width=True)
-                    st.caption("相关性 0.7 以上的因子之间几乎没有增量信息，"
-                               "把它们一起加进打分只是把同一个赌注下三遍，并不会分散风险。")
-
-                tradable = summ[summ["key"].isin(FACTOR_KEYS)].copy()
-                # 三道门槛全过才给权重。只看 t 会把"效果集中在少数时段"和
-                # "两段相反行情的平均数"这两类因子放进来，那是在拟合过去。
-                def _pass(r):
-                    return (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0
-                            and r["_agree"] and r["_ny"] > 0 and r["_same"] / r["_ny"] >= 8 / 9)
-                tradable["通过"] = tradable.apply(_pass, axis=1)
-                passed = tradable[tradable["通过"]]
-                st.markdown(f"**三道门槛全过的可交易因子：{len(passed)} / {len(tradable)}**")
-                st.caption("门槛：|修正 t| ≥ 2　且　IC/单调性/价差方向一致　且　同号年数 ≥ 8/9")
-                for _, r in tradable.iterrows():
-                    why = []
-                    if not (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0):
-                        why.append("不显著")
-                    if not r["_agree"]:
-                        why.append("三条证据方向打架")
-                    if r["_ny"] and r["_same"] / r["_ny"] < 8 / 9:
-                        why.append(f"逐年符号不稳({r['同号年数']})")
-                    st.write(("✅ " if r["通过"] else "❌ ") + r["因子"]
-                             + ("" if r["通过"] else "　— " + "、".join(why)))
-
-                if len(passed) == 0:
-                    st.error("一个都没过。不要去调仓位和止损，那救不回来——"
-                             "问题在因子本身，需要换一批因子重来。")
-                else:
-                    # 等权 + 符号，不按 t 的大小定权重：t 越大权重越大等于对
-                    # 样本内的显著性做二次拟合，样本外通常更差。
-                    sug = {k: 0.0 for k in FACTOR_KEYS}
-                    for _, r in passed.iterrows():
-                        sug[r["key"]] = float(np.sign(r["t(重叠修正)"]))
-                    st.write("建议权重（通过的等权取符号，未通过置 0）：",
-                             {ALL_DEF[k][0]: v for k, v in sug.items() if v != 0})
-                    st.caption("刻意不按 t 的大小分配权重——那等于对样本内显著性再拟合一次，"
-                               "样本外通常更差。等权更稳。")
-                    if st.button("把建议权重写入回测页"):
-                        for k, v in sug.items():
-                            ss["w_" + k] = v
-                        ss.pop("last_bt", None)
-                        st.rerun()
-
-            st.divider()
-            st.markdown("### 入场延迟扫描 —— 区分真反转与噪音")
-            st.markdown(
-                "反转类因子的分子用的是排名当日的收盘价，而未来收益的分母也是它。"
-                "这一天价格里的买卖价差跳动会同时抬高因子、压低未来收益，**凭空造出负相关**。"
-                "真实的定价效应扛得住推迟几天入场，价差跳动扛不住。\n\n"
-                "**看 0 日到 1 日那一步的落差**：崩塌就是噪音，稳住就是真效应。")
-            if st.button("运行延迟扫描"):
-                bar2 = st.progress(0.0)
-                gs = gap_scan(factors, panel["adj_close"], elig, rb, int(hz), FACTOR_KEYS,
-                              gaps=(0, 1, 3, 5, 10),
-                              progress=lambda p, n: bar2.progress(p, text=n))
-                ss["gapscan"] = gs
-                bar2.empty()
-            if ss.get("gapscan") is not None:
-                gs = ss["gapscan"]
-                gcols = [c for c in gs.columns if c.startswith("t@")]
-                st.dataframe(
-                    gs.drop(columns=["key"]).style
-                      .format({**{c: "{:.2f}" for c in gcols}, "残留比例": "{:.0%}"})
-                      .background_gradient(subset=gcols, cmap="RdYlGn", vmin=-5, vmax=5),
-                    use_container_width=True)
-                drops = []
-                for _, r in gs.iterrows():
-                    t0, t1 = r.get("t@延迟0日"), r.get("t@延迟1日")
-                    if np.isfinite(t0) and abs(t0) >= 2 and np.isfinite(t1):
-                        if abs(t1) < abs(t0) * 0.6:
-                            drops.append(r["因子"])
-                if drops:
-                    st.error("以下因子在延迟 1 天后显著性就崩掉了一半以上，"
-                             "**它们测出来的效应主要是微观结构噪音，不可交易**：\n\n"
-                             + "、".join(drops))
-                else:
-                    st.success("没有因子在延迟 1 天时崩塌，反转效应扛得住延迟入场。")
-
-            st.divider()
-            st.markdown("### 持有期扫描 —— 该拿多久")
-            st.markdown(
-                "信号有半衰期。持有期短于半衰期，信号浓度高但换手成本高；"
-                "长于半衰期，大半仓位时间都在拿过期信号。下表把两边一起算："
-                f"单次往返成本按 {ROUND_TRIP_COST:.2%}（佣金双边+印花税+滑点双边）。\n\n"
-                "**净超额只算多头那一组**（IC 为负时是 D1，为正时是 D10）相对当期截面均值的超额。"
-                "刻意不用「多空价差的一半」——A 股融券做空不现实，如果效应全部来自"
-                "「涨得多的那组暴跌」，纯多头一分钱都吃不到。"
-                "「多头贡献占比」低于 40% 就说明钱主要在你拿不到的空头端。")
-            if st.button("运行持有期扫描"):
-                bar3 = st.progress(0.0)
-                hs = horizon_scan(factors, panel["adj_close"], elig, rb, FACTOR_KEYS,
-                                  horizons=(1, 2, 3, 4, 6, 8), gap=int(gap),
-                                  progress=lambda p, n: bar3.progress(p, text=n))
-                ss["hscan"] = hs
-                bar3.empty()
-            if ss.get("hscan") is not None:
-                hs = ss["hscan"]
-                tc = [c for c in hs.columns if c.startswith("t@")]
-                nc = [c for c in hs.columns if c.startswith("净超额@")]
-                st.dataframe(
-                    hs.drop(columns=["key"]).style
-                      .format({**{c: "{:.2f}" for c in tc},
-                               **{c: "{:.1%}" for c in nc},
-                               "最优净超额": "{:.1%}", "最优持有周": "{:.0f}",
-                               "多头贡献占比": "{:.0%}", "空头年化(拿不到)": "{:.1%}"},
-                              na_rep="—")
-                      .background_gradient(subset=nc, cmap="RdYlGn", vmin=-0.15, vmax=0.15),
-                    use_container_width=True)
-                good = hs.dropna(subset=["最优净超额"])
-                good = good[good["最优净超额"] > 0]
-                if len(good):
-                    wk = good.sort_values("最优净超额", ascending=False).iloc[0]
-                    st.success(f"净超额最高的是「{wk['因子']}」：做多 {wk['做多哪组']} 组、"
-                               f"持有 {wk['最优持有周']:.0f} 周，估计年化净超额 {wk['最优净超额']:.1%}，"
-                               f"其中多头贡献占比 {wk['多头贡献占比']:.0%}。"
-                               "请把回测页的最长持有期调到这个量级——"
-                               "拿满 8 周意味着大半仓位时间都在持有已经过期的信号。")
-                    low = good[good["多头贡献占比"] < 0.4]
-                    if len(low):
-                        st.warning("以下因子的钱主要在空头端（涨得多的那组暴跌），"
-                                   "纯多头拿不到，别被总价差骗了：\n\n"
-                                   + "、".join(low["因子"].tolist()))
-                else:
-                    st.error("没有任何因子在任何持有期上做到净超额为正。"
-                             "扣掉换手成本后这个方向不成立，不要往下做回测。")
-
-            st.divider()
-            st.markdown("### 检验综合打分")
-            st.markdown(
-                "**单因子逐个过关，不代表合成之后还过关。** 相关的因子加在一起会互相稀释，"
-                "各自最优的持有期也未必一致。系统实际用的是这个合成分数，所以它必须"
-                "自己走一遍同样的检验。")
-            st.markdown("**权重（这里是唯一设置处，回测页直接读这里）**")
-            pc = st.columns(len(WEIGHT_PRESETS))
-            for j, (pname, pw) in enumerate(WEIGHT_PRESETS.items()):
-                if pc[j].button(pname, use_container_width=True):
-                    for k in FACTOR_KEYS:
-                        ss["w_" + k] = float(pw.get(k, 0.0))
-                    ss.pop("compscan", None)
-                    ss.pop("last_bt", None)
-                    st.rerun()
-            wc = st.columns(3)
-            for j, k in enumerate(FACTOR_KEYS):
-                wc[j % 3].number_input(ALL_DEF[k][0], -2.0, 2.0,
-                                       float(ss.get("w_" + k, FACTOR_DEF[k][1])),
-                                       0.1, key="w_" + k)
-            w_now = {k: float(ss.get("w_" + k, 0.0)) for k in FACTOR_KEYS}
-            live = {ALL_DEF[k][0]: v for k, v in w_now.items() if abs(v) > 1e-9}
-            st.write("当前生效权重：", live or "（全为 0 —— 先点上面的预设按钮）")
-            st.info("**跑之前把「样本止」改成 2022-12-31。** 现在这些数字都是 2018-2026 全样本，"
-                    "用全样本挑参数再用全样本回测，等于自己给自己打分。"
-                    "选定权重后，再用 2023 年之后验证一次。")
-            if st.button("检验综合打分", type="primary"):
-                if all(abs(v) < 1e-9 for v in w_now.values()):
-                    st.error("权重全为 0，没有可检验的合成分数。")
-                else:
-                    comp = cached_score(factors, elig, dkey, tuple(sorted(w_now.items())))
-                    cf = {COMPOSITE_KEY: comp}
-                    r = layered_test(comp, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
-                    hsc = horizon_scan(cf, panel["adj_close"], elig, rb, [COMPOSITE_KEY],
-                                       horizons=(1, 2, 3, 4, 6, 8), gap=int(gap))
-                    gsc = gap_scan(cf, panel["adj_close"], elig, rb, int(hz), [COMPOSITE_KEY],
-                                   gaps=(0, 1, 3, 5, 10))
-                    ss["compscan"] = (r, hsc, gsc, dict(w_now))
-            if ss.get("compscan"):
-                r, hsc, gsc, wsaved = ss["compscan"]
-                if not r.get("ok"):
-                    st.error("样本不足。")
-                else:
-                    yr = r["ic_year"]
-                    same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum())
-                    agree = (np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
-                             and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
-                    m = st.columns(5)
-                    m[0].metric("IC 均值", f"{r['ic_mean']:.4f}")
-                    m[1].metric("t(重叠修正)", f"{r['t_nw']:.2f}")
-                    m[2].metric("单调性", f"{r['monotonic']:.2f}")
-                    m[3].metric("同号年数", f"{same}/{len(yr)}")
-                    m[4].metric("多头贡献占比", f"{r['long_share']:.0%}")
-                    hr = hsc.iloc[0]
-                    nc2 = [c for c in hsc.columns if c.startswith("净超额@")]
-                    st.markdown("**合成分数的持有期曲线**")
-                    st.bar_chart(pd.Series({c.replace("净超额@", ""): hr[c] for c in nc2},
-                                           name="年化净超额"))
-                    st.markdown("**合成分数的分组超额（相对截面均值）**")
-                    st.bar_chart(r["group_excess"].rename(f"未来{hz}周超额"))
-                    g0, g1 = gsc.iloc[0]["t@延迟0日"], gsc.iloc[0]["t@延迟1日"]
-                    ok_all = (abs(r["t_nw"]) >= 2 and agree and len(yr) and same / len(yr) >= 8 / 9
-                              and pd.notna(hr.get("最优持有周")))
-                    if ok_all:
-                        st.success(
-                            f"合成分数全部过关：做多 {hr['做多哪组']} 组、持有 "
-                            f"{hr['最优持有周']:.0f} 周，年化净超额 {hr['最优净超额']:+.1%}，"
-                            f"多头贡献 {hr['多头贡献占比']:.0%}，延迟入场不衰减"
-                            f"（{g0:.2f}→{g1:.2f}）。可以去回测页了，"
-                            f"把最长持有期设成 {hr['最优持有周']:.0f}-{hr['最优持有周']+1:.0f} 周。")
-                    else:
-                        bad = []
-                        if abs(r["t_nw"]) < 2: bad.append("不显著")
-                        if not agree: bad.append("三条证据方向打架")
-                        if len(yr) and same / len(yr) < 8 / 9: bad.append(f"逐年符号不稳({same}/{len(yr)})")
-                        if pd.isna(hr.get("最优持有周")): bad.append("没有任何持有期净超额为正")
-                        st.error("合成分数没过关：" + "、".join(bad)
-                                 + "。合成反而不如单因子，通常是权重里混进了互相抵消的因子——"
-                                   "去掉净超额为负的那些再试。")
-
-            st.divider()
-            st.markdown("### 一键导出全部结果")
-            _tabs = {}
-            if ss.get("scan"):
-                _tabs["01_汇总"] = ss["scan"][0].drop(
-                    columns=[c for c in ss["scan"][0].columns if c.startswith("_")])
-                _tabs["02_分年度IC"] = ss["scan"][1]
-                _tabs["03_因子相关性"] = ss["scan"][2]
-            if ss.get("gapscan") is not None:
-                _tabs["04_入场延迟扫描"] = ss["gapscan"]
-            if ss.get("hscan") is not None:
-                _tabs["05_持有期扫描"] = ss["hscan"]
-            if ss.get("compscan"):
-                _r, _h, _g, _w = ss["compscan"]
-                _tabs["06_合成打分_持有期"] = _h
-                _tabs["07_合成打分_延迟"] = _g
-                _tabs["08_合成打分_权重"] = pd.DataFrame(
-                    [{"因子": ALL_DEF[k][0], "权重": v} for k, v in _w.items()])
-            if _tabs:
-                meta = pd.DataFrame([{
-                    "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "股票数": len(panel["codes"]), "交易日数": len(panel["cal"]),
-                    "样本区间": f"{ls_}~{le_}", "持有期(周)": hz, "入场延迟(日)": gap,
-                    "市值中性化": "是" if neu else "否",
-                    "市值区间(亿)": f"{mv_lo:.0f}-{mv_hi:.0f}", "最低股价": min_price,
-                    "调仓次数": len(rb)}]).T.rename(columns={0: "值"})
-                _tabs["00_运行参数"] = meta
-                st.download_button(
-                    f"下载全部结果（{len(_tabs)} 张表，zip）",
-                    export_bundle(dict(sorted(_tabs.items()))),
-                    f"factor_scan_{dt.date.today():%Y%m%d}.zip", "application/zip",
-                    type="primary", use_container_width=True)
-                st.caption("包含运行参数、汇总、分年度 IC、相关性矩阵、延迟扫描、持有期扫描。"
-                           "参数表一并导出，免得回头对不上是哪次跑的。")
-            else:
-                st.caption("先运行上面的扫描，这里才会出现下载按钮。")
-
-            st.divider()
-            st.markdown("**单因子细看**")
-            fkey = st.selectbox("因子", TEST_KEYS, format_func=lambda k: ALL_DEF[k][0])
-            if st.button("画分层曲线"):
-                f = factors[fkey]
-                if neu and "logsize" in factors and fkey != "logsize":
-                    f = size_neutralize(f, factors["logsize"], elig)
-                res = layered_test(f, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
-                if not res.get("ok"):
-                    st.error("样本不足，放宽日期或降低门槛。")
-                else:
-                    m = st.columns(5)
-                    m[0].metric("多空价差", f"{res['spread']:.2%}")
-                    m[1].metric("IC 均值", f"{res['ic_mean']:.4f}")
-                    m[2].metric("t(重叠修正)", f"{res['t_nw']:.2f}")
-                    m[3].metric("单调性", f"{res['monotonic']:.2f}")
-                    m[4].metric("IC>0 占比", f"{res['ic_pos']:.1%}")
-                    st.bar_chart(res["group_excess"].rename(f"未来{hz}周超额（相对截面均值）"))
-                    st.caption(f"做多 **{res['long_side']}** 组，多头超额 {res['long_excess']:+.2%}／"
-                               f"{hz}周，空头端 {res['short_excess']:+.2%}（A股拿不到）。"
-                               f"多头贡献占比 {res['long_share']:.0%}。")
-                    st.line_chart(res["curve"])
-                    st.line_chart(res["ic"].rolling(12).mean().rename("IC(12期均线)"))
-
-    # ---------------- 策略回测 ----------------
-    with t3:
-        st.subheader("完整策略回测")
-        w1, w2 = st.columns([2, 3])
-        with w1:
-            st.markdown("**因子权重**（在「因子分层检验」页设置）")
-            weights = {k: float(ss.get("w_" + k, 0.0)) for k in FACTOR_KEYS}
-            st.dataframe(pd.DataFrame([{"因子": ALL_DEF[k][0], "权重": v}
-                                       for k, v in weights.items() if abs(v) > 1e-9])
-                         if any(abs(v) > 1e-9 for v in weights.values())
-                         else pd.DataFrame({"提示": ["权重全为 0"]}),
-                         use_container_width=True, hide_index=True)
-            if not ss.get("compscan"):
-                st.warning("还没检验过合成打分。建议先回上一页跑「检验综合打分」——"
-                           "单因子过关不代表合成后过关。")
-        with w2:
-            g1, g2 = st.columns(2)
-            top_n = g1.slider("持股数 N", 3, 40, 20,
-                              help="5 只是最初的默认值，不是你的约束。边际薄的时候，"
-                                   "分散比集中更重要——见因子检验页的信息比表。")
-            buf = g2.slider("缓冲带（跌出该名次才卖）", top_n, 60, min(15, max(top_n, 15)))
-            min_hw = g1.slider("最短持有（周）", 1, 4, 1)
-            max_hw = g2.slider("最长持有（周）", 2, 12, 8)
-            trail = g1.slider("移动止损", 0.05, 0.30, 0.12, 0.01)
-            hard = g2.slider("固定止损", 0.05, 0.30, 0.10, 0.01)
-            use_bd = g1.checkbox("市场宽度调仓位", True)
-            min_ex = g2.slider("最低仓位", 0.0, 1.0, 0.30, 0.05)
-            bt_comm = g1.number_input("佣金（单边，万分之）", 0.0, 10.0, 3.0, 0.1, key="bc")
-            bt_slip = g2.number_input("滑点（单边，%）", 0.0, 0.5, 0.10, 0.01, key="bsl")
-            bt_s = g1.date_input("回测起", dt.date(2018, 1, 1), key="bs")
-            bt_e = g2.date_input("回测止", dt.date.today(), key="be")
-            st.caption("建议：2018-2022 作为样本内调参，2023 年之后只跑一次，不回头改。")
-
-        if st.button("运行回测", type="primary"):
-            if all(abs(v) < 1e-9 for v in weights.values()):
-                st.error("权重全为 0，没有可用的打分。请先到「因子分层检验」页设置权重。")
-                st.stop()
-            score = cached_score(factors, elig, dkey, tuple(sorted(weights.items())))
-            rb = [d for d in rebal_all if pd.Timestamp(bt_s) <= d <= pd.Timestamp(bt_e)]
-            prm = dict(capital=1_000_000.0, top_n=top_n, buffer_rank=buf,
-                       min_hold_w=min_hw, max_hold_w=max_hw,
-                       trail_stop=trail, hard_stop=hard,
-                       use_breadth=use_bd, min_expo=min_ex, breadth_lo=0.20, breadth_hi=0.60,
-                       commission=bt_comm / 10000.0, stamp=0.0005,
-                       slippage=bt_slip / 100.0,
-                       no_trade_band=0.25, bt_start=bt_s)
-            with st.spinner("回测中…"):
-                r = run_backtest(panel, score, elig, rb, prm)
-                eq = r["equity"].loc[pd.Timestamp(bt_s):pd.Timestamp(bt_e)]
-                bh = r["bench"].reindex(eq.index)
-                stats = perf_stats(eq, r["trades"], r["npos"].reindex(eq.index), bh)
-            ss["last_bt"] = (eq, bh, r, stats)
-
-        if ss.get("last_bt"):
-            eq, bh, r, stats = ss["last_bt"]
-            k = st.columns(4)
-            k[0].metric("年化收益", _fmt(stats.get("年化收益")))
-            k[1].metric("最大回撤", _fmt(stats.get("最大回撤")))
-            k[2].metric("年化超额（对池内等权）", _fmt(stats.get("年化超额")))
-            k[3].metric("夏普", f"{stats.get('夏普', float('nan')):.2f}")
-            k2 = st.columns(4)
-            k2[0].metric("胜率", _fmt(stats.get("胜率", float("nan"))))
-            k2[1].metric("盈亏比", f"{stats.get('盈亏比', float('nan')):.2f}")
-            k2[2].metric("平均持仓周", f"{stats.get('平均持仓周', float('nan')):.1f}")
-            k2[3].metric("最大单年空窗周", stats.get("最大单年空窗周", 0))
-
-            norm = pd.DataFrame({"策略": eq / eq.iloc[0], "股票池等权": bh / bh.iloc[0]})
-            st.line_chart(norm)
-            st.line_chart((eq / eq.cummax() - 1.0).rename("回撤"))
-            cA, cB = st.columns(2)
-            with cA:
-                st.markdown("**每年空窗周数**（约束：≤5）")
-                st.dataframe(stats["_空窗周_按年"].rename("空窗周"), use_container_width=True)
-            with cB:
-                st.markdown("**仓位与持股数**")
-                st.line_chart(pd.DataFrame({"仓位": r["exposure"].reindex(eq.index),
-                                            "持股数/10": r["npos"].reindex(eq.index) / 10.0}))
-            if len(r["trades"]):
-                st.markdown("**成交明细**")
-                st.dataframe(r["trades"].tail(300), use_container_width=True, height=320)
-                st.download_button("下载全部成交记录 CSV",
-                                   r["trades"].to_csv(index=False).encode("utf-8-sig"),
-                                   "trades.csv", "text/csv")
-            st.info("判断标准：样本外年化超过池内等权基准 8-10 个百分点、最大回撤 40% 以内，"
-                    "这个系统就可用。达不到就承认，不要继续调参。")
-
-    # ---------------- 当前选股 ----------------
-    with t4:
-        st.subheader("最新一期选股")
-        weights_now = {k: st.session_state.get("w_" + k, FACTOR_DEF[k][1]) for k in FACTOR_KEYS}
-        score = cached_score(factors, elig, dkey, tuple(sorted(weights_now.items())))
-        d = panel["cal"][-1]
-        s = score.loc[d].dropna().sort_values(ascending=False)
-        if not len(s):
-            st.warning("最新交易日没有合格股票，请放宽筛选条件。")
-        else:
-            nshow = st.slider("显示前几名", 5, 50, 20)
-            top = s.head(nshow)
-            nm = basic.set_index("ts_code")["name"].to_dict() if len(basic) else {}
-            ind = uni.set_index("ts_code")["ind_name"].to_dict() if len(uni) else {}
-            tb = pd.DataFrame({
-                "代码": top.index,
-                "名称": [nm.get(c, "") for c in top.index],
-                "行业": [ind.get(c, "") for c in top.index],
-                "收盘价": [panel["raw_close"].loc[d, c] for c in top.index],
-                "流通市值(亿)": [panel["circ_mv"].loc[d, c] / 1e4 for c in top.index],
-                "综合分": top.values,
+    if len(s) < top_n:
+        st.error(f"合格股票不足 {top_n} 只，本周无候选。")
+    else:
+        nm = basic.set_index("ts_code")["name"].to_dict()
+        ind = uni.set_index("ts_code")["ind_name"].to_dict()
+        picks = list(s.index[lo - 1: lo - 1 + top_n])
+        rows = []
+        for r, c in enumerate(picks, 1):
+            rows.append({
+                "序": r, "代码": c, "名称": nm.get(c, ""), "行业": ind.get(c, ""),
+                "收盘价": round(float(panel["raw_close"].loc[d, c]), 2),
+                "流通市值(亿)": round(float(panel["circ_mv"].loc[d, c]) / 1e4, 0),
+                "距60日高点": f"{factors['dist_hi'].loc[d, c]:.1%}",
+                "近5日涨幅": f"{factors['rev5'].loc[d, c]:.1%}",
             })
-            for k in FACTOR_KEYS:
-                tb[FACTOR_DEF[k][0]] = [factors[k].loc[d, c] for c in top.index]
-            st.caption(f"数据日期：{d:%Y-%m-%d}　合格池：{int(elig.loc[d].sum())} 只")
-            st.dataframe(tb.round(3), use_container_width=True, height=520)
-            st.download_button("下载选股结果 CSV", tb.to_csv(index=False).encode("utf-8-sig"),
-                               f"picks_{d:%Y%m%d}.csv", "text/csv")
-        st.caption("提醒：ST 判定用的是当前名称，历史上曾被 ST 后来摘帽的股票无法完全还原，"
-                   "这是本系统已知的一个小口径偏差。")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.download_button("下载本周候选 CSV",
+                           pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"),
+                           f"picks_{d:%Y%m%d}.csv", "text/csv")
+        st.caption(f"取的是排名第 {lo} 到 {lo+top_n-1} 名，不是第 1 名起——原因见下方「为什么」。")
+
+    # ---- 止盈止损参考 ----
+    st.divider()
+    st.subheader("止盈止损参考")
+    if ss.get("path") is None:
+        with st.spinner("统计中…"):
+            ss["path"] = picked_path_stats(score, panel["adj_close"], elig, rebal,
+                                           top_n=top_n, weeks=8, gap=1)
+    ps = ss["path"]
+    if len(ps):
+        st.dataframe(ps.style.format({"最大涨幅_中位": "{:+.1%}", "最大跌幅_中位": "{:+.1%}",
+                                      "最大跌幅_25分位": "{:+.1%}", "期末收益_中位": "{:+.1%}",
+                                      "期末为正比例": "{:.0%}"}),
+                     use_container_width=True)
+        w4 = ps.loc[4] if 4 in ps.index else ps.iloc[-1]
+        st.markdown(
+            f"**怎么用**：历史上这批股票买入后 4 周内，一半会回撤到 "
+            f"{w4['最大跌幅_中位']:.0%} 以内，四分之一会跌到 {w4['最大跌幅_25分位']:.0%}。"
+            f"**止损设在 {w4['最大跌幅_25分位']:.0%} 以外**，才不会被正常波动扫出局；"
+            f"设在 {w4['最大跌幅_中位']:.0%} 以内则一半以上的仓位会被无谓止损掉。")
+
+    # ---- 为什么 ----
+    st.divider()
+    with st.expander("为什么这样选（点开看依据）", expanded=False):
+        st.markdown("**一、名次段检验：为什么不取第 1 名**")
+        st.markdown(
+            "分层检验测的是前 10%（上百只）的平均值。只买 3 只时买的是前 0.2%，"
+            "那是从没验证过的区间——最极端的几只往往是真出问题的公司，不是被错杀的。"
+            "下表按名次分段实测未来 4 周相对全池的超额：")
+        st.dataframe(bt.style.format({"平均超额": "{:+.2%}", "胜率": "{:.1%}",
+                                      "标准误": "{:.3%}", "t值": "{:.2f}"})
+                       .background_gradient(subset=["平均超额"], cmap="RdYlGn"),
+                     use_container_width=True)
+        st.info(f"实测最优名次段是 **{best_band}**，所以本周候选从第 {lo} 名开始取。")
+
+        st.markdown("**二、空窗检查**")
+        ew = empty_week_stats(score, elig, rebal, top_n=top_n)
+        st.dataframe(ew.rename("选不满的周数").to_frame().T, use_container_width=True)
+        st.caption("排名系统永远有前 N 名，所以结构上不会空窗。"
+                   "上表若全为 0，说明你「一年空窗不超过 5 周」的要求自动满足。")
+
+        st.markdown("**三、诚实的边界**")
+        st.warning(
+            "这份名单**不承诺跑赢**。持股 1-3 只时，你的盈亏几乎完全由个股运气决定，"
+            "而不是由排名质量决定——这是分散度的算术，不是因子好坏的问题。\n\n"
+            "它能做的是：把 1400 只筛到符合你硬约束、且避开了历史上表现最差那一档的"
+            f"少数几只。前几名的超额是每 4 周约 "
+            f"{bt.loc[best_band, '平均超额']:.1%}，扣掉买卖成本后所剩不多。\n\n"
+            "**请把它当候选池，不要当买入指令。** 最终决定还是你自己的。")
+
+    if API_ERRORS:
+        with st.expander(f"接口异常 {len(API_ERRORS)} 条"):
+            st.write(API_ERRORS[-30:])
 
 
 if __name__ == "__main__" and st is not None:
