@@ -748,6 +748,7 @@ def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
             net = r["long_excess"] * turns - cost * turns
             row[f"t@{h}周"] = t_
             row[f"净超额@{h}周"] = net
+            row[f"_毛@{h}"] = r["long_excess"] * turns    # 不含成本，用于成本敏感性
             if np.isfinite(t_) and abs(t_) >= 2.0 and net > best:
                 best, best_h = net, h
                 row["_ls"] = r["long_side"]
@@ -774,6 +775,24 @@ def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
+def cost_grid(hs_row: pd.Series, horizons=HZ_LIST,
+              slips=(0.0010, 0.0007, 0.0005, 0.0003)) -> pd.DataFrame:
+    """
+    成本 × 持有期 敏感性网格。
+    毛超额是数据给的，成本是假设。当净超额接近零时，结论几乎完全由成本假设决定，
+    所以必须把这个依赖摊开给人看，而不是塞一个数字了事。
+    """
+    out = {}
+    for sl in slips:
+        rt = 0.0003 * 2 + 0.0005 + 2 * sl          # 佣金双边 + 印花税 + 滑点双边
+        col = {}
+        for h in horizons:
+            g = hs_row.get(f"_毛@{h}")
+            col[f"{h}周"] = (g - rt * (52.0 / h)) if pd.notna(g) else np.nan
+        out[f"单边滑点{sl:.2%}"] = col
+    return pd.DataFrame(out).T
+
+
 def eval_weights(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
                  elig: pd.DataFrame, rebal: List[pd.Timestamp], weights: Dict[str, float],
                  gap: int = 1, horizons=(1, 2, 3, 4, 6, 8), fixed_h: Optional[int] = None,
@@ -786,6 +805,12 @@ def eval_weights(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
     row = hs.iloc[0]
     hb = row["最优持有周"]
     h_use = int(fixed_h) if fixed_h else (int(hb) if pd.notna(hb) else 2)
+    # 样本外必须报"样本内选定持有期"上的成绩。报各持有期里最好的那个，
+    # 等于拿样本外数据挑了参数，那就不叫样本外了。
+    if fixed_h:
+        hb = float(h_use)
+        row = row.copy()
+        row["最优净超额"] = row.get(f"净超额@{h_use}周", np.nan)
     r = layered_test(comp, adj_close, elig, rebal, h_use, 10, gap=gap)
     g = gap_scan(cf, adj_close, elig, rebal, h_use, [COMPOSITE_KEY], gaps=(0, 1))
     yr = r.get("ic_year", pd.Series(dtype=float))
@@ -795,6 +820,7 @@ def eval_weights(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
     return {"t(重叠修正)": r["t_nw"], "同号年数": f"{same}/{len(yr)}",
             "方向一致": "是" if agree else "否", "多头贡献占比": r["long_share"],
             "最优持有周": hb, "年化净超额": row["最优净超额"],
+            "_same": same, "_ny": len(yr),
             "延迟0日t": float(g.iloc[0]["t@延迟0日"]), "延迟1日t": float(g.iloc[0]["t@延迟1日"]),
             "_ok": bool(abs(r["t_nw"]) >= 2 and agree and len(yr) and same / len(yr) >= 8 / 9
                         and pd.notna(hb) and r["long_share"] >= 0.40),
@@ -1347,12 +1373,39 @@ def main():
                     why.append("样本外三条证据方向打架")
                 if pd.notna(oos["多头贡献占比"]) and oos["多头贡献占比"] < 0.40:
                     why.append("样本外多头占比不足40%")
+                if oos["_ny"] and oos["_same"] / oos["_ny"] < 8 / 9:
+                    why.append(f"样本外逐年符号不稳（{oos['同号年数']}）")
+                if not why:
+                    why.append("多项指标处在临界值")
                 st.error(
                     f"**{ab['win']} 在样本内最好（{wr['年化净超额']:+.1%}），"
                     f"但样本外没过：" + "、".join(why) + "。**\n\n"
                     "样本内好、样本外垮，通常意味着样本内那部分是行情特征而不是稳定效应。"
                     "权重已写入回测页，你可以跑一次看看实际曲线，但**不要**因为样本外不好"
                     "就回头改权重再试——那就把样本外也用掉了。")
+
+            if ab.get("oos") is not None and ab["oos"].get("_hs") is not None:
+                st.markdown("**样本外：成本 × 持有期 敏感性**")
+                st.caption(
+                    "毛超额是数据给的，成本是假设。当净超额接近零时，结论几乎完全由"
+                    "成本假设决定，所以这里把它摊开。默认用的是单边滑点 0.10%（偏保守）——"
+                    "如果你的实际成交规模小、标的流动性好，0.05% 可能更贴近现实。"
+                    "**绿色格子才是可交易的组合。**")
+                cg = cost_grid(ab["oos"]["_hs"].iloc[0])
+                st.dataframe(cg.style.format("{:+.1%}", na_rep="—")
+                             .background_gradient(cmap="RdYlGn", vmin=-0.10, vmax=0.10),
+                             use_container_width=True)
+                best = cg.max().max()
+                if pd.notna(best) and best > 0.05:
+                    pos = cg.stack().idxmax()
+                    st.info(f"最好的组合是「{pos[0]}、持有{pos[1]}」，样本外净超额 {best:+.1%}。"
+                            "注意这是在样本外数据上挑出来的最优格子，实际会比它差。")
+                elif pd.notna(best) and best > 0:
+                    st.warning(f"所有组合里最高只有 {best:+.1%}。"
+                               "即使按最乐观的成本假设，这个边际也太薄，"
+                               "5 只股票的组合波动会把它完全淹没。")
+                else:
+                    st.error("在任何成本与持有期组合下，样本外净超额都不为正。")
 
         st.divider()
         with st.expander("高级：逐因子扫描 / 自定义权重 / 导出", expanded=False):
