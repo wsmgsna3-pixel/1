@@ -1125,6 +1125,19 @@ def profit_concentration(tr: pd.DataFrame, ks=(1, 3, 5, 10, 20)) -> pd.DataFrame
     return out
 
 
+def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
+    """把所有结果表打包成一个 zip（纯标准库，无额外依赖）。"""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, df in tables.items():
+            if df is None or not len(df):
+                continue
+            z.writestr(f"{name}.csv", df.to_csv().encode("utf-8-sig"))
+    return buf.getvalue()
+
+
 # ======================================================================
 # 八、界面
 # ======================================================================
@@ -1385,6 +1398,28 @@ def main():
                 st.caption("中位收益率每周都为负、均值为正 —— 典型的趋势型分布："
                            "多数标的阴跌，少数狂奔，收益全在右尾。"
                            "**这意味着止盈不能设太窄，否则正好砍掉唯一赚钱的那条尾巴。**")
+
+            st.divider()
+            st.markdown("### 一键导出全部结果")
+            _t = {"01_方法对比": cm,
+                  "02_周度表_含超额": res[pick_m]["wt"].assign(方法=pick_m),
+                  "03_样本内外": sp if "sp" in dir() else None,
+                  "04_逐年": ys if "ys" in dir() else None,
+                  "05_利润集中度": pc if "pc" in dir() else None}
+            if ss.get("grid"):
+                _t["06_网格_平均收益"] = ss["grid"][1]
+                _t["07_网格_聚类t"] = ss["grid"][2]
+            _t["00_参数"] = pd.DataFrame([{
+                "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "股票数": len(panel["codes"]), "交易日数": len(panel["cal"]),
+                "每周选": top_n, "止盈": f"{tp:.0%}", "止损": f"{sl:.0%}",
+                "超时": f"{maxw}周", "周度表方法": pick_m}]).T.rename(columns={0: "值"})
+            st.download_button(
+                "下载全部结果（zip）",
+                export_all({k: v for k, v in sorted(_t.items()) if v is not None}),
+                f"result_{dt.date.today():%Y%m%d_%H%M}.zip", "application/zip",
+                type="primary", use_container_width=True)
+            st.caption("包含方法对比、周度表（含超额）、样本内外、逐年、集中度、网格。")
 
     # ---------------- 本周选股 ----------------
     with t2:
