@@ -776,7 +776,8 @@ def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
 
 
 def cost_grid(hs_row: pd.Series, horizons=HZ_LIST,
-              slips=(0.0010, 0.0007, 0.0005, 0.0003)) -> pd.DataFrame:
+              slips=(0.0010, 0.0007, 0.0005, 0.0003, 0.0002),
+              comm: float = 0.0003, stamp: float = 0.0005) -> pd.DataFrame:
     """
     成本 × 持有期 敏感性网格。
     毛超额是数据给的，成本是假设。当净超额接近零时，结论几乎完全由成本假设决定，
@@ -784,7 +785,7 @@ def cost_grid(hs_row: pd.Series, horizons=HZ_LIST,
     """
     out = {}
     for sl in slips:
-        rt = 0.0003 * 2 + 0.0005 + 2 * sl          # 佣金双边 + 印花税 + 滑点双边
+        rt = comm * 2 + stamp + 2 * sl              # 佣金双边 + 印花税 + 滑点双边
         col = {}
         for h in horizons:
             g = hs_row.get(f"_毛@{h}")
@@ -1391,7 +1392,13 @@ def main():
                     "成本假设决定，所以这里把它摊开。默认用的是单边滑点 0.10%（偏保守）——"
                     "如果你的实际成交规模小、标的流动性好，0.05% 可能更贴近现实。"
                     "**绿色格子才是可交易的组合。**")
-                cg = cost_grid(ab["oos"]["_hs"].iloc[0])
+                cc1, cc2 = st.columns(2)
+                comm_bp = cc1.number_input("佣金（单边，万分之）", 0.0, 10.0, 3.0, 0.1,
+                                           help="万3=3.0。券商最低可到万0.854，"
+                                                "这一项直接决定结论，按你的实际费率填。")
+                stamp_bp = cc2.number_input("印花税（卖出，千分之）", 0.0, 2.0, 0.5, 0.1)
+                cg = cost_grid(ab["oos"]["_hs"].iloc[0],
+                               comm=comm_bp / 10000.0, stamp=stamp_bp / 1000.0)
                 st.dataframe(cg.style.format("{:+.1%}", na_rep="—")
                              .background_gradient(cmap="RdYlGn", vmin=-0.10, vmax=0.10),
                              use_container_width=True)
@@ -1406,6 +1413,25 @@ def main():
                                "5 只股票的组合波动会把它完全淹没。")
                 else:
                     st.error("在任何成本与持有期组合下，样本外净超额都不为正。")
+
+                st.markdown("**这点边际够不够用：持股数决定一切**")
+                st.caption(
+                    "边际再真，如果被组合自身的波动淹没也没意义。跟踪误差按个股特质"
+                    "波动 35%／√N 估算。**持股 5 只是我最初设的默认值，不是你的约束。**"
+                    "30 只约占合格池 8%，正好对应我们测的 D1 组；5 只是前 1.4%，属于外推。")
+                edge = float(best) if pd.notna(best) else 0.0
+                rows_ir = []
+                for N in (5, 10, 20, 30, 40):
+                    te = 0.35 / np.sqrt(N)
+                    ir = edge / te if te > 0 else np.nan
+                    yrs = (2.0 / ir) ** 2 if ir and ir > 0 else np.nan
+                    rows_ir.append({"持股数": N, "跟踪误差": te, "信息比": ir,
+                                    "证明所需年数": yrs})
+                ir_df = pd.DataFrame(rows_ir).set_index("持股数")
+                st.dataframe(ir_df.style.format({"跟踪误差": "{:.1%}", "信息比": "{:.2f}",
+                                                 "证明所需年数": "{:.0f}"}, na_rep="—"),
+                             use_container_width=True)
+                st.caption(f"按当前最优格子 {edge:+.1%} 计算。信息比 0.5 以上才算勉强可用。")
 
         st.divider()
         with st.expander("高级：逐因子扫描 / 自定义权重 / 导出", expanded=False):
@@ -1772,7 +1798,9 @@ def main():
                            "单因子过关不代表合成后过关。")
         with w2:
             g1, g2 = st.columns(2)
-            top_n = g1.slider("持股数 N", 3, 15, 5)
+            top_n = g1.slider("持股数 N", 3, 40, 20,
+                              help="5 只是最初的默认值，不是你的约束。边际薄的时候，"
+                                   "分散比集中更重要——见因子检验页的信息比表。")
             buf = g2.slider("缓冲带（跌出该名次才卖）", top_n, 60, min(15, max(top_n, 15)))
             min_hw = g1.slider("最短持有（周）", 1, 4, 1)
             max_hw = g2.slider("最长持有（周）", 2, 12, 8)
@@ -1780,6 +1808,8 @@ def main():
             hard = g2.slider("固定止损", 0.05, 0.30, 0.10, 0.01)
             use_bd = g1.checkbox("市场宽度调仓位", True)
             min_ex = g2.slider("最低仓位", 0.0, 1.0, 0.30, 0.05)
+            bt_comm = g1.number_input("佣金（单边，万分之）", 0.0, 10.0, 3.0, 0.1, key="bc")
+            bt_slip = g2.number_input("滑点（单边，%）", 0.0, 0.5, 0.10, 0.01, key="bsl")
             bt_s = g1.date_input("回测起", dt.date(2018, 1, 1), key="bs")
             bt_e = g2.date_input("回测止", dt.date.today(), key="be")
             st.caption("建议：2018-2022 作为样本内调参，2023 年之后只跑一次，不回头改。")
@@ -1794,7 +1824,8 @@ def main():
                        min_hold_w=min_hw, max_hold_w=max_hw,
                        trail_stop=trail, hard_stop=hard,
                        use_breadth=use_bd, min_expo=min_ex, breadth_lo=0.20, breadth_hi=0.60,
-                       commission=0.0003, stamp=0.0005, slippage=0.001,
+                       commission=bt_comm / 10000.0, stamp=0.0005,
+                       slippage=bt_slip / 100.0,
                        no_trade_band=0.25, bt_start=bt_s)
             with st.spinner("回测中…"):
                 r = run_backtest(panel, score, elig, rb, prm)
