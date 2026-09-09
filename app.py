@@ -60,13 +60,20 @@ SW_L2_ALL = ["电池", "光伏设备", "风电设备", "电网设备", "其他�
 SW_L2_DEFAULT = ["电池", "光伏设备", "风电设备", "其他电源设备Ⅱ", "自动化设备"]
 
 # 因子登记表: 内部名 -> (中文名, 默认权重)
+# 默认权重一律为 0：不预设任何结论，权重必须由检验结果决定。
 FACTOR_DEF = {
-    "mom_ra":  ("风险调整动量(60日,跳过最近5日)", 1.0),
-    "trend_q": ("趋势质量(斜率×R²)",             1.0),
-    "rel_str": ("板块相对强度(60日超额)",         0.5),
-    "vol_exp": ("量能扩张(5日额/60日额)",         0.5),
-    "dist_hi": ("距60日高点(越近越高)",           0.5),
-    "rev5":    ("5日反转(近5日涨幅)",            -0.5),
+    "mom_ra":  ("风险调整动量(60日,跳过最近5日)", 0.0),
+    "trend_q": ("趋势质量(斜率×R²)",             0.0),
+    "rel_str": ("板块相对强度(60日超额)",         0.0),
+    "vol_exp": ("量能扩张(5日额/60日额)",         0.0),
+    "dist_hi": ("距60日高点(越近越高)",           0.0),
+    "rev5":    ("5日反转(近5日涨幅)",            -0.0),
+}
+# 预设权重组，方便对比。名字即用途。
+WEIGHT_PRESETS = {
+    "A组：只用 距60日高点": {"dist_hi": -1.0},
+    "B组：距60日高点 + 5日反转": {"dist_hi": -1.0, "rev5": -0.5},
+    "全部清零": {},
 }
 FACTOR_KEYS = list(FACTOR_DEF.keys())
 
@@ -703,6 +710,7 @@ def gap_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
+HZ_LIST = (1, 2, 3, 4, 6, 8)
 ROUND_TRIP_COST = 0.0003 * 2 + 0.0005 + 0.001 * 2   # 佣金双边 + 印花税 + 滑点双边 = 0.31%
 
 
@@ -764,6 +772,33 @@ def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
         if progress:
             progress((n + 1) / len(keys), row["因子"])
     return pd.DataFrame(rows)
+
+
+def eval_weights(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
+                 elig: pd.DataFrame, rebal: List[pd.Timestamp], weights: Dict[str, float],
+                 gap: int = 1, horizons=(1, 2, 3, 4, 6, 8), fixed_h: Optional[int] = None,
+                 progress=None) -> dict:
+    """把一组权重合成打分，跑完整检验，返回一行结论。"""
+    comp = composite_score(factors, elig, weights)
+    cf = {COMPOSITE_KEY: comp}
+    hs = horizon_scan(cf, adj_close, elig, rebal, [COMPOSITE_KEY],
+                      horizons=horizons, gap=gap, progress=progress)
+    row = hs.iloc[0]
+    hb = row["最优持有周"]
+    h_use = int(fixed_h) if fixed_h else (int(hb) if pd.notna(hb) else 2)
+    r = layered_test(comp, adj_close, elig, rebal, h_use, 10, gap=gap)
+    g = gap_scan(cf, adj_close, elig, rebal, h_use, [COMPOSITE_KEY], gaps=(0, 1))
+    yr = r.get("ic_year", pd.Series(dtype=float))
+    same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum()) if len(yr) else 0
+    agree = bool(np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
+                 and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
+    return {"t(重叠修正)": r["t_nw"], "同号年数": f"{same}/{len(yr)}",
+            "方向一致": "是" if agree else "否", "多头贡献占比": r["long_share"],
+            "最优持有周": hb, "年化净超额": row["最优净超额"],
+            "延迟0日t": float(g.iloc[0]["t@延迟0日"]), "延迟1日t": float(g.iloc[0]["t@延迟1日"]),
+            "_ok": bool(abs(r["t_nw"]) >= 2 and agree and len(yr) and same / len(yr) >= 8 / 9
+                        and pd.notna(hb) and r["long_share"] >= 0.40),
+            "_hs": hs, "_r": r, "_h": h_use}
 
 
 def export_bundle(tables: Dict[str, pd.DataFrame]) -> bytes:
@@ -1219,344 +1254,469 @@ def main():
 
     # ---------------- 因子分层检验 ----------------
     with t2:
-        st.subheader("先回答一个问题：这些打分有没有排序能力？")
+        st.subheader("因子检验")
+        st.markdown("### 一键 A/B 对比")
         st.markdown(
-            "**t 的符号只说明方向，门槛是 |t| > 2。** t 为负不是失败，是因子要反过来用。\n\n"
-            "但看结果之前先记住两件事：① 动量、趋势质量、相对强度、距高点、5日反转"
-            "本质都是「近期价格强弱」的变体，彼此高度相关，**六个因子大约只是两个独立赌注**；"
-            "② 池子有 50-1000 亿的市值上下限，动量高的股票平均更靠近上沿，"
-            "所以「动量为负」可能只是「小市值跑赢」的伪装——下面的市值诊断就是查这个的。")
+            "**不需要设任何参数。** 这个按钮会自动做完四件事：\n\n"
+            "1. 用**样本内 2018-2022** 分别检验 A、B 两组权重\n"
+            "2. 挑出更好的一组\n"
+            "3. 用**样本外 2023 年至今**验证它（这一步只跑一次，不回头改）\n"
+            "4. 把胜出的权重写进回测页\n\n"
+            "A 组 = 只用「距60日高点」（权重 -1）　　"
+            "B 组 = 距60日高点 -1 ＋ 5日反转 -0.5")
 
-        c0 = st.columns(5)
-        hz = c0[0].select_slider("持有期（周）", [1, 2, 4, 6, 8], 4)
-        gap = c0[1].select_slider("入场延迟（交易日）", [0, 1, 3, 5, 10], 1,
-                                  help="0 = 用排名当日收盘价入场。这会让因子的分子和"
-                                       "未来收益的分母共用同一个价格，噪音会凭空造出负相关。"
-                                       "回测是次日开盘成交，所以 1 才是与回测一致的口径。")
-        ls_ = c0[2].date_input("样本起", dt.date(2018, 1, 1), key="ls")
-        le_ = c0[3].date_input("样本止", dt.date.today(), key="le")
-        neu = c0[4].checkbox("市值中性化", False,
-                             help="截面上把因子对 log 流通市值回归取残差。"
-                                  "勾选后再看一遍 IC：如果因子显著性大幅塌掉，"
-                                  "说明它原本的效果主要来自市值暴露，不是因子本身。")
-        rb = [d for d in rebal_all if pd.Timestamp(ls_) <= d <= pd.Timestamp(le_)]
-
-        if st.button("扫描全部因子（含市值诊断）", type="primary"):
-            bar = st.progress(0.0)
-            summ, ydf = scan_all_factors(factors, panel["adj_close"], elig, rb,
-                                         int(hz), TEST_KEYS, neu,
-                                         lambda p, n: bar.progress(p, text=n), gap=int(gap))
-            ss["scan"] = (summ, ydf, factor_corr(factors, elig, rb, TEST_KEYS),
-                          int(hz), neu, int(gap))
-            bar.empty()
-
-        if ss.get("scan"):
-            summ, ydf, corr, hz_done, neu_done, gap_done = ss["scan"]
-            tag = "（已市值中性化）" if neu_done else ""
-            st.markdown(f"**汇总{tag}　持有期 {hz_done} 周　入场延迟 {gap_done} 日**")
-            show = summ.drop(columns=[c for c in summ.columns
-                                      if c == "key" or c.startswith("_")]).copy()
-            st.dataframe(
-                show.style.format({"IC均值": "{:.4f}", "t(重叠修正)": "{:.2f}",
-                                   "单调性": "{:.2f}", "多空价差": "{:.2%}",
-                                   "IC>0占比": "{:.1%}"})
-                    .background_gradient(subset=["t(重叠修正)"], cmap="RdYlGn", vmin=-4, vmax=4),
-                use_container_width=True)
-            st.caption(
-                "**「方向一致」是这张表里最该先看的一列。** IC、分组单调性、多空价差"
-                "是同一件事的三种量法，方向不一致说明因子的效果集中在少数高波动时段，"
-                "总均值和分组结果各说各话——这种因子不能用。"
-                "「同号年数」低于 8/9 的同样不能用：总均值只是两段相反行情的平均数。")
-
-            diag = summ[summ["key"] == "logsize"]
-            if len(diag):
-                d0 = diag.iloc[0]
-                st.markdown("**市值诊断**")
-                if abs(d0["t(重叠修正)"]) >= 2:
-                    direc = "小市值跑赢大市值" if d0["IC均值"] < 0 else "大市值跑赢小市值"
-                    st.warning(
-                        f"流通市值本身就是个显著因子（IC {d0['IC均值']:.4f}，"
-                        f"修正 t {d0['t(重叠修正)']:.2f}），方向是**{direc}**。"
-                        "请务必勾选「市值中性化」再扫一遍：如果价格类因子的显著性"
-                        "在中性化后大幅塌掉，那它们原本测出来的效果主要是市值暴露，"
-                        "照着这个结果去建仓等于在赌市值风格，不是在赌你想赌的东西。")
-                else:
-                    st.success(f"流通市值本身不显著（修正 t {d0['t(重叠修正)']:.2f}），"
-                               "价格类因子的结果没有被市值污染。")
-
-            st.markdown("**分年度 IC**")
-            if len(ydf):
-                st.dataframe(ydf.style.format("{:.4f}")
-                             .background_gradient(cmap="RdYlGn", vmin=-0.08, vmax=0.08),
-                             use_container_width=True)
-                st.caption("这张表比总均值重要得多。如果某因子在 2019-2021 是一个符号、"
-                           "2023 年之后翻成另一个符号，那它的总均值只是两段相反行情的平均数，"
-                           "拿去做实盘等于赌行情会退回从前。逐年同号才叫稳定。")
-
-            if len(corr):
-                st.markdown("**因子截面相关性**")
-                st.dataframe(corr.style.format("{:.2f}")
-                             .background_gradient(cmap="coolwarm", vmin=-1, vmax=1),
-                             use_container_width=True)
-                st.caption("相关性 0.7 以上的因子之间几乎没有增量信息，"
-                           "把它们一起加进打分只是把同一个赌注下三遍，并不会分散风险。")
-
-            tradable = summ[summ["key"].isin(FACTOR_KEYS)].copy()
-            # 三道门槛全过才给权重。只看 t 会把"效果集中在少数时段"和
-            # "两段相反行情的平均数"这两类因子放进来，那是在拟合过去。
-            def _pass(r):
-                return (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0
-                        and r["_agree"] and r["_ny"] > 0 and r["_same"] / r["_ny"] >= 8 / 9)
-            tradable["通过"] = tradable.apply(_pass, axis=1)
-            passed = tradable[tradable["通过"]]
-            st.markdown(f"**三道门槛全过的可交易因子：{len(passed)} / {len(tradable)}**")
-            st.caption("门槛：|修正 t| ≥ 2　且　IC/单调性/价差方向一致　且　同号年数 ≥ 8/9")
-            for _, r in tradable.iterrows():
-                why = []
-                if not (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0):
-                    why.append("不显著")
-                if not r["_agree"]:
-                    why.append("三条证据方向打架")
-                if r["_ny"] and r["_same"] / r["_ny"] < 8 / 9:
-                    why.append(f"逐年符号不稳({r['同号年数']})")
-                st.write(("✅ " if r["通过"] else "❌ ") + r["因子"]
-                         + ("" if r["通过"] else "　— " + "、".join(why)))
-
-            if len(passed) == 0:
-                st.error("一个都没过。不要去调仓位和止损，那救不回来——"
-                         "问题在因子本身，需要换一批因子重来。")
+        IN_END, OUT_BEG = pd.Timestamp("2022-12-31"), pd.Timestamp("2023-01-01")
+        if st.button("开始 A/B 对比", type="primary", use_container_width=True):
+            rb_in = [d for d in rebal_all if d <= IN_END]
+            rb_out = [d for d in rebal_all if d >= OUT_BEG]
+            if len(rb_in) < 50 or len(rb_out) < 20:
+                st.error("样本内或样本外调仓次数太少，检查数据起止日期。")
             else:
-                # 等权 + 符号，不按 t 的大小定权重：t 越大权重越大等于对
-                # 样本内的显著性做二次拟合，样本外通常更差。
-                sug = {k: 0.0 for k in FACTOR_KEYS}
-                for _, r in passed.iterrows():
-                    sug[r["key"]] = float(np.sign(r["t(重叠修正)"]))
-                st.write("建议权重（通过的等权取符号，未通过置 0）：",
-                         {ALL_DEF[k][0]: v for k, v in sug.items() if v != 0})
-                st.caption("刻意不按 t 的大小分配权重——那等于对样本内显著性再拟合一次，"
-                           "样本外通常更差。等权更稳。")
-                if st.button("把建议权重写入回测页"):
-                    for k, v in sug.items():
-                        ss["w_" + k] = v
+                groups = {"A组": {"dist_hi": -1.0},
+                          "B组": {"dist_hi": -1.0, "rev5": -0.5}}
+                bar = st.progress(0.0, text="准备中…")
+                done, total = 0, len(groups) * len(HZ_LIST) + len(HZ_LIST)
+                res = {}
+                for gname, gw in groups.items():
+                    full = {k: float(gw.get(k, 0.0)) for k in FACTOR_KEYS}
+                    def _cb(p, nm, _g=gname):
+                        nonlocal done
+                        done += 1
+                        bar.progress(min(done / total, 1.0), text=f"样本内 {_g}…")
+                    res[gname] = eval_weights(factors, panel["adj_close"], elig, rb_in,
+                                              full, gap=1, horizons=HZ_LIST, progress=_cb)
+                    res[gname]["_w"] = full
+                # 样本内净超额更高者胜出（NaN 视为最差）
+                def _sc(x):
+                    v = x["年化净超额"]
+                    return v if pd.notna(v) else -9e9
+                win = max(res, key=lambda g: _sc(res[g]))
+                wres = res[win]
+                oos = None
+                if pd.notna(wres["年化净超额"]):
+                    def _cb2(p, nm):
+                        nonlocal done
+                        done += 1
+                        bar.progress(min(done / total, 1.0), text="样本外验证…")
+                    oos = eval_weights(factors, panel["adj_close"], elig, rb_out,
+                                       wres["_w"], gap=1, horizons=HZ_LIST,
+                                       fixed_h=wres["_h"], progress=_cb2)
+                bar.empty()
+                ss["ab"] = {"res": res, "win": win, "oos": oos,
+                            "h": wres["_h"], "w": wres["_w"]}
+                for k, v in wres["_w"].items():
+                    ss["w_" + k] = v
+                ss.pop("last_bt", None)
+                st.rerun()
+
+        if ss.get("ab"):
+            ab = ss["ab"]
+            cols = ["t(重叠修正)", "方向一致", "同号年数", "多头贡献占比",
+                    "最优持有周", "年化净超额", "延迟0日t", "延迟1日t"]
+            tbl = pd.DataFrame({g: {c: r[c] for c in cols} for g, r in ab["res"].items()}).T
+            if ab["oos"] is not None:
+                tbl.loc[f"{ab['win']}·样本外"] = {c: ab["oos"][c] for c in cols}
+            st.markdown("**结果**（前两行=样本内 2018-2022，末行=样本外 2023至今）")
+            st.dataframe(tbl.style.format({"t(重叠修正)": "{:.2f}", "多头贡献占比": "{:.0%}",
+                                           "最优持有周": "{:.0f}", "年化净超额": "{:+.1%}",
+                                           "延迟0日t": "{:.2f}", "延迟1日t": "{:.2f}"},
+                                          na_rep="—"),
+                         use_container_width=True)
+
+            wr = ab["res"][ab["win"]]
+            oos = ab["oos"]
+            if not pd.notna(wr["年化净超额"]):
+                st.error("**两组在样本内都没有任何持有期的净超额为正。** "
+                         "这个方向不成立，不要往下做回测。")
+            elif oos is None:
+                st.warning("样本外未能完成验证。")
+            elif oos["_ok"] and pd.notna(oos["年化净超额"]) and oos["年化净超额"] > 0:
+                st.success(
+                    f"**{ab['win']} 胜出，且通过样本外验证。**　"
+                    f"样本内净超额 {wr['年化净超额']:+.1%}，样本外 {oos['年化净超额']:+.1%}，"
+                    f"持有 {ab['h']} 周。权重已自动写入回测页。\n\n"
+                    f"下一步：去「策略回测」页，把**最长持有期设成 {ab['h']} 周**，"
+                    f"回测起止设 2023-01-01 到今天，点运行。")
+            else:
+                why = []
+                if pd.isna(oos["年化净超额"]) or oos["年化净超额"] <= 0:
+                    why.append("样本外净超额不为正")
+                if abs(oos["t(重叠修正)"]) < 2:
+                    why.append("样本外不显著")
+                if oos["方向一致"] != "是":
+                    why.append("样本外三条证据方向打架")
+                if pd.notna(oos["多头贡献占比"]) and oos["多头贡献占比"] < 0.40:
+                    why.append("样本外多头占比不足40%")
+                st.error(
+                    f"**{ab['win']} 在样本内最好（{wr['年化净超额']:+.1%}），"
+                    f"但样本外没过：" + "、".join(why) + "。**\n\n"
+                    "样本内好、样本外垮，通常意味着样本内那部分是行情特征而不是稳定效应。"
+                    "权重已写入回测页，你可以跑一次看看实际曲线，但**不要**因为样本外不好"
+                    "就回头改权重再试——那就把样本外也用掉了。")
+
+        st.divider()
+        with st.expander("高级：逐因子扫描 / 自定义权重 / 导出", expanded=False):
+            st.subheader("先回答一个问题：这些打分有没有排序能力？")
+            st.markdown(
+                "**t 的符号只说明方向，门槛是 |t| > 2。** t 为负不是失败，是因子要反过来用。\n\n"
+                "但看结果之前先记住两件事：① 动量、趋势质量、相对强度、距高点、5日反转"
+                "本质都是「近期价格强弱」的变体，彼此高度相关，**六个因子大约只是两个独立赌注**；"
+                "② 池子有 50-1000 亿的市值上下限，动量高的股票平均更靠近上沿，"
+                "所以「动量为负」可能只是「小市值跑赢」的伪装——下面的市值诊断就是查这个的。")
+
+            c0 = st.columns(5)
+            hz = c0[0].select_slider("持有期（周）", [1, 2, 4, 6, 8], 4)
+            gap = c0[1].select_slider("入场延迟（交易日）", [0, 1, 3, 5, 10], 1,
+                                      help="0 = 用排名当日收盘价入场。这会让因子的分子和"
+                                           "未来收益的分母共用同一个价格，噪音会凭空造出负相关。"
+                                           "回测是次日开盘成交，所以 1 才是与回测一致的口径。")
+            ls_ = c0[2].date_input("样本起", dt.date(2018, 1, 1), key="ls")
+            le_ = c0[3].date_input("样本止", dt.date.today(), key="le")
+            neu = c0[4].checkbox("市值中性化", False,
+                                 help="截面上把因子对 log 流通市值回归取残差。"
+                                      "勾选后再看一遍 IC：如果因子显著性大幅塌掉，"
+                                      "说明它原本的效果主要来自市值暴露，不是因子本身。")
+            rb = [d for d in rebal_all if pd.Timestamp(ls_) <= d <= pd.Timestamp(le_)]
+
+            if st.button("扫描全部因子（含市值诊断）", type="primary"):
+                bar = st.progress(0.0)
+                summ, ydf = scan_all_factors(factors, panel["adj_close"], elig, rb,
+                                             int(hz), TEST_KEYS, neu,
+                                             lambda p, n: bar.progress(p, text=n), gap=int(gap))
+                ss["scan"] = (summ, ydf, factor_corr(factors, elig, rb, TEST_KEYS),
+                              int(hz), neu, int(gap))
+                bar.empty()
+
+            if ss.get("scan"):
+                summ, ydf, corr, hz_done, neu_done, gap_done = ss["scan"]
+                tag = "（已市值中性化）" if neu_done else ""
+                st.markdown(f"**汇总{tag}　持有期 {hz_done} 周　入场延迟 {gap_done} 日**")
+                show = summ.drop(columns=[c for c in summ.columns
+                                          if c == "key" or c.startswith("_")]).copy()
+                st.dataframe(
+                    show.style.format({"IC均值": "{:.4f}", "t(重叠修正)": "{:.2f}",
+                                       "单调性": "{:.2f}", "多空价差": "{:.2%}",
+                                       "IC>0占比": "{:.1%}"})
+                        .background_gradient(subset=["t(重叠修正)"], cmap="RdYlGn", vmin=-4, vmax=4),
+                    use_container_width=True)
+                st.caption(
+                    "**「方向一致」是这张表里最该先看的一列。** IC、分组单调性、多空价差"
+                    "是同一件事的三种量法，方向不一致说明因子的效果集中在少数高波动时段，"
+                    "总均值和分组结果各说各话——这种因子不能用。"
+                    "「同号年数」低于 8/9 的同样不能用：总均值只是两段相反行情的平均数。")
+
+                diag = summ[summ["key"] == "logsize"]
+                if len(diag):
+                    d0 = diag.iloc[0]
+                    st.markdown("**市值诊断**")
+                    if abs(d0["t(重叠修正)"]) >= 2:
+                        direc = "小市值跑赢大市值" if d0["IC均值"] < 0 else "大市值跑赢小市值"
+                        st.warning(
+                            f"流通市值本身就是个显著因子（IC {d0['IC均值']:.4f}，"
+                            f"修正 t {d0['t(重叠修正)']:.2f}），方向是**{direc}**。"
+                            "请务必勾选「市值中性化」再扫一遍：如果价格类因子的显著性"
+                            "在中性化后大幅塌掉，那它们原本测出来的效果主要是市值暴露，"
+                            "照着这个结果去建仓等于在赌市值风格，不是在赌你想赌的东西。")
+                    else:
+                        st.success(f"流通市值本身不显著（修正 t {d0['t(重叠修正)']:.2f}），"
+                                   "价格类因子的结果没有被市值污染。")
+
+                st.markdown("**分年度 IC**")
+                if len(ydf):
+                    st.dataframe(ydf.style.format("{:.4f}")
+                                 .background_gradient(cmap="RdYlGn", vmin=-0.08, vmax=0.08),
+                                 use_container_width=True)
+                    st.caption("这张表比总均值重要得多。如果某因子在 2019-2021 是一个符号、"
+                               "2023 年之后翻成另一个符号，那它的总均值只是两段相反行情的平均数，"
+                               "拿去做实盘等于赌行情会退回从前。逐年同号才叫稳定。")
+
+                if len(corr):
+                    st.markdown("**因子截面相关性**")
+                    st.dataframe(corr.style.format("{:.2f}")
+                                 .background_gradient(cmap="coolwarm", vmin=-1, vmax=1),
+                                 use_container_width=True)
+                    st.caption("相关性 0.7 以上的因子之间几乎没有增量信息，"
+                               "把它们一起加进打分只是把同一个赌注下三遍，并不会分散风险。")
+
+                tradable = summ[summ["key"].isin(FACTOR_KEYS)].copy()
+                # 三道门槛全过才给权重。只看 t 会把"效果集中在少数时段"和
+                # "两段相反行情的平均数"这两类因子放进来，那是在拟合过去。
+                def _pass(r):
+                    return (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0
+                            and r["_agree"] and r["_ny"] > 0 and r["_same"] / r["_ny"] >= 8 / 9)
+                tradable["通过"] = tradable.apply(_pass, axis=1)
+                passed = tradable[tradable["通过"]]
+                st.markdown(f"**三道门槛全过的可交易因子：{len(passed)} / {len(tradable)}**")
+                st.caption("门槛：|修正 t| ≥ 2　且　IC/单调性/价差方向一致　且　同号年数 ≥ 8/9")
+                for _, r in tradable.iterrows():
+                    why = []
+                    if not (np.isfinite(r["t(重叠修正)"]) and abs(r["t(重叠修正)"]) >= 2.0):
+                        why.append("不显著")
+                    if not r["_agree"]:
+                        why.append("三条证据方向打架")
+                    if r["_ny"] and r["_same"] / r["_ny"] < 8 / 9:
+                        why.append(f"逐年符号不稳({r['同号年数']})")
+                    st.write(("✅ " if r["通过"] else "❌ ") + r["因子"]
+                             + ("" if r["通过"] else "　— " + "、".join(why)))
+
+                if len(passed) == 0:
+                    st.error("一个都没过。不要去调仓位和止损，那救不回来——"
+                             "问题在因子本身，需要换一批因子重来。")
+                else:
+                    # 等权 + 符号，不按 t 的大小定权重：t 越大权重越大等于对
+                    # 样本内的显著性做二次拟合，样本外通常更差。
+                    sug = {k: 0.0 for k in FACTOR_KEYS}
+                    for _, r in passed.iterrows():
+                        sug[r["key"]] = float(np.sign(r["t(重叠修正)"]))
+                    st.write("建议权重（通过的等权取符号，未通过置 0）：",
+                             {ALL_DEF[k][0]: v for k, v in sug.items() if v != 0})
+                    st.caption("刻意不按 t 的大小分配权重——那等于对样本内显著性再拟合一次，"
+                               "样本外通常更差。等权更稳。")
+                    if st.button("把建议权重写入回测页"):
+                        for k, v in sug.items():
+                            ss["w_" + k] = v
+                        ss.pop("last_bt", None)
+                        st.rerun()
+
+            st.divider()
+            st.markdown("### 入场延迟扫描 —— 区分真反转与噪音")
+            st.markdown(
+                "反转类因子的分子用的是排名当日的收盘价，而未来收益的分母也是它。"
+                "这一天价格里的买卖价差跳动会同时抬高因子、压低未来收益，**凭空造出负相关**。"
+                "真实的定价效应扛得住推迟几天入场，价差跳动扛不住。\n\n"
+                "**看 0 日到 1 日那一步的落差**：崩塌就是噪音，稳住就是真效应。")
+            if st.button("运行延迟扫描"):
+                bar2 = st.progress(0.0)
+                gs = gap_scan(factors, panel["adj_close"], elig, rb, int(hz), FACTOR_KEYS,
+                              gaps=(0, 1, 3, 5, 10),
+                              progress=lambda p, n: bar2.progress(p, text=n))
+                ss["gapscan"] = gs
+                bar2.empty()
+            if ss.get("gapscan") is not None:
+                gs = ss["gapscan"]
+                gcols = [c for c in gs.columns if c.startswith("t@")]
+                st.dataframe(
+                    gs.drop(columns=["key"]).style
+                      .format({**{c: "{:.2f}" for c in gcols}, "残留比例": "{:.0%}"})
+                      .background_gradient(subset=gcols, cmap="RdYlGn", vmin=-5, vmax=5),
+                    use_container_width=True)
+                drops = []
+                for _, r in gs.iterrows():
+                    t0, t1 = r.get("t@延迟0日"), r.get("t@延迟1日")
+                    if np.isfinite(t0) and abs(t0) >= 2 and np.isfinite(t1):
+                        if abs(t1) < abs(t0) * 0.6:
+                            drops.append(r["因子"])
+                if drops:
+                    st.error("以下因子在延迟 1 天后显著性就崩掉了一半以上，"
+                             "**它们测出来的效应主要是微观结构噪音，不可交易**：\n\n"
+                             + "、".join(drops))
+                else:
+                    st.success("没有因子在延迟 1 天时崩塌，反转效应扛得住延迟入场。")
+
+            st.divider()
+            st.markdown("### 持有期扫描 —— 该拿多久")
+            st.markdown(
+                "信号有半衰期。持有期短于半衰期，信号浓度高但换手成本高；"
+                "长于半衰期，大半仓位时间都在拿过期信号。下表把两边一起算："
+                f"单次往返成本按 {ROUND_TRIP_COST:.2%}（佣金双边+印花税+滑点双边）。\n\n"
+                "**净超额只算多头那一组**（IC 为负时是 D1，为正时是 D10）相对当期截面均值的超额。"
+                "刻意不用「多空价差的一半」——A 股融券做空不现实，如果效应全部来自"
+                "「涨得多的那组暴跌」，纯多头一分钱都吃不到。"
+                "「多头贡献占比」低于 40% 就说明钱主要在你拿不到的空头端。")
+            if st.button("运行持有期扫描"):
+                bar3 = st.progress(0.0)
+                hs = horizon_scan(factors, panel["adj_close"], elig, rb, FACTOR_KEYS,
+                                  horizons=(1, 2, 3, 4, 6, 8), gap=int(gap),
+                                  progress=lambda p, n: bar3.progress(p, text=n))
+                ss["hscan"] = hs
+                bar3.empty()
+            if ss.get("hscan") is not None:
+                hs = ss["hscan"]
+                tc = [c for c in hs.columns if c.startswith("t@")]
+                nc = [c for c in hs.columns if c.startswith("净超额@")]
+                st.dataframe(
+                    hs.drop(columns=["key"]).style
+                      .format({**{c: "{:.2f}" for c in tc},
+                               **{c: "{:.1%}" for c in nc},
+                               "最优净超额": "{:.1%}", "最优持有周": "{:.0f}",
+                               "多头贡献占比": "{:.0%}", "空头年化(拿不到)": "{:.1%}"},
+                              na_rep="—")
+                      .background_gradient(subset=nc, cmap="RdYlGn", vmin=-0.15, vmax=0.15),
+                    use_container_width=True)
+                good = hs.dropna(subset=["最优净超额"])
+                good = good[good["最优净超额"] > 0]
+                if len(good):
+                    wk = good.sort_values("最优净超额", ascending=False).iloc[0]
+                    st.success(f"净超额最高的是「{wk['因子']}」：做多 {wk['做多哪组']} 组、"
+                               f"持有 {wk['最优持有周']:.0f} 周，估计年化净超额 {wk['最优净超额']:.1%}，"
+                               f"其中多头贡献占比 {wk['多头贡献占比']:.0%}。"
+                               "请把回测页的最长持有期调到这个量级——"
+                               "拿满 8 周意味着大半仓位时间都在持有已经过期的信号。")
+                    low = good[good["多头贡献占比"] < 0.4]
+                    if len(low):
+                        st.warning("以下因子的钱主要在空头端（涨得多的那组暴跌），"
+                                   "纯多头拿不到，别被总价差骗了：\n\n"
+                                   + "、".join(low["因子"].tolist()))
+                else:
+                    st.error("没有任何因子在任何持有期上做到净超额为正。"
+                             "扣掉换手成本后这个方向不成立，不要往下做回测。")
+
+            st.divider()
+            st.markdown("### 检验综合打分")
+            st.markdown(
+                "**单因子逐个过关，不代表合成之后还过关。** 相关的因子加在一起会互相稀释，"
+                "各自最优的持有期也未必一致。系统实际用的是这个合成分数，所以它必须"
+                "自己走一遍同样的检验。")
+            st.markdown("**权重（这里是唯一设置处，回测页直接读这里）**")
+            pc = st.columns(len(WEIGHT_PRESETS))
+            for j, (pname, pw) in enumerate(WEIGHT_PRESETS.items()):
+                if pc[j].button(pname, use_container_width=True):
+                    for k in FACTOR_KEYS:
+                        ss["w_" + k] = float(pw.get(k, 0.0))
+                    ss.pop("compscan", None)
                     ss.pop("last_bt", None)
                     st.rerun()
-
-        st.divider()
-        st.markdown("### 入场延迟扫描 —— 区分真反转与噪音")
-        st.markdown(
-            "反转类因子的分子用的是排名当日的收盘价，而未来收益的分母也是它。"
-            "这一天价格里的买卖价差跳动会同时抬高因子、压低未来收益，**凭空造出负相关**。"
-            "真实的定价效应扛得住推迟几天入场，价差跳动扛不住。\n\n"
-            "**看 0 日到 1 日那一步的落差**：崩塌就是噪音，稳住就是真效应。")
-        if st.button("运行延迟扫描"):
-            bar2 = st.progress(0.0)
-            gs = gap_scan(factors, panel["adj_close"], elig, rb, int(hz), FACTOR_KEYS,
-                          gaps=(0, 1, 3, 5, 10),
-                          progress=lambda p, n: bar2.progress(p, text=n))
-            ss["gapscan"] = gs
-            bar2.empty()
-        if ss.get("gapscan") is not None:
-            gs = ss["gapscan"]
-            gcols = [c for c in gs.columns if c.startswith("t@")]
-            st.dataframe(
-                gs.drop(columns=["key"]).style
-                  .format({**{c: "{:.2f}" for c in gcols}, "残留比例": "{:.0%}"})
-                  .background_gradient(subset=gcols, cmap="RdYlGn", vmin=-5, vmax=5),
-                use_container_width=True)
-            drops = []
-            for _, r in gs.iterrows():
-                t0, t1 = r.get("t@延迟0日"), r.get("t@延迟1日")
-                if np.isfinite(t0) and abs(t0) >= 2 and np.isfinite(t1):
-                    if abs(t1) < abs(t0) * 0.6:
-                        drops.append(r["因子"])
-            if drops:
-                st.error("以下因子在延迟 1 天后显著性就崩掉了一半以上，"
-                         "**它们测出来的效应主要是微观结构噪音，不可交易**：\n\n"
-                         + "、".join(drops))
-            else:
-                st.success("没有因子在延迟 1 天时崩塌，反转效应扛得住延迟入场。")
-
-        st.divider()
-        st.markdown("### 持有期扫描 —— 该拿多久")
-        st.markdown(
-            "信号有半衰期。持有期短于半衰期，信号浓度高但换手成本高；"
-            "长于半衰期，大半仓位时间都在拿过期信号。下表把两边一起算："
-            f"单次往返成本按 {ROUND_TRIP_COST:.2%}（佣金双边+印花税+滑点双边）。\n\n"
-            "**净超额只算多头那一组**（IC 为负时是 D1，为正时是 D10）相对当期截面均值的超额。"
-            "刻意不用「多空价差的一半」——A 股融券做空不现实，如果效应全部来自"
-            "「涨得多的那组暴跌」，纯多头一分钱都吃不到。"
-            "「多头贡献占比」低于 40% 就说明钱主要在你拿不到的空头端。")
-        if st.button("运行持有期扫描"):
-            bar3 = st.progress(0.0)
-            hs = horizon_scan(factors, panel["adj_close"], elig, rb, FACTOR_KEYS,
-                              horizons=(1, 2, 3, 4, 6, 8), gap=int(gap),
-                              progress=lambda p, n: bar3.progress(p, text=n))
-            ss["hscan"] = hs
-            bar3.empty()
-        if ss.get("hscan") is not None:
-            hs = ss["hscan"]
-            tc = [c for c in hs.columns if c.startswith("t@")]
-            nc = [c for c in hs.columns if c.startswith("净超额@")]
-            st.dataframe(
-                hs.drop(columns=["key"]).style
-                  .format({**{c: "{:.2f}" for c in tc},
-                           **{c: "{:.1%}" for c in nc},
-                           "最优净超额": "{:.1%}", "最优持有周": "{:.0f}",
-                           "多头贡献占比": "{:.0%}", "空头年化(拿不到)": "{:.1%}"},
-                          na_rep="—")
-                  .background_gradient(subset=nc, cmap="RdYlGn", vmin=-0.15, vmax=0.15),
-                use_container_width=True)
-            good = hs.dropna(subset=["最优净超额"])
-            good = good[good["最优净超额"] > 0]
-            if len(good):
-                wk = good.sort_values("最优净超额", ascending=False).iloc[0]
-                st.success(f"净超额最高的是「{wk['因子']}」：做多 {wk['做多哪组']} 组、"
-                           f"持有 {wk['最优持有周']:.0f} 周，估计年化净超额 {wk['最优净超额']:.1%}，"
-                           f"其中多头贡献占比 {wk['多头贡献占比']:.0%}。"
-                           "请把回测页的最长持有期调到这个量级——"
-                           "拿满 8 周意味着大半仓位时间都在持有已经过期的信号。")
-                low = good[good["多头贡献占比"] < 0.4]
-                if len(low):
-                    st.warning("以下因子的钱主要在空头端（涨得多的那组暴跌），"
-                               "纯多头拿不到，别被总价差骗了：\n\n"
-                               + "、".join(low["因子"].tolist()))
-            else:
-                st.error("没有任何因子在任何持有期上做到净超额为正。"
-                         "扣掉换手成本后这个方向不成立，不要往下做回测。")
-
-        st.divider()
-        st.markdown("### 检验综合打分")
-        st.markdown(
-            "**单因子逐个过关，不代表合成之后还过关。** 相关的因子加在一起会互相稀释，"
-            "各自最优的持有期也未必一致。系统实际用的是这个合成分数，所以它必须"
-            "自己走一遍同样的检验。")
-        w_now = {k: ss.get("w_" + k, FACTOR_DEF[k][1]) for k in FACTOR_KEYS}
-        st.write("当前权重：", {ALL_DEF[k][0]: v for k, v in w_now.items() if abs(v) > 1e-9}
-                 or "（全为 0，请先在回测页设权重或用上面的建议权重）")
-        if st.button("检验综合打分", type="primary"):
-            if all(abs(v) < 1e-9 for v in w_now.values()):
-                st.error("权重全为 0，没有可检验的合成分数。")
-            else:
-                comp = cached_score(factors, elig, dkey, tuple(sorted(w_now.items())))
-                cf = {COMPOSITE_KEY: comp}
-                r = layered_test(comp, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
-                hsc = horizon_scan(cf, panel["adj_close"], elig, rb, [COMPOSITE_KEY],
-                                   horizons=(1, 2, 3, 4, 6, 8), gap=int(gap))
-                gsc = gap_scan(cf, panel["adj_close"], elig, rb, int(hz), [COMPOSITE_KEY],
-                               gaps=(0, 1, 3, 5, 10))
-                ss["compscan"] = (r, hsc, gsc, dict(w_now))
-        if ss.get("compscan"):
-            r, hsc, gsc, wsaved = ss["compscan"]
-            if not r.get("ok"):
-                st.error("样本不足。")
-            else:
-                yr = r["ic_year"]
-                same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum())
-                agree = (np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
-                         and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
-                m = st.columns(5)
-                m[0].metric("IC 均值", f"{r['ic_mean']:.4f}")
-                m[1].metric("t(重叠修正)", f"{r['t_nw']:.2f}")
-                m[2].metric("单调性", f"{r['monotonic']:.2f}")
-                m[3].metric("同号年数", f"{same}/{len(yr)}")
-                m[4].metric("多头贡献占比", f"{r['long_share']:.0%}")
-                hr = hsc.iloc[0]
-                nc2 = [c for c in hsc.columns if c.startswith("净超额@")]
-                st.markdown("**合成分数的持有期曲线**")
-                st.bar_chart(pd.Series({c.replace("净超额@", ""): hr[c] for c in nc2},
-                                       name="年化净超额"))
-                st.markdown("**合成分数的分组超额（相对截面均值）**")
-                st.bar_chart(r["group_excess"].rename(f"未来{hz}周超额"))
-                g0, g1 = gsc.iloc[0]["t@延迟0日"], gsc.iloc[0]["t@延迟1日"]
-                ok_all = (abs(r["t_nw"]) >= 2 and agree and len(yr) and same / len(yr) >= 8 / 9
-                          and pd.notna(hr.get("最优持有周")))
-                if ok_all:
-                    st.success(
-                        f"合成分数全部过关：做多 {hr['做多哪组']} 组、持有 "
-                        f"{hr['最优持有周']:.0f} 周，年化净超额 {hr['最优净超额']:+.1%}，"
-                        f"多头贡献 {hr['多头贡献占比']:.0%}，延迟入场不衰减"
-                        f"（{g0:.2f}→{g1:.2f}）。可以去回测页了，"
-                        f"把最长持有期设成 {hr['最优持有周']:.0f}-{hr['最优持有周']+1:.0f} 周。")
+            wc = st.columns(3)
+            for j, k in enumerate(FACTOR_KEYS):
+                wc[j % 3].number_input(ALL_DEF[k][0], -2.0, 2.0,
+                                       float(ss.get("w_" + k, FACTOR_DEF[k][1])),
+                                       0.1, key="w_" + k)
+            w_now = {k: float(ss.get("w_" + k, 0.0)) for k in FACTOR_KEYS}
+            live = {ALL_DEF[k][0]: v for k, v in w_now.items() if abs(v) > 1e-9}
+            st.write("当前生效权重：", live or "（全为 0 —— 先点上面的预设按钮）")
+            st.info("**跑之前把「样本止」改成 2022-12-31。** 现在这些数字都是 2018-2026 全样本，"
+                    "用全样本挑参数再用全样本回测，等于自己给自己打分。"
+                    "选定权重后，再用 2023 年之后验证一次。")
+            if st.button("检验综合打分", type="primary"):
+                if all(abs(v) < 1e-9 for v in w_now.values()):
+                    st.error("权重全为 0，没有可检验的合成分数。")
                 else:
-                    bad = []
-                    if abs(r["t_nw"]) < 2: bad.append("不显著")
-                    if not agree: bad.append("三条证据方向打架")
-                    if len(yr) and same / len(yr) < 8 / 9: bad.append(f"逐年符号不稳({same}/{len(yr)})")
-                    if pd.isna(hr.get("最优持有周")): bad.append("没有任何持有期净超额为正")
-                    st.error("合成分数没过关：" + "、".join(bad)
-                             + "。合成反而不如单因子，通常是权重里混进了互相抵消的因子——"
-                               "去掉净超额为负的那些再试。")
+                    comp = cached_score(factors, elig, dkey, tuple(sorted(w_now.items())))
+                    cf = {COMPOSITE_KEY: comp}
+                    r = layered_test(comp, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
+                    hsc = horizon_scan(cf, panel["adj_close"], elig, rb, [COMPOSITE_KEY],
+                                       horizons=(1, 2, 3, 4, 6, 8), gap=int(gap))
+                    gsc = gap_scan(cf, panel["adj_close"], elig, rb, int(hz), [COMPOSITE_KEY],
+                                   gaps=(0, 1, 3, 5, 10))
+                    ss["compscan"] = (r, hsc, gsc, dict(w_now))
+            if ss.get("compscan"):
+                r, hsc, gsc, wsaved = ss["compscan"]
+                if not r.get("ok"):
+                    st.error("样本不足。")
+                else:
+                    yr = r["ic_year"]
+                    same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum())
+                    agree = (np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
+                             and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
+                    m = st.columns(5)
+                    m[0].metric("IC 均值", f"{r['ic_mean']:.4f}")
+                    m[1].metric("t(重叠修正)", f"{r['t_nw']:.2f}")
+                    m[2].metric("单调性", f"{r['monotonic']:.2f}")
+                    m[3].metric("同号年数", f"{same}/{len(yr)}")
+                    m[4].metric("多头贡献占比", f"{r['long_share']:.0%}")
+                    hr = hsc.iloc[0]
+                    nc2 = [c for c in hsc.columns if c.startswith("净超额@")]
+                    st.markdown("**合成分数的持有期曲线**")
+                    st.bar_chart(pd.Series({c.replace("净超额@", ""): hr[c] for c in nc2},
+                                           name="年化净超额"))
+                    st.markdown("**合成分数的分组超额（相对截面均值）**")
+                    st.bar_chart(r["group_excess"].rename(f"未来{hz}周超额"))
+                    g0, g1 = gsc.iloc[0]["t@延迟0日"], gsc.iloc[0]["t@延迟1日"]
+                    ok_all = (abs(r["t_nw"]) >= 2 and agree and len(yr) and same / len(yr) >= 8 / 9
+                              and pd.notna(hr.get("最优持有周")))
+                    if ok_all:
+                        st.success(
+                            f"合成分数全部过关：做多 {hr['做多哪组']} 组、持有 "
+                            f"{hr['最优持有周']:.0f} 周，年化净超额 {hr['最优净超额']:+.1%}，"
+                            f"多头贡献 {hr['多头贡献占比']:.0%}，延迟入场不衰减"
+                            f"（{g0:.2f}→{g1:.2f}）。可以去回测页了，"
+                            f"把最长持有期设成 {hr['最优持有周']:.0f}-{hr['最优持有周']+1:.0f} 周。")
+                    else:
+                        bad = []
+                        if abs(r["t_nw"]) < 2: bad.append("不显著")
+                        if not agree: bad.append("三条证据方向打架")
+                        if len(yr) and same / len(yr) < 8 / 9: bad.append(f"逐年符号不稳({same}/{len(yr)})")
+                        if pd.isna(hr.get("最优持有周")): bad.append("没有任何持有期净超额为正")
+                        st.error("合成分数没过关：" + "、".join(bad)
+                                 + "。合成反而不如单因子，通常是权重里混进了互相抵消的因子——"
+                                   "去掉净超额为负的那些再试。")
 
-        st.divider()
-        st.markdown("### 一键导出全部结果")
-        _tabs = {}
-        if ss.get("scan"):
-            _tabs["01_汇总"] = ss["scan"][0].drop(
-                columns=[c for c in ss["scan"][0].columns if c.startswith("_")])
-            _tabs["02_分年度IC"] = ss["scan"][1]
-            _tabs["03_因子相关性"] = ss["scan"][2]
-        if ss.get("gapscan") is not None:
-            _tabs["04_入场延迟扫描"] = ss["gapscan"]
-        if ss.get("hscan") is not None:
-            _tabs["05_持有期扫描"] = ss["hscan"]
-        if ss.get("compscan"):
-            _r, _h, _g, _w = ss["compscan"]
-            _tabs["06_合成打分_持有期"] = _h
-            _tabs["07_合成打分_延迟"] = _g
-            _tabs["08_合成打分_权重"] = pd.DataFrame(
-                [{"因子": ALL_DEF[k][0], "权重": v} for k, v in _w.items()])
-        if _tabs:
-            meta = pd.DataFrame([{
-                "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "股票数": len(panel["codes"]), "交易日数": len(panel["cal"]),
-                "样本区间": f"{ls_}~{le_}", "持有期(周)": hz, "入场延迟(日)": gap,
-                "市值中性化": "是" if neu else "否",
-                "市值区间(亿)": f"{mv_lo:.0f}-{mv_hi:.0f}", "最低股价": min_price,
-                "调仓次数": len(rb)}]).T.rename(columns={0: "值"})
-            _tabs["00_运行参数"] = meta
-            st.download_button(
-                f"下载全部结果（{len(_tabs)} 张表，zip）",
-                export_bundle(dict(sorted(_tabs.items()))),
-                f"factor_scan_{dt.date.today():%Y%m%d}.zip", "application/zip",
-                type="primary", use_container_width=True)
-            st.caption("包含运行参数、汇总、分年度 IC、相关性矩阵、延迟扫描、持有期扫描。"
-                       "参数表一并导出，免得回头对不上是哪次跑的。")
-        else:
-            st.caption("先运行上面的扫描，这里才会出现下载按钮。")
-
-        st.divider()
-        st.markdown("**单因子细看**")
-        fkey = st.selectbox("因子", TEST_KEYS, format_func=lambda k: ALL_DEF[k][0])
-        if st.button("画分层曲线"):
-            f = factors[fkey]
-            if neu and "logsize" in factors and fkey != "logsize":
-                f = size_neutralize(f, factors["logsize"], elig)
-            res = layered_test(f, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
-            if not res.get("ok"):
-                st.error("样本不足，放宽日期或降低门槛。")
+            st.divider()
+            st.markdown("### 一键导出全部结果")
+            _tabs = {}
+            if ss.get("scan"):
+                _tabs["01_汇总"] = ss["scan"][0].drop(
+                    columns=[c for c in ss["scan"][0].columns if c.startswith("_")])
+                _tabs["02_分年度IC"] = ss["scan"][1]
+                _tabs["03_因子相关性"] = ss["scan"][2]
+            if ss.get("gapscan") is not None:
+                _tabs["04_入场延迟扫描"] = ss["gapscan"]
+            if ss.get("hscan") is not None:
+                _tabs["05_持有期扫描"] = ss["hscan"]
+            if ss.get("compscan"):
+                _r, _h, _g, _w = ss["compscan"]
+                _tabs["06_合成打分_持有期"] = _h
+                _tabs["07_合成打分_延迟"] = _g
+                _tabs["08_合成打分_权重"] = pd.DataFrame(
+                    [{"因子": ALL_DEF[k][0], "权重": v} for k, v in _w.items()])
+            if _tabs:
+                meta = pd.DataFrame([{
+                    "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "股票数": len(panel["codes"]), "交易日数": len(panel["cal"]),
+                    "样本区间": f"{ls_}~{le_}", "持有期(周)": hz, "入场延迟(日)": gap,
+                    "市值中性化": "是" if neu else "否",
+                    "市值区间(亿)": f"{mv_lo:.0f}-{mv_hi:.0f}", "最低股价": min_price,
+                    "调仓次数": len(rb)}]).T.rename(columns={0: "值"})
+                _tabs["00_运行参数"] = meta
+                st.download_button(
+                    f"下载全部结果（{len(_tabs)} 张表，zip）",
+                    export_bundle(dict(sorted(_tabs.items()))),
+                    f"factor_scan_{dt.date.today():%Y%m%d}.zip", "application/zip",
+                    type="primary", use_container_width=True)
+                st.caption("包含运行参数、汇总、分年度 IC、相关性矩阵、延迟扫描、持有期扫描。"
+                           "参数表一并导出，免得回头对不上是哪次跑的。")
             else:
-                m = st.columns(5)
-                m[0].metric("多空价差", f"{res['spread']:.2%}")
-                m[1].metric("IC 均值", f"{res['ic_mean']:.4f}")
-                m[2].metric("t(重叠修正)", f"{res['t_nw']:.2f}")
-                m[3].metric("单调性", f"{res['monotonic']:.2f}")
-                m[4].metric("IC>0 占比", f"{res['ic_pos']:.1%}")
-                st.bar_chart(res["group_excess"].rename(f"未来{hz}周超额（相对截面均值）"))
-                st.caption(f"做多 **{res['long_side']}** 组，多头超额 {res['long_excess']:+.2%}／"
-                           f"{hz}周，空头端 {res['short_excess']:+.2%}（A股拿不到）。"
-                           f"多头贡献占比 {res['long_share']:.0%}。")
-                st.line_chart(res["curve"])
-                st.line_chart(res["ic"].rolling(12).mean().rename("IC(12期均线)"))
+                st.caption("先运行上面的扫描，这里才会出现下载按钮。")
+
+            st.divider()
+            st.markdown("**单因子细看**")
+            fkey = st.selectbox("因子", TEST_KEYS, format_func=lambda k: ALL_DEF[k][0])
+            if st.button("画分层曲线"):
+                f = factors[fkey]
+                if neu and "logsize" in factors and fkey != "logsize":
+                    f = size_neutralize(f, factors["logsize"], elig)
+                res = layered_test(f, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
+                if not res.get("ok"):
+                    st.error("样本不足，放宽日期或降低门槛。")
+                else:
+                    m = st.columns(5)
+                    m[0].metric("多空价差", f"{res['spread']:.2%}")
+                    m[1].metric("IC 均值", f"{res['ic_mean']:.4f}")
+                    m[2].metric("t(重叠修正)", f"{res['t_nw']:.2f}")
+                    m[3].metric("单调性", f"{res['monotonic']:.2f}")
+                    m[4].metric("IC>0 占比", f"{res['ic_pos']:.1%}")
+                    st.bar_chart(res["group_excess"].rename(f"未来{hz}周超额（相对截面均值）"))
+                    st.caption(f"做多 **{res['long_side']}** 组，多头超额 {res['long_excess']:+.2%}／"
+                               f"{hz}周，空头端 {res['short_excess']:+.2%}（A股拿不到）。"
+                               f"多头贡献占比 {res['long_share']:.0%}。")
+                    st.line_chart(res["curve"])
+                    st.line_chart(res["ic"].rolling(12).mean().rename("IC(12期均线)"))
 
     # ---------------- 策略回测 ----------------
     with t3:
         st.subheader("完整策略回测")
         w1, w2 = st.columns([2, 3])
         with w1:
-            st.markdown("**因子权重**")
-            weights = {}
-            for k in FACTOR_KEYS:
-                weights[k] = st.slider(FACTOR_DEF[k][0], -2.0, 2.0, FACTOR_DEF[k][1], 0.1, key="w_" + k)
+            st.markdown("**因子权重**（在「因子分层检验」页设置）")
+            weights = {k: float(ss.get("w_" + k, 0.0)) for k in FACTOR_KEYS}
+            st.dataframe(pd.DataFrame([{"因子": ALL_DEF[k][0], "权重": v}
+                                       for k, v in weights.items() if abs(v) > 1e-9])
+                         if any(abs(v) > 1e-9 for v in weights.values())
+                         else pd.DataFrame({"提示": ["权重全为 0"]}),
+                         use_container_width=True, hide_index=True)
+            if not ss.get("compscan"):
+                st.warning("还没检验过合成打分。建议先回上一页跑「检验综合打分」——"
+                           "单因子过关不代表合成后过关。")
         with w2:
             g1, g2 = st.columns(2)
             top_n = g1.slider("持股数 N", 3, 15, 5)
@@ -1572,6 +1732,9 @@ def main():
             st.caption("建议：2018-2022 作为样本内调参，2023 年之后只跑一次，不回头改。")
 
         if st.button("运行回测", type="primary"):
+            if all(abs(v) < 1e-9 for v in weights.values()):
+                st.error("权重全为 0，没有可用的打分。请先到「因子分层检验」页设置权重。")
+                st.stop()
             score = cached_score(factors, elig, dkey, tuple(sorted(weights.items())))
             rb = [d for d in rebal_all if pd.Timestamp(bt_s) <= d <= pd.Timestamp(bt_e)]
             prm = dict(capital=1_000_000.0, top_n=top_n, buffer_rank=buf,
