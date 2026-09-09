@@ -577,7 +577,7 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
     cal = adj_close.index
     pos = {d: i for i, d in enumerate(cal)}
     step = horizon_weeks * 5
-    rows, ic_rows = [], []
+    rows, ex_rows, ic_rows = [], [], []
 
     for d in rebal:
         i = pos.get(d)
@@ -593,13 +593,18 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
         grp = pd.qcut(pd.Series(fv).rank(method="first"), n_group,
                       labels=False, duplicates="drop").to_numpy()
         means = [np.nanmean(rv[grp == g]) if (grp == g).sum() else np.nan for g in range(n_group)]
-        rows.append(pd.Series(means, index=[f"D{g+1}" for g in range(n_group)], name=d))
+        cols = [f"D{g+1}" for g in range(n_group)]
+        rows.append(pd.Series(means, index=cols, name=d))
+        # 相对当期截面均值的超额 —— 纯多头真正能吃到的部分
+        mkt = float(np.nanmean(rv))
+        ex_rows.append(pd.Series([m - mkt for m in means], index=cols, name=d))
         ic_rows.append(pd.Series({"date": d, "ic": _spearman(fv, rv)}))
 
     if not rows:
         return {"ok": False}
 
     grp_df = pd.DataFrame(rows)
+    ex_df = pd.DataFrame(ex_rows)
     ic = pd.DataFrame(ic_rows).set_index("date")["ic"].dropna()
 
     # 不重叠累计曲线
@@ -614,6 +619,14 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
     ic_year = ic.groupby(ic.index.year).mean() if len(ic) else pd.Series(dtype=float)
     ic_pos = float((ic > 0).mean()) if len(ic) else np.nan
     top, bot = grp_df.columns[-1], grp_df.columns[0]
+    # 钱在哪一端: IC 为负则做多最低组(D1), 为正则做多最高组(D10)。
+    # A股融券做空不现实, 所以只有多头那一端的超额才是真正能拿到的。
+    long_side = bot if (np.isfinite(ic_mean) and ic_mean < 0) else top
+    short_side = top if long_side == bot else bot
+    long_ex = float(ex_df[long_side].mean())
+    short_ex = float(ex_df[short_side].mean())
+    tot = abs(long_ex) + abs(short_ex)
+    long_share = (abs(long_ex) / tot) if tot > 1e-12 else np.nan
     # 单调性: 各组均值与组序号的秩相关
     ordered = grp_df.mean(axis=0).to_numpy()
     mono = _spearman(np.arange(len(ordered), dtype=float), ordered, min_n=4)
@@ -621,6 +634,9 @@ def layered_test(fac: pd.DataFrame, adj_close: pd.DataFrame, elig: pd.DataFrame,
     return {"ok": True, "group_mean": grp_df.mean(axis=0), "curve": curve, "ic": ic,
             "ic_mean": ic_mean, "icir": icir, "tstat": tstat, "t_nw": t_nw,
             "ic_year": ic_year, "ic_pos": ic_pos,
+            "group_excess": ex_df.mean(axis=0), "long_side": long_side,
+            "long_excess": long_ex, "short_excess": short_ex,
+            "long_share": long_share,
             "spread": float(grp_df[top].mean() - grp_df[bot].mean()),
             "monotonic": mono, "n_period": len(grp_df)}
 
@@ -698,10 +714,13 @@ def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
 
     信号有半衰期。持有期短于半衰期，吃到的信号浓度高但换手成本高；
     长于半衰期，大部分持仓时间都在拿过期信号。这里把两边一起算：
-      年化价差   = 十分组多空价差 × (52/持有周数)
-      长仓毛超额 ≈ |年化价差| / 2   (只做多，相对池内均值约取一半)
+      多头超额 = 做多那一组相对当期截面均值的超额（IC为负时是D1，为正时是D10）
+      年化毛超额 = 多头超额 × (52/持有周数)
       换手成本   = 单次往返成本 × (52/持有周数)
-      净超额     = 长仓毛超额 - 换手成本
+      净超额     = 年化毛超额 - 换手成本
+
+    这里刻意不用"多空价差的一半"。A股融券做空不现实，如果效应全部来自
+    "涨得多的那组暴跌"，纯多头一分钱都吃不到，用价差折半会严重高估。
     """
     rows = []
     for n, k in enumerate(keys):
@@ -716,14 +735,30 @@ def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
                 row[f"净超额@{h}周"] = np.nan
                 continue
             t_ = r["t_nw"]
-            ann_spread = abs(r["spread"]) * (52.0 / h)
-            net = ann_spread / 2.0 - cost * (52.0 / h)
+            turns = 52.0 / h
+            net = r["long_excess"] * turns - cost * turns
             row[f"t@{h}周"] = t_
             row[f"净超额@{h}周"] = net
             if np.isfinite(t_) and abs(t_) >= 2.0 and net > best:
                 best, best_h = net, h
-        row["最优持有周"] = best_h
-        row["最优净超额"] = best if best > -9e8 else np.nan
+                row["_ls"] = r["long_side"]
+                row["_lsh"] = r["long_share"]
+                row["_sh"] = r["short_excess"] * turns
+        # 净超额为负就不该叫"最优"。之前这里会把一个负数显示成推荐值。
+        if best > 0:
+            row["最优持有周"] = best_h
+            row["最优净超额"] = best
+            row["做多哪组"] = row.pop("_ls", "")
+            row["多头贡献占比"] = row.pop("_lsh", np.nan)
+            row["空头年化(拿不到)"] = row.pop("_sh", np.nan)
+        else:
+            row["最优持有周"] = np.nan
+            row["最优净超额"] = np.nan
+            row["做多哪组"] = "—"
+            row["多头贡献占比"] = np.nan
+            row["空头年化(拿不到)"] = np.nan
+            for kk in ("_ls", "_lsh", "_sh"):
+                row.pop(kk, None)
         rows.append(row)
         if progress:
             progress((n + 1) / len(keys), row["因子"])
@@ -1345,8 +1380,11 @@ def main():
         st.markdown(
             "信号有半衰期。持有期短于半衰期，信号浓度高但换手成本高；"
             "长于半衰期，大半仓位时间都在拿过期信号。下表把两边一起算："
-            f"单次往返成本按 {ROUND_TRIP_COST:.2%}（佣金双边+印花税+滑点双边），"
-            "长仓毛超额按十分组价差的一半估计。**只有净超额为正才值得做。**")
+            f"单次往返成本按 {ROUND_TRIP_COST:.2%}（佣金双边+印花税+滑点双边）。\n\n"
+            "**净超额只算多头那一组**（IC 为负时是 D1，为正时是 D10）相对当期截面均值的超额。"
+            "刻意不用「多空价差的一半」——A 股融券做空不现实，如果效应全部来自"
+            "「涨得多的那组暴跌」，纯多头一分钱都吃不到。"
+            "「多头贡献占比」低于 40% 就说明钱主要在你拿不到的空头端。")
         if st.button("运行持有期扫描"):
             bar3 = st.progress(0.0)
             hs = horizon_scan(factors, panel["adj_close"], elig, rb, FACTOR_KEYS,
@@ -1362,17 +1400,25 @@ def main():
                 hs.drop(columns=["key"]).style
                   .format({**{c: "{:.2f}" for c in tc},
                            **{c: "{:.1%}" for c in nc},
-                           "最优净超额": "{:.1%}", "最优持有周": "{:.0f}"})
+                           "最优净超额": "{:.1%}", "最优持有周": "{:.0f}",
+                           "多头贡献占比": "{:.0%}", "空头年化(拿不到)": "{:.1%}"},
+                          na_rep="—")
                   .background_gradient(subset=nc, cmap="RdYlGn", vmin=-0.15, vmax=0.15),
                 use_container_width=True)
             good = hs.dropna(subset=["最优净超额"])
             good = good[good["最优净超额"] > 0]
             if len(good):
                 wk = good.sort_values("最优净超额", ascending=False).iloc[0]
-                st.success(f"净超额最高的是「{wk['因子']}」，"
-                           f"持有 {wk['最优持有周']:.0f} 周，估计年化净超额 {wk['最优净超额']:.1%}。"
+                st.success(f"净超额最高的是「{wk['因子']}」：做多 {wk['做多哪组']} 组、"
+                           f"持有 {wk['最优持有周']:.0f} 周，估计年化净超额 {wk['最优净超额']:.1%}，"
+                           f"其中多头贡献占比 {wk['多头贡献占比']:.0%}。"
                            "请把回测页的最长持有期调到这个量级——"
                            "拿满 8 周意味着大半仓位时间都在持有已经过期的信号。")
+                low = good[good["多头贡献占比"] < 0.4]
+                if len(low):
+                    st.warning("以下因子的钱主要在空头端（涨得多的那组暴跌），"
+                               "纯多头拿不到，别被总价差骗了：\n\n"
+                               + "、".join(low["因子"].tolist()))
             else:
                 st.error("没有任何因子在任何持有期上做到净超额为正。"
                          "扣掉换手成本后这个方向不成立，不要往下做回测。")
@@ -1425,7 +1471,10 @@ def main():
                 m[2].metric("t(重叠修正)", f"{res['t_nw']:.2f}")
                 m[3].metric("单调性", f"{res['monotonic']:.2f}")
                 m[4].metric("IC>0 占比", f"{res['ic_pos']:.1%}")
-                st.bar_chart(res["group_mean"].rename(f"未来{hz}周平均收益"))
+                st.bar_chart(res["group_excess"].rename(f"未来{hz}周超额（相对截面均值）"))
+                st.caption(f"做多 **{res['long_side']}** 组，多头超额 {res['long_excess']:+.2%}／"
+                           f"{hz}周，空头端 {res['short_excess']:+.2%}（A股拿不到）。"
+                           f"多头贡献占比 {res['long_share']:.0%}。")
                 st.line_chart(res["curve"])
                 st.line_chart(res["ic"].rolling(12).mean().rename("IC(12期均线)"))
 
