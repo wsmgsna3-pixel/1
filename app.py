@@ -211,7 +211,7 @@ def _px_path(ts_code: str) -> str:
     return os.path.join(PX_DIR, ts_code.replace(".", "_") + ".pkl")
 
 
-PX_COLS = ["trade_date", "open", "close", "pre_close", "pct_chg", "amount", "circ_mv"]
+PX_COLS = ["trade_date", "open", "high", "low", "close", "pre_close", "pct_chg", "amount", "circ_mv"]
 
 
 def fetch_one_stock(pro_get: Callable, lim: Limiter, ts_code: str, start: str, end: str,
@@ -366,7 +366,10 @@ def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     pre_close = wide("pre_close")
     # adj_open 只用来当成交价，不参与链式累乘，降到 float32 无妨；
     # adj_close 逐日累乘且要反复做 pct_change（相近数相减会放大误差），保持 float64。
-    adj_open = (adj_close.shift(1) * (raw_open / pre_close).where(pre_close > 0)).astype(np.float32)
+    ratio = adj_close.shift(1) / pre_close.where(pre_close > 0)   # 当日复权换算比例
+    adj_open = (raw_open * ratio).astype(np.float32)
+    adj_high = (wide("high") * ratio).astype(np.float32)           # SKDJ 需要
+    adj_low = (wide("low") * ratio).astype(np.float32)
 
     # 涨跌停判定（创业板/科创板 20%，其余 10%）
     lim_pct = pd.Series([0.20 if (c.startswith("30") or c.startswith("688")) else 0.10
@@ -378,7 +381,8 @@ def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
 
     return dict(cal=cal, codes=codes,
                 raw_close=raw_close, amount=amount, circ_mv=circ_mv,
-                adj_close=adj_close, adj_open=adj_open, tradable=tradable,
+                adj_close=adj_close, adj_open=adj_open,
+                adj_high=adj_high, adj_low=adj_low, tradable=tradable,
                 limit_up_open=limit_up_open, limit_dn_open=limit_dn_open)
 
 
@@ -755,176 +759,440 @@ def empty_week_stats(score: pd.DataFrame, elig: pd.DataFrame,
 
 
 # ======================================================================
-# 六、界面 —— 一页，一个按钮，输出每周候选
+# 六、选股方法库 —— 每个方法返回一张打分表（越高越优先）
 # ======================================================================
-WEIGHTS = {"dist_hi": -1.0, "rev5": -0.5}      # 唯一通过全部检验的两个因子
+def to_weekly(df: pd.DataFrame, how: str = "last") -> pd.DataFrame:
+    """日线转周线（按自然周，取周内最后/最高/最低）。"""
+    g = df.resample("W-FRI")
+    return {"last": g.last, "max": g.max, "min": g.min}[how]()
 
 
+def _ema(df: pd.DataFrame, n: int) -> pd.DataFrame:
+    return df.ewm(span=n, adjust=False, min_periods=n).mean()
+
+
+def weekly_macd(wc: pd.DataFrame, fast=12, slow=26, sig=9) -> Dict[str, pd.DataFrame]:
+    dif = _ema(wc, fast) - _ema(wc, slow)
+    dea = _ema(dif, sig)
+    return {"dif": dif, "dea": dea, "hist": (dif - dea) * 2}
+
+
+def weekly_skdj(wc, wh, wl, n=9, m=3) -> Dict[str, pd.DataFrame]:
+    """SKDJ：RSV 先平滑再算 K，比普通 KDJ 慢，周线上噪音更少。"""
+    lo = wl.rolling(n).min()
+    hi = wh.rolling(n).max()
+    rng = (hi - lo).where((hi - lo) > 1e-9)
+    rsv = _ema((wc - lo) / rng * 100.0, m)
+    k = _ema(rsv, m)
+    d = k.rolling(m).mean()
+    return {"k": k, "d": d}
+
+
+def build_methods(panel: dict, factors: Dict[str, pd.DataFrame],
+                  elig: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    返回 {方法名: 日频打分表}。分数只在 elig 为真处有效，越高越优先。
+    周线指标算完后前向填充到日频——周中不会用到未来数据，因为每周只在
+    周五收盘后调仓，取的正是当周已经收完的那根周线。
+    """
+    A = panel["adj_close"]
+    cal = A.index
+    wc = to_weekly(A, "last")
+    wh = to_weekly(panel["adj_high"], "max")
+    wl = to_weekly(panel["adj_low"], "min")
+    out: Dict[str, pd.DataFrame] = {}
+
+    def daily(w: pd.DataFrame) -> pd.DataFrame:
+        return w.reindex(cal, method="ffill")
+
+    # --- 1. 趋势动量（正权重）：买强势股，不是买反弹 ---
+    z = lambda k, w: cs_zscore(factors[k], elig) * w
+    out["趋势动量"] = (z("mom_ra", 1.0).add(z("trend_q", 1.0), fill_value=0)
+                       .add(z("rel_str", 1.0), fill_value=0)).where(elig)
+
+    # --- 2. 周线MACD金叉（零轴上方）---
+    m = weekly_macd(wc)
+    cross = (m["dif"] > m["dea"]) & (m["dif"].shift(1) <= m["dea"].shift(1))
+    strength = (m["hist"] / wc.abs().where(wc.abs() > 1e-9))
+    sc = strength.where(cross & (m["dif"] > 0))
+    out["周线MACD金叉"] = daily(sc).where(elig)
+
+    # --- 3. 周线MACD多头（持续在零轴上且柱增）---
+    up = (m["dif"] > m["dea"]) & (m["dif"] > 0) & (m["hist"] > m["hist"].shift(1))
+    out["周线MACD多头"] = daily(strength.where(up)).where(elig)
+
+    # --- 4. 周线SKDJ金叉（低位）---
+    s = weekly_skdj(wc, wh, wl)
+    kx = (s["k"] > s["d"]) & (s["k"].shift(1) <= s["d"].shift(1)) & (s["k"] < 30)
+    out["周线SKDJ金叉"] = daily((50 - s["k"]).where(kx)).where(elig)
+
+    # --- 5. 创新高突破：周线收盘创 N 周新高 ---
+    for nw in (20, 52):
+        hh = wc.rolling(nw).max()
+        brk = wc >= hh
+        # 分数用"突破幅度 × 趋势质量"，避免选到刚好平高点的
+        sc2 = daily((wc / wc.rolling(nw).mean() - 1.0).where(brk))
+        out[f"创{nw}周新高"] = (sc2 + cs_zscore(factors["trend_q"], elig) * 0.01).where(elig)
+
+    # --- 6. 均线多头排列 + 回踩不破 ---
+    ma5, ma10, ma20 = wc.rolling(5).mean(), wc.rolling(10).mean(), wc.rolling(20).mean()
+    bull = (ma5 > ma10) & (ma10 > ma20) & (wc > ma5)
+    out["周线均线多头"] = daily(((ma5 / ma20 - 1.0)).where(bull)).where(elig)
+
+    # --- 7. 动量 + 量能配合 ---
+    out["动量+放量"] = (z("mom_ra", 1.0).add(z("trend_q", 0.5), fill_value=0)
+                        .add(z("vol_exp", 0.5), fill_value=0)).where(elig)
+
+    # --- 8. 反转（作为对照组，你说不要，但留着做基准）---
+    out["反转(对照)"] = (z("dist_hi", -1.0).add(z("rev5", -0.5), fill_value=0)).where(elig)
+
+    return out
+
+
+# ======================================================================
+# 七、逐笔独立回测 —— 没有组合概念，每只选出的股票各自跟踪
+# ======================================================================
+def pick_weekly(score: pd.DataFrame, elig: pd.DataFrame,
+                rebal: List[pd.Timestamp], top_n: int = 3,
+                rank_from: int = 1) -> pd.DataFrame:
+    """每个调仓日选出 top_n 只。返回 date / code / rank / score。"""
+    rows = []
+    for d in rebal:
+        if d not in score.index:
+            continue
+        s = score.loc[d].where(elig.loc[d]).dropna().sort_values(ascending=False)
+        picks = s.index[rank_from - 1: rank_from - 1 + top_n]
+        for r, c in enumerate(picks, rank_from):
+            rows.append({"date": d, "code": c, "rank": r, "score": float(s[c])})
+    return pd.DataFrame(rows)
+
+
+def track_picks(picks: pd.DataFrame, panel: dict, tp: float = 0.20,
+                sl: float = 0.08, max_days: int = 60,
+                comm: float = 0.0003, stamp: float = 0.0005,
+                slip: float = 0.001) -> pd.DataFrame:
+    """
+    每只选出的股票独立跟踪，直到止盈 / 止损 / 超时。互不影响，没有资金约束。
+    次日开盘买入（涨停买不到则放弃这笔）；触发条件按当日收盘判定，次日开盘卖出。
+    收盘判定+次日成交是保守口径：不假设你能在盘中精确摸到止损价。
+    """
+    cal = panel["adj_close"].index
+    codes = panel["codes"]
+    ci = {c: j for j, c in enumerate(codes)}
+    AC = panel["adj_close"].to_numpy(dtype=np.float64)
+    AO = panel["adj_open"].to_numpy(dtype=np.float32)
+    TRD = panel["tradable"].to_numpy(dtype=bool)
+    LU = panel["limit_up_open"].to_numpy(dtype=bool)
+    LD = panel["limit_dn_open"].to_numpy(dtype=bool)
+    pos = {d: i for i, d in enumerate(cal)}
+    cost_in = comm + slip
+    cost_out = comm + stamp + slip
+
+    out = []
+    for _, p in picks.iterrows():
+        i0 = pos.get(p["date"])
+        j = ci.get(p["code"])
+        if i0 is None or j is None:
+            continue
+        # 次日开盘买入
+        b = i0 + 1
+        while b < len(cal) and (not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j])):
+            b += 1
+            if b - i0 > 5:
+                break
+        if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
+            out.append({**p.to_dict(), "结果": "买不到(涨停/停牌)"})
+            continue
+        entry = float(AO[b, j]) * (1 + cost_in)
+
+        reason, exit_i, exit_px = "持有中", None, None
+        for k in range(b, min(b + max_days, len(cal))):
+            if not TRD[k, j] or not np.isfinite(AC[k, j]):
+                continue
+            r = AC[k, j] / entry - 1.0
+            if r >= tp:
+                reason = "止盈"
+            elif r <= -sl:
+                reason = "止损"
+            elif k - b >= max_days - 1:
+                reason = "超时"
+            if reason != "持有中":
+                e = k + 1                       # 次日开盘卖出
+                while e < len(cal) and (not TRD[e, j] or LD[e, j]
+                                        or not np.isfinite(AO[e, j])):
+                    e += 1
+                    if e - k > 5:
+                        break
+                if e < len(cal) and np.isfinite(AO[e, j]):
+                    exit_i, exit_px = e, float(AO[e, j]) * (1 - cost_out)
+                else:
+                    exit_i, exit_px = k, float(AC[k, j]) * (1 - cost_out)
+                break
+        if reason == "持有中":
+            out.append({**p.to_dict(), "结果": "尚未了结"})
+            continue
+        out.append({**p.to_dict(), "买入日": cal[b], "买入价": entry,
+                    "卖出日": cal[exit_i], "卖出价": exit_px, "结果": reason,
+                    "收益率": exit_px / entry - 1.0, "持有交易日": exit_i - b})
+    return pd.DataFrame(out)
+
+
+def holding_week_table(picks: pd.DataFrame, panel: dict, weeks: int = 12,
+                       comm: float = 0.0003, stamp: float = 0.0005,
+                       slip: float = 0.001) -> pd.DataFrame:
+    """
+    不设止盈止损，纯看「选出后持有到第 N 周」的表现。
+    这是判断该在第几周退出的依据：看收益率和胜率从第几周开始掉头。
+    """
+    cal = panel["adj_close"].index
+    ci = {c: j for j, c in enumerate(panel["codes"])}
+    AC = panel["adj_close"].to_numpy(dtype=np.float64)
+    AO = panel["adj_open"].to_numpy(dtype=np.float32)
+    TRD = panel["tradable"].to_numpy(dtype=bool)
+    LU = panel["limit_up_open"].to_numpy(dtype=bool)
+    pos = {d: i for i, d in enumerate(cal)}
+    rt = (comm + slip) + (comm + stamp + slip)
+
+    acc = {w: [] for w in range(1, weeks + 1)}
+    for _, p in picks.iterrows():
+        i0 = pos.get(p["date"]); j = ci.get(p["code"])
+        if i0 is None or j is None:
+            continue
+        b = i0 + 1
+        if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
+            continue
+        entry = float(AO[b, j])
+        for w in range(1, weeks + 1):
+            k = b + 5 * w
+            if k >= len(cal) or not np.isfinite(AC[k, j]):
+                continue
+            acc[w].append(AC[k, j] / entry - 1.0 - rt)
+
+    rows = []
+    for w in range(1, weeks + 1):
+        v = np.array(acc[w], dtype=float)
+        if len(v) < 10:
+            continue
+        se = v.std(ddof=1) / np.sqrt(len(v))
+        rows.append({"第N周": w, "样本数": len(v), "平均收益率": v.mean(),
+                     "中位收益率": float(np.median(v)), "胜率": float((v > 0).mean()),
+                     "标准误": se, "t值": v.mean() / se if se > 1e-12 else np.nan})
+    return pd.DataFrame(rows).set_index("第N周")
+
+
+def summarize_trades(tr: pd.DataFrame) -> dict:
+    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
+    if not len(d):
+        return {}
+    n = len(d)
+    win = d[d["收益率"] > 0]["收益率"]
+    los = d[d["收益率"] <= 0]["收益率"]
+    se = d["收益率"].std(ddof=1) / np.sqrt(n)
+    return {"笔数": n, "平均收益": d["收益率"].mean(), "中位收益": d["收益率"].median(),
+            "胜率": len(win) / n,
+            "盈亏比": (win.mean() / abs(los.mean())) if len(los) and abs(los.mean()) > 1e-9 else np.nan,
+            "t值": d["收益率"].mean() / se if se > 1e-12 else np.nan,
+            "平均持有周": d["持有交易日"].mean() / 5.0,
+            "止盈": (d["结果"] == "止盈").mean(), "止损": (d["结果"] == "止损").mean(),
+            "超时": (d["结果"] == "超时").mean()}
+
+
+# ======================================================================
+# 八、界面
+# ======================================================================
 def main():
     st.set_page_config(page_title="每周选股", layout="wide")
     ss = st.session_state
     ss.setdefault("panel", None)
-
     st.title("每周选股")
-    st.caption("科技 / 军工 / 新能源 / 机器人　·　流通市值 50-1000 亿　·　股价 10 元以上")
+    st.caption("科技/军工/新能源/机器人　·　流通市值 50-1000 亿　·　股价 10 元以上　·　每周末选 3 只")
 
     with st.sidebar:
-        st.header("设置")
+        st.header("① 数据")
         token = st.text_input("Tushare Token", type="password",
                               value=os.environ.get("TUSHARE_TOKEN", ""))
-        top_n = st.slider("每周选几只", 1, 5, 3)
-        st.caption("下面这些一般不用改。")
-        with st.expander("数据范围"):
+        with st.expander("下载范围"):
             start = st.date_input("起始", dt.date(2018, 1, 1))
             end = st.date_input("结束", dt.date.today())
             workers = st.slider("并发线程", 1, 8, 4)
             per_min = st.slider("每分钟请求上限", 60, 800, 400, 20)
-        run = st.button("下载数据并选股", type="primary", use_container_width=True)
+        run = st.button("下载数据", type="primary", use_container_width=True)
+
+        st.header("② 交易规则")
+        tp = st.slider("止盈 (%)", 5, 60, 20) / 100.0
+        sl = st.slider("止损 (%)", 3, 30, 8) / 100.0
+        maxw = st.slider("超时卖出 (周)", 4, 26, 12)
+        top_n = st.slider("每周选几只", 1, 5, 3)
+        with st.expander("成本"):
+            comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
+            slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
         if ss.get("panel") is not None:
-            st.success(f"已加载 {len(ss['panel']['codes'])} 只 × "
-                       f"{len(ss['panel']['cal'])} 个交易日")
+            st.success(f"已加载 {len(ss['panel']['codes'])} 只 × {len(ss['panel']['cal'])} 日")
 
     if run:
         if not token:
-            st.error("请先填 Tushare Token")
-            st.stop()
+            st.error("请先填 Tushare Token"); st.stop()
         try:
             import tushare as ts
         except ImportError:
-            st.error("未安装 tushare：pip install tushare")
-            st.stop()
-        ts.set_token(token)
-        pro = ts.pro_api(token)
-        lim = Limiter(per_min)
-        API_ERRORS.clear()
-        for k in ("panel", "factors", "result"):
+            st.error("未安装 tushare：pip install tushare"); st.stop()
+        ts.set_token(token); pro = ts.pro_api(token)
+        lim = Limiter(per_min); API_ERRORS.clear()
+        for k in ("panel", "factors", "methods", "cmp"):
             ss.pop(k, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-
-        with st.status("正在准备…", expanded=True) as status:
+        with st.status("准备中…", expanded=True) as stt:
             st.write("取行业成分股…")
             uni = fetch_universe(pro, lim, SW_L1_DEFAULT, SW_L2_DEFAULT)
             if not len(uni):
-                st.error("行业成分股为空，可能是 Tushare 积分不足。")
-                st.stop()
+                st.error("行业成分股为空，可能是 Tushare 积分不足。"); st.stop()
             st.write("取股票基础信息…")
             basic = fetch_stock_basic(pro, lim)
             st.write("市值预筛…")
             codes = prescreen_by_mv(pro, lim, list(uni["ts_code"]), s_str, e_str, 50, 1000)
             st.write(f"下载 {len(codes)} 只行情…")
-            bar = st.progress(0.0)
-            t0 = time.time()
+            bar = st.progress(0.0); t0 = time.time()
             px = download_all(token, codes, s_str, e_str, lim, True, workers,
-                              lambda done, tot, ok: bar.progress(
-                                  done / tot, text=f"{done}/{tot}　已用 {(time.time()-t0)/60:.1f} 分"))
+                              lambda dn, tt, ok: bar.progress(dn / tt,
+                                  text=f"{dn}/{tt}　{(time.time()-t0)/60:.1f} 分"))
             if not px:
-                st.error("没下到数据，检查 Token 与积分权限。")
-                st.stop()
-            st.write("计算因子…")
-            panel = build_panel(px)
-            px.clear(); del px; gc.collect()
-            ss["panel"] = panel
-            ss["basic"] = basic
-            ss["uni"] = uni
+                st.error("没下到数据，检查 Token 与积分。"); st.stop()
+            st.write("计算指标…")
+            panel = build_panel(px); px.clear(); del px; gc.collect()
+            ss["panel"], ss["basic"], ss["uni"] = panel, basic, uni
             ss["factors"] = compute_factors(panel["adj_close"], panel["amount"],
                                             circ_mv=panel["circ_mv"])
-            status.update(label=f"完成，耗时 {(time.time()-t0)/60:.1f} 分钟", state="complete")
+            stt.update(label=f"完成，耗时 {(time.time()-t0)/60:.1f} 分钟", state="complete")
 
     if ss.get("panel") is None:
-        st.info("左侧填入 Tushare Token 后点「下载数据并选股」。"
-                "首次约需 5-15 分钟，之后走本地缓存。")
-        st.stop()
+        st.info("左侧填 Token 后点「下载数据」。首次约 5-15 分钟，之后走本地缓存。"); st.stop()
 
     panel, basic, uni, factors = ss["panel"], ss["basic"], ss["uni"], ss["factors"]
     elig = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
-    score = composite_score(factors, elig, {k: WEIGHTS.get(k, 0.0) for k in FACTOR_KEYS})
+    if ss.get("methods") is None:
+        with st.spinner("构建选股方法…"):
+            ss["methods"] = build_methods(panel, factors, elig)
+    methods = ss["methods"]
     rebal = weekly_rebal_dates(panel["cal"])
+    maxd = maxw * 5
+    kw = dict(comm=comm, stamp=0.0005, slip=slip)
 
-    # ---- 一次性校准：前几名到底该取哪一段 ----
-    if ss.get("calib") is None:
-        with st.spinner("校准中（只做一次）…"):
-            bt = rank_band_test(score, panel["adj_close"], elig, rebal,
-                                horizon_weeks=4, gap=1)
-            ss["calib"] = bt
-    bt = ss["calib"]
-    best_band = bt["平均超额"].idxmax() if len(bt) else "第1-3名"
-    lo = int(best_band.replace("第", "").split("-")[0])
+    t1, t2, t3 = st.tabs(["方法对比", "本周选股", "逐笔明细"])
 
-    # ---- 本周候选 ----
-    d = panel["cal"][-1]
-    s = score.loc[d].where(elig.loc[d]).dropna().sort_values(ascending=False)
-    st.subheader(f"本周候选　（数据截至 {d:%Y-%m-%d}，合格池 {len(s)} 只）")
+    # ---------------- 方法对比 ----------------
+    with t1:
+        st.markdown("**先看哪个方法有效。** 每个方法都按同样规则跑：每周末选 "
+                    f"{top_n} 只，次日开盘买入，止盈 {tp:.0%} / 止损 {sl:.0%} / "
+                    f"{maxw} 周超时，含成本。")
+        if st.button("跑全部方法", type="primary"):
+            bar = st.progress(0.0)
+            res = {}
+            for n, (nm, sc) in enumerate(methods.items()):
+                pk = pick_weekly(sc, elig, rebal, top_n)
+                if len(pk) < 30:
+                    bar.progress((n + 1) / len(methods), text=nm); continue
+                tr = track_picks(pk, panel, tp, sl, maxd, **kw)
+                wt = holding_week_table(pk, panel, 12, **kw)
+                sm = summarize_trades(tr)
+                empty = 1.0 - pk.date.nunique() / max(1, len(rebal))
+                res[nm] = {"pk": pk, "tr": tr, "wt": wt, "sm": sm, "empty": empty}
+                bar.progress((n + 1) / len(methods), text=nm)
+            ss["cmp"] = res; bar.empty()
 
-    if len(s) < top_n:
-        st.error(f"合格股票不足 {top_n} 只，本周无候选。")
-    else:
-        nm = basic.set_index("ts_code")["name"].to_dict()
-        ind = uni.set_index("ts_code")["ind_name"].to_dict()
-        picks = list(s.index[lo - 1: lo - 1 + top_n])
-        rows = []
-        for r, c in enumerate(picks, 1):
-            rows.append({
-                "序": r, "代码": c, "名称": nm.get(c, ""), "行业": ind.get(c, ""),
-                "收盘价": round(float(panel["raw_close"].loc[d, c]), 2),
-                "流通市值(亿)": round(float(panel["circ_mv"].loc[d, c]) / 1e4, 0),
-                "距60日高点": f"{factors['dist_hi'].loc[d, c]:.1%}",
-                "近5日涨幅": f"{factors['rev5'].loc[d, c]:.1%}",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.download_button("下载本周候选 CSV",
-                           pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"),
-                           f"picks_{d:%Y%m%d}.csv", "text/csv")
-        st.caption(f"取的是排名第 {lo} 到 {lo+top_n-1} 名，不是第 1 名起——原因见下方「为什么」。")
+        if ss.get("cmp"):
+            res = ss["cmp"]
+            rows = []
+            for nm, r in res.items():
+                s = r["sm"]
+                if not s:
+                    continue
+                rows.append({"方法": nm, "笔数": s["笔数"], "平均收益": s["平均收益"],
+                             "中位收益": s["中位收益"], "胜率": s["胜率"],
+                             "盈亏比": s["盈亏比"], "t值": s["t值"],
+                             "平均持有周": s["平均持有周"], "止盈率": s["止盈"],
+                             "止损率": s["止损"], "空窗周占比": r["empty"]})
+            cm = pd.DataFrame(rows).set_index("方法").sort_values("t值", ascending=False)
+            st.dataframe(cm.style.format({"平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                                          "胜率": "{:.1%}", "盈亏比": "{:.2f}", "t值": "{:.2f}",
+                                          "平均持有周": "{:.1f}", "止盈率": "{:.0%}",
+                                          "止损率": "{:.0%}", "空窗周占比": "{:.1%}"}, na_rep="—")
+                           .background_gradient(subset=["t值"], cmap="RdYlGn", vmin=-3, vmax=3),
+                         use_container_width=True)
+            ok = cm[(cm["t值"] >= 2) & (cm["空窗周占比"] <= 5 / 52)]
+            if len(ok):
+                st.success(f"**{ok.index[0]}** 通过：t={ok['t值'].iloc[0]:.2f}（门槛 2.0），"
+                           f"空窗 {ok['空窗周占比'].iloc[0]*52:.0f} 周/年（上限 5）。")
+            else:
+                near = cm[cm["空窗周占比"] <= 5 / 52]
+                st.error("**没有方法达到 t≥2。** 满足空窗要求的方法里最高 t 值为 "
+                         f"{near['t值'].max():.2f}（{near['t值'].idxmax()}）。"
+                         "t<2 意味着平均收益和零分不出区别。")
+            st.caption("空窗周占比 = 选不满的周数比例。上限 5/52 ≈ 9.6%。"
+                       "MACD 金叉、SKDJ 金叉这类事件型信号天然稀疏，空窗率高是正常的。")
 
-    # ---- 止盈止损参考 ----
-    st.divider()
-    st.subheader("止盈止损参考")
-    if ss.get("path") is None:
-        with st.spinner("统计中…"):
-            ss["path"] = picked_path_stats(score, panel["adj_close"], elig, rebal,
-                                           top_n=top_n, weeks=8, gap=1)
-    ps = ss["path"]
-    if len(ps):
-        st.dataframe(ps.style.format({"最大涨幅_中位": "{:+.1%}", "最大跌幅_中位": "{:+.1%}",
-                                      "最大跌幅_25分位": "{:+.1%}", "期末收益_中位": "{:+.1%}",
-                                      "期末为正比例": "{:.0%}"}),
-                     use_container_width=True)
-        w4 = ps.loc[4] if 4 in ps.index else ps.iloc[-1]
-        st.markdown(
-            f"**怎么用**：历史上这批股票买入后 4 周内，一半会回撤到 "
-            f"{w4['最大跌幅_中位']:.0%} 以内，四分之一会跌到 {w4['最大跌幅_25分位']:.0%}。"
-            f"**止损设在 {w4['最大跌幅_25分位']:.0%} 以外**，才不会被正常波动扫出局；"
-            f"设在 {w4['最大跌幅_中位']:.0%} 以内则一半以上的仓位会被无谓止损掉。")
+            st.divider()
+            st.markdown("**第 1-12 周表现**（不设止盈止损，纯看持有到第 N 周）")
+            pick_m = st.selectbox("选方法", list(res.keys()),
+                                  index=list(res.keys()).index(cm.index[0]))
+            wt = res[pick_m]["wt"]
+            if len(wt):
+                st.dataframe(wt.style.format({"平均收益率": "{:+.2%}", "中位收益率": "{:+.2%}",
+                                              "胜率": "{:.1%}", "标准误": "{:.3%}", "t值": "{:.2f}"})
+                               .background_gradient(subset=["平均收益率"], cmap="RdYlGn"),
+                             use_container_width=True)
+                st.line_chart(wt[["平均收益率", "中位收益率"]])
+                st.line_chart(wt[["胜率"]])
+                pk_w = int(wt["平均收益率"].idxmax())
+                st.info(f"平均收益率在**第 {pk_w} 周**见顶。胜率在第 "
+                        f"{int(wt['胜率'].idxmax())} 周最高。超过这个点继续持有，"
+                        "期望不再增加而波动仍在累积。")
 
-    # ---- 为什么 ----
-    st.divider()
-    with st.expander("为什么这样选（点开看依据）", expanded=False):
-        st.markdown("**一、名次段检验：为什么不取第 1 名**")
-        st.markdown(
-            "分层检验测的是前 10%（上百只）的平均值。只买 3 只时买的是前 0.2%，"
-            "那是从没验证过的区间——最极端的几只往往是真出问题的公司，不是被错杀的。"
-            "下表按名次分段实测未来 4 周相对全池的超额：")
-        st.dataframe(bt.style.format({"平均超额": "{:+.2%}", "胜率": "{:.1%}",
-                                      "标准误": "{:.3%}", "t值": "{:.2f}"})
-                       .background_gradient(subset=["平均超额"], cmap="RdYlGn"),
-                     use_container_width=True)
-        st.info(f"实测最优名次段是 **{best_band}**，所以本周候选从第 {lo} 名开始取。")
+    # ---------------- 本周选股 ----------------
+    with t2:
+        mnames = list(methods.keys())
+        use = st.selectbox("用哪个方法", mnames, key="use_m")
+        sc = methods[use]
+        d = panel["cal"][-1]
+        s = sc.loc[d].where(elig.loc[d]).dropna().sort_values(ascending=False)
+        st.subheader(f"{d:%Y-%m-%d}　候选 {len(s)} 只")
+        if len(s) == 0:
+            st.warning("本周该方法没有符合条件的股票（信号未触发）。换个方法或等下周。")
+        else:
+            nm = basic.set_index("ts_code")["name"].to_dict()
+            ind = uni.set_index("ts_code")["ind_name"].to_dict()
+            rows = []
+            for r, c in enumerate(s.index[:top_n], 1):
+                px_ = float(panel["raw_close"].loc[d, c])
+                rows.append({"序": r, "代码": c, "名称": nm.get(c, ""), "行业": ind.get(c, ""),
+                             "收盘价": round(px_, 2),
+                             "流通市值(亿)": round(float(panel["circ_mv"].loc[d, c]) / 1e4),
+                             "止盈价": round(px_ * (1 + tp), 2),
+                             "止损价": round(px_ * (1 - sl), 2)})
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.download_button("下载 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+                               f"picks_{d:%Y%m%d}.csv", "text/csv")
+            st.caption("止盈止损价按收盘价估算，实际以你的买入价为准。")
 
-        st.markdown("**二、空窗检查**")
-        ew = empty_week_stats(score, elig, rebal, top_n=top_n)
-        st.dataframe(ew.rename("选不满的周数").to_frame().T, use_container_width=True)
-        st.caption("排名系统永远有前 N 名，所以结构上不会空窗。"
-                   "上表若全为 0，说明你「一年空窗不超过 5 周」的要求自动满足。")
-
-        st.markdown("**三、诚实的边界**")
-        st.warning(
-            "这份名单**不承诺跑赢**。持股 1-3 只时，你的盈亏几乎完全由个股运气决定，"
-            "而不是由排名质量决定——这是分散度的算术，不是因子好坏的问题。\n\n"
-            "它能做的是：把 1400 只筛到符合你硬约束、且避开了历史上表现最差那一档的"
-            f"少数几只。前几名的超额是每 4 周约 "
-            f"{bt.loc[best_band, '平均超额']:.1%}，扣掉买卖成本后所剩不多。\n\n"
-            "**请把它当候选池，不要当买入指令。** 最终决定还是你自己的。")
+    # ---------------- 逐笔明细 ----------------
+    with t3:
+        if not ss.get("cmp"):
+            st.info("先到「方法对比」页点「跑全部方法」。")
+        else:
+            res = ss["cmp"]
+            m2 = st.selectbox("看哪个方法的明细", list(res.keys()), key="det_m")
+            tr = res[m2]["tr"].copy()
+            for c in ("买入价", "卖出价"):
+                if c in tr.columns:
+                    tr[c] = tr[c].round(3)
+            if "收益率" in tr.columns:
+                tr["收益率"] = tr["收益率"].map(lambda v: f"{v:+.2%}" if pd.notna(v) else "")
+            st.dataframe(tr.sort_values("date", ascending=False),
+                         use_container_width=True, height=520)
+            st.download_button("下载全部成交 CSV",
+                               res[m2]["tr"].to_csv(index=False).encode("utf-8-sig"),
+                               f"trades_{m2}.csv", "text/csv")
 
     if API_ERRORS:
         with st.expander(f"接口异常 {len(API_ERRORS)} 条"):
