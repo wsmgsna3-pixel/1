@@ -78,7 +78,8 @@ DIAG_DEF = {
     "amihud":  ("非流动性(|收益|/成交额，诊断用)", 0.0),
 }
 DIAG_KEYS = list(DIAG_DEF.keys())
-ALL_DEF = {**FACTOR_DEF, **DIAG_DEF}
+COMPOSITE_KEY = "composite"
+ALL_DEF = {**FACTOR_DEF, **DIAG_DEF, COMPOSITE_KEY: ("综合打分（当前权重）", 0.0)}
 TEST_KEYS = FACTOR_KEYS + DIAG_KEYS
 
 
@@ -1424,6 +1425,69 @@ def main():
                          "扣掉换手成本后这个方向不成立，不要往下做回测。")
 
         st.divider()
+        st.markdown("### 检验综合打分")
+        st.markdown(
+            "**单因子逐个过关，不代表合成之后还过关。** 相关的因子加在一起会互相稀释，"
+            "各自最优的持有期也未必一致。系统实际用的是这个合成分数，所以它必须"
+            "自己走一遍同样的检验。")
+        w_now = {k: ss.get("w_" + k, FACTOR_DEF[k][1]) for k in FACTOR_KEYS}
+        st.write("当前权重：", {ALL_DEF[k][0]: v for k, v in w_now.items() if abs(v) > 1e-9}
+                 or "（全为 0，请先在回测页设权重或用上面的建议权重）")
+        if st.button("检验综合打分", type="primary"):
+            if all(abs(v) < 1e-9 for v in w_now.values()):
+                st.error("权重全为 0，没有可检验的合成分数。")
+            else:
+                comp = cached_score(factors, elig, dkey, tuple(sorted(w_now.items())))
+                cf = {COMPOSITE_KEY: comp}
+                r = layered_test(comp, panel["adj_close"], elig, rb, int(hz), 10, gap=int(gap))
+                hsc = horizon_scan(cf, panel["adj_close"], elig, rb, [COMPOSITE_KEY],
+                                   horizons=(1, 2, 3, 4, 6, 8), gap=int(gap))
+                gsc = gap_scan(cf, panel["adj_close"], elig, rb, int(hz), [COMPOSITE_KEY],
+                               gaps=(0, 1, 3, 5, 10))
+                ss["compscan"] = (r, hsc, gsc, dict(w_now))
+        if ss.get("compscan"):
+            r, hsc, gsc, wsaved = ss["compscan"]
+            if not r.get("ok"):
+                st.error("样本不足。")
+            else:
+                yr = r["ic_year"]
+                same = int((np.sign(yr) == np.sign(r["ic_mean"])).sum())
+                agree = (np.sign(r["ic_mean"]) == np.sign(r["monotonic"])
+                         and np.sign(r["ic_mean"]) == np.sign(r["spread"]))
+                m = st.columns(5)
+                m[0].metric("IC 均值", f"{r['ic_mean']:.4f}")
+                m[1].metric("t(重叠修正)", f"{r['t_nw']:.2f}")
+                m[2].metric("单调性", f"{r['monotonic']:.2f}")
+                m[3].metric("同号年数", f"{same}/{len(yr)}")
+                m[4].metric("多头贡献占比", f"{r['long_share']:.0%}")
+                hr = hsc.iloc[0]
+                nc2 = [c for c in hsc.columns if c.startswith("净超额@")]
+                st.markdown("**合成分数的持有期曲线**")
+                st.bar_chart(pd.Series({c.replace("净超额@", ""): hr[c] for c in nc2},
+                                       name="年化净超额"))
+                st.markdown("**合成分数的分组超额（相对截面均值）**")
+                st.bar_chart(r["group_excess"].rename(f"未来{hz}周超额"))
+                g0, g1 = gsc.iloc[0]["t@延迟0日"], gsc.iloc[0]["t@延迟1日"]
+                ok_all = (abs(r["t_nw"]) >= 2 and agree and len(yr) and same / len(yr) >= 8 / 9
+                          and pd.notna(hr.get("最优持有周")))
+                if ok_all:
+                    st.success(
+                        f"合成分数全部过关：做多 {hr['做多哪组']} 组、持有 "
+                        f"{hr['最优持有周']:.0f} 周，年化净超额 {hr['最优净超额']:+.1%}，"
+                        f"多头贡献 {hr['多头贡献占比']:.0%}，延迟入场不衰减"
+                        f"（{g0:.2f}→{g1:.2f}）。可以去回测页了，"
+                        f"把最长持有期设成 {hr['最优持有周']:.0f}-{hr['最优持有周']+1:.0f} 周。")
+                else:
+                    bad = []
+                    if abs(r["t_nw"]) < 2: bad.append("不显著")
+                    if not agree: bad.append("三条证据方向打架")
+                    if len(yr) and same / len(yr) < 8 / 9: bad.append(f"逐年符号不稳({same}/{len(yr)})")
+                    if pd.isna(hr.get("最优持有周")): bad.append("没有任何持有期净超额为正")
+                    st.error("合成分数没过关：" + "、".join(bad)
+                             + "。合成反而不如单因子，通常是权重里混进了互相抵消的因子——"
+                               "去掉净超额为负的那些再试。")
+
+        st.divider()
         st.markdown("### 一键导出全部结果")
         _tabs = {}
         if ss.get("scan"):
@@ -1435,6 +1499,12 @@ def main():
             _tabs["04_入场延迟扫描"] = ss["gapscan"]
         if ss.get("hscan") is not None:
             _tabs["05_持有期扫描"] = ss["hscan"]
+        if ss.get("compscan"):
+            _r, _h, _g, _w = ss["compscan"]
+            _tabs["06_合成打分_持有期"] = _h
+            _tabs["07_合成打分_延迟"] = _g
+            _tabs["08_合成打分_权重"] = pd.DataFrame(
+                [{"因子": ALL_DEF[k][0], "权重": v} for k, v in _w.items()])
         if _tabs:
             meta = pd.DataFrame([{
                 "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
