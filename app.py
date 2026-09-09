@@ -850,6 +850,85 @@ def build_methods(panel: dict, factors: Dict[str, pd.DataFrame],
 
 
 # ======================================================================
+# 六B、方法合成 —— 叠加有两种做法，效果完全不同
+# ======================================================================
+def _pct_rank(sc: pd.DataFrame, elig: pd.DataFrame) -> pd.DataFrame:
+    """
+    把打分转成截面百分位 [0,1]，没有信号的填 0。
+    填 0 而不是 NaN 很重要：MACD金叉这类事件型方法大部分股票没信号，
+    "没信号"本身就是一种表态（不推荐），不该当缺失值丢掉。
+    """
+    x = sc.where(elig)
+    r = x.rank(axis=1, pct=True)
+    return r.fillna(0.0).where(elig)
+
+
+def method_corr_matrix(methods: Dict[str, pd.DataFrame], elig: pd.DataFrame,
+                       rebal: List[pd.Timestamp]) -> pd.DataFrame:
+    """调仓日截面上，各方法百分位打分的平均相关性。相关性越高，合成越没用。"""
+    names = list(methods)
+    pr = {n: _pct_rank(methods[n], elig) for n in names}
+    dates = [d for d in rebal[::4] if d in elig.index]
+    acc = np.zeros((len(names), len(names)))
+    cnt = 0
+    for d in dates:
+        m = elig.loc[d]
+        M = pd.concat([pr[n].loc[d].where(m) for n in names], axis=1, keys=names).dropna()
+        if len(M) < 30 or M.std().min() < 1e-9:
+            continue
+        acc += M.corr().to_numpy()
+        cnt += 1
+    if cnt == 0:
+        return pd.DataFrame()
+    return pd.DataFrame(acc / cnt, index=names, columns=names)
+
+
+def combine_methods(methods: Dict[str, pd.DataFrame], elig: pd.DataFrame,
+                    names: List[str], mode: str = "average",
+                    top_k: int = 20) -> pd.DataFrame:
+    """
+    mode="average"：各方法百分位取平均。提高的是"广度"——把多个弱信号
+        平均掉各自的噪音。候选永远排得满，不会空窗。
+    mode="vote"：数一只股票进了几个方法的前 top_k。提高的是"选择性"——
+        只有多个方法同时看好才入选。质量可能更高，但候选变少、空窗率上升。
+    """
+    pr = {n: _pct_rank(methods[n], elig) for n in names if n in methods}
+    if not pr:
+        return pd.DataFrame(np.nan, index=elig.index, columns=elig.columns)
+    if mode == "average":
+        tot = None
+        for v in pr.values():
+            tot = v if tot is None else tot.add(v, fill_value=0.0)
+        return (tot / len(pr)).where(elig)
+    # vote：进入某方法前 top_k 记 1 票，票数相同再用平均百分位打破平局
+    votes, avg = None, None
+    for v in pr.values():
+        rk = v.rank(axis=1, ascending=False, method="first")
+        hit = (rk <= top_k).astype(np.float32)
+        votes = hit if votes is None else votes.add(hit, fill_value=0.0)
+        avg = v if avg is None else avg.add(v, fill_value=0.0)
+    out = votes + (avg / len(pr)) * 0.5      # 票数为主，百分位破平局
+    return out.where(elig & (votes >= 2))    # 至少两个方法同时看好
+
+
+TREND_SET = ["趋势动量", "动量+放量", "周线MACD多头", "周线均线多头",
+             "创20周新高", "创52周新高"]
+
+
+def add_combined(methods: Dict[str, pd.DataFrame], elig: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """把合成方法加进方法表，让它们走完全相同的检验流程。"""
+    have = [n for n in TREND_SET if n in methods]
+    if len(have) >= 2:
+        methods["【合成】趋势类平均"] = combine_methods(methods, elig, have, "average")
+        methods["【合成】趋势类投票≥2"] = combine_methods(methods, elig, have, "vote", 20)
+        methods["【合成】投票≥2(前50)"] = combine_methods(methods, elig, have, "vote", 50)
+        core = [n for n in ("趋势动量", "创20周新高", "周线MACD多头") if n in methods]
+        if len(core) == 3:
+            methods["【合成】三核心平均"] = combine_methods(methods, elig, core, "average")
+    return methods
+
+
+# ======================================================================
 # 七、逐笔独立回测 —— 没有组合概念，每只选出的股票各自跟踪
 # ======================================================================
 def pick_weekly(score: pd.DataFrame, elig: pd.DataFrame,
@@ -1213,7 +1292,7 @@ def main():
     elig = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
     if ss.get("methods") is None:
         with st.spinner("构建选股方法…"):
-            ss["methods"] = build_methods(panel, factors, elig)
+            ss["methods"] = add_combined(build_methods(panel, factors, elig), elig)
     methods = ss["methods"]
     rebal = weekly_rebal_dates(panel["cal"])
     maxd = maxw * 5
@@ -1223,6 +1302,28 @@ def main():
 
     # ---------------- 方法对比 ----------------
     with t1:
+        with st.expander("方法之间有多相关？（决定合成有没有用）", expanded=False):
+            if st.button("算相关性矩阵"):
+                with st.spinner("计算中…"):
+                    ss["mcorr"] = method_corr_matrix(
+                        {k: v for k, v in methods.items() if not k.startswith("【合成】")},
+                        elig, rebal)
+            if ss.get("mcorr") is not None and len(ss["mcorr"]):
+                mc = ss["mcorr"]
+                st.dataframe(mc.style.format("{:.2f}")
+                             .background_gradient(cmap="coolwarm", vmin=-1, vmax=1),
+                             use_container_width=True)
+                tr_ = [n for n in TREND_SET if n in mc.index]
+                if len(tr_) >= 2:
+                    sub = mc.loc[tr_, tr_].to_numpy()
+                    rho = (sub.sum() - len(tr_)) / (len(tr_) ** 2 - len(tr_))
+                    N = len(tr_)
+                    gain = np.sqrt(N / (1 + (N - 1) * rho)) if rho > -1 / (N - 1) else np.nan
+                    st.info(f"趋势类方法之间的平均相关性 **ρ={rho:.2f}**。"
+                            f"合成 {N} 个的理论强度提升是 √(N/(1+(N-1)ρ)) = **{gain:.2f} 倍**。\n\n"
+                            f"也就是说，最好的单方法 t=1.91 合成后大约到 **{1.91*gain:.2f}**。"
+                            "ρ 越接近 1，合成越没用——因为它们说的其实是同一件事。")
+
         st.markdown("**先看哪个方法有效。** 每个方法都按同样规则跑：每周末选 "
                     f"{top_n} 只，次日开盘买入，止盈 {tp:.0%} / 止损 {sl:.0%} / "
                     f"{maxw} 周超时，含成本。")
