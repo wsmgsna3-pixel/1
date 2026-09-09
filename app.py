@@ -686,6 +686,63 @@ def gap_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
+ROUND_TRIP_COST = 0.0003 * 2 + 0.0005 + 0.001 * 2   # 佣金双边 + 印花税 + 滑点双边 = 0.31%
+
+
+def horizon_scan(factors: Dict[str, pd.DataFrame], adj_close: pd.DataFrame,
+                 elig: pd.DataFrame, rebal: List[pd.Timestamp], keys: List[str],
+                 horizons=(1, 2, 3, 4, 6, 8), gap: int = 1,
+                 cost: float = ROUND_TRIP_COST, progress=None) -> pd.DataFrame:
+    """
+    持有期扫描 —— 回答"该持有多久"。
+
+    信号有半衰期。持有期短于半衰期，吃到的信号浓度高但换手成本高；
+    长于半衰期，大部分持仓时间都在拿过期信号。这里把两边一起算：
+      年化价差   = 十分组多空价差 × (52/持有周数)
+      长仓毛超额 ≈ |年化价差| / 2   (只做多，相对池内均值约取一半)
+      换手成本   = 单次往返成本 × (52/持有周数)
+      净超额     = 长仓毛超额 - 换手成本
+    """
+    rows = []
+    for n, k in enumerate(keys):
+        if k not in factors:
+            continue
+        row = {"因子": ALL_DEF.get(k, (k, 0))[0], "key": k}
+        best, best_h = -9e9, np.nan
+        for h in horizons:
+            r = layered_test(factors[k], adj_close, elig, rebal, h, 10, gap=gap)
+            if not r.get("ok"):
+                row[f"t@{h}周"] = np.nan
+                row[f"净超额@{h}周"] = np.nan
+                continue
+            t_ = r["t_nw"]
+            ann_spread = abs(r["spread"]) * (52.0 / h)
+            net = ann_spread / 2.0 - cost * (52.0 / h)
+            row[f"t@{h}周"] = t_
+            row[f"净超额@{h}周"] = net
+            if np.isfinite(t_) and abs(t_) >= 2.0 and net > best:
+                best, best_h = net, h
+        row["最优持有周"] = best_h
+        row["最优净超额"] = best if best > -9e8 else np.nan
+        rows.append(row)
+        if progress:
+            progress((n + 1) / len(keys), row["因子"])
+    return pd.DataFrame(rows)
+
+
+def export_bundle(tables: Dict[str, pd.DataFrame]) -> bytes:
+    """把所有结果表打包成一个 zip（纯标准库，不依赖 openpyxl）。"""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, df in tables.items():
+            if df is None or not len(df):
+                continue
+            z.writestr(f"{name}.csv", df.to_csv().encode("utf-8-sig"))
+    return buf.getvalue()
+
+
 def factor_corr(factors: Dict[str, pd.DataFrame], elig: pd.DataFrame,
                 rebal: List[pd.Timestamp], keys: List[str]) -> pd.DataFrame:
     """调仓日截面秩相关的平均值。用来看这些因子到底是几个独立的赌注。"""
@@ -1282,6 +1339,74 @@ def main():
                          + "、".join(drops))
             else:
                 st.success("没有因子在延迟 1 天时崩塌，反转效应扛得住延迟入场。")
+
+        st.divider()
+        st.markdown("### 持有期扫描 —— 该拿多久")
+        st.markdown(
+            "信号有半衰期。持有期短于半衰期，信号浓度高但换手成本高；"
+            "长于半衰期，大半仓位时间都在拿过期信号。下表把两边一起算："
+            f"单次往返成本按 {ROUND_TRIP_COST:.2%}（佣金双边+印花税+滑点双边），"
+            "长仓毛超额按十分组价差的一半估计。**只有净超额为正才值得做。**")
+        if st.button("运行持有期扫描"):
+            bar3 = st.progress(0.0)
+            hs = horizon_scan(factors, panel["adj_close"], elig, rb, FACTOR_KEYS,
+                              horizons=(1, 2, 3, 4, 6, 8), gap=int(gap),
+                              progress=lambda p, n: bar3.progress(p, text=n))
+            ss["hscan"] = hs
+            bar3.empty()
+        if ss.get("hscan") is not None:
+            hs = ss["hscan"]
+            tc = [c for c in hs.columns if c.startswith("t@")]
+            nc = [c for c in hs.columns if c.startswith("净超额@")]
+            st.dataframe(
+                hs.drop(columns=["key"]).style
+                  .format({**{c: "{:.2f}" for c in tc},
+                           **{c: "{:.1%}" for c in nc},
+                           "最优净超额": "{:.1%}", "最优持有周": "{:.0f}"})
+                  .background_gradient(subset=nc, cmap="RdYlGn", vmin=-0.15, vmax=0.15),
+                use_container_width=True)
+            good = hs.dropna(subset=["最优净超额"])
+            good = good[good["最优净超额"] > 0]
+            if len(good):
+                wk = good.sort_values("最优净超额", ascending=False).iloc[0]
+                st.success(f"净超额最高的是「{wk['因子']}」，"
+                           f"持有 {wk['最优持有周']:.0f} 周，估计年化净超额 {wk['最优净超额']:.1%}。"
+                           "请把回测页的最长持有期调到这个量级——"
+                           "拿满 8 周意味着大半仓位时间都在持有已经过期的信号。")
+            else:
+                st.error("没有任何因子在任何持有期上做到净超额为正。"
+                         "扣掉换手成本后这个方向不成立，不要往下做回测。")
+
+        st.divider()
+        st.markdown("### 一键导出全部结果")
+        _tabs = {}
+        if ss.get("scan"):
+            _tabs["01_汇总"] = ss["scan"][0].drop(
+                columns=[c for c in ss["scan"][0].columns if c.startswith("_")])
+            _tabs["02_分年度IC"] = ss["scan"][1]
+            _tabs["03_因子相关性"] = ss["scan"][2]
+        if ss.get("gapscan") is not None:
+            _tabs["04_入场延迟扫描"] = ss["gapscan"]
+        if ss.get("hscan") is not None:
+            _tabs["05_持有期扫描"] = ss["hscan"]
+        if _tabs:
+            meta = pd.DataFrame([{
+                "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "股票数": len(panel["codes"]), "交易日数": len(panel["cal"]),
+                "样本区间": f"{ls_}~{le_}", "持有期(周)": hz, "入场延迟(日)": gap,
+                "市值中性化": "是" if neu else "否",
+                "市值区间(亿)": f"{mv_lo:.0f}-{mv_hi:.0f}", "最低股价": min_price,
+                "调仓次数": len(rb)}]).T.rename(columns={0: "值"})
+            _tabs["00_运行参数"] = meta
+            st.download_button(
+                f"下载全部结果（{len(_tabs)} 张表，zip）",
+                export_bundle(dict(sorted(_tabs.items()))),
+                f"factor_scan_{dt.date.today():%Y%m%d}.zip", "application/zip",
+                type="primary", use_container_width=True)
+            st.caption("包含运行参数、汇总、分年度 IC、相关性矩阵、延迟扫描、持有期扫描。"
+                       "参数表一并导出，免得回头对不上是哪次跑的。")
+        else:
+            st.caption("先运行上面的扫描，这里才会出现下载按钮。")
 
         st.divider()
         st.markdown("**单因子细看**")
