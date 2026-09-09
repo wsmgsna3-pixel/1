@@ -981,20 +981,70 @@ def holding_week_table(picks: pd.DataFrame, panel: dict, weeks: int = 12,
 
 
 def summarize_trades(tr: pd.DataFrame) -> dict:
+    """
+    t 值必须按周聚类。同一周选出的 3 只共享当周的大盘涨跌，不是独立样本；
+    而且平均持有 2-3 周，相邻周的持仓在时间上重叠。直接拿 1284 笔算 t，
+    等于假装有 1284 个独立观测，会把显著性放大一倍以上。
+    做法：先按选出日取周内均值，再对这条周序列做 Newey-West 修正。
+    """
     d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
     if not len(d):
         return {}
     n = len(d)
     win = d[d["收益率"] > 0]["收益率"]
     los = d[d["收益率"] <= 0]["收益率"]
-    se = d["收益率"].std(ddof=1) / np.sqrt(n)
-    return {"笔数": n, "平均收益": d["收益率"].mean(), "中位收益": d["收益率"].median(),
-            "胜率": len(win) / n,
+    se_naive = d["收益率"].std(ddof=1) / np.sqrt(n)
+    t_naive = d["收益率"].mean() / se_naive if se_naive > 1e-12 else np.nan
+
+    wk = d.groupby("date")["收益率"].mean().sort_index()
+    hold_w = d["持有交易日"].mean() / 5.0
+    t_cl = newey_west_t(wk, lag=max(1, int(round(hold_w))))
+    return {"笔数": n, "周数": len(wk), "平均收益": d["收益率"].mean(),
+            "中位收益": d["收益率"].median(), "胜率": len(win) / n,
             "盈亏比": (win.mean() / abs(los.mean())) if len(los) and abs(los.mean()) > 1e-9 else np.nan,
-            "t值": d["收益率"].mean() / se if se > 1e-12 else np.nan,
-            "平均持有周": d["持有交易日"].mean() / 5.0,
+            "t值(朴素)": t_naive, "t值(按周聚类)": t_cl,
+            "平均持有周": hold_w,
             "止盈": (d["结果"] == "止盈").mean(), "止损": (d["结果"] == "止损").mean(),
             "超时": (d["结果"] == "超时").mean()}
+
+
+def tp_sl_grid(picks: pd.DataFrame, panel: dict, tps, sls, max_days: int,
+               progress=None, **kw) -> tuple:
+    """
+    止盈 × 止损 网格。
+    止损设在正常波动之内，被扫出局的就是噪音不是判断错误；设得太宽又拿不住。
+    这个网格用数据找出该设在哪，而不是拍脑袋。返回 (平均收益表, 聚类t值表)。
+    """
+    mean_g, t_g = {}, {}
+    tot = len(tps) * len(sls)
+    k = 0
+    for sl in sls:
+        mrow, trow = {}, {}
+        for tp in tps:
+            tr = track_picks(picks, panel, tp, sl, max_days, **kw)
+            s = summarize_trades(tr)
+            mrow[f"止盈{tp:.0%}"] = s.get("平均收益", np.nan)
+            trow[f"止盈{tp:.0%}"] = s.get("t值(按周聚类)", np.nan)
+            k += 1
+            if progress:
+                progress(k / tot, f"止损{sl:.0%} 止盈{tp:.0%}")
+        mean_g[f"止损{sl:.0%}"] = mrow
+        t_g[f"止损{sl:.0%}"] = trow
+    return pd.DataFrame(mean_g).T, pd.DataFrame(t_g).T
+
+
+def split_summary(tr: pd.DataFrame, cut: str = "2023-01-01") -> pd.DataFrame:
+    """样本内 / 样本外 分开看。全样本好而样本外垮，是最常见的自欺方式。"""
+    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
+    if not len(d):
+        return pd.DataFrame()
+    cut = pd.Timestamp(cut)
+    out = {}
+    for lab, seg in (("样本内", d[d["date"] < cut]), ("样本外", d[d["date"] >= cut])):
+        if len(seg) < 30:
+            continue
+        out[lab] = summarize_trades(seg)
+    return pd.DataFrame(out).T
 
 
 # ======================================================================
@@ -1108,28 +1158,84 @@ def main():
                 if not s:
                     continue
                 rows.append({"方法": nm, "笔数": s["笔数"], "平均收益": s["平均收益"],
-                             "中位收益": s["中位收益"], "胜率": s["胜率"],
-                             "盈亏比": s["盈亏比"], "t值": s["t值"],
-                             "平均持有周": s["平均持有周"], "止盈率": s["止盈"],
-                             "止损率": s["止损"], "空窗周占比": r["empty"]})
-            cm = pd.DataFrame(rows).set_index("方法").sort_values("t值", ascending=False)
-            st.dataframe(cm.style.format({"平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
-                                          "胜率": "{:.1%}", "盈亏比": "{:.2f}", "t值": "{:.2f}",
-                                          "平均持有周": "{:.1f}", "止盈率": "{:.0%}",
+                             "胜率": s["胜率"], "盈亏比": s["盈亏比"],
+                             "t值(朴素)": s["t值(朴素)"], "t值(按周聚类)": s["t值(按周聚类)"],
+                             "平均持有周": s["平均持有周"], "止损率": s["止损"],
+                             "空窗周占比": r["empty"]})
+            cm = pd.DataFrame(rows).set_index("方法").sort_values("t值(按周聚类)", ascending=False)
+            st.dataframe(cm.style.format({"平均收益": "{:+.2%}", "胜率": "{:.1%}",
+                                          "盈亏比": "{:.2f}", "t值(朴素)": "{:.2f}",
+                                          "t值(按周聚类)": "{:.2f}", "平均持有周": "{:.1f}",
                                           "止损率": "{:.0%}", "空窗周占比": "{:.1%}"}, na_rep="—")
-                           .background_gradient(subset=["t值"], cmap="RdYlGn", vmin=-3, vmax=3),
+                           .background_gradient(subset=["t值(按周聚类)"], cmap="RdYlGn",
+                                                vmin=-3, vmax=3),
                          use_container_width=True)
-            ok = cm[(cm["t值"] >= 2) & (cm["空窗周占比"] <= 5 / 52)]
+            st.warning(
+                "**看「t值(按周聚类)」，不要看朴素 t。** 同一周选出的 3 只共享当周大盘涨跌，"
+                "不是独立样本；平均持有 2-3 周，相邻周的持仓还在时间上重叠。"
+                "拿一千多笔当独立观测算 t，会把显著性放大一倍以上——"
+                "我在完全没有选股能力的模拟数据上测过：朴素 t=1.95，聚类后只剩 0.91。")
+            ok = cm[(cm["t值(按周聚类)"] >= 2) & (cm["空窗周占比"] <= 5 / 52)]
             if len(ok):
-                st.success(f"**{ok.index[0]}** 通过：t={ok['t值'].iloc[0]:.2f}（门槛 2.0），"
-                           f"空窗 {ok['空窗周占比'].iloc[0]*52:.0f} 周/年（上限 5）。")
+                st.success(f"**{ok.index[0]}** 通过：聚类 t={ok['t值(按周聚类)'].iloc[0]:.2f}"
+                           f"（门槛 2.0），空窗 {ok['空窗周占比'].iloc[0]*52:.0f} 周/年（上限 5）。"
+                           "下一步：看下方的样本内外拆分，样本外也站得住才算数。")
             else:
                 near = cm[cm["空窗周占比"] <= 5 / 52]
-                st.error("**没有方法达到 t≥2。** 满足空窗要求的方法里最高 t 值为 "
-                         f"{near['t值'].max():.2f}（{near['t值'].idxmax()}）。"
-                         "t<2 意味着平均收益和零分不出区别。")
-            st.caption("空窗周占比 = 选不满的周数比例。上限 5/52 ≈ 9.6%。"
-                       "MACD 金叉、SKDJ 金叉这类事件型信号天然稀疏，空窗率高是正常的。")
+                st.error("**没有方法的聚类 t 达到 2。** 满足空窗要求的方法里最高为 "
+                         f"{near['t值(按周聚类)'].max():.2f}（{near['t值(按周聚类)'].idxmax()}）。"
+                         "这意味着平均收益和零还分不出区别。")
+            st.caption("空窗周占比上限 5/52 ≈ 9.6%。MACD/SKDJ 金叉这类事件型信号天然稀疏。")
+
+            st.divider()
+            st.markdown("**样本内 / 样本外**（2023-01-01 分界）")
+            m3 = st.selectbox("看哪个方法", list(res.keys()),
+                              index=list(res.keys()).index(cm.index[0]), key="sp_m")
+            sp = split_summary(res[m3]["tr"], "2023-01-01")
+            if len(sp):
+                st.dataframe(sp[["笔数", "平均收益", "胜率", "盈亏比",
+                                 "t值(按周聚类)"]].style.format(
+                    {"平均收益": "{:+.2%}", "胜率": "{:.1%}", "盈亏比": "{:.2f}",
+                     "t值(按周聚类)": "{:.2f}"}), use_container_width=True)
+                if "样本外" in sp.index and "样本内" in sp.index:
+                    a, o = sp.loc["样本内"], sp.loc["样本外"]
+                    if o["t值(按周聚类)"] >= 2 and o["平均收益"] > 0:
+                        st.success(f"样本外依然站得住（t={o['t值(按周聚类)']:.2f}）。")
+                    else:
+                        st.error(f"样本外没站住：平均收益 {o['平均收益']:+.2%}，"
+                                 f"聚类 t={o['t值(按周聚类)']:.2f}。"
+                                 "样本内好、样本外垮，通常说明样本内那部分是行情特征。")
+
+            st.divider()
+            st.markdown("**止盈 × 止损 网格**")
+            st.markdown(
+                f"当前止损 {sl:.0%}，实测止损率约 65%、平均持有仅 2.3 周——"
+                "远短于超时上限，说明绝大多数仓位是被止损打掉的，不是走完了行情。"
+                "而选出后 4 周内最大回撤的中位数就有 -7.7%，**8% 的止损设在了正常波动之内**。"
+                "下面用数据找该设在哪。")
+            if st.button("跑止盈止损网格"):
+                bar2 = st.progress(0.0)
+                mg, tg = tp_sl_grid(res[m3]["pk"], panel,
+                                    [0.10, 0.15, 0.20, 0.30, 0.40],
+                                    [0.06, 0.08, 0.12, 0.16, 0.20], maxd,
+                                    progress=lambda p, n2: bar2.progress(p, text=n2), **kw)
+                ss["grid"] = (m3, mg, tg); bar2.empty()
+            if ss.get("grid"):
+                gm, mg, tg = ss["grid"]
+                st.caption(f"方法：{gm}")
+                c1, c2 = st.columns(2)
+                c1.markdown("平均单笔收益")
+                c1.dataframe(mg.style.format("{:+.2%}", na_rep="—")
+                             .background_gradient(cmap="RdYlGn"), use_container_width=True)
+                c2.markdown("聚类 t 值")
+                c2.dataframe(tg.style.format("{:.2f}", na_rep="—")
+                             .background_gradient(cmap="RdYlGn", vmin=-3, vmax=3),
+                             use_container_width=True)
+                bt_ = tg.stack().idxmax()
+                st.info(f"聚类 t 最高的组合：**{bt_[0]} / {bt_[1]}**，"
+                        f"t={tg.stack().max():.2f}，单笔均值 {mg.loc[bt_]:+.2%}。"
+                        "注意这是在同一份数据上挑出来的最优格子，实际会比它差；"
+                        "挑完务必回到上面看样本外。")
 
             st.divider()
             st.markdown("**第 1-12 周表现**（不设止盈止损，纯看持有到第 N 周）")
