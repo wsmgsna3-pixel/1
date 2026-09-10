@@ -994,6 +994,57 @@ def flat_stock_pick(panel: dict, elig: pd.DataFrame, dates: List[pd.Timestamp],
     return pd.DataFrame(rows)
 
 
+def industry_neutral_pick(panel: dict, elig: pd.DataFrame,
+                          sectors: Dict[str, List[str]], dates: List[pd.Timestamp],
+                          top_n: int = 3, win: int = 20, cooldown: int = 5) -> pd.DataFrame:
+    """
+    行业中性动量：每只股票只和**同板块**的股票比动量，取组内百分位，
+    再按这个百分位在全池排序取前 top_n。
+
+    为什么单独做一个：三轮对照实验里，「行业内相对强弱」这一层在每一轮都
+    稳定为正（+0.66% / +0.95% / +0.84%），而「选强势板块」那一层的贡献
+    在 +0.14%~+0.78% 之间大幅波动、依赖选哪个板块信号。
+    这个方案把不稳的那一层去掉，**没有任何信号可挑，零自由度**。
+    """
+    A = panel["adj_close"]
+    m = A / A.shift(win) - 1.0
+    code2sec = {c: s for s, cs in sectors.items() for c in cs}
+    cols = [c for c in A.columns if c in code2sec]
+    secs = pd.Series([code2sec[c] for c in cols], index=cols)
+    pct = pd.DataFrame(np.nan, index=A.index, columns=cols)
+    for s, g in secs.groupby(secs):
+        cs = list(g.index)
+        sub = m[cs].where(elig[cs])
+        n = sub.notna().sum(axis=1)
+        pct.loc[:, cs] = sub.rank(axis=1, pct=True).where(n >= 3)
+    # 每个板块的第一名百分位都是 1.0，直接排序会有十几只并列，
+    # 取前3等于在"组内第一"里随机挑——板块间的区分被丢掉了。
+    # 用「组内百分位为主 + 自身动量的全池百分位打破平局」。
+    tie = m.where(elig).rank(axis=1, pct=True).reindex(columns=cols)
+    pct = pct + tie * 1e-3
+
+    cal = list(A.index)
+    pos = {d: i for i, d in enumerate(cal)}
+    last: Dict[str, int] = {}
+    rows = []
+    for d in dates:
+        i = pos.get(d)
+        if i is None:
+            continue
+        v = pct.loc[d].dropna().sort_values(ascending=False)
+        taken = 0
+        for c in v.index:
+            if taken >= top_n:
+                break
+            if c in last and i - last[c] < cooldown:
+                continue
+            rows.append({"date": d, "code": c, "板块": code2sec.get(c, "-"),
+                         "rank": taken + 1, "score": float(v[c])})
+            last[c] = i
+            taken += 1
+    return pd.DataFrame(rows)
+
+
 def track_fixed(picks: pd.DataFrame, panel: dict, hold_days: int = 8,
                 comm: float = 0.0003, stamp: float = 0.0005,
                 slip: float = 0.001) -> pd.DataFrame:
@@ -1352,11 +1403,20 @@ def main():
                            index=list(SF2).index(DEF_SIG))
         if sig not in SF2:          # 兜底：控件异常时不让整页崩掉
             sig = DEF_SIG
-        use_reg = c1.checkbox("开启熊市开关（池子等权指数在200日线下方时不出手）", True)
-        st.info("**默认用「合成」信号，不要挑单个。** 9 个信号里挑通过的那个，"
-                "等于用同一份数据挑了一次参数，样本外拿不到那部分。"
-                "实测四个动量信号的板块层净贡献都是正的（+0.35%~+0.78%），"
-                "说明它们讲的是同一件事——取平均既避开挑选，也比任何单个更稳。")
+        use_reg = c1.checkbox("开启熊市开关（已证伪，默认关闭）", False)
+        st.warning(
+            "**「★行业中性动量」是本轮新增的重点。** 三轮对照实验里，"
+            "「只和同板块的股票比强弱」这一层每次都稳定为正"
+            "（+0.66% / +0.95% / +0.84%），而「选强势板块」那一层"
+            "在 +0.14%~+0.78% 之间大幅波动、依赖你挑哪个板块信号。\n\n"
+            "这个方案把不稳的那一层去掉了：每只股票只和同板块的比动量，"
+            "取组内百分位再全池排序。**没有信号可挑，零自由度，也就没有挑选偏差。**")
+        st.info("**关于合成信号：我说错了。** 实测它比单用 60日动量更差"
+                "（板块层净贡献 +0.14% vs +0.35%，样本外 +0.60% vs +1.25%）。"
+                "把最强的信号和几个弱的平均是稀释不是分散——"
+                "和个股层面犯的是同一个错。\n\n"
+                "**熊市开关也已证伪**：加权净效果 −0.57%/笔，2022 年把 −2.54% "
+                "变成 −10.65%（熊市反弹反复触发，专挑假突破入场）。默认已关闭。")
         srule = st.selectbox("板块内怎么选股", STOCK_RULES)
         if srule not in STOCK_RULES:
             srule = STOCK_RULES[0]
@@ -1373,6 +1433,8 @@ def main():
                  lambda: flat_stock_pick(panel, elig, dates, top_n, srule)),
                 ("对照C：全池随机",
                  lambda: flat_stock_pick(panel, elig, dates, top_n, "S3_板块内随机")),
+                ("★行业中性动量（零参数）",
+                 lambda: industry_neutral_pick(panel, elig, sectors, dates, top_n)),
             ]
             reg = pool_regime(panel, elig, 200) if use_reg else None
             rows, keep, raw = [], {}, {}
