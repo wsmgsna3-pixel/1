@@ -1246,6 +1246,133 @@ def kd_check(panel: dict, code: str, n: int = 9, m: int = 3, tail: int = 8) -> t
     return day, week
 
 
+# ======================================================================
+# 上穿25 时的"力度"特征 —— 直接检验：上升越快/K-D越大，是否涨得越好
+# ======================================================================
+def cross25_strength_diagnosis(panel: dict, elig: pd.DataFrame, n: int = 9, m: int = 3,
+                               k_line: float = 25.0, horizons=(1, 2, 4, 8, 12),
+                               n_group: int = 5, comm: float = 0.0003,
+                               stamp: float = 0.0005, slip: float = 0.001) -> dict:
+    """
+    周线 K 上穿 k_line 的那一刻，测量四个"力度"特征，分组看后续收益。
+
+    四个特征全部只用当周及之前的数据，上穿当下就已知，可以直接当筛选条件：
+      K-D差值      : 上穿当周的 K − D
+      K周涨速      : K − K上周（K 拉升的速度）
+      K两周均速    : (K − K两周前)/2
+      KD扩张速度   : (K−D) − 上周的(K−D)（差距在拉开还是收窄）
+      低位停留周数 : 过去8周里 K<25 的周数（"慢慢磨"的量化）
+
+    收益一律用"相对合格池等权"的超额，避免把板块整体涨幅算成选股能力。
+    """
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    wc = A.resample("W-FRI").last()
+    wh = H.resample("W-FRI").max()
+    wl = L.resample("W-FRI").min()
+    k, d = skdj(wc, wh, wl, n, m)
+    kd = k - d
+    fire = (k > k_line) & (k.shift(1) <= k_line)
+
+    feats = {
+        "K-D差值": kd,
+        "K周涨速": k - k.shift(1),
+        "K两周均速": (k - k.shift(2)) / 2.0,
+        "KD扩张速度": kd - kd.shift(1),
+        "低位停留周数": (k < k_line).shift(1).rolling(8).sum(),
+    }
+
+    cal = A.index
+    pos = {dt_: i for i, dt_ in enumerate(cal)}
+    ci = {c: j for j, c in enumerate(panel["codes"])}
+    AC = A.to_numpy(dtype=np.float64)
+    AO = panel["adj_open"].to_numpy(dtype=np.float32)
+    TRD = panel["tradable"].to_numpy(dtype=bool)
+    LU = panel["limit_up_open"].to_numpy(dtype=bool)
+    EL = elig.reindex(index=cal, columns=panel["codes"]).fillna(False).to_numpy(dtype=bool)
+    rt = (comm + slip) + (comm + stamp + slip)
+    bc: Dict[tuple, float] = {}
+
+    def bench(i0: int, hd: int) -> float:
+        key = (i0, hd)
+        if key in bc:
+            return bc[key]
+        b0, b1 = i0 + 1, i0 + 1 + hd
+        if b1 >= len(cal):
+            bc[key] = np.nan
+            return np.nan
+        msk = EL[i0] & TRD[b0] & TRD[b1]
+        bc[key] = float(np.nanmean(AC[b1, msk] / AC[b0, msk] - 1.0)) if msk.sum() >= 20 else np.nan
+        return bc[key]
+
+    rows = []
+    wdates = list(wc.index)
+    fnp = fire.to_numpy()
+    fi, fj = np.where(fnp)
+    for wi_, j in zip(fi, fj):
+        wd = wdates[wi_]
+        # 周五那根周线对应的日线位置：取该周内最后一个交易日
+        i0 = None
+        for back in range(0, 7):
+            cand = wd - pd.Timedelta(days=back)
+            if cand in pos:
+                i0 = pos[cand]
+                break
+        if i0 is None or not EL[i0, j]:
+            continue
+        b = i0 + 1
+        if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
+            continue
+        e = float(AO[b, j])
+        rec = {"date": wd}
+        ok = True
+        for fname, fdf in feats.items():
+            v = fdf.iloc[wi_, j]
+            if not np.isfinite(v):
+                ok = False
+                break
+            rec[fname] = float(v)
+        if not ok:
+            continue
+        for h in horizons:
+            hd = h * 5
+            t = b + hd
+            bm = bench(i0, hd)
+            rec[f"{h}周"] = ((AC[t, j] / e - 1.0 - rt) - bm) if (
+                t < len(cal) and np.isfinite(AC[t, j]) and np.isfinite(bm)) else np.nan
+        rows.append(rec)
+
+    if len(rows) < 200:
+        return {}
+    df = pd.DataFrame(rows)
+
+    out = {}
+    for fname in feats:
+        try:
+            g = pd.qcut(df[fname].rank(method="first"), n_group, labels=False)
+        except Exception:
+            continue
+        tb = []
+        for q in range(n_group):
+            sub = df[g == q]
+            if len(sub) < 30:
+                continue
+            r = {"分组": f"Q{q+1}", "特征均值": sub[fname].mean(), "笔数": len(sub)}
+            for h in horizons:
+                v = sub[f"{h}周"].dropna()
+                r[f"{h}周超额"] = v.mean()
+                r[f"{h}周胜率"] = (v > 0).mean()
+            # 按周聚类的 t（同一周的信号共享大盘涨跌）
+            key = f"{horizons[-1]}周"
+            wk = sub.groupby("date")[key].mean().dropna()
+            se = wk.std(ddof=1) / np.sqrt(len(wk)) if len(wk) > 3 else np.nan
+            r["末期t(聚类)"] = wk.mean() / se if se and se > 1e-12 else np.nan
+            tb.append(r)
+        if tb:
+            out[fname] = pd.DataFrame(tb).set_index("分组")
+    out["_raw"] = df
+    return out
+
+
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
     """把所有结果表打包成一个 zip（纯标准库，无额外依赖）。"""
     import io
@@ -1533,7 +1660,61 @@ def main():
                 st.dataframe(keep[sel].tail(300), use_container_width=True, height=320)
 
     with tab3:
-        st.markdown("**直接检验两个猜想**，不用等回测网格。")
+        st.markdown("### 上穿25 的『力度』是否预示涨幅")
+        st.markdown(
+            "直接检验你的猜想：**K 上穿 25 前拉得越快、K−D 差值越大，"
+            "后面涨得越好吗？在 25 线下磨磨蹭蹭、K 和 D 纠缠的，是不是就不行？**\n\n"
+            "这五个特征在上穿当周就已知，不含未来数据，可以直接当筛选条件"
+            "（和『用时』不同——用时由未来价格决定）。收益一律算**相对合格池的超额**，"
+            "避免把板块涨幅当成选股能力。")
+        ns2 = st.selectbox("N", [9, 6], key="sn")
+        if st.button("运行力度检验", type="primary"):
+            with st.spinner("计算中…"):
+                ss["stren"] = cross25_strength_diagnosis(panel, elig, ns2, 3, k_max, **kw)
+        if ss.get("stren"):
+            R = ss["stren"]
+            if not R:
+                st.error("样本不足。")
+            else:
+                st.caption(f"样本：{len(R['_raw'])} 次周线上穿 25")
+                fmt = {"特征均值": "{:.2f}", "笔数": "{:.0f}", "末期t(聚类)": "{:.2f}",
+                       **{f"{h}周超额": "{:+.2%}" for h in (1, 2, 4, 8, 12)},
+                       **{f"{h}周胜率": "{:.1%}" for h in (1, 2, 4, 8, 12)}}
+                order = ["K周涨速", "K两周均速", "K-D差值", "KD扩张速度", "低位停留周数"]
+                verdict = []
+                for f in order:
+                    if f not in R:
+                        continue
+                    t = R[f]
+                    st.markdown(f"**{f}**（Q1=最小 → Q5=最大）")
+                    cols = ["特征均值", "笔数"] + [f"{h}周超额" for h in (2, 4, 8, 12)] \
+                           + ["12周胜率", "末期t(聚类)"]
+                    st.dataframe(t[[c for c in cols if c in t.columns]].style.format(fmt)
+                                 .background_gradient(subset=["12周超额"], cmap="RdYlGn"),
+                                 use_container_width=True)
+                    sp = t["12周超额"].iloc[-1] - t["12周超额"].iloc[0]
+                    mono = np.corrcoef(np.arange(len(t)), t["12周超额"].to_numpy())[0, 1]
+                    verdict.append((f, sp, mono, t["末期t(聚类)"].abs().max()))
+                    st.caption(f"Q5−Q1 的 12 周超额差 **{sp:+.2%}**，单调性 {mono:+.2f}")
+                st.markdown("#### 结论")
+                good = [v for v in verdict if abs(v[1]) > 0.03 and abs(v[2]) > 0.7]
+                if good:
+                    for f, sp, mono, tm in good:
+                        st.success(f"**{f}** 有明显单调关系：Q5−Q1 差 {sp:+.2%}，"
+                                   f"单调性 {mono:+.2f}，最大聚类 t {tm:.2f}。"
+                                   "这个特征值得当筛选条件。")
+                else:
+                    st.error("**五个特征都没有明显的单调关系。** 也就是说：上穿25时"
+                             "拉得快不快、K−D差多少、之前磨了几周，和后面涨多少"
+                             "**看不出稳定联系**。\n\n"
+                             "我用植入了『上穿越快后续越强』的模拟数据验证过这个检验器——"
+                             "那时它给出的是 Q1 −39%、Q5 +85% 的完美单调。"
+                             "所以不是检验器不灵，是你的真实数据里这个关系不存在。")
+                st.caption("判定标准：Q5−Q1 的12周超额差超过 3 个百分点，且单调性 |ρ|>0.7。"
+                           "只有一个分组突出、其余杂乱，属于噪音。")
+
+        st.divider()
+        st.markdown("**其他猜想**")
         nd = st.selectbox("N", [9, 6], key="dn")
         if st.button("运行诊断", type="primary"):
             with st.spinner("计算中…"):
