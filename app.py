@@ -821,7 +821,14 @@ BREAK_MODES = {
     "F_突破25且≤6天": 6,
 }
 ALL_BUY_MODES = {**BUY_MODES, **BREAK_MODES}
-EXIT_MODES = ["X0_死叉即卖", "X1_K到过50后死叉才卖"]
+# 退出方式。指标说明原文：
+#   "K在80左右向下交叉D时，视为卖出信号参考"
+#   "SKDJ波动于50左右的任何讯号，其作用不大"
+# 也就是说只有**高位死叉**才是卖出信号，K 在 40-50 附近的死叉应当忽略。
+# X0 是我最初的实现（任何死叉都卖），与指标用法不符，保留作对照。
+EXIT_MODES = ["X0_任何死叉即卖", "X1_K到过50后死叉", "X2_K到过75后死叉", "X3_死叉时K≥75"]
+EXIT_ARM = {"X0_任何死叉即卖": 0.0, "X1_K到过50后死叉": 50.0,
+            "X2_K到过75后死叉": 75.0, "X3_死叉时K≥75": 75.0}
 # 低位纠缠过滤：过去 CHURN_WIN 个交易日里，在 25 线下方发生过几次金叉。
 # 反复金叉死叉说明指标在低位来回打转、行情起不来。这个计数**只用过去的数据**，
 # 金叉当下就已知，所以可以当筛选条件——而"用时"不行，它由未来价格决定。
@@ -931,8 +938,7 @@ def skdj_picks(panel: dict, elig: pd.DataFrame, n: int, buy_mode: str,
 
 def track_skdj(picks: pd.DataFrame, panel: dict, n: int, max_days: int = 30,
                comm: float = 0.0003, stamp: float = 0.0005,
-               slip: float = 0.001, exit_mode: str = "X0_死叉即卖",
-               k_arm: float = 50.0) -> pd.DataFrame:
+               slip: float = 0.001, exit_mode: str = "X2_K到过75后死叉") -> pd.DataFrame:
     """
     次日开盘买入（涨停买不到则放弃）；日线死叉次日开盘卖出，或满 max_days 超时。
     同一只股票在前一笔未了结前不重复建仓。
@@ -941,9 +947,9 @@ def track_skdj(picks: pd.DataFrame, panel: dict, n: int, max_days: int = 30,
     k, d = skdj(A, H, L, n, 3)
     DEAD = ((k < d) & (k.shift(1) >= d.shift(1))).to_numpy(dtype=bool)
     KV = k.to_numpy(dtype=np.float32)
-    # X1：K 还没到过 k_arm 就出现的死叉视为"行情没启动的假死叉"，忽略它。
-    # 现状是平均 6 天就被死叉平仓，根本没给行情展开的机会。
-    arm_needed = (exit_mode == "X1_K到过50后死叉才卖")
+    k_arm = EXIT_ARM.get(exit_mode, 0.0)
+    strict_now = (exit_mode == "X3_死叉时K≥75")   # 要求死叉当时 K 就在高位
+    arm_needed = k_arm > 0 and not strict_now      # 要求 K 曾到过高位
 
     cal = A.index
     ci = {c: j for j, c in enumerate(panel["codes"])}
@@ -972,7 +978,12 @@ def track_skdj(picks: pd.DataFrame, panel: dict, n: int, max_days: int = 30,
         for t in range(b, min(b + max_days, len(cal))):
             if arm_needed and not armed and np.isfinite(KV[t, j]) and KV[t, j] >= k_arm:
                 armed = True
-            if DEAD[t, j] and t > b and armed:
+            hit = DEAD[t, j] and t > b
+            if strict_now:
+                hit = hit and np.isfinite(KV[t, j]) and KV[t, j] >= k_arm
+            elif arm_needed:
+                hit = hit and armed
+            if hit:
                 reason = "死叉"
             elif t - b >= max_days - 1:
                 reason = "超时"
@@ -1188,6 +1199,27 @@ def churn_diagnosis(panel: dict, elig: pd.DataFrame, n: int = 9,
             agg("低位停留", ["<30%", "30-50%", "50-70%", "≥70%"]))
 
 
+def kd_check(panel: dict, code: str, n: int = 9, m: int = 3, tail: int = 8) -> tuple:
+    """
+    核对工具：输出我算出来的日线 / 周线 K、D 最后几天的值，
+    供与交易软件显示的数值逐个比对。对不上就说明公式有出入，
+    后面测什么都没有意义 —— 这一步必须先过。
+    """
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    if code not in A.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    k, d = skdj(A[[code]], H[[code]], L[[code]], n, m)
+    day = pd.DataFrame({"K": k[code].round(2), "D": d[code].round(2),
+                        "K-D": (k[code] - d[code]).round(2)}).dropna().tail(tail)
+    wc = A[[code]].resample("W-FRI").last()
+    wh = H[[code]].resample("W-FRI").max()
+    wl = L[[code]].resample("W-FRI").min()
+    wk, wd = skdj(wc, wh, wl, n, m)
+    week = pd.DataFrame({"K": wk[code].round(2), "D": wd[code].round(2),
+                         "K-D": (wk[code] - wd[code]).round(2)}).dropna().tail(tail)
+    return day, week
+
+
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
     """把所有结果表打包成一个 zip（纯标准库，无额外依赖）。"""
     import io
@@ -1286,11 +1318,47 @@ def main():
     elig = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
 
-    tab1, tab3, tab2 = st.tabs(["回测结果", "低位形态诊断", "今日候选"])
+    tab0, tab1, tab3, tab2 = st.tabs(["① 先核对指标", "② 回测结果",
+                                      "低位形态诊断", "今日候选"])
+
+    with tab0:
+        st.markdown("### 先确认我算的 SKDJ 和你软件里的一致")
+        st.markdown("公式对不上，后面测什么都没意义。输入代码，把下面的 K、D "
+                    "和同花顺显示的数值逐个比对。")
+        cc = st.columns(3)
+        code_in = cc[0].text_input("股票代码", "688017.SH")
+        n_in = cc[1].selectbox("N", [9, 6], key="ckn")
+        m_in = cc[2].selectbox("M", [3, 4, 5], key="ckm")
+        if st.button("核对", type="primary"):
+            dday, wweek = kd_check(panel, code_in.strip().upper(), n_in, m_in)
+            if not len(dday):
+                st.error(f"{code_in} 不在已下载的股票池里。检查代码格式（如 688017.SH），"
+                         "或它可能不符合市值/股价筛选条件而未被下载。")
+            else:
+                c1, c2 = st.columns(2)
+                c1.markdown("**日线**")
+                c1.dataframe(dday, use_container_width=True)
+                c2.markdown("**周线**")
+                c2.dataframe(wweek, use_container_width=True)
+                st.info("最后一行应该和你软件上当前显示的 K、D 基本一致"
+                        "（小数点后可能差 0.1 以内，属正常）。"
+                        "**如果差很多，把你的公式源码发我，我改公式。**")
+        st.caption("已知参考值：绿的谐波 688017 日线 K=41.32 D=39.72，"
+                   "周线 K=19.74 D=22.77；芯原股份 688521 日线 K=46.83 D=55.77，"
+                   "周线 K=14.27 D=14.23。（2026-09-10）")
 
     with tab1:
         wfs = WK_FILTERS if wk_on else ["F0_不过滤"]
-        ems = EXIT_MODES
+        ems = st.multiselect("卖出方式（按指标说明，应是高位死叉才卖）", EXIT_MODES,
+                             default=["X0_任何死叉即卖", "X2_K到过75后死叉",
+                                      "X3_死叉时K≥75"])
+        st.caption("指标说明原文：「K在80左右向下交叉D时，视为卖出信号参考」"
+                   "「SKDJ波动于50左右的任何讯号，其作用不大」。"
+                   "**X0 是我最初的实现——任何死叉都卖，与说明不符**，"
+                   "实测 79% 的卖出发生在 K<75、52% 发生在 K<50，"
+                   "正是说明书说「作用不大」的区域。保留它做对照。")
+        if not ems:
+            ems = ["X2_K到过75后死叉"]
         ncomb = 2 * len(ALL_BUY_MODES) * len(wfs) * len(CHURN_FILTERS) * len(ems)
         st.markdown(f"一次跑完 **2种N × {len(ALL_BUY_MODES)}个买入时点 × "
                     f"{len(CHURN_FILTERS)}种纠缠过滤 × {len(ems)}种卖出"
