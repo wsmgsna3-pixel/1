@@ -893,6 +893,41 @@ def sector_layer_test(fac: pd.DataFrame, IDX: pd.DataFrame, horizons=(3, 5, 8, 1
     return pd.DataFrame(out).set_index("分组")
 
 
+# ---------------- 买入位置过滤（日线 SKDJ K 值）----------------
+def daily_k(panel: dict, n: int = 9, m: int = 3) -> pd.DataFrame:
+    """日线 SKDJ 的 K 值。买入当天就已知，不含未来数据。"""
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    lo, hi = L.rolling(n).min(), H.rolling(n).max()
+    rng = (hi - lo).where((hi - lo) > 1e-9)
+    ema = lambda d, p: d.ewm(span=p, adjust=False, min_periods=p).mean()
+    rsv = ema((A - lo) / rng * 100.0, m)
+    return ema(rsv, m).astype(np.float32)
+
+
+K_FILTER_NAMES = ["K0_不过滤", "K1_只买K<75", "K2_只买K<60",
+                  "K3_只买K<75且近5日未到过75", "K4_只买K<75且K在上升",
+                  "K5_只买K>75(反向对照)"]
+
+
+def build_k_masks(kdf: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    买入位置的候选条件，全部只用当日及之前的数据。
+
+    K3 针对"从75上方跌下来才3-4天"那种速跌形态：K 现在虽然只有60多，
+    但刚从超买区掉下来，是下跌途中而不是低位启动。
+    K5 是反向对照——如果 K>75 真的差，只买 K>75 应该明显更差。
+    """
+    k = kdf
+    was_high = (k >= 75).rolling(5).max().fillna(0).astype(bool)
+    rising = k > k.shift(1)
+    return {"K0_不过滤": None,
+            "K1_只买K<75": k < 75,
+            "K2_只买K<60": k < 60,
+            "K3_只买K<75且近5日未到过75": (k < 75) & (~was_high),
+            "K4_只买K<75且K在上升": (k < 75) & rising,
+            "K5_只买K>75(反向对照)": k >= 75}
+
+
 # ---------------- 板块 → 个股 两层选股 ----------------
 STOCK_RULES = ["S1_板块内最强", "S2_板块内最弱(回调)", "S3_板块内随机"]
 
@@ -902,7 +937,8 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                       top_sec: int = 2, top_n: int = 3,
                       stock_rule: str = "S1_板块内最强",
                       sec_rule: str = "最强", cooldown: int = 5,
-                      seed: int = 20260910) -> pd.DataFrame:
+                      seed: int = 20260910, kdf: pd.DataFrame = None,
+                      k_mask: pd.DataFrame = None) -> pd.DataFrame:
     """
     两层选股：先按 sec_fac 选出 top_sec 个板块，再在板块内按 stock_rule 选股。
     sec_rule="随机" 时板块层用随机选择 —— 这是判断"板块层有没有加分"的对照组。
@@ -915,6 +951,9 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
     last: Dict[str, int] = {}
     rows = []
     secnames = list(sectors)
+    # 买入位置过滤：不合格的直接跳过，由下一名顺位替补，
+    # 所以每次仍然选满 top_n 只 —— 这和之前那些"剔除但不补位"的
+    # 过滤器有本质区别，不会让候选数腰斩、空窗爆掉。
     for d in dates:
         i = pos.get(d)
         if i is None or d not in sec_fac.index:
@@ -948,10 +987,34 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                 break
             if c in last and i - last[c] < cooldown:
                 continue
-            rows.append({"date": d, "code": c, "板块": s, "rank": taken + 1, "score": sc})
+            if k_mask is not None:
+                if c not in k_mask.columns or not bool(k_mask.loc[d, c]):
+                    continue
+            rows.append({"date": d, "code": c, "板块": s, "rank": taken + 1,
+                         "score": sc, "买入K": (float(kdf.loc[d, c])
+                                                if kdf is not None and c in kdf.columns
+                                                else np.nan)})
             last[c] = i
             taken += 1
     return pd.DataFrame(rows)
+
+
+def k_bucket_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
+    """按买入当天的日线 K 值分档，看后续收益。直接检验「K>75 买入是否更差」。"""
+    if not len(tr) or "买入K" not in picks.columns:
+        return pd.DataFrame()
+    m = picks[["date", "code", "买入K"]].drop_duplicates(["date", "code"])
+    d = tr.merge(m, on=["date", "code"], how="left").dropna(subset=["买入K", "收益率"])
+    if len(d) < 100:
+        return pd.DataFrame()
+    bins = [0, 40, 55, 65, 75, 85, 101]
+    lab = ["<40", "40-55", "55-65", "65-75", "75-85", ">85"]
+    d["档"] = pd.cut(d["买入K"], bins=bins, labels=lab, right=False)
+    g = d.groupby("档", observed=True)["收益率"]
+    out = pd.DataFrame({"笔数": g.size(), "平均收益": g.mean(),
+                        "中位收益": g.median(), "胜率": g.apply(lambda x: (x > 0).mean())})
+    out["占比"] = out["笔数"] / out["笔数"].sum()
+    return out
 
 
 def flat_stock_pick(panel: dict, elig: pd.DataFrame, dates: List[pd.Timestamp],
@@ -1416,6 +1479,14 @@ def main():
         ss["sf2_key"] = dkey
         gc.collect()
     SF2 = ss["sf2"]
+    if ss.get("kmask_key") != dkey:
+        with st.spinner("计算日线 SKDJ…"):
+            _kdf = daily_k(panel)
+            ss["kdf"] = _kdf
+            ss["kmasks"] = build_k_masks(_kdf)
+            ss["kmask_key"] = dkey
+            gc.collect()
+    KDF, KM = ss["kdf"], ss["kmasks"]
     DEF_SIG = "【合成】动量族平均" if "【合成】动量族平均" in SF2 else list(SF2)[0]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
@@ -1534,12 +1605,18 @@ def main():
         srule = st.selectbox("板块内怎么选股", STOCK_RULES)
         if srule not in STOCK_RULES:
             srule = STOCK_RULES[0]
+        kf = st.selectbox("买入位置过滤（日线SKDJ）", K_FILTER_NAMES)
+        if kf not in K_FILTER_NAMES:
+            kf = K_FILTER_NAMES[0]
+        st.caption("不合格的候选**由下一名顺位替补**，每次仍选满设定只数——"
+                   "这和之前那些「剔除但不补位」的过滤器不同，不会让交易数腰斩。")
         if st.button("运行对照实验", type="primary"):
             bar = st.progress(0.0)
             plans = [
                 ("两层：最强板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF2[sig], dates,
-                                           top_sec, top_n, srule, "最强")),
+                                           top_sec, top_n, srule, "最强",
+                                           kdf=KDF, k_mask=KM.get(kf))),
                 ("对照A：随机板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF2[sig], dates,
                                            top_sec, top_n, srule, "随机")),
@@ -1613,6 +1690,63 @@ def main():
                                    "看「差异」列在 2018/2022 是不是明显为正——"
                                    "如果是，说明开关掐对了地方；"
                                    "如果在牛市年份也大幅为正，那是过度拟合的信号。")
+                st.divider()
+                st.markdown("### 买入位置对比（日线SKDJ K值）")
+                st.caption("同一套选股规则，只改「买入时 K 在什么位置」这一个变量。"
+                           "不合格的由下一名替补，所以交易数基本不变——是干净的单变量对比。")
+                if st.button("跑全部买入位置条件"):
+                    bar4 = st.progress(0.0); rows4 = []
+                    base_pk = None
+                    for i4, nm4 in enumerate(K_FILTER_NAMES):
+                        pk4 = sector_then_stock(panel, elig, sectors, SF2[sig], dates,
+                                                top_sec, top_n, srule, "最强",
+                                                kdf=KDF, k_mask=KM.get(nm4))
+                        tr4 = track_fixed(pk4, panel, hold, **kw) if len(pk4) else pd.DataFrame()
+                        s4 = _st(tr4)
+                        if nm4 == "K0_不过滤":
+                            base_pk, base_tr = pk4, tr4
+                        if s4:
+                            rows4.append({"买入位置": nm4, **s4})
+                        bar4.progress((i4 + 1) / len(K_FILTER_NAMES), text=nm4)
+                    bar4.empty()
+                    ss["kres"] = (pd.DataFrame(rows4).set_index("买入位置"),
+                                  k_bucket_diagnosis(base_pk, base_tr))
+                if ss.get("kres"):
+                    kdf_res, kbk = ss["kres"]
+                    st.dataframe(kdf_res.style.format(
+                        {"笔数": "{:.0f}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                         "胜率": "{:.1%}", "聚类t": "{:.2f}"})
+                        .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
+                        use_container_width=True)
+                    if len(kbk):
+                        st.markdown("**不过滤时，买入当天的 K 值分布**")
+                        st.dataframe(kbk.style.format(
+                            {"笔数": "{:.0f}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                             "胜率": "{:.1%}", "占比": "{:.1%}"})
+                            .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
+                            use_container_width=True)
+                        hi_share = kbk.loc[[x for x in kbk.index if x in ("75-85", ">85")],
+                                           "占比"].sum() if len(kbk) else 0
+                        st.info(f"**买入时 K>75 的占 {hi_share:.0%}。** "
+                                "板块内动量最强 = 涨得最多 = K 高，"
+                                "所以这个选股规则**结构性地在超买区买入**。"
+                                "如果 K>75 确实是负收益区，这个过滤的影响会很大。")
+                    try:
+                        b0 = kdf_res.loc["K0_不过滤", "平均收益"]
+                        b1 = kdf_res.loc["K1_只买K<75", "平均收益"]
+                        b5 = kdf_res.loc["K5_只买K>75(反向对照)", "平均收益"]
+                        st.metric("K<75 相对不过滤", f"{b1-b0:+.3%} / 笔")
+                        if b1 > b0 and b5 < b0:
+                            st.success("**方向一致**：只买 K<75 更好，只买 K>75 更差。"
+                                       "反向对照给出相反结果，这比单看一个数字可信得多。")
+                        elif b1 > b0:
+                            st.warning("K<75 更好，但反向对照没给出相反结果——证据只算一半。")
+                        else:
+                            st.error("过滤没有改善。你在 12 笔上看到的现象，"
+                                     "在全池 8 年数据上不成立。")
+                    except Exception:
+                        pass
+
                 st.divider()
                 st.markdown("### ⑤ 滚动前推检验（搜索过参数后，唯一还算数的检验）")
                 st.error("**如果你试过多个配置再挑最好的，上面的「样本外」已经不算数了。** "
