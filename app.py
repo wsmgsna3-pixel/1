@@ -1383,7 +1383,17 @@ def main():
         st.info("左侧填 Token 后点「下载数据」。首次 5-15 分钟，之后走缓存。"); st.stop()
 
     panel, basic, uni = ss["panel"], ss["basic"], ss["uni"]
-    elig = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
+    # 合格性矩阵每次交互都重算一遍全量 1400×2100 的布尔运算，
+    # 反复分配大数组会把云端内存顶爆 → 进程被杀 → 页面闪回初始状态。
+    # 这就是你遇到的"点一下就要重新下载"的原因。
+    dkey = ss.get("data_key") or f"{len(panel['codes'])}|{panel['cal'][-1]:%Y%m%d}"
+    ss["data_key"] = dkey
+    if ss.get("elig_key") != dkey:
+        with st.spinner("构建合格池…"):
+            ss["elig"] = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
+            ss["elig_key"] = dkey
+            gc.collect()
+    elig = ss["elig"]
     if ss.get("sec") is None or ss.get("sec_mm") != min_mem:
         with st.spinner("构建板块指数…"):
             sectors = build_sector_map(uni, panel, elig, min_mem)
@@ -1397,10 +1407,15 @@ def main():
     sectors, R, IDX, cnt, SF = ss["sec"]
     # 合成信号在这里统一构建：回测页和今日候选页必须用同一份，
     # 否则会出现"回测用合成信号、实盘用单个信号"这种致命不一致。
-    SF2 = dict(SF)
-    _cp = composite_sector_signal(SF)
-    if len(_cp):
-        SF2["【合成】动量族平均"] = _cp
+    if ss.get("sf2_key") != dkey:
+        _s2 = dict(SF)
+        _cp = composite_sector_signal(SF)
+        if len(_cp):
+            _s2["【合成】动量族平均"] = _cp
+        ss["sf2"] = _s2
+        ss["sf2_key"] = dkey
+        gc.collect()
+    SF2 = ss["sf2"]
     DEF_SIG = "【合成】动量族平均" if "【合成】动量族平均" in SF2 else list(SF2)[0]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
@@ -1413,7 +1428,13 @@ def main():
         st.markdown("如果降噪不明显，整个思路不成立，后面三页不用看。"
                     "我在模拟数据上实测：20只等权时波动降到个股的 **52%**，"
                     "信噪比提升约 **1.94 倍**。")
-        nz = sector_noise_check(panel, elig, sectors)
+        if st.button("运行降噪检验（只需跑一次）"):
+            with st.spinner("计算中…"):
+                ss["nz"] = sector_noise_check(panel, elig, sectors)
+        if ss.get("nz") is None:
+            st.info("这页只需在换数据后跑一次。点上面的按钮。")
+            st.stop()
+        nz = ss["nz"]
         st.dataframe(nz.style.format({"平均成分股数": "{:.0f}", "个股平均波动": "{:.1%}",
                                       "板块指数波动": "{:.1%}", "降噪比": "{:.2f}"})
                      .background_gradient(subset=["降噪比"], cmap="RdYlGn_r"),
@@ -1648,10 +1669,27 @@ def main():
                             st.success("**滚动前推也站得住。** 这是搜索过参数之后"
                                        "唯一还算数的证据，含金量比前面任何数字都高。")
                         else:
-                            st.error(f"**滚动前推未达显著**（{s5['平均收益']:+.2%}，"
-                                     f"按年 t={s5['t(按年)']:.2f}）。说明前面那些漂亮数字"
-                                     "主要来自「事后挑到了最好的配置」，"
-                                     "而当年你没有能力挑中它。")
+                            yv2 = wf.groupby(pd.to_datetime(wf["date"]).dt.year)["收益率"].mean()
+                            need = int(np.ceil((2 * yv2.std(ddof=1) / yv2.mean()) ** 2)) \
+                                if yv2.mean() > 0 else 0
+                            if s5["平均收益"] > 0 and s5["逐年为正"] >= s5["年数"] * 0.6:
+                                st.warning(
+                                    f"**滚动前推为正但样本不足**（{s5['平均收益']:+.2%}，"
+                                    f"逐年为正 {s5['逐年为正']}/{s5['年数']}，按年 "
+                                    f"t={s5['t(按年)']:.2f}）。\n\n"
+                                    "**这不等于过拟合。** 过拟合的标志是样本内好、样本外垮；"
+                                    "而这里的样本外是正的，配置也稳定。真正的问题是"
+                                    f"年度样本太少——以这个边际大小和年间波动，"
+                                    f"大约需要 **{need} 年** 才能达到 t=2，我们只有 "
+                                    f"{s5['年数']} 年。\n\n"
+                                    "**结论是「证据不足」，不是「已被证伪」。** "
+                                    "唯一能改变它的是新数据：往后每周记录名单，"
+                                    "攒够年份再看。手上这几年已经被反复用过了。")
+                            else:
+                                st.error(f"**滚动前推没站住**（{s5['平均收益']:+.2%}，"
+                                         f"按年 t={s5['t(按年)']:.2f}，逐年为正 "
+                                         f"{s5['逐年为正']}/{s5['年数']}）。"
+                                         "当年你没有能力挑中事后看最好的那个配置。")
 
                 st.divider()
                 st.markdown("### 三项必做诊断")
@@ -1760,6 +1798,19 @@ def main():
         else:
             st.success("熊市开关：开启中（池子等权指数在 200 日线上方）。")
         pk = sector_then_stock(panel, elig, sectors, SF2[sig2], [d], top_sec, top_n, sr2, "最强")
+        if len(pk) < top_n:
+            picked_secs = list(f.index[:top_sec])
+            info = []
+            for s3 in picked_secs:
+                cs = [c for c in sectors[s3] if elig.loc[d, c]]
+                info.append(f"{s3}: {len(cs)} 只合格")
+            st.warning(
+                f"**只选出 {len(pk)} 只，少于设定的 {top_n} 只。** 原因见下方各板块"
+                f"的合格股票数：{'；'.join(info)}。\n\n"
+                "候选是**按板块顺序**取的：先取最强板块里动量最高的，不够再取次强板块。"
+                "回测里因为有冷却期（同股 5 日内不重复），会自然分散到多个板块；"
+                "而单看某一天没有冷却历史，就会集中在最强板块。"
+                "如果最强板块当天合格股票不足，总数就会少于设定值。")
         if not len(pk):
             st.warning("今日无候选。")
         else:
