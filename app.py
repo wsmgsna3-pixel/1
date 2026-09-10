@@ -1029,6 +1029,65 @@ def track_fixed(picks: pd.DataFrame, panel: dict, hold_days: int = 8,
     return pd.DataFrame(out)
 
 
+# ---------------- 三项必做诊断 ----------------
+def _clustered(d: pd.DataFrame) -> float:
+    day = d.groupby("date")["收益率"].mean().sort_index()
+    se = day.std(ddof=1) / np.sqrt(len(day)) if len(day) > 3 else np.nan
+    return float(day.mean() / se) if se and se > 1e-12 else np.nan
+
+
+def split_check(tr: pd.DataFrame, cut: str = "2023-01-01") -> pd.DataFrame:
+    """样本内 / 样本外。全样本好而样本外垮，是最常见的自欺方式。"""
+    d = tr.dropna(subset=["收益率"]) if len(tr) else pd.DataFrame()
+    if not len(d):
+        return pd.DataFrame()
+    c = pd.Timestamp(cut)
+    rows = {}
+    for lab, seg in (("样本内", d[d["date"] < c]), ("样本外", d[d["date"] >= c])):
+        if len(seg) < 50:
+            continue
+        rows[lab] = {"笔数": len(seg), "平均收益": seg["收益率"].mean(),
+                     "中位收益": seg["收益率"].median(),
+                     "胜率": (seg["收益率"] > 0).mean(), "聚类t": _clustered(seg)}
+    return pd.DataFrame(rows).T
+
+
+def yearly_check(tr: pd.DataFrame) -> pd.DataFrame:
+    """逐年。靠单独一年撑起来的平均值只是那一年的行情。"""
+    d = tr.dropna(subset=["收益率"]) if len(tr) else pd.DataFrame()
+    if not len(d):
+        return pd.DataFrame()
+    rows = {}
+    for y, g in d.groupby(pd.to_datetime(d["date"]).dt.year):
+        if len(g) < 30:
+            continue
+        rows[y] = {"笔数": len(g), "平均收益": g["收益率"].mean(),
+                   "中位收益": g["收益率"].median(),
+                   "胜率": (g["收益率"] > 0).mean(), "聚类t": _clustered(g)}
+    return pd.DataFrame(rows).T
+
+
+def concentration_check(tr: pd.DataFrame, ks=(1, 3, 5, 10, 20)) -> pd.DataFrame:
+    """利润集中度。绝大部分利润来自极少数几笔的话，那是彩票不是策略。"""
+    d = tr.dropna(subset=["收益率"]) if len(tr) else pd.DataFrame()
+    if len(d) < 50:
+        return pd.DataFrame()
+    v = d["收益率"].sort_values(ascending=False).to_numpy()
+    tot = v.sum()
+    rows = []
+    for k in ks:
+        if k >= len(v):
+            continue
+        rows.append({"最赚的前N笔": k,
+                     "占总利润": v[:k].sum() / tot if abs(tot) > 1e-12 else np.nan,
+                     "剔除后单笔均值": v[k:].mean(),
+                     "剩余比例": v[k:].mean() / v.mean() if abs(v.mean()) > 1e-12 else np.nan})
+    out = pd.DataFrame(rows).set_index("最赚的前N笔")
+    out.attrs["原均值"] = float(v.mean())
+    out.attrs["总笔数"] = int(len(v))
+    return out
+
+
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
     """把所有结果表打包成一个 zip（纯标准库，无额外依赖）。"""
     import io
@@ -1283,6 +1342,60 @@ def main():
             except Exception:
                 pass
             if keep:
+                st.divider()
+                st.markdown("### 三项必做诊断")
+                st.caption("前面几轮就是这三项戳破的幻觉：平均收益漂亮，"
+                           "但利润 94% 来自 513 笔里的 5 笔、或者只靠一年撑着、"
+                           "或者样本内好样本外垮。")
+                dsel = st.selectbox("诊断哪个方案", list(keep), key="diag_sel")
+                trd = keep[dsel]
+                c1, c2 = st.columns(2)
+                sp = split_check(trd)
+                c1.markdown("**样本内 / 样本外**（2023-01-01 分界）")
+                if len(sp):
+                    c1.dataframe(sp.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
+                                                  "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                                                  "聚类t": "{:.2f}"}),
+                                 use_container_width=True)
+                pc = concentration_check(trd)
+                c2.markdown("**利润集中度**")
+                if len(pc):
+                    c2.dataframe(pc.style.format({"占总利润": "{:.1%}",
+                                                  "剔除后单笔均值": "{:+.3%}",
+                                                  "剩余比例": "{:.0%}"}),
+                                 use_container_width=True)
+                    c2.caption(f"全部 {pc.attrs['总笔数']} 笔，原始均值 "
+                               f"{pc.attrs['原均值']:+.2%}")
+                yy = yearly_check(trd)
+                st.markdown("**逐年**")
+                if len(yy):
+                    st.dataframe(yy.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
+                                                  "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                                                  "聚类t": "{:.2f}"})
+                                 .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
+                                 use_container_width=True)
+                    npos = int((yy["平均收益"] > 0).sum())
+                    msgs = []
+                    if len(sp) == 2:
+                        o = sp.loc["样本外"]
+                        msgs.append(("样本外 " + ("站得住" if o["平均收益"] > 0 and o["聚类t"] >= 1.5
+                                                 else "没站住")
+                                     + f"（{o['平均收益']:+.2%}，t={o['聚类t']:.2f}）",
+                                     o["平均收益"] > 0 and o["聚类t"] >= 1.5))
+                    if len(pc) and 5 in pc.index:
+                        keep5 = pc.loc[5, "剩余比例"]
+                        msgs.append((f"剔除最赚的5笔后仍保留 {keep5:.0%} 的均值",
+                                     keep5 > 0.5))
+                    msgs.append((f"逐年为正 {npos}/{len(yy)}", npos >= len(yy) * 0.7))
+                    for txt, good in msgs:
+                        (st.success if good else st.error)(("✅ " if good else "❌ ") + txt)
+                    if all(g for _, g in msgs):
+                        st.success("**三项全过。** 这是整个项目里第一次。"
+                                   "可以考虑小仓位实盘验证了。")
+                    else:
+                        st.warning("有诊断未通过。未通过的那几项正是最容易骗人的地方。")
+
+                st.divider()
                 d = st.selectbox("看哪个方案的成交明细", list(keep))
                 st.dataframe(keep[d].tail(300), use_container_width=True, height=300)
                 if st.button("生成导出包"):
@@ -1298,6 +1411,13 @@ def main():
                         tb["03_板块信号分层"] = pd.concat(
                             [t.assign(信号=k) for k, t in ss["sigres"].items()])
                     tb["04_降噪检验"] = sector_noise_check(panel, elig, sectors)
+                    for k2, v2 in keep.items():
+                        tag = k2.split("：")[0]
+                        for nm2, fn2 in (("样本内外", split_check), ("逐年", yearly_check),
+                                         ("集中度", concentration_check)):
+                            r2 = fn2(v2)
+                            if len(r2):
+                                tb[f"05_{nm2}_{tag}"] = r2
                     ss["zipb"] = export_all(tb)
                     ss["zipn"] = f"sector_{dt.datetime.now():%Y%m%d_%H%M}.zip"
                 if ss.get("zipb"):
