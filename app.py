@@ -1260,15 +1260,31 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
     return pd.DataFrame(picked).set_index("年"), wf
 
 
-def wf_summary(wf: pd.DataFrame, allt_best: pd.DataFrame = None) -> dict:
+def wf_summary(wf: pd.DataFrame, hold_days: int = 20, step_days: int = 3) -> dict:
+    """
+    滚动前推的统计。给三个 t，从宽松到严格：
+
+      按日聚类(朴素)   —— 相邻批次重叠，会被放大约 sqrt(持有期/选股间隔) 倍
+      按日聚类(重叠修正) —— Newey-West，我此前在这里漏做了
+      按年聚类        —— 只有几个独立年份，最保守，也最难自欺
+
+    真正该看的是**按年**：滚动前推每年重新挑一次配置，年与年之间才是
+    真正独立的观测。按日算会把同一年内高度重叠的持仓当成几百个独立样本。
+    """
     if not len(wf):
         return {}
     v = wf["收益率"]
     day = wf.groupby("date")["收益率"].mean().sort_index()
     se = day.std(ddof=1) / np.sqrt(len(day)) if len(day) > 3 else np.nan
+    lag = max(1, int(np.ceil(hold_days / max(step_days, 1))))
+    yr = wf.groupby(pd.to_datetime(wf["date"]).dt.year)["收益率"].mean()
+    sey = yr.std(ddof=1) / np.sqrt(len(yr)) if len(yr) > 2 else np.nan
     return {"笔数": len(v), "平均收益": v.mean(), "中位收益": v.median(),
             "胜率": float((v > 0).mean()),
-            "聚类t": float(day.mean() / se) if se and se > 1e-12 else np.nan}
+            "t(按日,朴素)": float(day.mean() / se) if se and se > 1e-12 else np.nan,
+            "t(按日,重叠修正)": newey_west_t(day, lag=lag),
+            "t(按年)": float(yr.mean() / sey) if sey and sey > 1e-12 else np.nan,
+            "年数": len(yr), "逐年为正": int((yr > 0).sum())}
 
 
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
@@ -1596,12 +1612,19 @@ def main():
                     if not len(wf):
                         st.warning("样本不足。")
                     else:
-                        s5 = wf_summary(wf)
+                        s5 = wf_summary(wf, hold_days=hold, step_days=every)
                         m5 = st.columns(4)
                         m5[0].metric("滚动前推 平均收益", f"{s5['平均收益']:+.2%}")
                         m5[1].metric("胜率", f"{s5['胜率']:.1%}")
-                        m5[2].metric("聚类t", f"{s5['聚类t']:.2f}")
+                        m5[2].metric("t(按年，最严格)", f"{s5['t(按年)']:.2f}",
+                                     f"逐年为正 {s5['逐年为正']}/{s5['年数']}")
                         m5[3].metric("笔数", f"{s5['笔数']}")
+                        st.caption(
+                            f"另两个口径供对照：按日朴素 t={s5['t(按日,朴素)']:.2f}，"
+                            f"按日重叠修正 t={s5['t(按日,重叠修正)']:.2f}。"
+                            "**该看的是「按年」**——滚动前推每年重新挑一次配置，"
+                            "年与年之间才是真正独立的观测；按日算会把同一年内高度重叠的"
+                            "持仓当成几百个独立样本，严重高估。")
                         st.dataframe(picked.style.format(
                             {"历史t": "{:.2f}", "当年笔数": "{:.0f}",
                              "当年平均收益": "{:+.2%}", "当年胜率": "{:.1%}"})
@@ -1611,12 +1634,22 @@ def main():
                         st.caption(f"每年选中的配置见「选中配置」列。逐年为正 {npos}/{len(picked)}。"
                                    "**注意每年选中的配置是否稳定**——如果年年都换，"
                                    "说明所谓最优只是当年的运气。")
-                        if s5["聚类t"] >= 2 and s5["平均收益"] > 0:
+                        # 额外看：剔除表现最好的两年后还剩多少
+                        yv = wf.groupby(pd.to_datetime(wf["date"]).dt.year)["收益率"]
+                        ym, yn = yv.mean(), yv.size()
+                        top2 = ym.nlargest(2).index
+                        rest = wf[~pd.to_datetime(wf["date"]).dt.year.isin(top2)]
+                        if len(rest):
+                            st.warning(
+                                f"**剔除最好的两年（{list(top2)}）后，其余年份平均 "
+                                f"{rest['收益率'].mean():+.3%}/笔。** 如果这个数接近零，"
+                                "说明整体成绩靠少数年份撑着——那几年的行情你无法预定。")
+                        if s5["t(按年)"] >= 2 and s5["平均收益"] > 0:
                             st.success("**滚动前推也站得住。** 这是搜索过参数之后"
                                        "唯一还算数的证据，含金量比前面任何数字都高。")
                         else:
-                            st.error(f"**滚动前推没站住**（{s5['平均收益']:+.2%}，"
-                                     f"t={s5['聚类t']:.2f}）。说明前面那些漂亮数字"
+                            st.error(f"**滚动前推未达显著**（{s5['平均收益']:+.2%}，"
+                                     f"按年 t={s5['t(按年)']:.2f}）。说明前面那些漂亮数字"
                                      "主要来自「事后挑到了最好的配置」，"
                                      "而当年你没有能力挑中它。")
 
