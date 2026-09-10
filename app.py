@@ -759,449 +759,197 @@ def empty_week_stats(score: pd.DataFrame, elig: pd.DataFrame,
 
 
 # ======================================================================
-# 六、选股方法库 —— 每个方法返回一张打分表（越高越优先）
+# SKDJ 选股 —— 日线金叉 + 加速确认 + 周线形态过滤
 # ======================================================================
-def to_weekly(df: pd.DataFrame, how: str = "last") -> pd.DataFrame:
-    """日线转周线（按自然周，取周内最后/最高/最低）。"""
-    g = df.resample("W-FRI")
-    return {"last": g.last, "max": g.max, "min": g.min}[how]()
-
-
-def _ema(df: pd.DataFrame, n: int) -> pd.DataFrame:
+def _ema_df(df: pd.DataFrame, n: int) -> pd.DataFrame:
     return df.ewm(span=n, adjust=False, min_periods=n).mean()
 
 
-def weekly_macd(wc: pd.DataFrame, fast=12, slow=26, sig=9) -> Dict[str, pd.DataFrame]:
-    dif = _ema(wc, fast) - _ema(wc, slow)
-    dea = _ema(dif, sig)
-    return {"dif": dif, "dea": dea, "hist": (dif - dea) * 2}
-
-
-def weekly_skdj(wc, wh, wl, n=9, m=3) -> Dict[str, pd.DataFrame]:
-    """SKDJ：RSV 先平滑再算 K，比普通 KDJ 慢，周线上噪音更少。"""
-    lo = wl.rolling(n).min()
-    hi = wh.rolling(n).max()
+def skdj(close: pd.DataFrame, high: pd.DataFrame, low: pd.DataFrame,
+         n: int = 9, m: int = 3):
+    """
+    SKDJ（慢速KD）：
+        RSV = EMA((C - LLV(L,n)) / (HHV(H,n) - LLV(L,n)) * 100, m)
+        K   = EMA(RSV, m)
+        D   = MA(K, m)
+    """
+    lo = low.rolling(n).min()
+    hi = high.rolling(n).max()
     rng = (hi - lo).where((hi - lo) > 1e-9)
-    rsv = _ema((wc - lo) / rng * 100.0, m)
-    k = _ema(rsv, m)
+    rsv = _ema_df((close - lo) / rng * 100.0, m)
+    k = _ema_df(rsv, m)
     d = k.rolling(m).mean()
-    return {"k": k, "d": d}
+    return k, d
 
 
-def build_methods(panel: dict, factors: Dict[str, pd.DataFrame],
-                  elig: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+def weekly_skdj_state(panel: dict, n: int = 9, m: int = 3):
     """
-    返回 {方法名: 日频打分表}。分数只在 elig 为真处有效，越高越优先。
-    周线指标算完后前向填充到日频——周中不会用到未来数据，因为每周只在
-    周五收盘后调仓，取的正是当周已经收完的那根周线。
+    周线 SKDJ 状态，前向填充到日频。返回：
+      wk_above : 周线 K > D（已金叉状态）
+      wk_since : 距最近一次周线死叉过了几周（从未死叉记为 999）
+    周线只用当周已收完的那根，不会用到未来数据。
     """
-    A = panel["adj_close"]
-    cal = A.index
-    wc = to_weekly(A, "last")
-    wh = to_weekly(panel["adj_high"], "max")
-    wl = to_weekly(panel["adj_low"], "min")
-    out: Dict[str, pd.DataFrame] = {}
+    wc = panel["adj_close"].resample("W-FRI").last()
+    wh = panel["adj_high"].resample("W-FRI").max()
+    wl = panel["adj_low"].resample("W-FRI").min()
+    k, d = skdj(wc, wh, wl, n, m)
+    above = k > d
+    dead = (k < d) & (k.shift(1) >= d.shift(1))          # 周线死叉
 
-    def daily(w: pd.DataFrame) -> pd.DataFrame:
-        return w.reindex(cal, method="ffill")
+    idx = np.arange(len(dead.index), dtype=float)
+    marker = pd.DataFrame(np.where(dead.to_numpy(), idx[:, None], np.nan),
+                          index=dead.index, columns=dead.columns).ffill()
+    since = pd.DataFrame(idx[:, None] - marker.to_numpy(),
+                         index=dead.index, columns=dead.columns).fillna(999.0)
 
-    # --- 1. 趋势动量（正权重）：买强势股，不是买反弹 ---
-    z = lambda k, w: cs_zscore(factors[k], elig) * w
-    out["趋势动量"] = (z("mom_ra", 1.0).add(z("trend_q", 1.0), fill_value=0)
-                       .add(z("rel_str", 1.0), fill_value=0)).where(elig)
-
-    # --- 2. 周线MACD金叉（零轴上方）---
-    m = weekly_macd(wc)
-    cross = (m["dif"] > m["dea"]) & (m["dif"].shift(1) <= m["dea"].shift(1))
-    strength = (m["hist"] / wc.abs().where(wc.abs() > 1e-9))
-    sc = strength.where(cross & (m["dif"] > 0))
-    out["周线MACD金叉"] = daily(sc).where(elig)
-
-    # --- 3. 周线MACD多头（持续在零轴上且柱增）---
-    up = (m["dif"] > m["dea"]) & (m["dif"] > 0) & (m["hist"] > m["hist"].shift(1))
-    out["周线MACD多头"] = daily(strength.where(up)).where(elig)
-
-    # --- 4. 周线SKDJ金叉（低位）---
-    s = weekly_skdj(wc, wh, wl)
-    kx = (s["k"] > s["d"]) & (s["k"].shift(1) <= s["d"].shift(1)) & (s["k"] < 30)
-    out["周线SKDJ金叉"] = daily((50 - s["k"]).where(kx)).where(elig)
-
-    # --- 5. 创新高突破：周线收盘创 N 周新高 ---
-    for nw in (20, 52):
-        hh = wc.rolling(nw).max()
-        brk = wc >= hh
-        # 分数用"突破幅度 × 趋势质量"，避免选到刚好平高点的
-        sc2 = daily((wc / wc.rolling(nw).mean() - 1.0).where(brk))
-        out[f"创{nw}周新高"] = (sc2 + cs_zscore(factors["trend_q"], elig) * 0.01).where(elig)
-
-    # --- 6. 均线多头排列 + 回踩不破 ---
-    ma5, ma10, ma20 = wc.rolling(5).mean(), wc.rolling(10).mean(), wc.rolling(20).mean()
-    bull = (ma5 > ma10) & (ma10 > ma20) & (wc > ma5)
-    out["周线均线多头"] = daily(((ma5 / ma20 - 1.0)).where(bull)).where(elig)
-
-    # --- 7. 动量 + 量能配合 ---
-    out["动量+放量"] = (z("mom_ra", 1.0).add(z("trend_q", 0.5), fill_value=0)
-                        .add(z("vol_exp", 0.5), fill_value=0)).where(elig)
-
-    # --- 8. 反转（作为对照组，你说不要，但留着做基准）---
-    out["反转(对照)"] = (z("dist_hi", -1.0).add(z("rev5", -0.5), fill_value=0)).where(elig)
-
-    return out
+    cal = panel["adj_close"].index
+    return (above.reindex(cal, method="ffill").fillna(False),
+            since.reindex(cal, method="ffill").fillna(999.0))
 
 
-# ======================================================================
-# 六B、方法合成 —— 叠加有两种做法，效果完全不同
-# ======================================================================
-def _pct_rank(sc: pd.DataFrame, elig: pd.DataFrame) -> pd.DataFrame:
+BUY_MODES = {
+    "A_金叉次日": 0,      # 不确认，D+1 开盘买
+    "B_确认1天": 1,       # D+1 收盘确认扩大，D+2 开盘买
+    "C_确认2天": 2,       # D+1、D+2 连续扩大，D+3 开盘买
+}
+WK_FILTERS = ["F0_不过滤", "F1_距死叉≥10周", "F2_周线已金叉"]
+
+
+def skdj_picks(panel: dict, elig: pd.DataFrame, n: int, buy_mode: str,
+               wk_filter: str, k_max: float = 25.0, top_n: int = 3,
+               wk_n: int = 9, min_weeks: int = 10) -> pd.DataFrame:
     """
-    把打分转成截面百分位 [0,1]，没有信号的填 0。
-    填 0 而不是 NaN 很重要：MACD金叉这类事件型方法大部分股票没信号，
-    "没信号"本身就是一种表态（不推荐），不该当缺失值丢掉。
+    生成候选：日线 K 上穿 D 且 K<k_max → 按 buy_mode 决定确认天数与决策日 →
+    决策日按 round(K-D, 2) 排序，并列时流通市值大者优先 → 取前 top_n。
+
+    K-D 取两位小数，与交易软件显示精度一致；这样"数值相同"才真的会发生，
+    市值打破平局这条规则才有意义（不取整的话浮点数几乎不可能精确相等）。
     """
-    x = sc.where(elig)
-    r = x.rank(axis=1, pct=True)
-    return r.fillna(0.0).where(elig)
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    k, d = skdj(A, H, L, n, 3)
+    kd = k - d
+    gold = (k > d) & (k.shift(1) <= d.shift(1)) & (k < k_max)
 
+    conf = int(BUY_MODES[buy_mode])
+    ok = gold.copy()
+    for j in range(1, conf + 1):                        # 逐日确认 K-D 持续扩大
+        ok &= (kd.shift(-j) > kd.shift(-(j - 1)))
+    decide = ok.shift(conf).fillna(False)               # 决策日 = 金叉日 + conf
 
-def method_corr_matrix(methods: Dict[str, pd.DataFrame], elig: pd.DataFrame,
-                       rebal: List[pd.Timestamp]) -> pd.DataFrame:
-    """调仓日截面上，各方法百分位打分的平均相关性。相关性越高，合成越没用。"""
-    names = list(methods)
-    pr = {n: _pct_rank(methods[n], elig) for n in names}
-    dates = [d for d in rebal[::4] if d in elig.index]
-    acc = np.zeros((len(names), len(names)))
-    cnt = 0
-    for d in dates:
-        m = elig.loc[d]
-        M = pd.concat([pr[n].loc[d].where(m) for n in names], axis=1, keys=names).dropna()
-        if len(M) < 30 or M.std().min() < 1e-9:
-            continue
-        acc += M.corr().to_numpy()
-        cnt += 1
-    if cnt == 0:
-        return pd.DataFrame()
-    return pd.DataFrame(acc / cnt, index=names, columns=names)
+    if wk_filter != "F0_不过滤":
+        wk_above, wk_since = weekly_skdj_state(panel, wk_n, 3)
+        decide &= (wk_above if wk_filter == "F2_周线已金叉"
+                   else (wk_since >= min_weeks))
 
-
-def combine_methods(methods: Dict[str, pd.DataFrame], elig: pd.DataFrame,
-                    names: List[str], mode: str = "average",
-                    top_k: int = 20) -> pd.DataFrame:
-    """
-    mode="average"：各方法百分位取平均。提高的是"广度"——把多个弱信号
-        平均掉各自的噪音。候选永远排得满，不会空窗。
-    mode="vote"：数一只股票进了几个方法的前 top_k。提高的是"选择性"——
-        只有多个方法同时看好才入选。质量可能更高，但候选变少、空窗率上升。
-    """
-    pr = {n: _pct_rank(methods[n], elig) for n in names if n in methods}
-    if not pr:
-        return pd.DataFrame(np.nan, index=elig.index, columns=elig.columns)
-    if mode == "average":
-        tot = None
-        for v in pr.values():
-            tot = v if tot is None else tot.add(v, fill_value=0.0)
-        return (tot / len(pr)).where(elig)
-    # vote：进入某方法前 top_k 记 1 票，票数相同再用平均百分位打破平局
-    votes, avg = None, None
-    for v in pr.values():
-        rk = v.rank(axis=1, ascending=False, method="first")
-        hit = (rk <= top_k).astype(np.float32)
-        votes = hit if votes is None else votes.add(hit, fill_value=0.0)
-        avg = v if avg is None else avg.add(v, fill_value=0.0)
-    out = votes + (avg / len(pr)) * 0.5      # 票数为主，百分位破平局
-    return out.where(elig & (votes >= 2))    # 至少两个方法同时看好
-
-
-TREND_SET = ["趋势动量", "动量+放量", "周线MACD多头", "周线均线多头",
-             "创20周新高", "创52周新高"]
-
-
-def add_combined(methods: Dict[str, pd.DataFrame], elig: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """把合成方法加进方法表，让它们走完全相同的检验流程。"""
-    have = [n for n in TREND_SET if n in methods]
-    if len(have) >= 2:
-        methods["【合成】趋势类平均"] = combine_methods(methods, elig, have, "average")
-        methods["【合成】趋势类投票≥2"] = combine_methods(methods, elig, have, "vote", 20)
-        methods["【合成】投票≥2(前50)"] = combine_methods(methods, elig, have, "vote", 50)
-        core = [n for n in ("趋势动量", "创20周新高", "周线MACD多头") if n in methods]
-        if len(core) == 3:
-            methods["【合成】三核心平均"] = combine_methods(methods, elig, core, "average")
-    return methods
-
-
-# ======================================================================
-# 七、逐笔独立回测 —— 没有组合概念，每只选出的股票各自跟踪
-# ======================================================================
-def pick_weekly(score: pd.DataFrame, elig: pd.DataFrame,
-                rebal: List[pd.Timestamp], top_n: int = 3,
-                rank_from: int = 1) -> pd.DataFrame:
-    """每个调仓日选出 top_n 只。返回 date / code / rank / score。"""
+    decide &= elig.reindex_like(decide).fillna(False)
+    kd_r = kd.round(2)                                   # 交易软件显示精度
+    cmv = panel["circ_mv"]
+    cal = list(A.index)
     rows = []
-    for d in rebal:
-        if d not in score.index:
+    for i, dt_ in enumerate(cal):
+        sel = decide.iloc[i]
+        if not sel.any():
             continue
-        s = score.loc[d].where(elig.loc[d]).dropna().sort_values(ascending=False)
-        picks = s.index[rank_from - 1: rank_from - 1 + top_n]
-        for r, c in enumerate(picks, rank_from):
-            rows.append({"date": d, "code": c, "rank": r, "score": float(s[c])})
+        codes = sel[sel].index
+        sub = pd.DataFrame({"kd": kd_r.iloc[i].reindex(codes),
+                            "mv": cmv.iloc[i].reindex(codes)}).dropna()
+        if not len(sub):
+            continue
+        sub = sub.sort_values(["kd", "mv"], ascending=[False, False])
+        for r, c in enumerate(sub.index[:top_n], 1):
+            rows.append({"date": dt_, "code": c, "rank": r,
+                         "kd": float(sub.loc[c, "kd"]),
+                         "mv": float(sub.loc[c, "mv"])})
     return pd.DataFrame(rows)
 
 
-def track_picks(picks: pd.DataFrame, panel: dict, tp: float = 0.20,
-                sl: float = 0.08, max_days: int = 60,
-                comm: float = 0.0003, stamp: float = 0.0005,
-                slip: float = 0.001) -> pd.DataFrame:
+def track_skdj(picks: pd.DataFrame, panel: dict, n: int, max_days: int = 30,
+               comm: float = 0.0003, stamp: float = 0.0005,
+               slip: float = 0.001) -> pd.DataFrame:
     """
-    每只选出的股票独立跟踪，直到止盈 / 止损 / 超时。互不影响，没有资金约束。
-    次日开盘买入（涨停买不到则放弃这笔）；触发条件按当日收盘判定，次日开盘卖出。
-    收盘判定+次日成交是保守口径：不假设你能在盘中精确摸到止损价。
+    次日开盘买入（涨停买不到则放弃）；日线死叉次日开盘卖出，或满 max_days 超时。
+    同一只股票在前一笔未了结前不重复建仓。
     """
-    cal = panel["adj_close"].index
-    codes = panel["codes"]
-    ci = {c: j for j, c in enumerate(codes)}
-    AC = panel["adj_close"].to_numpy(dtype=np.float64)
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    k, d = skdj(A, H, L, n, 3)
+    DEAD = ((k < d) & (k.shift(1) >= d.shift(1))).to_numpy(dtype=bool)
+
+    cal = A.index
+    ci = {c: j for j, c in enumerate(panel["codes"])}
     AO = panel["adj_open"].to_numpy(dtype=np.float32)
     TRD = panel["tradable"].to_numpy(dtype=bool)
     LU = panel["limit_up_open"].to_numpy(dtype=bool)
     LD = panel["limit_dn_open"].to_numpy(dtype=bool)
-    pos = {d: i for i, d in enumerate(cal)}
-    cost_in = comm + slip
-    cost_out = comm + stamp + slip
+    pos = {dt_: i for i, dt_ in enumerate(cal)}
+    cin, cout = comm + slip, comm + stamp + slip
 
+    busy_until: Dict[str, int] = {}
     out = []
-    for _, p in picks.iterrows():
-        i0 = pos.get(p["date"])
-        j = ci.get(p["code"])
-        if i0 is None or j is None:
-            continue
-        # 次日开盘买入
-        b = i0 + 1
-        while b < len(cal) and (not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j])):
-            b += 1
-            if b - i0 > 5:
-                break
-        if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
-            out.append({**p.to_dict(), "结果": "买不到(涨停/停牌)"})
-            continue
-        entry = float(AO[b, j]) * (1 + cost_in)
-
-        reason, exit_i, exit_px = "持有中", None, None
-        for k in range(b, min(b + max_days, len(cal))):
-            if not TRD[k, j] or not np.isfinite(AC[k, j]):
-                continue
-            r = AC[k, j] / entry - 1.0
-            if r >= tp:
-                reason = "止盈"
-            elif r <= -sl:
-                reason = "止损"
-            elif k - b >= max_days - 1:
-                reason = "超时"
-            if reason != "持有中":
-                e = k + 1                       # 次日开盘卖出
-                while e < len(cal) and (not TRD[e, j] or LD[e, j]
-                                        or not np.isfinite(AO[e, j])):
-                    e += 1
-                    if e - k > 5:
-                        break
-                if e < len(cal) and np.isfinite(AO[e, j]):
-                    exit_i, exit_px = e, float(AO[e, j]) * (1 - cost_out)
-                else:
-                    exit_i, exit_px = k, float(AC[k, j]) * (1 - cost_out)
-                break
-        if reason == "持有中":
-            out.append({**p.to_dict(), "结果": "尚未了结"})
-            continue
-        out.append({**p.to_dict(), "买入日": cal[b], "买入价": entry,
-                    "卖出日": cal[exit_i], "卖出价": exit_px, "结果": reason,
-                    "收益率": exit_px / entry - 1.0, "持有交易日": exit_i - b})
-    return pd.DataFrame(out)
-
-
-def holding_week_table(picks: pd.DataFrame, panel: dict, elig: pd.DataFrame,
-                       weeks: int = 12, comm: float = 0.0003, stamp: float = 0.0005,
-                       slip: float = 0.001) -> pd.DataFrame:
-    """
-    不设止盈止损，纯看「选出后持有到第 N 周」的表现。
-
-    关键：必须同时给出「同期股票池等权收益」和两者之差。
-    2018-2026 池子本身在涨，持有任何股票 9 周都会有正的平均收益——
-    只看绝对收益无法区分「选股能力」和「池子自己涨」。超额才是选股能力。
-
-    t 值按选出周聚类：同一周选出的 3 只共享当周大盘涨跌，不是独立样本。
-    """
-    cal = panel["adj_close"].index
-    ci = {c: j for j, c in enumerate(panel["codes"])}
-    AC = panel["adj_close"].to_numpy(dtype=np.float64)
-    AO = panel["adj_open"].to_numpy(dtype=np.float32)
-    TRD = panel["tradable"].to_numpy(dtype=bool)
-    LU = panel["limit_up_open"].to_numpy(dtype=bool)
-    EL = elig.reindex(index=cal, columns=panel["codes"]).fillna(False).to_numpy(dtype=bool)
-    pos = {d: i for i, d in enumerate(cal)}
-    rt = (comm + slip) + (comm + stamp + slip)
-
-    # 每个选出日、每个持有期的「池内等权收益」——基准
-    bench_cache: Dict[tuple, float] = {}
-
-    def bench(i0: int, w: int) -> float:
-        key = (i0, w)
-        if key in bench_cache:
-            return bench_cache[key]
-        b0, b1 = i0 + 1, i0 + 1 + 5 * w
-        if b1 >= len(cal):
-            bench_cache[key] = np.nan
-            return np.nan
-        m = EL[i0] & TRD[b0] & TRD[b1]
-        if m.sum() < 20:
-            bench_cache[key] = np.nan
-            return np.nan
-        v = float(np.nanmean(AC[b1, m] / AC[b0, m] - 1.0))
-        bench_cache[key] = v
-        return v
-
-    acc = {w: [] for w in range(1, weeks + 1)}
-    for _, p in picks.iterrows():
+    for _, p in picks.sort_values("date").iterrows():
         i0 = pos.get(p["date"]); j = ci.get(p["code"])
         if i0 is None or j is None:
             continue
+        if busy_until.get(p["code"], -1) > i0:          # 前一笔还没了结
+            continue
         b = i0 + 1
         if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
             continue
-        entry = float(AO[b, j])
-        for w in range(1, weeks + 1):
-            k = b + 5 * w
-            if k >= len(cal) or not np.isfinite(AC[k, j]):
-                continue
-            bm = bench(i0, w)
-            if not np.isfinite(bm):
-                continue
-            r = AC[k, j] / entry - 1.0 - rt
-            acc[w].append((p["date"], r, r - bm, bm))
+        entry = float(AO[b, j]) * (1 + cin)
 
+        reason, ex = "尚未了结", None
+        for t in range(b, min(b + max_days, len(cal))):
+            if DEAD[t, j] and t > b:
+                reason = "死叉"
+            elif t - b >= max_days - 1:
+                reason = "超时"
+            if reason != "尚未了结":
+                e = t + 1
+                while e < len(cal) and (not TRD[e, j] or LD[e, j]
+                                        or not np.isfinite(AO[e, j])):
+                    e += 1
+                    if e - t > 5:
+                        break
+                ex = e if e < len(cal) and np.isfinite(AO[e, j]) else None
+                break
+        if ex is None:
+            continue
+        exit_px = float(AO[ex, j]) * (1 - cout)
+        busy_until[p["code"]] = ex
+        out.append({"date": p["date"], "code": p["code"], "rank": p["rank"],
+                    "kd": p["kd"], "买入日": cal[b], "买入价": entry,
+                    "卖出日": cal[ex], "卖出价": exit_px, "结果": reason,
+                    "收益率": exit_px / entry - 1.0, "持有交易日": ex - b})
+    return pd.DataFrame(out)
+
+
+def random_control(panel: dict, elig: pd.DataFrame, dates, top_n: int = 3,
+                   seed: int = 20260909) -> pd.DataFrame:
+    """随机对照：同样每天选 top_n 只，纯随机。任何方法必须显著优于它。"""
+    rng = np.random.default_rng(seed)
     rows = []
-    for w in range(1, weeks + 1):
-        if len(acc[w]) < 20:
+    for dt_ in dates:
+        if dt_ not in elig.index:
             continue
-        df = pd.DataFrame(acc[w], columns=["date", "ret", "ex", "bm"])
-        wk = df.groupby("date")["ex"].mean().sort_index()     # 按周聚类
-        se = wk.std(ddof=1) / np.sqrt(len(wk)) if len(wk) > 2 else np.nan
-        t_cl = newey_west_t(wk, lag=max(1, w))                 # 重叠持有期 -> HAC
-        rows.append({"第N周": w, "样本数": len(df),
-                     "平均收益率": df["ret"].mean(), "中位收益率": df["ret"].median(),
-                     "池均值(基准)": df["bm"].mean(),
-                     "超额": df["ex"].mean(), "超额中位": df["ex"].median(),
-                     "跑赢池比例": float((df["ex"] > 0).mean()),
-                     "胜率(绝对)": float((df["ret"] > 0).mean()),
-                     "超额t(聚类)": t_cl})
-    return pd.DataFrame(rows).set_index("第N周")
-
-
-def summarize_trades(tr: pd.DataFrame) -> dict:
-    """
-    t 值必须按周聚类。同一周选出的 3 只共享当周的大盘涨跌，不是独立样本；
-    而且平均持有 2-3 周，相邻周的持仓在时间上重叠。直接拿 1284 笔算 t，
-    等于假装有 1284 个独立观测，会把显著性放大一倍以上。
-    做法：先按选出日取周内均值，再对这条周序列做 Newey-West 修正。
-    """
-    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
-    if not len(d):
-        return {}
-    n = len(d)
-    win = d[d["收益率"] > 0]["收益率"]
-    los = d[d["收益率"] <= 0]["收益率"]
-    se_naive = d["收益率"].std(ddof=1) / np.sqrt(n)
-    t_naive = d["收益率"].mean() / se_naive if se_naive > 1e-12 else np.nan
-
-    wk = d.groupby("date")["收益率"].mean().sort_index()
-    hold_w = d["持有交易日"].mean() / 5.0
-    t_cl = newey_west_t(wk, lag=max(1, int(round(hold_w))))
-    return {"笔数": n, "周数": len(wk), "平均收益": d["收益率"].mean(),
-            "中位收益": d["收益率"].median(), "胜率": len(win) / n,
-            "盈亏比": (win.mean() / abs(los.mean())) if len(los) and abs(los.mean()) > 1e-9 else np.nan,
-            "t值(朴素)": t_naive, "t值(按周聚类)": t_cl,
-            "平均持有周": hold_w,
-            "止盈": (d["结果"] == "止盈").mean(), "止损": (d["结果"] == "止损").mean(),
-            "超时": (d["结果"] == "超时").mean()}
-
-
-def tp_sl_grid(picks: pd.DataFrame, panel: dict, tps, sls, max_days: int,
-               progress=None, **kw) -> tuple:
-    """
-    止盈 × 止损 网格。
-    止损设在正常波动之内，被扫出局的就是噪音不是判断错误；设得太宽又拿不住。
-    这个网格用数据找出该设在哪，而不是拍脑袋。返回 (平均收益表, 聚类t值表)。
-    """
-    mean_g, t_g = {}, {}
-    tot = len(tps) * len(sls)
-    k = 0
-    for sl in sls:
-        mrow, trow = {}, {}
-        for tp in tps:
-            tr = track_picks(picks, panel, tp, sl, max_days, **kw)
-            s = summarize_trades(tr)
-            mrow[f"止盈{tp:.0%}"] = s.get("平均收益", np.nan)
-            trow[f"止盈{tp:.0%}"] = s.get("t值(按周聚类)", np.nan)
-            k += 1
-            if progress:
-                progress(k / tot, f"止损{sl:.0%} 止盈{tp:.0%}")
-        mean_g[f"止损{sl:.0%}"] = mrow
-        t_g[f"止损{sl:.0%}"] = trow
-    return pd.DataFrame(mean_g).T, pd.DataFrame(t_g).T
-
-
-def split_summary(tr: pd.DataFrame, cut: str = "2023-01-01") -> pd.DataFrame:
-    """样本内 / 样本外 分开看。全样本好而样本外垮，是最常见的自欺方式。"""
-    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
-    if not len(d):
-        return pd.DataFrame()
-    cut = pd.Timestamp(cut)
-    out = {}
-    for lab, seg in (("样本内", d[d["date"] < cut]), ("样本外", d[d["date"] >= cut])):
-        if len(seg) < 30:
+        c = elig.loc[dt_]
+        c = c[c].index
+        if len(c) < top_n:
             continue
-        out[lab] = summarize_trades(seg)
-    return pd.DataFrame(out).T
+        for r, code in enumerate(rng.choice(c, top_n, replace=False), 1):
+            rows.append({"date": dt_, "code": code, "rank": r, "kd": np.nan, "mv": np.nan})
+    return pd.DataFrame(rows)
 
 
-def yearly_summary(tr: pd.DataFrame) -> pd.DataFrame:
-    """
-    逐年表现。一个真实的效应应该多数年份同号；靠单独一年撑起来的
-    平均值，只是那一年的行情，不是可重复的能力。
-    """
-    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
-    if not len(d):
-        return pd.DataFrame()
-    rows = {}
-    for y, g in d.groupby(d["date"].dt.year):
-        if len(g) < 20:
-            continue
-        wk = g.groupby("date")["收益率"].mean().sort_index()
-        se = wk.std(ddof=1) / np.sqrt(len(wk)) if len(wk) > 2 else np.nan
-        rows[y] = {"笔数": len(g), "平均收益": g["收益率"].mean(),
-                   "中位收益": g["收益率"].median(),
-                   "胜率": (g["收益率"] > 0).mean(),
-                   "t值": wk.mean() / se if se and se > 1e-12 else np.nan}
-    return pd.DataFrame(rows).T
-
-
-def profit_concentration(tr: pd.DataFrame, ks=(1, 3, 5, 10, 20)) -> pd.DataFrame:
-    """
-    利润集中度。如果总利润的绝大部分来自极少数几笔，那不是策略是彩票——
-    你无法指望下一段时间还能碰上那几笔。
-    """
-    d = tr.dropna(subset=["收益率"]) if "收益率" in tr.columns else pd.DataFrame()
-    if len(d) < 30:
-        return pd.DataFrame()
-    v = d["收益率"].sort_values(ascending=False).to_numpy()
-    tot = v.sum()
-    rows = []
-    for k in ks:
-        if k >= len(v):
-            continue
-        rows.append({"最赚的前N笔": k, "占总利润": v[:k].sum() / tot if abs(tot) > 1e-12 else np.nan,
-                     "剔除后单笔均值": v[k:].mean()})
-    out = pd.DataFrame(rows).set_index("最赚的前N笔")
-    out.attrs["原均值"] = float(v.mean())
-    out.attrs["总笔数"] = int(len(v))
-    return out
+def empty_weeks_per_year(picks: pd.DataFrame, cal: pd.DatetimeIndex,
+                         warmup: int = 130) -> pd.Series:
+    """整周一只都没选出来的周数，按年汇总。"""
+    c = cal[warmup:]
+    allw = pd.Series(1, index=c).resample("W-FRI").size()
+    if not len(picks):
+        return pd.Series(len(allw), index=[c[0].year])
+    hit = picks.groupby(pd.to_datetime(picks["date"])).size().resample("W-FRI").size()
+    hit = hit.reindex(allw.index, fill_value=0)
+    empty = (hit == 0)
+    return empty.groupby(empty.index.year).sum()
 
 
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
@@ -1218,254 +966,46 @@ def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
 
 
 # ======================================================================
-# 九、日线起涨点识别 —— 事件型信号，触发当日入选
+# 界面 —— 一页，一个按钮
 # ======================================================================
-def _cross_up(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
-    return (a > b) & (a.shift(1) <= b.shift(1))
+def _stats(tr: pd.DataFrame) -> dict:
+    """按日聚类的 t 值：同一天选出的几只共享当天大盘涨跌，不是独立样本。"""
+    d = tr.dropna(subset=["收益率"]) if len(tr) and "收益率" in tr.columns else pd.DataFrame()
+    if len(d) < 30:
+        return {}
+    w = d[d["收益率"] > 0]["收益率"]
+    l = d[d["收益率"] <= 0]["收益率"]
+    day = d.groupby("date")["收益率"].mean().sort_index()
+    hold = d["持有交易日"].mean()
+    return {"笔数": len(d), "平均收益": d["收益率"].mean(), "中位收益": d["收益率"].median(),
+            "胜率": len(w) / len(d),
+            "盈亏比": (w.mean() / abs(l.mean())) if len(l) and abs(l.mean()) > 1e-9 else np.nan,
+            "聚类t": newey_west_t(day, lag=max(1, int(round(hold)))),
+            "平均持有日": hold, "死叉退出": (d["结果"] == "死叉").mean()}
 
 
-def build_daily_methods(panel: dict, elig: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """
-    每个方法返回日频打分表：**只在信号触发当日**给分，其余为 NaN。
-    分数用于同日多只触发时排序，越高越优先。
-
-    与之前周线方法的根本区别：这些是"状态转变"的事件，不是持续排名。
-    起涨点本质是一次性的，不该每天重复推荐同一只股票。
-    """
-    A = panel["adj_close"]
-    H, L = panel["adj_high"], panel["adj_low"]
-    AMT = panel["amount"]
-    out: Dict[str, pd.DataFrame] = {}
-
-    ma5, ma10, ma20, ma60 = (A.rolling(n).mean() for n in (5, 10, 20, 60))
-    ret = A.pct_change()
-    vol20 = ret.rolling(20).std()
-    vol60 = ret.rolling(60).std()
-    amt20 = AMT.rolling(20).mean()
-    vr = AMT / amt20.where(amt20 > 1e-9)                    # 量比
-    hh20, hh60 = A.rolling(20).max(), A.rolling(60).max()
-    up_days = (ret > 0).rolling(20).sum() / 20.0            # 20日内收阳占比
-
-    # --- 1. 放量突破20日新高 ---
-    brk20 = (A >= hh20.shift(1)) & (vr > 1.5) & (A > ma20)
-    out["日线-放量破20日高"] = (vr * (A / ma20 - 1.0)).where(brk20)
-
-    # --- 2. 放量突破60日新高（更强的确认）---
-    brk60 = (A >= hh60.shift(1)) & (vr > 1.5) & (A > ma20)
-    out["日线-放量破60日高"] = (vr * (A / ma60 - 1.0)).where(brk60)
-
-    # --- 3. 波动率压缩后启动（squeeze）---
-    # 20日波动率处于过去120日的低位 → 能量积蓄；随后放量突破 → 释放
-    vq = vol20.rolling(120).rank(pct=True)
-    sq = (vq < 0.25) & (A >= hh20.shift(1)) & (vr > 1.3)
-    out["日线-波动压缩后突破"] = ((1.0 - vq) * vr).where(sq)
-
-    # --- 4. 均线金叉（MA5上穿MA20，且MA20向上）---
-    gc = _cross_up(ma5, ma20) & (ma20 > ma20.shift(5)) & (A > ma60)
-    out["日线-均线金叉"] = (vr * (ma20 / ma20.shift(20) - 1.0)).where(gc)
-
-    # --- 5. 日线MACD零轴上金叉 ---
-    dif = _ema(A, 12) - _ema(A, 26)
-    dea = _ema(dif, 9)
-    mgc = _cross_up(dif, dea) & (dif > 0)
-    out["日线-MACD零上金叉"] = ((dif - dea) / A.abs().where(A.abs() > 1e-9) * vr).where(mgc)
-
-    # --- 6. 回踩企稳：上升趋势中回调后重新走强 ---
-    dd = A / hh60 - 1.0                                     # 距60日高点
-    pull = (A > ma20) & (ma20 > ma60) & (dd.shift(3) < -0.05) & (dd.shift(3) > -0.20) \
-           & (ret > 0) & (ret.shift(1) > 0) & (ret.shift(2) > 0)
-    out["日线-回踩企稳"] = (vr * (-dd.shift(3))).where(pull)
-
-    # --- 7. 动量加速（二阶量）---
-    m20 = A / A.shift(20) - 1.0
-    m60 = A / A.shift(60) - 1.0
-    acc = (m20 > m60 / 3.0 * 1.5) & (m20 > 0) & (m60 > 0) & (A > ma20)
-    out["日线-动量加速"] = (m20 - m60 / 3.0).where(acc)
-
-    # --- 8. 低波动 + 正动量（低波动异象）---
-    lv = (vol60.rank(axis=1, pct=True) < 0.4) & (m60 > 0) & (A > ma20) & _cross_up(A, ma20)
-    out["日线-低波动启动"] = (m60 / vol60.where(vol60 > 1e-9)).where(lv)
-
-    # --- 9. 连续强势启动：3连阳且累计涨幅可观 ---
-    r3 = A / A.shift(3) - 1.0
-    st3 = (ret > 0) & (ret.shift(1) > 0) & (ret.shift(2) > 0) & (r3 > 0.05) \
-          & (A > ma20) & (up_days > 0.5)
-    out["日线-三连阳启动"] = (r3 * vr).where(st3)
-
-    # --- 10. 首板跟进（A股特有）：出现涨停且此前20日无涨停 ---
-    lim = pd.Series([0.195 if (c.startswith("30") or c.startswith("688")) else 0.095
-                     for c in A.columns], index=A.columns)
-    up_lim = ret.ge(lim, axis=1)
-    first = up_lim & (up_lim.rolling(20).sum().shift(1) == 0) & (A > ma20)
-    out["日线-首板跟进"] = (vr * (A / ma20 - 1.0)).where(first)
-
-    # --- 对照组：每日随机选。任何方法必须显著优于它才算有东西。---
-    rng = np.random.default_rng(20260909)
-    rnd = pd.DataFrame(rng.random(A.shape), index=A.index, columns=A.columns)
-    out["【对照】每日随机"] = rnd
-
-    return {k: v.where(elig) for k, v in out.items()}
-
-
-# 在纯随机游走数据上实测：10 个日线方法里最大聚类 t 达到 2.54。
-# 也就是说，测的方法越多，最大 t 就越容易偶然冲高。日线方法数量多，
-# 门槛必须比单一检验的 2.0 更严。
-DAILY_T_THRESHOLD = 3.0
-
-
-def daily_rebal_dates(cal: pd.DatetimeIndex, warmup: int = 130) -> List[pd.Timestamp]:
-    """每个交易日都扫描。前 warmup 天是指标预热期。"""
-    return list(cal[warmup:])
-
-
-def pick_daily(score: pd.DataFrame, elig: pd.DataFrame, dates: List[pd.Timestamp],
-               top_n: int = 3, cooldown: int = 10) -> pd.DataFrame:
-    """
-    每日扫描触发的股票，取分数最高的 top_n。
-
-    cooldown：同一只股票在 N 个交易日内不重复入选。
-    起涨信号常常连续几天都成立，不加冷却会把同一只票买 5 遍，
-    看起来交易很多，其实是同一个赌注重复下注，会严重高估样本量。
-    """
-    cal = list(score.index)
-    pos = {d: i for i, d in enumerate(cal)}
-    last: Dict[str, int] = {}
-    rows = []
-    for d in dates:
-        i = pos.get(d)
-        if i is None:
-            continue
-        s = score.loc[d].where(elig.loc[d]).dropna().sort_values(ascending=False)
-        taken = 0
-        for c in s.index:
-            if taken >= top_n:
-                break
-            if c in last and i - last[c] < cooldown:
-                continue
-            rows.append({"date": d, "code": c, "rank": taken + 1, "score": float(s[c])})
-            last[c] = i
-            taken += 1
-    return pd.DataFrame(rows)
-
-
-def holding_day_table(picks: pd.DataFrame, panel: dict, elig: pd.DataFrame,
-                      days=(1, 2, 3, 5, 8, 10, 15, 20, 25, 30, 40, 60),
-                      comm: float = 0.0003, stamp: float = 0.0005,
-                      slip: float = 0.001) -> pd.DataFrame:
-    """按持有天数（不是周）看表现，含池均值基准与按日聚类的 t。"""
-    cal = panel["adj_close"].index
-    ci = {c: j for j, c in enumerate(panel["codes"])}
-    AC = panel["adj_close"].to_numpy(dtype=np.float64)
-    AO = panel["adj_open"].to_numpy(dtype=np.float32)
-    TRD = panel["tradable"].to_numpy(dtype=bool)
-    LU = panel["limit_up_open"].to_numpy(dtype=bool)
-    EL = elig.reindex(index=cal, columns=panel["codes"]).fillna(False).to_numpy(dtype=bool)
-    pos = {d: i for i, d in enumerate(cal)}
-    rt = (comm + slip) + (comm + stamp + slip)
-    bc: Dict[tuple, float] = {}
-
-    def bench(i0: int, h: int) -> float:
-        key = (i0, h)
-        if key in bc:
-            return bc[key]
-        b0, b1 = i0 + 1, i0 + 1 + h
-        if b1 >= len(cal):
-            bc[key] = np.nan
-            return np.nan
-        m = EL[i0] & TRD[b0] & TRD[b1]
-        bc[key] = float(np.nanmean(AC[b1, m] / AC[b0, m] - 1.0)) if m.sum() >= 20 else np.nan
-        return bc[key]
-
-    acc = {h: [] for h in days}
-    for _, p in picks.iterrows():
-        i0 = pos.get(p["date"]); j = ci.get(p["code"])
-        if i0 is None or j is None:
-            continue
-        b = i0 + 1
-        if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
-            continue
-        entry = float(AO[b, j])
-        for h in days:
-            k = b + h
-            if k >= len(cal) or not np.isfinite(AC[k, j]):
-                continue
-            bm = bench(i0, h)
-            if not np.isfinite(bm):
-                continue
-            r = AC[k, j] / entry - 1.0 - rt
-            acc[h].append((p["date"], r, r - bm, bm))
-
-    rows = []
-    for h in days:
-        if len(acc[h]) < 30:
-            continue
-        df = pd.DataFrame(acc[h], columns=["date", "ret", "ex", "bm"])
-        dd = df.groupby("date")["ex"].mean().sort_index()
-        rows.append({"持有天数": h, "样本数": len(df),
-                     "平均收益率": df["ret"].mean(), "中位收益率": df["ret"].median(),
-                     "池均值(基准)": df["bm"].mean(), "超额": df["ex"].mean(),
-                     "跑赢池比例": float((df["ex"] > 0).mean()),
-                     "胜率(绝对)": float((df["ret"] > 0).mean()),
-                     "超额t(聚类)": newey_west_t(dd, lag=max(1, h))})
-    return pd.DataFrame(rows).set_index("持有天数")
-
-
-def empty_week_from_picks(picks: pd.DataFrame, cal: pd.DatetimeIndex,
-                          warmup: int = 130) -> pd.Series:
-    """按自然周统计：整周一只都没选出来的周数（按年汇总）。"""
-    if not len(picks):
-        return pd.Series(dtype=int)
-    c = cal[warmup:]
-    allw = pd.Series(1, index=c).resample("W-FRI").size()
-    hit = picks.groupby(pd.to_datetime(picks["date"])).size().resample("W-FRI").size()
-    hit = hit.reindex(allw.index, fill_value=0)
-    empty = (hit == 0)
-    return empty.groupby(empty.index.year).sum()
-
-
-# ======================================================================
-# 八、界面
-# ======================================================================
 def main():
-    st.set_page_config(page_title="每周选股", layout="wide")
+    st.set_page_config(page_title="SKDJ 选股验证", layout="wide")
     ss = st.session_state
     ss.setdefault("panel", None)
-    st.title("每周选股")
-    st.caption("科技/军工/新能源/机器人　·　流通市值 50-1000 亿　·　股价 10 元以上　·　每周末选 3 只")
+    st.title("SKDJ 选股")
+    st.caption("日线金叉(K<25) → 加速确认 → 周线形态过滤 → 死叉卖出")
 
     with st.sidebar:
-        st.header("① 数据")
         token = st.text_input("Tushare Token", type="password",
                               value=os.environ.get("TUSHARE_TOKEN", ""))
-        with st.expander("下载范围"):
-            start = st.date_input("起始", dt.date(2018, 1, 1))
-            end = st.date_input("结束", dt.date.today())
-            workers = st.slider("并发线程", 1, 8, 4)
-            per_min = st.slider("每分钟请求上限", 60, 800, 400, 20)
-        run = st.button("下载数据", type="primary", use_container_width=True)
-
-        st.header("② 选股模式")
-        mode = st.radio("模式", ["日线起涨点", "周线排名"], index=0,
-                        help="日线起涨点：每天扫描全池，找刚开始上涨的股票，做一波日线级别的浪。"
-                             "周线排名：每周五按因子排名取前N名。")
-        st.header("③ 交易规则")
-        tp = st.slider("止盈 (%)", 5, 60, 20) / 100.0
-        sl = st.slider("止损 (%)", 3, 30, 8) / 100.0
-        if mode == "日线起涨点":
-            maxd_in = st.slider("超时卖出 (交易日)", 5, 60, 30)
-            cooldown = st.slider("同股冷却 (交易日)", 0, 30, 10,
-                                 help="起涨信号常连续几天成立。不加冷却会把同一只买好几遍，"
-                                      "看似交易多，其实是同一个赌注重复下注，会高估样本量。")
-            maxw = maxd_in / 5.0
-        else:
-            maxw = st.slider("超时卖出 (周)", 4, 26, 12)
-            maxd_in, cooldown = int(maxw * 5), 0
-        top_n = st.slider("每周选几只", 1, 5, 3)
-        with st.expander("成本"):
+        top_n = st.slider("每天选几只", 1, 5, 3)
+        maxd = st.slider("超时卖出(交易日)", 10, 60, 30)
+        with st.expander("其他设置"):
+            start = st.date_input("数据起始", dt.date(2018, 1, 1))
+            end = st.date_input("数据结束", dt.date.today())
+            k_max = st.slider("金叉时 K 的上限", 10, 50, 25)
             comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
             slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
+            workers = st.slider("下载并发", 1, 8, 4)
+        run = st.button("下载数据", type="primary", use_container_width=True)
         if ss.get("panel") is not None:
-            st.success(f"已加载 {len(ss['panel']['codes'])} 只 × {len(ss['panel']['cal'])} 日")
+            st.success(f"{len(ss['panel']['codes'])} 只 × {len(ss['panel']['cal'])} 日")
 
     if run:
         if not token:
@@ -1475,12 +1015,12 @@ def main():
         except ImportError:
             st.error("未安装 tushare：pip install tushare"); st.stop()
         ts.set_token(token); pro = ts.pro_api(token)
-        lim = Limiter(per_min); API_ERRORS.clear()
-        for k in ("panel", "factors", "methods", "cmp"):
-            ss.pop(k, None)
+        lim = Limiter(400); API_ERRORS.clear()
+        for kk in ("panel", "res"):
+            ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
-        with st.status("准备中…", expanded=True) as stt:
+        with st.status("下载中…", expanded=True) as stt:
             st.write("取行业成分股…")
             uni = fetch_universe(pro, lim, SW_L1_DEFAULT, SW_L2_DEFAULT)
             if not len(uni):
@@ -1489,321 +1029,139 @@ def main():
             basic = fetch_stock_basic(pro, lim)
             st.write("市值预筛…")
             codes = prescreen_by_mv(pro, lim, list(uni["ts_code"]), s_str, e_str, 50, 1000)
-            st.write(f"下载 {len(codes)} 只行情…")
+            st.write(f"下载 {len(codes)} 只…")
             bar = st.progress(0.0); t0 = time.time()
             px = download_all(token, codes, s_str, e_str, lim, True, workers,
-                              lambda dn, tt, ok: bar.progress(dn / tt,
-                                  text=f"{dn}/{tt}　{(time.time()-t0)/60:.1f} 分"))
+                              lambda a, b, c: bar.progress(a / b,
+                                  text=f"{a}/{b}　{(time.time()-t0)/60:.1f} 分"))
             if not px:
-                st.error("没下到数据，检查 Token 与积分。"); st.stop()
-            st.write("计算指标…")
+                st.error("没下到数据。"); st.stop()
             panel = build_panel(px); px.clear(); del px; gc.collect()
             ss["panel"], ss["basic"], ss["uni"] = panel, basic, uni
-            ss["factors"] = compute_factors(panel["adj_close"], panel["amount"],
-                                            circ_mv=panel["circ_mv"])
-            stt.update(label=f"完成，耗时 {(time.time()-t0)/60:.1f} 分钟", state="complete")
+            stt.update(label=f"完成，{(time.time()-t0)/60:.1f} 分钟", state="complete")
 
     if ss.get("panel") is None:
-        st.info("左侧填 Token 后点「下载数据」。首次约 5-15 分钟，之后走本地缓存。"); st.stop()
+        st.info("左侧填 Token 后点「下载数据」。首次 5-15 分钟，之后走缓存。"); st.stop()
 
-    panel, basic, uni, factors = ss["panel"], ss["basic"], ss["uni"], ss["factors"]
+    panel, basic, uni = ss["panel"], ss["basic"], ss["uni"]
     elig = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
-    mkey = f"methods_{mode}"
-    if ss.get(mkey) is None:
-        with st.spinner("构建选股方法…"):
-            ss[mkey] = (build_daily_methods(panel, elig) if mode == "日线起涨点"
-                        else add_combined(build_methods(panel, factors, elig), elig))
-    methods = ss[mkey]
-    daily_mode = (mode == "日线起涨点")
-    rebal = (daily_rebal_dates(panel["cal"]) if daily_mode
-             else weekly_rebal_dates(panel["cal"]))
-    maxd = int(maxd_in)
-    T_BAR = DAILY_T_THRESHOLD if daily_mode else 2.0
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
 
-    t1, t2, t3 = st.tabs(["方法对比", "本周选股", "逐笔明细"])
+    tab1, tab2 = st.tabs(["回测结果", "今日候选"])
 
-    # ---------------- 方法对比 ----------------
-    with t1:
-        with st.expander("方法之间有多相关？（决定合成有没有用）", expanded=not daily_mode):
-            if st.button("算相关性矩阵"):
-                with st.spinner("计算中…"):
-                    ss["mcorr"] = method_corr_matrix(
-                        {k: v for k, v in methods.items() if not k.startswith("【合成】")},
-                        elig, rebal)
-            if ss.get("mcorr") is not None and len(ss["mcorr"]):
-                mc = ss["mcorr"]
-                st.dataframe(mc.style.format("{:.2f}")
-                             .background_gradient(cmap="coolwarm", vmin=-1, vmax=1),
-                             use_container_width=True)
-                tr_ = [n for n in TREND_SET if n in mc.index]
-                if len(tr_) >= 2:
-                    sub = mc.loc[tr_, tr_].to_numpy()
-                    rho = (sub.sum() - len(tr_)) / (len(tr_) ** 2 - len(tr_))
-                    N = len(tr_)
-                    gain = np.sqrt(N / (1 + (N - 1) * rho)) if rho > -1 / (N - 1) else np.nan
-                    st.info(f"趋势类方法之间的平均相关性 **ρ={rho:.2f}**。"
-                            f"合成 {N} 个的理论强度提升是 √(N/(1+(N-1)ρ)) = **{gain:.2f} 倍**。\n\n"
-                            f"也就是说，最好的单方法 t=1.91 合成后大约到 **{1.91*gain:.2f}**。"
-                            "ρ 越接近 1，合成越没用——因为它们说的其实是同一件事。")
-
-        st.markdown("**先看哪个方法有效。** 每个方法都按同样规则跑：每周末选 "
-                    f"{top_n} 只，次日开盘买入，止盈 {tp:.0%} / 止损 {sl:.0%} / "
-                    f"{maxw} 周超时，含成本。")
-        if st.button("跑全部方法", type="primary"):
-            bar = st.progress(0.0)
-            res = {}
-            for n, (nm, sc) in enumerate(methods.items()):
-                pk = (pick_daily(sc, elig, rebal, top_n, cooldown) if daily_mode
-                      else pick_weekly(sc, elig, rebal, top_n))
-                if len(pk) < 30:
-                    bar.progress((n + 1) / len(methods), text=nm); continue
-                tr = track_picks(pk, panel, tp, sl, maxd, **kw)
-                wt = (holding_day_table(pk, panel, elig, **kw) if daily_mode
-                      else holding_week_table(pk, panel, elig, 12, **kw))
-                sm = summarize_trades(tr)
-                if daily_mode:
-                    ew = empty_week_from_picks(pk, panel["cal"])
-                    empty = float(ew.mean()) / 52.0 if len(ew) else 0.0
-                else:
-                    empty = 1.0 - pk.date.nunique() / max(1, len(rebal))
-                res[nm] = {"pk": pk, "tr": tr, "wt": wt, "sm": sm, "empty": empty}
-                bar.progress((n + 1) / len(methods), text=nm)
-            ss["cmp"] = res; bar.empty()
-
-        if ss.get("cmp"):
-            res = ss["cmp"]
-            rows = []
-            for nm, r in res.items():
-                s = r["sm"]
+    with tab1:
+        st.markdown(f"一次跑完 **2 种 N × 3 个买入时点 × 3 种周线过滤 = 18 个组合**，"
+                    f"外加随机对照组。全部用同一套规则：每天选 {top_n} 只，"
+                    f"次日开盘买，死叉次日开盘卖，{maxd} 日超时。")
+        if st.button("运行全部组合", type="primary", use_container_width=True):
+            combos = [(n, bm, wf) for n in (6, 9) for bm in BUY_MODES for wf in WK_FILTERS]
+            bar = st.progress(0.0); rows = []; keep = {}
+            for i, (n, bm, wf) in enumerate(combos):
+                pk = skdj_picks(panel, elig, n, bm, wf, k_max, top_n)
+                tr = track_skdj(pk, panel, n, maxd, **kw) if len(pk) else pd.DataFrame()
+                s = _stats(tr)
+                bar.progress((i + 1) / (len(combos) + 1), text=f"N={n} {bm} {wf}")
                 if not s:
                     continue
-                rows.append({"方法": nm, "笔数": s["笔数"], "平均收益": s["平均收益"],
-                             "胜率": s["胜率"], "盈亏比": s["盈亏比"],
-                             "t值(朴素)": s["t值(朴素)"], "t值(按周聚类)": s["t值(按周聚类)"],
-                             "平均持有周": s["平均持有周"], "止损率": s["止损"],
-                             "空窗周占比": r["empty"]})
-            cm = pd.DataFrame(rows).set_index("方法").sort_values("t值(按周聚类)", ascending=False)
-            st.dataframe(cm.style.format({"平均收益": "{:+.2%}", "胜率": "{:.1%}",
-                                          "盈亏比": "{:.2f}", "t值(朴素)": "{:.2f}",
-                                          "t值(按周聚类)": "{:.2f}", "平均持有周": "{:.1f}",
-                                          "止损率": "{:.0%}", "空窗周占比": "{:.1%}"}, na_rep="—")
-                           .background_gradient(subset=["t值(按周聚类)"], cmap="RdYlGn",
-                                                vmin=-3, vmax=3),
-                         use_container_width=True)
-            st.warning(
-                "**看「t值(按周聚类)」，不要看朴素 t。** 同一周选出的 3 只共享当周大盘涨跌，"
-                "不是独立样本；平均持有 2-3 周，相邻周的持仓还在时间上重叠。"
-                "拿一千多笔当独立观测算 t，会把显著性放大一倍以上——"
-                "我在完全没有选股能力的模拟数据上测过：朴素 t=1.95，聚类后只剩 0.91。")
-            if daily_mode and "【对照】每日随机" in cm.index:
-                ct = cm.loc["【对照】每日随机", "t值(按周聚类)"]
-                st.error(f"**先看随机对照组：t={ct:.2f}。** 任何方法必须显著高于它才算有东西。"
-                         "在纯噪音数据上我实测过，11 个方法里最好的 t=2.54，"
-                         f"而随机对照组 t=2.46——几乎一样，说明那个『最优』完全是噪音。"
-                         f"\n\n日线模式测了 {len(cm)} 个方法，多重比较会把最大 t 抬高，"
-                         f"所以门槛提到 **{T_BAR:.1f}**，不是 2.0。")
-            ok = cm[(cm["t值(按周聚类)"] >= T_BAR) & (cm["空窗周占比"] <= 5 / 52)]
+                ew = empty_weeks_per_year(pk, panel["cal"])
+                rows.append({"N": n, "买入时点": bm, "周线过滤": wf, **s,
+                             "空窗周/年": float(ew.mean())})
+                keep[f"N{n}|{bm}|{wf}"] = tr
+            rc = random_control(panel, elig, list(panel["cal"][130:]), top_n)
+            trc = track_skdj(rc.assign(kd=np.nan), panel, 9, maxd, **kw)
+            sc = _stats(trc)
+            bar.empty()
+            ss["res"] = (pd.DataFrame(rows), sc, keep)
+
+        if ss.get("res"):
+            df, sc, keep = ss["res"]
+            if sc:
+                st.error(f"**随机对照组：平均收益 {sc['平均收益']:+.2%}，"
+                         f"胜率 {sc['胜率']:.1%}，聚类 t = {sc['聚类t']:.2f}。**　"
+                         "下面任何组合都必须明显超过它才算有东西。")
+            show = df.sort_values("聚类t", ascending=False)
+            st.dataframe(show.style.format(
+                {"平均收益": "{:+.2%}", "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                 "盈亏比": "{:.2f}", "聚类t": "{:.2f}", "平均持有日": "{:.1f}",
+                 "死叉退出": "{:.0%}", "空窗周/年": "{:.1f}"})
+                .background_gradient(subset=["聚类t"], cmap="RdYlGn", vmin=-3, vmax=3),
+                use_container_width=True, height=560, hide_index=True)
+
+            best = show.iloc[0]
+            T_BAR = 3.0
+            ok = show[(show["聚类t"] >= T_BAR) & (show["空窗周/年"] <= 5)]
             if len(ok):
-                st.success(f"**{ok.index[0]}** 通过：聚类 t={ok['t值(按周聚类)'].iloc[0]:.2f}"
-                           f"（门槛 {T_BAR:.1f}），空窗 {ok['空窗周占比'].iloc[0]*52:.0f} 周/年（上限 5）。"
-                           "下一步：看下方的样本内外拆分，样本外也站得住才算数。")
+                b = ok.iloc[0]
+                st.success(f"**通过：N={b['N']}　{b['买入时点']}　{b['周线过滤']}**　"
+                           f"聚类 t={b['聚类t']:.2f}，平均单笔 {b['平均收益']:+.2%}，"
+                           f"胜率 {b['胜率']:.1%}，空窗 {b['空窗周/年']:.1f} 周/年。")
             else:
-                near = cm[cm["空窗周占比"] <= 5 / 52]
-                st.error(f"**没有方法的聚类 t 达到 {T_BAR:.1f}。** 满足空窗要求的方法里最高为 "
-                         f"{near['t值(按周聚类)'].max():.2f}（{near['t值(按周聚类)'].idxmax()}）。"
-                         "这意味着平均收益和零还分不出区别。")
-            st.caption("空窗周占比上限 5/52 ≈ 9.6%。MACD/SKDJ 金叉这类事件型信号天然稀疏。")
+                near = show[show["空窗周/年"] <= 5]
+                hi = near["聚类t"].max() if len(near) else np.nan
+                st.error(f"**没有组合达到门槛。** 满足空窗要求(≤5周/年)的组合里，"
+                         f"最高聚类 t = {hi:.2f}，门槛 {T_BAR:.1f}。")
+            st.caption(f"门槛用 {T_BAR:.1f} 而不是 2.0：18 个格子里挑最大值，"
+                       "即使全是噪音，最大 t 的期望也有 2.7-3.0。")
 
-            st.divider()
-            st.markdown("**样本内 / 样本外**（2023-01-01 分界）")
-            m3 = st.selectbox("看哪个方法", list(res.keys()),
-                              index=list(res.keys()).index(cm.index[0]), key="sp_m")
-            sp = split_summary(res[m3]["tr"], "2023-01-01")
-            if len(sp):
-                st.dataframe(sp[["笔数", "平均收益", "胜率", "盈亏比",
-                                 "t值(按周聚类)"]].style.format(
-                    {"平均收益": "{:+.2%}", "胜率": "{:.1%}", "盈亏比": "{:.2f}",
-                     "t值(按周聚类)": "{:.2f}"}), use_container_width=True)
-                if "样本外" in sp.index and "样本内" in sp.index:
-                    a, o = sp.loc["样本内"], sp.loc["样本外"]
-                    if o["t值(按周聚类)"] >= 2 and o["平均收益"] > 0:
-                        st.success(f"样本外依然站得住（t={o['t值(按周聚类)']:.2f}）。")
-                    else:
-                        st.error(f"样本外没站住：平均收益 {o['平均收益']:+.2%}，"
-                                 f"聚类 t={o['t值(按周聚类)']:.2f}。"
-                                 "样本内好、样本外垮，通常说明样本内那部分是行情特征。")
+            st.markdown("### 梯度分析 —— 比单个格子可靠")
+            st.caption("单个格子的高 t 可能是运气。如果「确认」或「周线过滤」真的有用，"
+                       "应该在所有组合上都体现出来，而不是只在某一格。")
+            c1, c2 = st.columns(2)
+            g1 = df.groupby("买入时点")[["聚类t", "平均收益", "胜率", "笔数"]].mean()
+            c1.markdown("**加速确认有没有用**")
+            c1.dataframe(g1.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
+                                          "胜率": "{:.1%}", "笔数": "{:.0f}"}),
+                         use_container_width=True)
+            g2 = df.groupby("周线过滤")[["聚类t", "平均收益", "胜率", "空窗周/年"]].mean()
+            c2.markdown("**周线过滤有没有用**")
+            c2.dataframe(g2.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
+                                          "胜率": "{:.1%}", "空窗周/年": "{:.1f}"}),
+                         use_container_width=True)
+            g3 = df.groupby("N")[["聚类t", "平均收益", "胜率"]].mean()
+            st.markdown("**N=6 还是 N=9**")
+            st.dataframe(g3.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
+                                          "胜率": "{:.1%}"}), use_container_width=True)
 
-            st.divider()
-            st.markdown("**逐年表现 + 利润集中度**")
-            st.caption("上一轮就是这两个诊断戳破了幻觉：平均收益漂亮，但 94% 的利润来自 "
-                       "513 笔里的 5 笔。真实的效应应该多数年份同号，且不依赖极少数暴利。")
-            ys = yearly_summary(res[m3]["tr"])
-            if len(ys):
-                st.dataframe(ys.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
-                                              "中位收益": "{:+.2%}", "胜率": "{:.1%}",
-                                              "t值": "{:.2f}"})
-                               .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
-                             use_container_width=True)
-                pos_y = int((ys["平均收益"] > 0).sum())
-                st.write(f"平均收益为正的年份：**{pos_y}/{len(ys)}**")
-            pc = profit_concentration(res[m3]["tr"])
-            if len(pc):
-                st.dataframe(pc.style.format({"占总利润": "{:.1%}",
-                                              "剔除后单笔均值": "{:+.3%}"}),
-                             use_container_width=True)
-                st.caption(f"全部 {pc.attrs['总笔数']} 笔，原始单笔均值 "
-                           f"{pc.attrs['原均值']:+.2%}。若剔除最赚的 5 笔后均值就塌到零附近，"
-                           "说明利润集中在极少数运气，不可重复。")
-                if 5 in pc.index and abs(pc.attrs["原均值"]) > 1e-9:
-                    keep = pc.loc[5, "剔除后单笔均值"] / pc.attrs["原均值"]
-                    if keep < 0.4:
-                        st.error(f"剔除最赚的 5 笔后，单笔均值只剩原来的 {keep:.0%}。"
-                                 "这是彩票式分布，不是可重复的边际。")
-                    else:
-                        st.success(f"剔除最赚的 5 笔后仍保留 {keep:.0%} 的均值，"
-                                   "利润不是靠极少数暴利撑起来的。")
+            with st.expander("导出 / 成交明细"):
+                sel = st.selectbox("看哪个组合的明细", list(keep))
+                tr = keep[sel]
+                st.dataframe(tr.tail(300), use_container_width=True, height=320)
+                if st.button("生成导出包"):
+                    tb = {"01_全部组合": df, "02_随机对照": pd.DataFrame([sc]),
+                          "03_按买入时点": g1, "04_按周线过滤": g2, "05_按N": g3,
+                          f"06_明细_{sel}": tr}
+                    ss["zipb"] = export_all(tb)
+                    ss["zipn"] = f"skdj_{dt.datetime.now():%Y%m%d_%H%M}.zip"
+                if ss.get("zipb"):
+                    st.download_button(f"下载 {ss['zipn']}", ss["zipb"], ss["zipn"],
+                                       "application/zip", type="primary")
 
-            st.divider()
-            st.markdown("**止盈 × 止损 网格**")
-            st.markdown(
-                f"当前止损 {sl:.0%}，实测止损率约 65%、平均持有仅 2.3 周——"
-                "远短于超时上限，说明绝大多数仓位是被止损打掉的，不是走完了行情。"
-                "而选出后 4 周内最大回撤的中位数就有 -7.7%，**8% 的止损设在了正常波动之内**。"
-                "下面用数据找该设在哪。")
-            if st.button("跑止盈止损网格"):
-                bar2 = st.progress(0.0)
-                mg, tg = tp_sl_grid(res[m3]["pk"], panel,
-                                    [0.10, 0.15, 0.20, 0.30, 0.40],
-                                    [0.06, 0.08, 0.12, 0.16, 0.20], maxd,
-                                    progress=lambda p, n2: bar2.progress(p, text=n2), **kw)
-                ss["grid"] = (m3, mg, tg); bar2.empty()
-            if ss.get("grid"):
-                gm, mg, tg = ss["grid"]
-                st.caption(f"方法：{gm}")
-                c1, c2 = st.columns(2)
-                c1.markdown("平均单笔收益")
-                c1.dataframe(mg.style.format("{:+.2%}", na_rep="—")
-                             .background_gradient(cmap="RdYlGn"), use_container_width=True)
-                c2.markdown("聚类 t 值")
-                c2.dataframe(tg.style.format("{:.2f}", na_rep="—")
-                             .background_gradient(cmap="RdYlGn", vmin=-3, vmax=3),
-                             use_container_width=True)
-                bt_ = tg.stack().idxmax()
-                st.warning(
-                    f"聚类 t 最高的是 **{bt_[0]} / {bt_[1]}**（t={tg.stack().max():.2f}）——"
-                    "**但别拿这个数字当证据。** 25 个格子里挑最大值，即使全是噪音，"
-                    "最大 |t| 的期望也有 1.9-2.3。\n\n"
-                    "**该信的是梯度方向**：如果放宽止损后平均收益一列列单调上升，"
-                    "那说明原来的止损设在了正常波动之内，把没走完的仓位提前打掉了——"
-                    "这是一致的规律，不是幸运格子。\n\n"
-                    "**止损该设在哪，用波动定，别用网格挑。** 「本周选股」页给出了"
-                    "选出后各周的回撤分布，止损设在 25 分位之外才不会被正常波动扫出局。")
-
-            st.divider()
-            st.markdown("**持有 N 天/周 的表现**（不设止盈止损）")
-            pick_m = st.selectbox("选方法", list(res.keys()),
-                                  index=list(res.keys()).index(cm.index[0]))
-            wt = res[pick_m]["wt"]
-            if len(wt):
-                st.dataframe(wt.style.format(
-                    {"平均收益率": "{:+.2%}", "中位收益率": "{:+.2%}",
-                     "池均值(基准)": "{:+.2%}", "超额": "{:+.2%}", "超额中位": "{:+.2%}",
-                     "跑赢池比例": "{:.1%}", "胜率(绝对)": "{:.1%}", "超额t(聚类)": "{:.2f}"})
-                    .background_gradient(subset=["超额"], cmap="RdYlGn"),
-                    use_container_width=True)
-                st.warning(
-                    "**看「超额」和「超额t(聚类)」，不要看「平均收益率」。** "
-                    "2018-2026 股票池本身在涨，持有任何股票 9 周都会有正的平均收益——"
-                    "绝对收益分不清「选股能力」和「池子自己涨」。"
-                    "「池均值(基准)」就是同期在合格池里等权持有的结果，两者之差才是选股能力。")
-                st.line_chart(wt[["平均收益率", "池均值(基准)", "超额"]])
-                st.line_chart(wt[["跑赢池比例"]])
-                ex_pk = wt["超额"].idxmax()
-                sig = wt[wt["超额t(聚类)"] >= T_BAR]
-                if len(sig):
-                    st.success(
-                        f"超额在**持有 {ex_pk}** 见顶（{wt.loc[ex_pk,'超额']:+.2%}，"
-                        f"聚类 t={wt.loc[ex_pk,'超额t(聚类)']:.2f}）。"
-                        f"聚类 t≥{T_BAR:.1f} 的持有期：{list(sig.index)}。")
-                else:
-                    st.error(
-                        f"**没有任何持有期的超额达到聚类 t≥{T_BAR:.1f}。** 最高为 "
-                        f"{wt['超额t(聚类)'].idxmax()}（t="
-                        f"{wt['超额t(聚类)'].max():.2f}）。这意味着扣掉池子自身的涨幅后，"
-                        "选出的股票和随机挑还分不出区别。")
-                st.caption("中位收益率每周都为负、均值为正 —— 典型的趋势型分布："
-                           "多数标的阴跌，少数狂奔，收益全在右尾。"
-                           "**这意味着止盈不能设太窄，否则正好砍掉唯一赚钱的那条尾巴。**")
-
-            st.divider()
-            st.markdown("### 一键导出全部结果")
-            _t = {"01_方法对比": cm,
-                  "02_周度表_含超额": res[pick_m]["wt"].assign(方法=pick_m),
-                  "03_样本内外": sp if "sp" in dir() else None,
-                  "04_逐年": ys if "ys" in dir() else None,
-                  "05_利润集中度": pc if "pc" in dir() else None}
-            if ss.get("grid"):
-                _t["06_网格_平均收益"] = ss["grid"][1]
-                _t["07_网格_聚类t"] = ss["grid"][2]
-            _t["00_参数"] = pd.DataFrame([{
-                "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "股票数": len(panel["codes"]), "交易日数": len(panel["cal"]),
-                "每周选": top_n, "止盈": f"{tp:.0%}", "止损": f"{sl:.0%}",
-                "超时": f"{maxw}周", "周度表方法": pick_m}]).T.rename(columns={0: "值"})
-            st.download_button(
-                "下载全部结果（zip）",
-                export_all({k: v for k, v in sorted(_t.items()) if v is not None}),
-                f"result_{dt.date.today():%Y%m%d_%H%M}.zip", "application/zip",
-                type="primary", use_container_width=True)
-            st.caption("包含方法对比、周度表（含超额）、样本内外、逐年、集中度、网格。")
-
-    # ---------------- 本周选股 ----------------
-    with t2:
-        mnames = list(methods.keys())
-        use = st.selectbox("用哪个方法", mnames, key="use_m")
-        st.caption("日线模式下这里显示的是**最新交易日触发的**股票，不是排名前N。")
-        sc = methods[use]
-        d = panel["cal"][-1]
-        s = sc.loc[d].where(elig.loc[d]).dropna().sort_values(ascending=False)
-        st.subheader(f"{d:%Y-%m-%d}　候选 {len(s)} 只")
-        if len(s) == 0:
-            st.warning("本周该方法没有符合条件的股票（信号未触发）。换个方法或等下周。")
+    with tab2:
+        n2 = st.selectbox("N", [9, 6])
+        bm2 = st.selectbox("买入时点", list(BUY_MODES))
+        wf2 = st.selectbox("周线过滤", WK_FILTERS)
+        pk = skdj_picks(panel, elig, n2, bm2, wf2, k_max, top_n)
+        if not len(pk):
+            st.warning("这个组合下历史上没有候选。")
         else:
+            last = pk["date"].max()
+            cur = pk[pk["date"] == last]
             nm = basic.set_index("ts_code")["name"].to_dict()
             ind = uni.set_index("ts_code")["ind_name"].to_dict()
-            rows = []
-            for r, c in enumerate(s.index[:top_n], 1):
-                px_ = float(panel["raw_close"].loc[d, c])
-                rows.append({"序": r, "代码": c, "名称": nm.get(c, ""), "行业": ind.get(c, ""),
-                             "收盘价": round(px_, 2),
-                             "流通市值(亿)": round(float(panel["circ_mv"].loc[d, c]) / 1e4),
-                             "止盈价": round(px_ * (1 + tp), 2),
-                             "止损价": round(px_ * (1 - sl), 2)})
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-            st.download_button("下载 CSV", df.to_csv(index=False).encode("utf-8-sig"),
-                               f"picks_{d:%Y%m%d}.csv", "text/csv")
-            st.caption("止盈止损价按收盘价估算，实际以你的买入价为准。")
-
-    # ---------------- 逐笔明细 ----------------
-    with t3:
-        if not ss.get("cmp"):
-            st.info("先到「方法对比」页点「跑全部方法」。")
-        else:
-            res = ss["cmp"]
-            m2 = st.selectbox("看哪个方法的明细", list(res.keys()), key="det_m")
-            tr = res[m2]["tr"].copy()
-            for c in ("买入价", "卖出价"):
-                if c in tr.columns:
-                    tr[c] = tr[c].round(3)
-            if "收益率" in tr.columns:
-                tr["收益率"] = tr["收益率"].map(lambda v: f"{v:+.2%}" if pd.notna(v) else "")
-            st.dataframe(tr.sort_values("date", ascending=False),
-                         use_container_width=True, height=520)
-            st.download_button("下载全部成交 CSV",
-                               res[m2]["tr"].to_csv(index=False).encode("utf-8-sig"),
-                               f"trades_{m2}.csv", "text/csv")
+            st.subheader(f"最近一次触发：{last:%Y-%m-%d}（{len(cur)} 只）")
+            if last < panel["cal"][-1]:
+                st.caption(f"数据最新日期是 {panel['cal'][-1]:%Y-%m-%d}，"
+                           f"最近 {(panel['cal'][-1]-last).days} 天没有新信号。")
+            out = pd.DataFrame([{
+                "序": int(r["rank"]), "代码": r["code"], "名称": nm.get(r["code"], ""),
+                "行业": ind.get(r["code"], ""),
+                "收盘价": round(float(panel["raw_close"].loc[last, r["code"]]), 2),
+                "流通市值(亿)": round(float(r["mv"]) / 1e4),
+                "K−D": round(float(r["kd"]), 2)} for _, r in cur.iterrows()])
+            st.dataframe(out, use_container_width=True, hide_index=True)
+            st.download_button("下载 CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                               f"skdj_{last:%Y%m%d}.csv", "text/csv")
+            st.caption("卖出按日线 SKDJ 死叉执行，不设固定止盈止损。")
 
     if API_ERRORS:
         with st.expander(f"接口异常 {len(API_ERRORS)} 条"):
