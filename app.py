@@ -812,12 +812,68 @@ BUY_MODES = {
     "B_确认1天": 1,       # D+1 收盘确认扩大，D+2 开盘买
     "C_确认2天": 2,       # D+1、D+2 连续扩大，D+3 开盘买
 }
+# 状态触发：等 K 真正站上 25 再买。与"固定延迟几天"不同——
+# 1 天冲过 25 的股票和磨了 10 天才过的，在固定延迟框架里被同等对待，
+# 而这两者恰恰是要区分的。
+BREAK_MODES = {
+    "D_突破25次日": 99,        # K 上穿 25 的次日买，不限用时
+    "E_突破25且≤3天": 3,       # 且从金叉起用时不超过 3 天（只要快的）
+    "F_突破25且≤6天": 6,
+}
+ALL_BUY_MODES = {**BUY_MODES, **BREAK_MODES}
+EXIT_MODES = ["X0_死叉即卖", "X1_K到过50后死叉才卖"]
+# 低位纠缠过滤：过去 CHURN_WIN 个交易日里，在 25 线下方发生过几次金叉。
+# 反复金叉死叉说明指标在低位来回打转、行情起不来。这个计数**只用过去的数据**，
+# 金叉当下就已知，所以可以当筛选条件——而"用时"不行，它由未来价格决定。
+CHURN_WIN = 60
+CHURN_FILTERS = {"C_不限": 99, "C_过去60日≤1次": 1, "C_过去60日0次": 0}
+
+
+def low_zone_churn(panel: dict, n: int = 9, k_max: float = 25.0,
+                   window: int = CHURN_WIN):
+    """返回 (纠缠次数, 低位停留占比)，均严格向后看（shift(1) 后再统计）。"""
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    k, d = skdj(A, H, L, n, 3)
+    gold_low = (k > d) & (k.shift(1) <= d.shift(1)) & (k < k_max)
+    churn = gold_low.shift(1).rolling(window).sum()
+    stay = (k < k_max).shift(1).rolling(window).mean()
+    return churn, stay
 WK_FILTERS = ["F0_不过滤", "F1_距死叉≥10周", "F2_周线已金叉"]
+
+
+def break25_events(panel: dict, elig: pd.DataFrame, n: int = 9,
+                   k_max: float = 25.0, k_line: float = 25.0,
+                   max_wait: int = 20):
+    """
+    金叉(K<k_max)之后，K 第一次上穿 k_line 的事件，并记录用了几天。
+
+    返回 (fire, days_taken)：fire 为触发当日为真的布尔表，days_taken 为
+    从金叉到突破所用的交易日数。金叉后若先死叉、或超过 max_wait 天仍未
+    突破，则该次金叉作废——这正是"在25线下方磨蹭太久"的情形。
+    """
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    k, d = skdj(A, H, L, n, 3)
+    gold = (k > d) & (k.shift(1) <= d.shift(1)) & (k < k_max)
+    dead = (k < d) & (k.shift(1) >= d.shift(1))
+
+    idx = np.arange(len(A.index), dtype=float)
+    gm = pd.DataFrame(np.where(gold.to_numpy(), idx[:, None], np.nan),
+                      index=A.index, columns=A.columns).ffill()
+    dm = pd.DataFrame(np.where(dead.to_numpy(), idx[:, None], np.nan),
+                      index=A.index, columns=A.columns).ffill()
+    in_gold = gm.notna() & (gm > dm.fillna(-1))          # 仍处于金叉状态
+    since = pd.DataFrame(idx[:, None] - gm.to_numpy(),
+                         index=A.index, columns=A.columns)
+
+    brk = (k > k_line) & (k.shift(1) <= k_line)
+    first = brk & in_gold & (since <= max_wait) & (since >= 1)
+    return first, since.where(first)
 
 
 def skdj_picks(panel: dict, elig: pd.DataFrame, n: int, buy_mode: str,
                wk_filter: str, k_max: float = 25.0, top_n: int = 3,
-               wk_n: int = 9, min_weeks: int = 10) -> pd.DataFrame:
+               wk_n: int = 9, min_weeks: int = 10,
+               churn_filter: str = "C_不限") -> pd.DataFrame:
     """
     生成候选：日线 K 上穿 D 且 K<k_max → 按 buy_mode 决定确认天数与决策日 →
     决策日按 round(K-D, 2) 排序，并列时流通市值大者优先 → 取前 top_n。
@@ -830,16 +886,26 @@ def skdj_picks(panel: dict, elig: pd.DataFrame, n: int, buy_mode: str,
     kd = k - d
     gold = (k > d) & (k.shift(1) <= d.shift(1)) & (k < k_max)
 
-    conf = int(BUY_MODES[buy_mode])
-    ok = gold.copy()
-    for j in range(1, conf + 1):                        # 逐日确认 K-D 持续扩大
-        ok &= (kd.shift(-j) > kd.shift(-(j - 1)))
-    decide = ok.shift(conf).fillna(False)               # 决策日 = 金叉日 + conf
+    if buy_mode in BREAK_MODES:
+        fire, days = break25_events(panel, elig, n, k_max, k_line=k_max)
+        lim_d = BREAK_MODES[buy_mode]
+        decide = (fire & (days <= lim_d)).fillna(False)  # 决策日 = 突破当日
+    else:
+        conf = int(BUY_MODES[buy_mode])
+        ok = gold.copy()
+        for j in range(1, conf + 1):                    # 逐日确认 K-D 持续扩大
+            ok &= (kd.shift(-j) > kd.shift(-(j - 1)))
+        decide = ok.shift(conf).fillna(False)           # 决策日 = 金叉日 + conf
 
     if wk_filter != "F0_不过滤":
         wk_above, wk_since = weekly_skdj_state(panel, wk_n, 3)
         decide &= (wk_above if wk_filter == "F2_周线已金叉"
                    else (wk_since >= min_weeks))
+
+    lim_c = CHURN_FILTERS.get(churn_filter, 99)
+    if lim_c < 99:
+        churn, _ = low_zone_churn(panel, n, k_max)
+        decide &= (churn.reindex_like(decide) <= lim_c).fillna(False)
 
     decide &= elig.reindex_like(decide).fillna(False)
     kd_r = kd.round(2)                                   # 交易软件显示精度
@@ -865,7 +931,8 @@ def skdj_picks(panel: dict, elig: pd.DataFrame, n: int, buy_mode: str,
 
 def track_skdj(picks: pd.DataFrame, panel: dict, n: int, max_days: int = 30,
                comm: float = 0.0003, stamp: float = 0.0005,
-               slip: float = 0.001) -> pd.DataFrame:
+               slip: float = 0.001, exit_mode: str = "X0_死叉即卖",
+               k_arm: float = 50.0) -> pd.DataFrame:
     """
     次日开盘买入（涨停买不到则放弃）；日线死叉次日开盘卖出，或满 max_days 超时。
     同一只股票在前一笔未了结前不重复建仓。
@@ -873,6 +940,10 @@ def track_skdj(picks: pd.DataFrame, panel: dict, n: int, max_days: int = 30,
     A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
     k, d = skdj(A, H, L, n, 3)
     DEAD = ((k < d) & (k.shift(1) >= d.shift(1))).to_numpy(dtype=bool)
+    KV = k.to_numpy(dtype=np.float32)
+    # X1：K 还没到过 k_arm 就出现的死叉视为"行情没启动的假死叉"，忽略它。
+    # 现状是平均 6 天就被死叉平仓，根本没给行情展开的机会。
+    arm_needed = (exit_mode == "X1_K到过50后死叉才卖")
 
     cal = A.index
     ci = {c: j for j, c in enumerate(panel["codes"])}
@@ -897,8 +968,11 @@ def track_skdj(picks: pd.DataFrame, panel: dict, n: int, max_days: int = 30,
         entry = float(AO[b, j]) * (1 + cin)
 
         reason, ex = "尚未了结", None
+        armed = not arm_needed
         for t in range(b, min(b + max_days, len(cal))):
-            if DEAD[t, j] and t > b:
+            if arm_needed and not armed and np.isfinite(KV[t, j]) and KV[t, j] >= k_arm:
+                armed = True
+            if DEAD[t, j] and t > b and armed:
                 reason = "死叉"
             elif t - b >= max_days - 1:
                 reason = "超时"
@@ -952,6 +1026,168 @@ def empty_weeks_per_year(picks: pd.DataFrame, cal: pd.DatetimeIndex,
     return empty.groupby(empty.index.year).sum()
 
 
+def wait_time_diagnosis(panel: dict, elig: pd.DataFrame, n: int = 9,
+                        k_max: float = 25.0, max_wait: int = 20,
+                        horizons=(3, 5, 10, 15), comm: float = 0.0003,
+                        stamp: float = 0.0005, slip: float = 0.001) -> tuple:
+    """
+    回答："在25线下方磨太久"是不是问题所在。返回 (可交易表, 说明表, 占比)。
+
+    ⚠ 分组变量"用时"本身由未来价格决定 —— K 是价格的函数，"20天没突破25"
+    等于"这20天没涨"。如果统一从金叉次日入场再按用时分组，就是拿"之后涨没涨"
+    分组去看"之后涨了多少"，纯属同义反复。我第一版就是这么写的，在纯随机数据
+    上都能跑出 +1.8% vs -3.7% 的假象。
+
+    所以给两张表：
+      可交易表：从**突破25的次日**入场。此时用时已是已知信息，分组合法。
+                 回答"突破得快的，之后是不是走得更好"。
+      说明表  ：统一从金叉次日入场（含未突破组）。**不可交易**，只用于
+                 说明未突破组有多差、以及为什么不能拿它当筛选条件。
+    """
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    k, d = skdj(A, H, L, n, 3)
+    gold = ((k > d) & (k.shift(1) <= d.shift(1)) & (k < k_max)) & elig
+    fire, days = break25_events(panel, elig, n, k_max, k_max, max_wait)
+
+    cal = A.index
+    idx = np.arange(len(cal), dtype=float)
+    gm = pd.DataFrame(np.where(gold.to_numpy(), idx[:, None], np.nan),
+                      index=cal, columns=A.columns).ffill()
+    fire_np, days_np, gm_np = fire.to_numpy(), days.to_numpy(), gm.to_numpy()
+    AC = A.to_numpy(dtype=np.float64)
+    AO = panel["adj_open"].to_numpy(dtype=np.float32)
+    TRD = panel["tradable"].to_numpy(dtype=bool)
+    LU = panel["limit_up_open"].to_numpy(dtype=bool)
+    rt = (comm + slip) + (comm + stamp + slip)
+
+    def bucket(w):
+        if not np.isfinite(w):
+            return "未突破25"
+        if w <= 1:
+            return "1天"
+        if w <= 3:
+            return "2-3天"
+        if w <= 6:
+            return "4-6天"
+        if w <= 10:
+            return "7-10天"
+        return "11-20天"
+
+    def fwd(b, j):
+        if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
+            return None
+        e = float(AO[b, j])
+        return {f"{h}日": (AC[b + h, j] / e - 1.0 - rt)
+                if b + h < len(cal) and np.isfinite(AC[b + h, j]) else np.nan
+                for h in horizons}
+
+    tradable, explain = [], []
+    gi, gj = np.where(gold.to_numpy())
+    for i, j in zip(gi, gj):
+        hi = min(i + max_wait + 1, len(cal))
+        seg = fire_np[i + 1:hi, j]
+        w, tb = np.nan, None
+        if seg.any():
+            t = i + 1 + int(np.argmax(seg))
+            if np.isfinite(gm_np[t, j]) and int(gm_np[t, j]) == i:
+                w, tb = float(days_np[t, j]), t
+        g = bucket(w)
+        r1 = fwd(i + 1, j)                       # 说明用：金叉次日入场
+        if r1:
+            explain.append({"date": cal[i], "分组": g, **r1})
+        if tb is not None:
+            r2 = fwd(tb + 1, j)                  # 可交易：突破次日入场
+            if r2:
+                tradable.append({"date": cal[tb], "分组": g, **r2})
+
+    order = ["1天", "2-3天", "4-6天", "7-10天", "11-20天", "未突破25"]
+
+    def agg(rows):
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        out = []
+        for g in order:
+            sub = df[df["分组"] == g]
+            if len(sub) < 30:
+                continue
+            r = {"用时": g, "笔数": len(sub), "占比": len(sub) / len(df)}
+            for h in horizons:
+                v = sub[f"{h}日"].dropna()
+                r[f"{h}日均值"] = v.mean()
+                r[f"{h}日胜率"] = (v > 0).mean()
+            out.append(r)
+        return pd.DataFrame(out).set_index("用时") if out else pd.DataFrame()
+
+    ex = agg(explain)
+    nev = float(ex.loc["未突破25", "占比"]) if len(ex) and "未突破25" in ex.index else np.nan
+    return agg(tradable), ex, nev
+
+
+def churn_diagnosis(panel: dict, elig: pd.DataFrame, n: int = 9,
+                    k_max: float = 25.0, horizons=(3, 5, 10, 15),
+                    comm: float = 0.0003, stamp: float = 0.0005,
+                    slip: float = 0.001) -> tuple:
+    """
+    按"过去60日在25线下方的金叉次数"分组，看后续收益。
+
+    与"用时"诊断不同，这个分组变量在金叉当下就已知，所以结论可以直接
+    拿来当筛选条件，不存在前视问题。同时给出"低位停留占比"的分组。
+    """
+    A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
+    k, d = skdj(A, H, L, n, 3)
+    gold = ((k > d) & (k.shift(1) <= d.shift(1)) & (k < k_max)) & elig
+    churn, stay = low_zone_churn(panel, n, k_max)
+
+    cal = A.index
+    AC = A.to_numpy(dtype=np.float64)
+    AO = panel["adj_open"].to_numpy(dtype=np.float32)
+    TRD = panel["tradable"].to_numpy(dtype=bool)
+    LU = panel["limit_up_open"].to_numpy(dtype=bool)
+    CH, ST = churn.to_numpy(dtype=np.float32), stay.to_numpy(dtype=np.float32)
+    rt = (comm + slip) + (comm + stamp + slip)
+
+    rows = []
+    gi, gj = np.where(gold.to_numpy())
+    for i, j in zip(gi, gj):
+        b = i + 1
+        if b >= len(cal) or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
+            continue
+        e = float(AO[b, j])
+        c, s_ = CH[i, j], ST[i, j]
+        if not np.isfinite(c):
+            continue
+        rec = {"date": cal[i],
+               "纠缠": ("0次" if c < 0.5 else "1次" if c < 1.5
+                        else "2次" if c < 2.5 else "3次及以上"),
+               "低位停留": ("<30%" if s_ < .3 else "30-50%" if s_ < .5
+                            else "50-70%" if s_ < .7 else "≥70%")}
+        for h in horizons:
+            t = b + h
+            rec[f"{h}日"] = (AC[t, j] / e - 1.0 - rt) if t < len(cal) and np.isfinite(AC[t, j]) else np.nan
+        rows.append(rec)
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+    df = pd.DataFrame(rows)
+
+    def agg(col, order):
+        out = []
+        for g in order:
+            sub = df[df[col] == g]
+            if len(sub) < 30:
+                continue
+            r = {col: g, "笔数": len(sub), "占比": len(sub) / len(df)}
+            for h in horizons:
+                v = sub[f"{h}日"].dropna()
+                r[f"{h}日均值"] = v.mean()
+                r[f"{h}日胜率"] = (v > 0).mean()
+            out.append(r)
+        return pd.DataFrame(out).set_index(col) if out else pd.DataFrame()
+
+    return (agg("纠缠", ["0次", "1次", "2次", "3次及以上"]),
+            agg("低位停留", ["<30%", "30-50%", "50-70%", "≥70%"]))
+
+
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
     """把所有结果表打包成一个 zip（纯标准库，无额外依赖）。"""
     import io
@@ -1000,6 +1236,9 @@ def main():
             start = st.date_input("数据起始", dt.date(2018, 1, 1))
             end = st.date_input("数据结束", dt.date.today())
             k_max = st.slider("金叉时 K 的上限", 10, 50, 25)
+            wk_on = st.checkbox("加入周线过滤维度", False,
+                                help="周线过滤会把空窗推到 17-18 周/年，远超你 5 周的上限，"
+                                     "默认不进入网格。勾选后组合数翻三倍。")
             comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
             slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
             workers = st.slider("下载并发", 1, 8, 4)
@@ -1047,26 +1286,34 @@ def main():
     elig = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
 
-    tab1, tab2 = st.tabs(["回测结果", "今日候选"])
+    tab1, tab3, tab2 = st.tabs(["回测结果", "低位形态诊断", "今日候选"])
 
     with tab1:
-        st.markdown(f"一次跑完 **2 种 N × 3 个买入时点 × 3 种周线过滤 = 18 个组合**，"
-                    f"外加随机对照组。全部用同一套规则：每天选 {top_n} 只，"
-                    f"次日开盘买，死叉次日开盘卖，{maxd} 日超时。")
+        wfs = WK_FILTERS if wk_on else ["F0_不过滤"]
+        ems = EXIT_MODES
+        ncomb = 2 * len(ALL_BUY_MODES) * len(wfs) * len(CHURN_FILTERS) * len(ems)
+        st.markdown(f"一次跑完 **2种N × {len(ALL_BUY_MODES)}个买入时点 × "
+                    f"{len(CHURN_FILTERS)}种纠缠过滤 × {len(ems)}种卖出"
+                    + (f" × {len(wfs)}种周线过滤" if wk_on else "")
+                    + f" = {ncomb} 个组合**，外加随机对照组。"
+                    f"每天选 {top_n} 只，次日开盘买，{maxd} 日超时。")
         if st.button("运行全部组合", type="primary", use_container_width=True):
-            combos = [(n, bm, wf) for n in (6, 9) for bm in BUY_MODES for wf in WK_FILTERS]
+            combos = [(n, bm, wf, cf, em) for n in (6, 9) for bm in ALL_BUY_MODES
+                      for wf in wfs for cf in CHURN_FILTERS for em in ems]
             bar = st.progress(0.0); rows = []; keep = {}
-            for i, (n, bm, wf) in enumerate(combos):
-                pk = skdj_picks(panel, elig, n, bm, wf, k_max, top_n)
-                tr = track_skdj(pk, panel, n, maxd, **kw) if len(pk) else pd.DataFrame()
+            for i, (n, bm, wf, cf, em) in enumerate(combos):
+                pk = skdj_picks(panel, elig, n, bm, wf, k_max, top_n, churn_filter=cf)
+                tr = (track_skdj(pk, panel, n, maxd, exit_mode=em, **kw)
+                      if len(pk) else pd.DataFrame())
                 s = _stats(tr)
-                bar.progress((i + 1) / (len(combos) + 1), text=f"N={n} {bm} {wf}")
+                bar.progress((i + 1) / (len(combos) + 1),
+                             text=f"{i+1}/{len(combos)}　N={n} {bm}")
                 if not s:
                     continue
                 ew = empty_weeks_per_year(pk, panel["cal"])
-                rows.append({"N": n, "买入时点": bm, "周线过滤": wf, **s,
-                             "空窗周/年": float(ew.mean())})
-                keep[f"N{n}|{bm}|{wf}"] = tr
+                rows.append({"N": n, "买入时点": bm, "纠缠过滤": cf, "卖出": em,
+                             "周线过滤": wf, **s, "空窗周/年": float(ew.mean())})
+                keep[f"N{n}|{bm}|{cf}|{em}|{wf}"] = tr
             rc = random_control(panel, elig, list(panel["cal"][130:]), top_n)
             trc = track_skdj(rc.assign(kd=np.nan), panel, 9, maxd, **kw)
             sc = _stats(trc)
@@ -1088,11 +1335,12 @@ def main():
                 use_container_width=True, height=560, hide_index=True)
 
             best = show.iloc[0]
-            T_BAR = 3.0
+            T_BAR = 3.2 if len(show) > 24 else 3.0
             ok = show[(show["聚类t"] >= T_BAR) & (show["空窗周/年"] <= 5)]
             if len(ok):
                 b = ok.iloc[0]
-                st.success(f"**通过：N={b['N']}　{b['买入时点']}　{b['周线过滤']}**　"
+                st.success(f"**通过：N={b['N']}　{b['买入时点']}　{b['纠缠过滤']}　"
+                           f"{b['卖出']}　{b['周线过滤']}**　"
                            f"聚类 t={b['聚类t']:.2f}，平均单笔 {b['平均收益']:+.2%}，"
                            f"胜率 {b['胜率']:.1%}，空窗 {b['空窗周/年']:.1f} 周/年。")
             else:
@@ -1100,8 +1348,8 @@ def main():
                 hi = near["聚类t"].max() if len(near) else np.nan
                 st.error(f"**没有组合达到门槛。** 满足空窗要求(≤5周/年)的组合里，"
                          f"最高聚类 t = {hi:.2f}，门槛 {T_BAR:.1f}。")
-            st.caption(f"门槛用 {T_BAR:.1f} 而不是 2.0：18 个格子里挑最大值，"
-                       "即使全是噪音，最大 t 的期望也有 2.7-3.0。")
+            st.caption(f"门槛用 {T_BAR:.1f} 而不是 2.0：{len(show)} 个格子里挑最大值，"
+                       "即使全是噪音，最大 t 的期望也在 3 附近。")
 
             st.markdown("### 梯度分析 —— 比单个格子可靠")
             st.caption("单个格子的高 t 可能是运气。如果「确认」或「周线过滤」真的有用，"
@@ -1117,30 +1365,97 @@ def main():
             c2.dataframe(g2.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
                                           "胜率": "{:.1%}", "空窗周/年": "{:.1f}"}),
                          use_container_width=True)
-            g3 = df.groupby("N")[["聚类t", "平均收益", "胜率"]].mean()
+            c3, c4 = st.columns(2)
+            g3 = df.groupby("纠缠过滤")[["聚类t", "平均收益", "胜率", "笔数", "空窗周/年"]].mean()
+            c3.markdown("**低位纠缠过滤有没有用**")
+            c3.dataframe(g3.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
+                                          "胜率": "{:.1%}", "笔数": "{:.0f}",
+                                          "空窗周/年": "{:.1f}"}), use_container_width=True)
+            g4 = df.groupby("卖出")[["聚类t", "平均收益", "胜率", "平均持有日"]].mean()
+            c4.markdown("**卖出方式**")
+            c4.dataframe(g4.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
+                                          "胜率": "{:.1%}", "平均持有日": "{:.1f}"}),
+                         use_container_width=True)
+            g5 = df.groupby("N")[["聚类t", "平均收益", "胜率"]].mean()
             st.markdown("**N=6 还是 N=9**")
-            st.dataframe(g3.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
+            st.dataframe(g5.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
                                           "胜率": "{:.1%}"}), use_container_width=True)
 
-            with st.expander("导出 / 成交明细"):
-                sel = st.selectbox("看哪个组合的明细", list(keep))
-                tr = keep[sel]
-                st.dataframe(tr.tail(300), use_container_width=True, height=320)
-                if st.button("生成导出包"):
+            st.markdown("### 导出")
+            st.caption("一次打包全部内容，包含 18 个组合的成交明细（合并成一张表，"
+                       "用「组合」列区分），不用逐个导。")
+            if st.button("生成导出包", type="primary", use_container_width=True):
+                with st.spinner("打包中…"):
+                    # 18 个组合的明细合并成一张表，避免让人下载 18 次
+                    allt = pd.concat(
+                        [t.assign(组合=nm) for nm, t in keep.items() if len(t)],
+                        axis=0, ignore_index=True) if keep else pd.DataFrame()
                     tb = {"01_全部组合": df, "02_随机对照": pd.DataFrame([sc]),
-                          "03_按买入时点": g1, "04_按周线过滤": g2, "05_按N": g3,
-                          f"06_明细_{sel}": tr}
+                          "03_按买入时点": g1, "04_按周线过滤": g2,
+                          "05_按纠缠过滤": g3, "06_按卖出方式": g4, "07_按N": g5,
+                          "08_全部成交明细": allt,
+                          "00_参数": pd.DataFrame([{
+                              "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                              "股票数": len(panel["codes"]),
+                              "交易日数": len(panel["cal"]),
+                              "每天选": top_n, "超时(交易日)": maxd,
+                              "金叉K上限": k_max}]).T.rename(columns={0: "值"})}
                     ss["zipb"] = export_all(tb)
                     ss["zipn"] = f"skdj_{dt.datetime.now():%Y%m%d_%H%M}.zip"
-                if ss.get("zipb"):
-                    st.download_button(f"下载 {ss['zipn']}", ss["zipb"], ss["zipn"],
-                                       "application/zip", type="primary")
+                    del allt
+                    gc.collect()
+            if ss.get("zipb"):
+                st.download_button(
+                    f"下载 {ss['zipn']}（{len(ss['zipb'])/1024:.0f} KB，含全部明细）",
+                    ss["zipb"], ss["zipn"], "application/zip",
+                    type="primary", use_container_width=True)
+
+            with st.expander("看某个组合的成交明细"):
+                sel = st.selectbox("组合", list(keep))
+                st.dataframe(keep[sel].tail(300), use_container_width=True, height=320)
+
+    with tab3:
+        st.markdown("**直接检验两个猜想**，不用等回测网格。")
+        nd = st.selectbox("N", [9, 6], key="dn")
+        if st.button("运行诊断", type="primary"):
+            with st.spinner("计算中…"):
+                ss["diag"] = (churn_diagnosis(panel, elig, nd, k_max, **kw),
+                              wait_time_diagnosis(panel, elig, nd, k_max, **kw))
+        if ss.get("diag"):
+            (t_ch, t_st), (t_tr, t_ex, nev) = ss["diag"]
+            f = {"占比": "{:.1%}", **{f"{h}日均值": "{:+.2%}" for h in (3, 5, 10, 15)},
+                 **{f"{h}日胜率": "{:.1%}" for h in (3, 5, 10, 15)}}
+            st.markdown("#### 猜想一：低位反复金叉死叉的股票表现差")
+            st.caption("分组依据是**过去60日**的金叉次数，金叉当下就已知，"
+                       "可以直接当筛选条件。")
+            if len(t_ch):
+                st.dataframe(t_ch.style.format(f).background_gradient(
+                    subset=["10日均值"], cmap="RdYlGn"), use_container_width=True)
+                st.dataframe(t_st.style.format(f).background_gradient(
+                    subset=["10日均值"], cmap="RdYlGn"), use_container_width=True)
+                sp = t_ch["10日均值"].max() - t_ch["10日均值"].min()
+                st.info(f"各组 10 日收益极差 **{sp:.2%}**。差异明显且单调（纠缠越多越差），"
+                        "才说明这个条件有用；如果各组差不多，卡它就没有意义。")
+            st.markdown("#### 猜想二：突破25用时越短越好")
+            st.warning("**下面第一张是可交易的，第二张不是。** 「用时」由未来价格决定"
+                       "（K 是价格的函数），如果统一从金叉次日入场再按用时分组，"
+                       "等于拿『之后涨没涨』分组去看『之后涨了多少』，纯属同义反复——"
+                       "我第一版就写错了，纯随机数据上都能跑出 +1.8% vs -3.7% 的假象。")
+            if len(t_tr):
+                st.markdown("**可交易：从突破25的次日入场**")
+                st.dataframe(t_tr.style.format(f).background_gradient(
+                    subset=["10日均值"], cmap="RdYlGn"), use_container_width=True)
+            if len(t_ex):
+                st.markdown(f"**仅供说明（不可交易）：统一从金叉次日入场**　"
+                            f"金叉后20日内未突破25的占 **{nev:.1%}**")
+                st.dataframe(t_ex.style.format(f), use_container_width=True)
 
     with tab2:
         n2 = st.selectbox("N", [9, 6])
-        bm2 = st.selectbox("买入时点", list(BUY_MODES))
+        bm2 = st.selectbox("买入时点", list(ALL_BUY_MODES))
+        cf2 = st.selectbox("纠缠过滤", list(CHURN_FILTERS))
         wf2 = st.selectbox("周线过滤", WK_FILTERS)
-        pk = skdj_picks(panel, elig, n2, bm2, wf2, k_max, top_n)
+        pk = skdj_picks(panel, elig, n2, bm2, wf2, k_max, top_n, churn_filter=cf2)
         if not len(pk):
             st.warning("这个组合下历史上没有候选。")
         else:
