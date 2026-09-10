@@ -832,8 +832,8 @@ def sector_factors(R: pd.DataFrame, IDX: pd.DataFrame,
         out[f"板块{w}日动量"] = IDX / IDX.shift(w) - 1.0
     vol = R.rolling(20).std() * np.sqrt(252)
     out["板块风险调整动量"] = (IDX / IDX.shift(20) - 1.0) / vol.where(vol > 1e-9)
-    m20 = IDX / IDX.shift(20) - 1.0
-    out["板块相对强度"] = m20.sub(m20.mean(axis=1), axis=0)
+    # 注：曾有"板块相对强度"= 20日动量减截面均值，那是单调变换，
+    # 截面排序与20日动量完全相同，等于同一个信号数了两遍，已删除。
     hh = IDX.rolling(60).max()
     out["板块距60日高点"] = IDX / hh - 1.0
     out["板块创20日新高"] = (IDX >= IDX.rolling(20).max()).astype(float)
@@ -883,8 +883,12 @@ def sector_layer_test(fac: pd.DataFrame, IDX: pd.DataFrame, horizons=(3, 5, 8, 1
             r[f"{h}日超额"] = v.mean()
             r[f"{h}日胜率"] = (v > 0).mean()
             if h == horizons[-1]:
+                # 必须做重叠修正：前瞻 h 个交易日、每 step 天采样一次，
+                # 相邻样本重叠 h/step 倍。用朴素标准误会把 t 放大约 sqrt(h/step)。
+                lag = max(1, int(np.ceil(h / max(step, 1))))
+                r["末期t(重叠修正)"] = newey_west_t(v, lag=lag)
                 se = v.std(ddof=1) / np.sqrt(len(v))
-                r["末期t"] = v.mean() / se if se > 1e-12 else np.nan
+                r["末期t(朴素)"] = v.mean() / se if se > 1e-12 else np.nan
         out.append(r)
     return pd.DataFrame(out).set_index("分组")
 
@@ -1182,15 +1186,18 @@ def main():
                 summ.append({"板块信号": nm, "Q4−Q1": v[-1] - v[0],
                              "单调性": float(np.corrcoef(np.arange(len(v)), v)[0, 1]),
                              "Q4超额": v[-1], "Q1超额": v[0],
-                             "末期t(Q4)": t["末期t"].iloc[-1]})
+                             "末期t(重叠修正)": t["末期t(重叠修正)"].iloc[-1],
+                             "末期t(朴素)": t["末期t(朴素)"].iloc[-1]})
             sm = pd.DataFrame(summ).set_index("板块信号").sort_values(
                 "Q4−Q1", key=abs, ascending=False)
             st.dataframe(sm.style.format({"Q4−Q1": "{:+.2%}", "单调性": "{:+.2f}",
                                           "Q4超额": "{:+.2%}", "Q1超额": "{:+.2%}",
-                                          "末期t(Q4)": "{:.2f}"})
+                                          "末期t(重叠修正)": "{:.2f}",
+                                          "末期t(朴素)": "{:.2f}"})
                          .background_gradient(subset=["Q4−Q1"], cmap="RdYlGn"),
                          use_container_width=True)
-            ok = sm[(sm["Q4−Q1"].abs() > 0.01) & (sm["单调性"].abs() > 0.8)]
+            ok = sm[(sm["Q4−Q1"].abs() > 0.01) & (sm["单调性"].abs() > 0.8)
+                    & (sm["末期t(重叠修正)"].abs() > 2)]
             if len(ok):
                 st.success(f"**{ok.index[0]}** 有明显单调关系："
                            f"Q4−Q1 = {ok['Q4−Q1'].iloc[0]:+.2%}，"
@@ -1205,8 +1212,14 @@ def main():
                 {**{f"{h}日超额": "{:+.2%}" for h in (3, 5, 8, 15)},
                  **{f"{h}日胜率": "{:.1%}" for h in (3, 5, 8, 15)}, "末期t": "{:.2f}"}),
                 use_container_width=True)
-            st.caption("判定：|Q4−Q1| > 1个百分点 且 |单调性| > 0.8。"
-                       "只有一组突出、其余杂乱的属于噪音。")
+            st.warning("**看「末期t(重叠修正)」，不要看朴素 t。** 15日前瞻收益每 "
+                       f"{every} 天采样一次，相邻样本重叠，朴素标准误会把 t 放大约 "
+                       "√(重叠倍数)。这一处我最初漏做了修正，其他检验都做了。")
+            st.info("**真正的证据是一致性，不是单个 t 值。** 如果动量类的几个信号"
+                    "单调性全部同号、Q4−Q1 全部同向，而且「创新高」这类反向信号"
+                    "呈现相反的单调性——这种内部一致的结构很难从噪音里产生，"
+                    "比某一个格子的高 t 值可信得多。")
+            st.caption("判定：|Q4−Q1| > 1个百分点 且 |单调性| > 0.8 且 |重叠修正t| > 2。")
 
     # ---------- ③ 板块层加分吗 ----------
     with t2_:
