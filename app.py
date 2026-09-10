@@ -1251,6 +1251,13 @@ def main():
             ss["sec"] = (sectors, R, IDX, cnt, sector_factors(R, IDX, amt))
             ss["sec_mm"] = min_mem
     sectors, R, IDX, cnt, SF = ss["sec"]
+    # 合成信号在这里统一构建：回测页和今日候选页必须用同一份，
+    # 否则会出现"回测用合成信号、实盘用单个信号"这种致命不一致。
+    SF2 = dict(SF)
+    _cp = composite_sector_signal(SF)
+    if len(_cp):
+        SF2["【合成】动量族平均"] = _cp
+    DEF_SIG = "【合成】动量族平均" if "【合成】动量族平均" in SF2 else list(SF2)[0]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
 
@@ -1340,25 +1347,24 @@ def main():
         st.markdown("### 板块层到底加不加分")
         st.markdown("**核心对照**：同样的选股规则，一次用「最强板块」筛，一次用「随机板块」筛。"
                     "两者之差就是板块层的净贡献。再加一个「不分板块直接全池选」做参照。")
-        SF2 = dict(SF)
-        comp = composite_sector_signal(SF)
-        if len(comp):
-            SF2["【合成】动量族平均"] = comp
         c0, c1 = st.columns(2)
         sig = c0.selectbox("用哪个板块信号", list(SF2),
-                           index=list(SF2).index("【合成】动量族平均")
-                           if "【合成】动量族平均" in SF2 else 0)
+                           index=list(SF2).index(DEF_SIG))
+        if sig not in SF2:          # 兜底：控件异常时不让整页崩掉
+            sig = DEF_SIG
         use_reg = c1.checkbox("开启熊市开关（池子等权指数在200日线下方时不出手）", True)
         st.info("**默认用「合成」信号，不要挑单个。** 9 个信号里挑通过的那个，"
                 "等于用同一份数据挑了一次参数，样本外拿不到那部分。"
                 "实测四个动量信号的板块层净贡献都是正的（+0.35%~+0.78%），"
                 "说明它们讲的是同一件事——取平均既避开挑选，也比任何单个更稳。")
         srule = st.selectbox("板块内怎么选股", STOCK_RULES)
+        if srule not in STOCK_RULES:
+            srule = STOCK_RULES[0]
         if st.button("运行对照实验", type="primary"):
             bar = st.progress(0.0)
             plans = [
                 ("两层：最强板块 + " + srule,
-                 lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
+                 lambda: sector_then_stock(panel, elig, sectors, SF2[sig], dates,
                                            top_sec, top_n, srule, "最强")),
                 ("对照A：随机板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF2[sig], dates,
@@ -1516,17 +1522,28 @@ def main():
 
     # ---------- ④ 今日候选 ----------
     with t3_:
-        sig2 = st.selectbox("板块信号", list(SF), key="s2",
-                            index=list(SF).index("板块20日动量") if "板块20日动量" in SF else 0)
+        sig2 = st.selectbox("板块信号", list(SF2), key="s2",
+                            index=list(SF2).index(DEF_SIG))
+        if sig2 not in SF2:
+            sig2 = DEF_SIG
         sr2 = st.selectbox("板块内选股", STOCK_RULES, key="r2")
+        if sr2 not in STOCK_RULES:
+            sr2 = STOCK_RULES[0]
         d = panel["cal"][-1]
-        f = SF[sig2].loc[d].dropna().sort_values(ascending=False)
+        f = SF2[sig2].loc[d].dropna().sort_values(ascending=False)
         st.subheader(f"{d:%Y-%m-%d}　板块排名")
         st.dataframe(pd.DataFrame({"板块": f.index, "信号值": f.values,
                                    "合格成分股": [int(elig.loc[d, sectors[s]].sum())
                                                 for s in f.index]}).head(10),
                      use_container_width=True, hide_index=True)
-        pk = sector_then_stock(panel, elig, sectors, SF[sig2], [d], top_sec, top_n, sr2, "最强")
+        reg2 = pool_regime(panel, elig, 200)
+        on = bool(reg2.get(d, False))
+        if not on:
+            st.error("**熊市开关：关闭中。** 合格池等权指数在 200 日线下方，"
+                     "按回测口径今天不该出手。下面的候选仅供参考。")
+        else:
+            st.success("熊市开关：开启中（池子等权指数在 200 日线上方）。")
+        pk = sector_then_stock(panel, elig, sectors, SF2[sig2], [d], top_sec, top_n, sr2, "最强")
         if not len(pk):
             st.warning("今日无候选。")
         else:
