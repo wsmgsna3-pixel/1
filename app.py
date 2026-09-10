@@ -832,6 +832,23 @@ EXIT_ARM = {"X0_任何死叉即卖": 0.0, "X1_K到过50后死叉": 50.0,
 # 低位纠缠过滤：过去 CHURN_WIN 个交易日里，在 25 线下方发生过几次金叉。
 # 反复金叉死叉说明指标在低位来回打转、行情起不来。这个计数**只用过去的数据**，
 # 金叉当下就已知，所以可以当筛选条件——而"用时"不行，它由未来价格决定。
+# 趋势过滤：SKDJ 低位金叉发生时，这只股票处在长期上升趋势的回调中，
+# 还是已经转入下跌趋势？前者是"上车"，后者是"接刀"。
+# 这是从图上看出来的假设，必须用全池数据检验，不能信那几张图。
+TREND_FILTERS = {"T0_不过滤": None, "T1_价>周线MA30": "px",
+                 "T2_周线MA10>MA30": "ma", "T3_两者都要": "both"}
+
+
+def weekly_trend_state(panel: dict):
+    """周线均线结构，前向填充到日频。只用已收完的周线，无未来数据。"""
+    wc = panel["adj_close"].resample("W-FRI").last()
+    ma10, ma30 = wc.rolling(10).mean(), wc.rolling(30).mean()
+    cal = panel["adj_close"].index
+    above_px = (wc > ma30).reindex(cal, method="ffill").fillna(False)
+    above_ma = (ma10 > ma30).reindex(cal, method="ffill").fillna(False)
+    return above_px, above_ma
+
+
 CHURN_WIN = 60
 CHURN_FILTERS = {"C_不限": 99, "C_过去60日≤1次": 1, "C_过去60日0次": 0}
 
@@ -880,7 +897,8 @@ def break25_events(panel: dict, elig: pd.DataFrame, n: int = 9,
 def skdj_picks(panel: dict, elig: pd.DataFrame, n: int, buy_mode: str,
                wk_filter: str, k_max: float = 25.0, top_n: int = 3,
                wk_n: int = 9, min_weeks: int = 10,
-               churn_filter: str = "C_不限") -> pd.DataFrame:
+               churn_filter: str = "C_不限",
+               trend_filter: str = "T0_不过滤") -> pd.DataFrame:
     """
     生成候选：日线 K 上穿 D 且 K<k_max → 按 buy_mode 决定确认天数与决策日 →
     决策日按 round(K-D, 2) 排序，并列时流通市值大者优先 → 取前 top_n。
@@ -908,6 +926,14 @@ def skdj_picks(panel: dict, elig: pd.DataFrame, n: int, buy_mode: str,
         wk_above, wk_since = weekly_skdj_state(panel, wk_n, 3)
         decide &= (wk_above if wk_filter == "F2_周线已金叉"
                    else (wk_since >= min_weeks))
+
+    tf = TREND_FILTERS.get(trend_filter)
+    if tf:
+        ap, am = weekly_trend_state(panel)
+        if tf in ("px", "both"):
+            decide &= ap.reindex_like(decide).fillna(False)
+        if tf in ("ma", "both"):
+            decide &= am.reindex_like(decide).fillna(False)
 
     lim_c = CHURN_FILTERS.get(churn_filter, 99)
     if lim_c < 99:
@@ -1349,9 +1375,20 @@ def main():
 
     with tab1:
         wfs = WK_FILTERS if wk_on else ["F0_不过滤"]
+        cA, cB = st.columns(2)
+        bms = cA.multiselect("买入时点", list(ALL_BUY_MODES),
+                             default=["A_金叉次日", "B_确认1天", "D_突破25次日"])
+        cfs = cB.multiselect("纠缠过滤", list(CHURN_FILTERS),
+                             default=["C_不限", "C_过去60日≤1次"])
+        st.caption("默认已收窄：C_确认2天、E/F 突破限时、纠缠0次 前几轮都证明更差，"
+                   "去掉它们能把组合数从 432 降到 96 —— 组合越多，"
+                   "多重比较的门槛越高，真信号越难通过。想全测可以自己勾上。")
         ems = st.multiselect("卖出方式（按指标说明，应是高位死叉才卖）", EXIT_MODES,
-                             default=["X0_任何死叉即卖", "X2_K到过75后死叉",
-                                      "X3_死叉时K≥75"])
+                             default=["X0_任何死叉即卖", "X2_K到过75后死叉"])
+        if not bms:
+            bms = ["A_金叉次日"]
+        if not cfs:
+            cfs = ["C_不限"]
         st.caption("指标说明原文：「K在80左右向下交叉D时，视为卖出信号参考」"
                    "「SKDJ波动于50左右的任何讯号，其作用不大」。"
                    "**X0 是我最初的实现——任何死叉都卖，与说明不符**，"
@@ -1359,29 +1396,33 @@ def main():
                    "正是说明书说「作用不大」的区域。保留它做对照。")
         if not ems:
             ems = ["X2_K到过75后死叉"]
-        ncomb = 2 * len(ALL_BUY_MODES) * len(wfs) * len(CHURN_FILTERS) * len(ems)
-        st.markdown(f"一次跑完 **2种N × {len(ALL_BUY_MODES)}个买入时点 × "
-                    f"{len(CHURN_FILTERS)}种纠缠过滤 × {len(ems)}种卖出"
+        ncomb = 2 * len(bms) * len(wfs) * len(cfs) * len(ems) * len(TREND_FILTERS)
+        st.markdown(f"一次跑完 **2种N × {len(bms)}个买入时点 × "
+                    f"{len(TREND_FILTERS)}种趋势过滤 × "
+                    f"{len(cfs)}种纠缠过滤 × {len(ems)}种卖出"
                     + (f" × {len(wfs)}种周线过滤" if wk_on else "")
                     + f" = {ncomb} 个组合**，外加随机对照组。"
                     f"每天选 {top_n} 只，次日开盘买，{maxd} 日超时。")
         if st.button("运行全部组合", type="primary", use_container_width=True):
-            combos = [(n, bm, wf, cf, em) for n in (6, 9) for bm in ALL_BUY_MODES
-                      for wf in wfs for cf in CHURN_FILTERS for em in ems]
+            combos = [(n, bm, wf, cf, em, tf) for n in (6, 9) for bm in bms
+                      for wf in wfs for cf in cfs for em in ems
+                      for tf in TREND_FILTERS]
             bar = st.progress(0.0); rows = []; keep = {}
-            for i, (n, bm, wf, cf, em) in enumerate(combos):
-                pk = skdj_picks(panel, elig, n, bm, wf, k_max, top_n, churn_filter=cf)
+            for i, (n, bm, wf, cf, em, tf) in enumerate(combos):
+                pk = skdj_picks(panel, elig, n, bm, wf, k_max, top_n,
+                                churn_filter=cf, trend_filter=tf)
                 tr = (track_skdj(pk, panel, n, maxd, exit_mode=em, **kw)
                       if len(pk) else pd.DataFrame())
                 s = _stats(tr)
                 bar.progress((i + 1) / (len(combos) + 1),
-                             text=f"{i+1}/{len(combos)}　N={n} {bm}")
+                             text=f"{i+1}/{len(combos)}　N={n} {bm} {tf}")
                 if not s:
                     continue
                 ew = empty_weeks_per_year(pk, panel["cal"])
-                rows.append({"N": n, "买入时点": bm, "纠缠过滤": cf, "卖出": em,
-                             "周线过滤": wf, **s, "空窗周/年": float(ew.mean())})
-                keep[f"N{n}|{bm}|{cf}|{em}|{wf}"] = tr
+                rows.append({"N": n, "买入时点": bm, "趋势过滤": tf, "纠缠过滤": cf,
+                             "卖出": em, "周线过滤": wf, **s,
+                             "空窗周/年": float(ew.mean())})
+                keep[f"N{n}|{bm}|{tf}|{cf}|{em}|{wf}"] = tr
             rc = random_control(panel, elig, list(panel["cal"][130:]), top_n)
             trc = track_skdj(rc.assign(kd=np.nan), panel, 9, maxd, **kw)
             sc = _stats(trc)
@@ -1403,11 +1444,11 @@ def main():
                 use_container_width=True, height=560, hide_index=True)
 
             best = show.iloc[0]
-            T_BAR = 3.2 if len(show) > 24 else 3.0
+            T_BAR = 3.4 if len(show) > 60 else 3.2 if len(show) > 24 else 3.0
             ok = show[(show["聚类t"] >= T_BAR) & (show["空窗周/年"] <= 5)]
             if len(ok):
                 b = ok.iloc[0]
-                st.success(f"**通过：N={b['N']}　{b['买入时点']}　{b['纠缠过滤']}　"
+                st.success(f"**通过：N={b['N']}　{b['买入时点']}　{b['趋势过滤']}　{b['纠缠过滤']}　"
                            f"{b['卖出']}　{b['周线过滤']}**　"
                            f"聚类 t={b['聚类t']:.2f}，平均单笔 {b['平均收益']:+.2%}，"
                            f"胜率 {b['胜率']:.1%}，空窗 {b['空窗周/年']:.1f} 周/年。")
@@ -1433,6 +1474,14 @@ def main():
             c2.dataframe(g2.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
                                           "胜率": "{:.1%}", "空窗周/年": "{:.1f}"}),
                          use_container_width=True)
+            st.markdown("**趋势过滤有没有用**（本轮新增：只在长期上升趋势的回调中买）")
+            gT = df.groupby("趋势过滤")[["聚类t", "平均收益", "胜率", "笔数",
+                                        "空窗周/年"]].mean()
+            st.dataframe(gT.style.format({"聚类t": "{:.2f}", "平均收益": "{:+.2%}",
+                                          "胜率": "{:.1%}", "笔数": "{:.0f}",
+                                          "空窗周/年": "{:.1f}"}), use_container_width=True)
+            st.caption("这个假设来自你那九张图——乾照光电价格在周线MA30下方33%，"
+                       "其余八只中位在上方11%。但九张图证明不了什么，看这张表。")
             c3, c4 = st.columns(2)
             g3 = df.groupby("纠缠过滤")[["聚类t", "平均收益", "胜率", "笔数", "空窗周/年"]].mean()
             c3.markdown("**低位纠缠过滤有没有用**")
@@ -1461,6 +1510,7 @@ def main():
                     tb = {"01_全部组合": df, "02_随机对照": pd.DataFrame([sc]),
                           "03_按买入时点": g1, "04_按周线过滤": g2,
                           "05_按纠缠过滤": g3, "06_按卖出方式": g4, "07_按N": g5,
+                          "09_按趋势过滤": gT,
                           "08_全部成交明细": allt,
                           "00_参数": pd.DataFrame([{
                               "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -1521,9 +1571,11 @@ def main():
     with tab2:
         n2 = st.selectbox("N", [9, 6])
         bm2 = st.selectbox("买入时点", list(ALL_BUY_MODES))
+        tf2 = st.selectbox("趋势过滤", list(TREND_FILTERS))
         cf2 = st.selectbox("纠缠过滤", list(CHURN_FILTERS))
         wf2 = st.selectbox("周线过滤", WK_FILTERS)
-        pk = skdj_picks(panel, elig, n2, bm2, wf2, k_max, top_n, churn_filter=cf2)
+        pk = skdj_picks(panel, elig, n2, bm2, wf2, k_max, top_n,
+                        churn_filter=cf2, trend_filter=tf2)
         if not len(pk):
             st.warning("这个组合下历史上没有候选。")
         else:
