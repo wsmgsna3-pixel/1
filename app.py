@@ -1088,6 +1088,61 @@ def concentration_check(tr: pd.DataFrame, ks=(1, 3, 5, 10, 20)) -> pd.DataFrame:
     return out
 
 
+# ---------------- 避免挑选：合成信号 + 熊市开关 ----------------
+MOM_FAMILY = ["板块5日动量", "板块10日动量", "板块20日动量",
+              "板块60日动量", "板块风险调整动量"]
+
+
+def composite_sector_signal(SF: Dict[str, pd.DataFrame],
+                            names: List[str] = None) -> pd.DataFrame:
+    """
+    动量族信号的截面百分位平均。
+
+    为什么要合成：9 个信号里挑通过的那个，等于用同一份数据挑了一次参数，
+    样本外拿不到那部分。四个动量信号实测全部同向（净贡献 +0.35%~+0.78%），
+    说明它们说的是同一件事，取平均既避开挑选，又比任何单个更稳。
+    """
+    use = [n for n in (names or MOM_FAMILY) if n in SF]
+    if not use:
+        return pd.DataFrame()
+    tot = None
+    for n in use:
+        r = SF[n].rank(axis=1, pct=True)
+        tot = r if tot is None else tot.add(r, fill_value=0.0)
+    return tot / len(use)
+
+
+def pool_regime(panel: dict, elig: pd.DataFrame, ma: int = 200) -> pd.Series:
+    """
+    大盘状态：合格池等权指数是否在 ma 日均线上方。
+    不预测，只跟随。2018 和 2022 贡献了几乎全部大亏，而那两年正是
+    池子自身的熊市 —— 掐掉它们比继续优化选股规则价值更大。
+    """
+    r = panel["adj_close"].pct_change().where(elig.shift(1).fillna(False)).mean(axis=1)
+    idx = (1.0 + r.fillna(0.0)).cumprod()
+    return (idx > idx.rolling(ma).mean()).fillna(False)
+
+
+def apply_regime(picks: pd.DataFrame, regime: pd.Series) -> pd.DataFrame:
+    """只保留大盘在均线上方那些天的候选。"""
+    if not len(picks):
+        return picks
+    ok = picks["date"].map(lambda d: bool(regime.get(d, False)))
+    return picks[ok].reset_index(drop=True)
+
+
+def regime_compare(tr_all: pd.DataFrame, tr_on: pd.DataFrame) -> pd.DataFrame:
+    """开关前后的逐年对比。"""
+    def yr(t, lab):
+        d = t.dropna(subset=["收益率"])
+        g = d.groupby(pd.to_datetime(d["date"]).dt.year)["收益率"]
+        return pd.DataFrame({f"{lab}_笔数": g.size(), f"{lab}_平均收益": g.mean()})
+    a, b = yr(tr_all, "不用开关"), yr(tr_on, "用开关")
+    out = a.join(b, how="outer")
+    out["差异"] = out["用开关_平均收益"] - out["不用开关_平均收益"]
+    return out
+
+
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
     """把所有结果表打包成一个 zip（纯标准库，无额外依赖）。"""
     import io
@@ -1285,8 +1340,19 @@ def main():
         st.markdown("### 板块层到底加不加分")
         st.markdown("**核心对照**：同样的选股规则，一次用「最强板块」筛，一次用「随机板块」筛。"
                     "两者之差就是板块层的净贡献。再加一个「不分板块直接全池选」做参照。")
-        sig = st.selectbox("用哪个板块信号", list(SF),
-                           index=list(SF).index("板块20日动量") if "板块20日动量" in SF else 0)
+        SF2 = dict(SF)
+        comp = composite_sector_signal(SF)
+        if len(comp):
+            SF2["【合成】动量族平均"] = comp
+        c0, c1 = st.columns(2)
+        sig = c0.selectbox("用哪个板块信号", list(SF2),
+                           index=list(SF2).index("【合成】动量族平均")
+                           if "【合成】动量族平均" in SF2 else 0)
+        use_reg = c1.checkbox("开启熊市开关（池子等权指数在200日线下方时不出手）", True)
+        st.info("**默认用「合成」信号，不要挑单个。** 9 个信号里挑通过的那个，"
+                "等于用同一份数据挑了一次参数，样本外拿不到那部分。"
+                "实测四个动量信号的板块层净贡献都是正的（+0.35%~+0.78%），"
+                "说明它们讲的是同一件事——取平均既避开挑选，也比任何单个更稳。")
         srule = st.selectbox("板块内怎么选股", STOCK_RULES)
         if st.button("运行对照实验", type="primary"):
             bar = st.progress(0.0)
@@ -1295,26 +1361,30 @@ def main():
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
                                            top_sec, top_n, srule, "最强")),
                 ("对照A：随机板块 + " + srule,
-                 lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
+                 lambda: sector_then_stock(panel, elig, sectors, SF2[sig], dates,
                                            top_sec, top_n, srule, "随机")),
                 ("对照B：不分板块，全池 " + srule,
                  lambda: flat_stock_pick(panel, elig, dates, top_n, srule)),
                 ("对照C：全池随机",
                  lambda: flat_stock_pick(panel, elig, dates, top_n, "S3_板块内随机")),
             ]
-            rows, keep = [], {}
+            reg = pool_regime(panel, elig, 200) if use_reg else None
+            rows, keep, raw = [], {}, {}
             for i, (lab, fn) in enumerate(plans):
                 pk = fn()
+                if reg is not None and len(pk):
+                    raw[lab] = track_fixed(pk, panel, hold, **kw)
+                    pk = apply_regime(pk, reg)
                 tr = track_fixed(pk, panel, hold, **kw) if len(pk) else pd.DataFrame()
                 s_ = _st(tr)
                 bar.progress((i + 1) / len(plans), text=lab)
                 if s_:
                     rows.append({"方案": lab, **s_})
                     keep[lab] = tr
-            ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, sig, srule)
+            ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, sig, srule, raw)
             bar.empty()
         if ss.get("res"):
-            df, keep, sig_, sr_ = ss["res"]
+            df, keep, sig_, sr_, raw_ = ss["res"]
             st.dataframe(df.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
                                           "中位收益": "{:+.2%}", "胜率": "{:.1%}",
                                           "聚类t": "{:.2f}"})
@@ -1342,6 +1412,25 @@ def main():
             except Exception:
                 pass
             if keep:
+                if raw_:
+                    st.divider()
+                    st.markdown("### 熊市开关的效果")
+                    st.caption("2018 和 2022 贡献了几乎全部大亏，而那两年正是池子自身的熊市。"
+                               "开关不预测，只是跟随：等权指数在 200 日线下方时不出手。")
+                    k0 = list(keep)[0]
+                    if k0 in raw_:
+                        rc = regime_compare(raw_[k0], keep[k0])
+                        st.dataframe(rc.style.format(
+                            {"不用开关_笔数": "{:.0f}", "用开关_笔数": "{:.0f}",
+                             "不用开关_平均收益": "{:+.2%}", "用开关_平均收益": "{:+.2%}",
+                             "差异": "{:+.2%}"}, na_rep="—")
+                            .background_gradient(subset=["差异"], cmap="RdYlGn"),
+                            use_container_width=True)
+                        kept = len(keep[k0]) / max(1, len(raw_[k0]))
+                        st.caption(f"开关保留了 {kept:.0%} 的交易机会。"
+                                   "看「差异」列在 2018/2022 是不是明显为正——"
+                                   "如果是，说明开关掐对了地方；"
+                                   "如果在牛市年份也大幅为正，那是过度拟合的信号。")
                 st.divider()
                 st.markdown("### 三项必做诊断")
                 st.caption("前面几轮就是这三项戳破的幻觉：平均收益漂亮，"
