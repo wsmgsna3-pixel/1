@@ -1017,10 +1017,14 @@ def industry_neutral_pick(panel: dict, elig: pd.DataFrame,
         sub = m[cs].where(elig[cs])
         n = sub.notna().sum(axis=1)
         pct.loc[:, cs] = sub.rank(axis=1, pct=True).where(n >= 3)
-    # 每个板块的第一名百分位都是 1.0，直接排序会有十几只并列，
-    # 取前3等于在"组内第一"里随机挑——板块间的区分被丢掉了。
-    # 用「组内百分位为主 + 自身动量的全池百分位打破平局」。
-    tie = m.where(elig).rank(axis=1, pct=True).reindex(columns=cols)
+    # 每个板块的第一名百分位都是 1.0，十几只并列，必须打破平局。
+    # ⚠ 上一版我用「全池动量百分位」来破，等于在这些组内第一里挑绝对动量
+    # 最高的——而绝对动量正是已知的负收益端（全池最强 −0.16%）。
+    # 结果整个方案被拉回坑里（实测 +0.25%，介于 −0.16% 和 +0.84% 之间）。
+    # 平局必须用**中性**方式打破：确定性随机数，不引入任何方向性因子。
+    rs = np.random.default_rng(20260910)
+    tie = pd.DataFrame(rs.random((len(A.index), len(cols))),
+                       index=A.index, columns=cols)
     pct = pct + tie * 1e-3
 
     cal = list(A.index)
@@ -1192,6 +1196,79 @@ def regime_compare(tr_all: pd.DataFrame, tr_on: pd.DataFrame) -> pd.DataFrame:
     out = a.join(b, how="outer")
     out["差异"] = out["用开关_平均收益"] - out["不用开关_平均收益"]
     return out
+
+
+# ======================================================================
+# 滚动前推检验 —— 唯一能挽救"样本外已被搜索用掉"的办法
+# ======================================================================
+def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
+                 SF: Dict[str, pd.DataFrame], dates: List[pd.Timestamp],
+                 signals: List[str] = None, top_secs=(2, 3), top_ns=(3,),
+                 holds=(15, 20), start_year: int = 2021,
+                 comm: float = 0.0003, stamp: float = 0.0005,
+                 slip: float = 0.001, progress=None) -> tuple:
+    """
+    模拟"你当年真的会怎么做"：
+      每年年初，只用**截至上一年底**的数据，在全部配置里挑成绩最好的那个，
+      然后用它跑这一年，只记录这一年的结果。第二年重新挑。
+
+    这才是真正的样本外。全样本上挑一个最优配置再看它的"样本外"，
+    等于用样本外做了选择——那个数字已经不算数了。
+    """
+    sigs = [s for s in (signals or list(SF)) if s in SF]
+    cfgs = [(sg, ts, tn, hd) for sg in sigs for ts in top_secs
+            for tn in top_ns for hd in holds]
+    # 每个配置的全期成交只算一次，之后按年份切片即可
+    allt: Dict[tuple, pd.DataFrame] = {}
+    for i, (sg, ts, tn, hd) in enumerate(cfgs):
+        pk = sector_then_stock(panel, elig, sectors, SF[sg], dates, ts, tn, "S1_板块内最强", "最强")
+        tr = track_fixed(pk, panel, hd, comm=comm, stamp=stamp, slip=slip) if len(pk) else pd.DataFrame()
+        if len(tr):
+            tr = tr.dropna(subset=["收益率"]).copy()
+            tr["年"] = pd.to_datetime(tr["date"]).dt.year
+            allt[(sg, ts, tn, hd)] = tr
+        if progress:
+            progress((i + 1) / len(cfgs), f"{sg} {ts}板块 {tn}只 {hd}日")
+
+    years = sorted({y for t in allt.values() for y in t["年"].unique()})
+    years = [y for y in years if y >= start_year]
+    rows, picked = [], []
+    for y in years:
+        best, bcfg = -9e9, None
+        for cfg, tr in allt.items():
+            hist = tr[tr["年"] < y]
+            if len(hist) < 150:
+                continue
+            v = hist["收益率"]
+            se = v.std(ddof=1) / np.sqrt(len(v))
+            score = v.mean() / se if se > 1e-12 else -9e9   # 只用历史挑
+            if score > best:
+                best, bcfg = score, cfg
+        if bcfg is None:
+            continue
+        cur = allt[bcfg][allt[bcfg]["年"] == y]
+        if not len(cur):
+            continue
+        picked.append({"年": y, "选中配置": f"{bcfg[0]}|{bcfg[1]}板块|{bcfg[2]}只|{bcfg[3]}日",
+                       "历史t": best, "当年笔数": len(cur),
+                       "当年平均收益": cur["收益率"].mean(),
+                       "当年胜率": (cur["收益率"] > 0).mean()})
+        rows.append(cur.assign(年份=y))
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+    wf = pd.concat(rows, ignore_index=True)
+    return pd.DataFrame(picked).set_index("年"), wf
+
+
+def wf_summary(wf: pd.DataFrame, allt_best: pd.DataFrame = None) -> dict:
+    if not len(wf):
+        return {}
+    v = wf["收益率"]
+    day = wf.groupby("date")["收益率"].mean().sort_index()
+    se = day.std(ddof=1) / np.sqrt(len(day)) if len(day) > 3 else np.nan
+    return {"笔数": len(v), "平均收益": v.mean(), "中位收益": v.median(),
+            "胜率": float((v > 0).mean()),
+            "聚类t": float(day.mean() / se) if se and se > 1e-12 else np.nan}
 
 
 def export_all(tables: Dict[str, pd.DataFrame]) -> bytes:
@@ -1499,6 +1576,50 @@ def main():
                                    "看「差异」列在 2018/2022 是不是明显为正——"
                                    "如果是，说明开关掐对了地方；"
                                    "如果在牛市年份也大幅为正，那是过度拟合的信号。")
+                st.divider()
+                st.markdown("### ⑤ 滚动前推检验（搜索过参数后，唯一还算数的检验）")
+                st.error("**如果你试过多个配置再挑最好的，上面的「样本外」已经不算数了。** "
+                         "因为你在挑选时看过它。滚动前推模拟「你当年真的会怎么做」："
+                         "每年年初只用截至上一年底的数据挑配置，再用它跑这一年，"
+                         "第二年重新挑。这才是真正没被污染的样本外。")
+                if st.button("运行滚动前推", type="primary"):
+                    bar3 = st.progress(0.0)
+                    picked, wf = walk_forward(
+                        panel, elig, sectors, SF2, dates,
+                        signals=[s for s in SF2 if not s.startswith("【合成】")],
+                        top_secs=(2, 3), top_ns=(top_n,), holds=(15, 20),
+                        start_year=2021,
+                        progress=lambda p, n2: bar3.progress(p, text=n2), **kw)
+                    ss["wf"] = (picked, wf); bar3.empty()
+                if ss.get("wf"):
+                    picked, wf = ss["wf"]
+                    if not len(wf):
+                        st.warning("样本不足。")
+                    else:
+                        s5 = wf_summary(wf)
+                        m5 = st.columns(4)
+                        m5[0].metric("滚动前推 平均收益", f"{s5['平均收益']:+.2%}")
+                        m5[1].metric("胜率", f"{s5['胜率']:.1%}")
+                        m5[2].metric("聚类t", f"{s5['聚类t']:.2f}")
+                        m5[3].metric("笔数", f"{s5['笔数']}")
+                        st.dataframe(picked.style.format(
+                            {"历史t": "{:.2f}", "当年笔数": "{:.0f}",
+                             "当年平均收益": "{:+.2%}", "当年胜率": "{:.1%}"})
+                            .background_gradient(subset=["当年平均收益"], cmap="RdYlGn"),
+                            use_container_width=True)
+                        npos = int((picked["当年平均收益"] > 0).sum())
+                        st.caption(f"每年选中的配置见「选中配置」列。逐年为正 {npos}/{len(picked)}。"
+                                   "**注意每年选中的配置是否稳定**——如果年年都换，"
+                                   "说明所谓最优只是当年的运气。")
+                        if s5["聚类t"] >= 2 and s5["平均收益"] > 0:
+                            st.success("**滚动前推也站得住。** 这是搜索过参数之后"
+                                       "唯一还算数的证据，含金量比前面任何数字都高。")
+                        else:
+                            st.error(f"**滚动前推没站住**（{s5['平均收益']:+.2%}，"
+                                     f"t={s5['聚类t']:.2f}）。说明前面那些漂亮数字"
+                                     "主要来自「事后挑到了最好的配置」，"
+                                     "而当年你没有能力挑中它。")
+
                 st.divider()
                 st.markdown("### 三项必做诊断")
                 st.caption("前面几轮就是这三项戳破的幻觉：平均收益漂亮，"
