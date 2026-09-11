@@ -1151,6 +1151,48 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
     return pd.DataFrame(rows)
 
 
+def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
+                      cal) -> pd.DataFrame:
+    """
+    按「买入时，该板块已经连续霸榜几天」给同一批成交分组。
+
+    回答的是执行时机问题：龙头刚换就买 vs 它已经领跑几天才买，差别多大。
+    这是对同一批交易做划分，不做替补，所以没有"往排名深处挖"的污染。
+    """
+    if not len(tr):
+        return pd.DataFrame()
+    days = [d for d in cal if d in sec_fac.index and sec_fac.loc[d].notna().any()]
+    top = {}
+    for d in days:
+        top[d] = sec_fac.loc[d].idxmax()
+    age, prev, cnt = {}, None, 0
+    for d in days:                      # 当天龙头已连续第几天（只用过去，无前视）
+        cnt = cnt + 1 if top[d] == prev else 1
+        age[d] = cnt
+        prev = top[d]
+
+    m = picks[["date", "code", "板块"]].drop_duplicates(["date", "code"])
+    d0 = tr.merge(m, on=["date", "code"], how="left", suffixes=("", "_p"))
+    d0 = d0.dropna(subset=["收益率"]).copy()
+    d0["霸榜天数"] = d0["date"].map(age)
+    d0 = d0.dropna(subset=["霸榜天数"])
+    if len(d0) < 100:
+        return pd.DataFrame()
+    b = [0, 1, 2, 3, 5, 8, 999]
+    lab = ["第1天", "第2天", "第3天", "第4-5天", "第6-8天", "第9天以上"]
+    d0["档"] = pd.cut(d0["霸榜天数"], bins=b, labels=lab, right=True)
+    out = []
+    for g, sub in d0.groupby("档", observed=True):
+        day = sub.groupby("date")["收益率"].mean().sort_index()
+        se = day.std(ddof=1) / np.sqrt(len(day)) if len(day) > 3 else np.nan
+        out.append({"买入时机": g, "笔数": len(sub), "占比": len(sub) / len(d0),
+                    "平均收益": sub["收益率"].mean(),
+                    "中位收益": sub["收益率"].median(),
+                    "胜率": float((sub["收益率"] > 0).mean()),
+                    "聚类t": float(day.mean() / se) if se and se > 1e-12 else np.nan})
+    return pd.DataFrame(out).set_index("买入时机")
+
+
 def split_by_mask(picks: pd.DataFrame, tr: pd.DataFrame, mask: pd.DataFrame,
                    lab_yes: str = "是", lab_no: str = "否") -> pd.DataFrame:
     """
@@ -1976,17 +2018,22 @@ def main():
             base = list(keep)[0]
             pk0, tr0 = pks[base], keep[base]
             cond = st.selectbox("按什么条件划分",
-                                ["买入日在高位死叉后1-5天", "买入时 K≥75", "买入时 K≥60"])
+                                ["板块已霸榜几天（执行时机）",
+                                 "买入日在高位死叉后1-5天", "买入时 K≥75", "买入时 K≥60"])
             if st.button("运行干净划分", type="primary"):
                 with st.spinner("计算中…"):
-                    if cond == "买入日在高位死叉后1-5天":
+                    if cond.startswith("板块已霸榜"):
+                        ss["ksplit"] = run_age_diagnosis(pk0, tr0, SF[sig_],
+                                                         panel["cal"])
+                        ss["kbk"] = None
+                    elif cond == "买入日在高位死叉后1-5天":
                         mk = high_dead_cross_mask(KDF, DDF, 5); ly, ln = "死叉后1-5天", "其他"
                     elif cond == "买入时 K≥75":
                         mk = KDF >= 75; ly, ln = "K≥75", "K<75"
                     else:
                         mk = KDF >= 60; ly, ln = "K≥60", "K<60"
-                    ss["ksplit"] = split_by_mask(pk0, tr0, mk, ly, ln)
-                    ss["kbk"] = k_bucket_diagnosis(pk0, tr0)
+                        ss["ksplit"] = split_by_mask(pk0, tr0, mk, ly, ln)
+                        ss["kbk"] = k_bucket_diagnosis(pk0, tr0)
             if ss.get("ksplit") is not None and len(ss["ksplit"]):
                 st.dataframe(ss["ksplit"].style.format(
                     {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}",
@@ -1994,8 +2041,14 @@ def main():
                     .background_gradient(subset=["中位收益"], cmap="RdYlGn"),
                     use_container_width=True)
                 n_all = len(tr0.dropna(subset=["收益率"]))
-                st.caption(f"两组笔数合计 {int(ss['ksplit']['笔数'].sum())}，"
+                st.caption(f"各组笔数合计 {int(ss['ksplit']['笔数'].sum())}，"
                            f"总成交 {n_all} —— 相等说明是真划分，不是替补。")
+                if cond.startswith("板块已霸榜"):
+                    st.info("**这回答的是执行时机**：龙头刚换就买，和它已经领跑几天才买，"
+                            "差别多大。\n\n各档如果差不多，说明**错过前几天不用懊恼**，"
+                            "什么时候有钱什么时候买都行；如果「第1天」明显更好，"
+                            "那就值得盯紧龙头切换。\n\n"
+                            "判读时注意笔数：占比小的档标准误大，别被单个数字带走。")
                 st.info("**判读**：胜率差的标准误约 2-3 个百分点，"
                         "差异小于这个量级就是噪音。\n\n"
                         "**你只拿 1-3 只，抓到右尾的概率低，实际体验更接近中位数**——"
