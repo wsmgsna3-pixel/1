@@ -806,6 +806,8 @@ def extend_panel(pro, lim: Limiter, panel: dict, end_str: str,
         return panel, 0
 
     new = {k: pd.DataFrame(v).T.reindex(index=got, columns=codes) for k, v in acc.items()}
+    if "close" not in new or new["close"].notna().sum().sum() == 0:
+        return panel, 0
     raw_close = pd.concat([panel["raw_close"], new["close"]])
     raw_open = pd.concat([panel["raw_open"], new["open"]])
     amount = pd.concat([panel["amount"], new["amount"]])
@@ -883,13 +885,22 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
         return {}
     # 转回"每只股票一张长表"，复用 build_panel，保证和按股票下载的口径完全一致
     wide = {k: pd.DataFrame(v).T.sort_index() for k, v in rows.items() if v}
-    have = sorted(set().union(*[set(w.columns) for w in wide.values()]))
+    if "close" not in wide:
+        return {}
+    # 只保留在 daily 里真正出现过的股票。daily_basic 会返回当天全市场
+    # （含无成交的），daily 不会 —— 直接取并集会混进没有 close 列的股票。
+    have = sorted(wide["close"].columns)
     out = {}
     for c in have:
-        df = pd.DataFrame({k: w[c] for k, w in wide.items() if c in w.columns})
-        df = df.dropna(subset=["close"])
+        cols = {k: w[c] for k, w in wide.items() if c in w.columns}
+        if "close" not in cols:
+            continue
+        df = pd.DataFrame(cols).dropna(subset=["close"])
         if len(df) < 30:
             continue
+        for k in need:                       # 补齐 build_panel 需要的列
+            if k not in df.columns:
+                df[k] = np.nan
         df = df.reset_index().rename(columns={"index": "trade_date"})
         out[c] = df
     return out
