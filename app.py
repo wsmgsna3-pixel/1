@@ -1325,7 +1325,9 @@ def main():
             workers = st.slider("下载并发", 1, 8, 4)
         run = st.button("下载数据", type="primary", use_container_width=True)
         if ss.get("panel") is not None:
-            st.success(f"{len(ss['panel']['codes'])} 只 × {len(ss['panel']['cal'])} 日")
+            _p = ss["panel"]
+            st.success(f"{len(_p['codes'])} 只 × {len(_p['cal'])} 日")
+            st.caption(f"数据区间 {_p['cal'][0]:%Y-%m-%d} ~ **{_p['cal'][-1]:%Y-%m-%d}**")
 
     # ---------------- 下载 ----------------
     if run:
@@ -1374,6 +1376,10 @@ def main():
 
     panel, basic, uni = ss["panel"], ss["basic"], ss["uni"]
     dkey = f"{len(panel['codes'])}|{panel['cal'][-1]:%Y%m%d}|{min_mem}"
+    st.caption(f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**　·　"
+               f"{len(panel['codes'])} 只 × {len(panel['cal'])} 个交易日　·　"
+               f"{len(sectors) if ss.get('sec') else '?'} 个板块"
+               if ss.get("sec") else f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**")
 
     # 合格池、板块、信号、日线KD —— 全部按数据版本缓存。
     # 不缓存的话每次交互都要重算 1400×2100 的全量矩阵，反复分配大数组
@@ -1558,6 +1564,12 @@ def main():
                              .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
                              use_container_width=True)
                 st.write(f"逐年为正 **{int((yy['平均收益']>0).sum())}/{len(yy)}**")
+                st.caption(
+                    f"**最后一年（{yy.index[-1]}）的数字会随数据更新而变，其余年份不会。** "
+                    f"持有 {hold} 个交易日的规则下，数据末尾不足 {hold} 天的交易"
+                    "整笔被丢弃；每多几天数据，就有几笔能完成、被纳入统计。"
+                    f"当前数据截至 {panel['cal'][-1]:%Y-%m-%d}。"
+                    "拿不同日期跑出的结果对比时，只看最后一年之前的部分。")
 
             st.divider()
             st.markdown("### 滚动前推（搜索过参数后唯一算数的检验）")
@@ -1625,6 +1637,10 @@ def main():
                                   "买入价(实际)", "卖出价(实际)", "收益率",
                                   "持有交易日", "买入K", "买入价(复权)", "卖出价(复权)"]
                       if c in _td.columns]
+            if "卖出日" in _td.columns and len(_td):
+                st.caption(f"最晚卖出日 **{pd.to_datetime(_td['卖出日']).max():%Y-%m-%d}**"
+                           f"　·　数据截至 {panel['cal'][-1]:%Y-%m-%d}"
+                           f"　·　共 {len(_td)} 笔")
             st.dataframe(_td[_order].tail(300), use_container_width=True, height=300)
             st.caption("**买入价(实际)** 是当日真实开盘价，可直接与交易软件核对。"
                        "**买入价(复权)** 是起点归一化为 1.0 的前复权序列——"
