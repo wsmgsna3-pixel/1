@@ -843,6 +843,58 @@ def extend_panel(pro, lim: Limiter, panel: dict, end_str: str,
     return out, len(got)
 
 
+def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
+                     progress=None) -> dict:
+    """
+    按**交易日**取全市场，再筛出我们要的股票。
+
+    按股票取是每只 2 次调用、固定 2800 次，和时间跨度无关；
+    按交易日取是每天 2 次，跨度越短越划算。
+    交叉点在「天数 = 股票数」，约 5.7 年——短于此都该走这条路。
+    """
+    tc = api_call(pro.trade_cal, lim, exchange="SSE", start_date=start,
+                  end_date=end, is_open="1")
+    if tc is None or not len(tc):
+        return {}
+    days = sorted(str(x) for x in tc["cal_date"])
+    cs = set(codes)
+    need = ["open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
+    rows = {k: {} for k in need + ["circ_mv"]}
+    ok = 0
+    for i, d in enumerate(days):
+        dd = api_call(pro.daily, lim, trade_date=d)
+        if dd is None or not len(dd):
+            if progress:
+                progress((i + 1) / len(days), f"{d} 无数据")
+            continue
+        dd = dd[dd["ts_code"].isin(cs)].drop_duplicates("ts_code").set_index("ts_code")
+        db = api_call(pro.daily_basic, lim, trade_date=d, fields="ts_code,circ_mv")
+        dt_ = pd.Timestamp(d)
+        for k in need:
+            if k in dd.columns:
+                rows[k][dt_] = dd[k].astype(np.float32)
+        if db is not None and len(db):
+            rows["circ_mv"][dt_] = (db.drop_duplicates("ts_code")
+                                    .set_index("ts_code")["circ_mv"].astype(np.float32))
+        ok += 1
+        if progress and (i % 5 == 0 or i == len(days) - 1):
+            progress((i + 1) / len(days), f"{d}　{ok}/{len(days)}")
+    if not ok:
+        return {}
+    # 转回"每只股票一张长表"，复用 build_panel，保证和按股票下载的口径完全一致
+    wide = {k: pd.DataFrame(v).T.sort_index() for k, v in rows.items() if v}
+    have = sorted(set().union(*[set(w.columns) for w in wide.values()]))
+    out = {}
+    for c in have:
+        df = pd.DataFrame({k: w[c] for k, w in wide.items() if c in w.columns})
+        df = df.dropna(subset=["close"])
+        if len(df) < 30:
+            continue
+        df = df.reset_index().rename(columns={"index": "trade_date"})
+        out[c] = df
+    return out
+
+
 # ======================================================================
 # 板块层 —— 把选股单位从个股换成行业，目的是降噪
 # ======================================================================
@@ -1397,6 +1449,10 @@ def main():
         hold = st.slider("持有交易日", 3, 30, 20)
         with st.expander("其他设置"):
             start = st.date_input("数据起始", dt.date(2018, 1, 1))
+            st.caption("**只用第④页选股的话，2025-01-01 起就够**（约410个交易日），"
+                       "下载调用数只有全量的 29%。\n\n"
+                       "但第②页的样本内外拆分需跨越 2023-01-01，"
+                       "滚动前推需要 2021 年起——**要重新做验证就得用 2018 年起**。")
             end = st.date_input("数据结束", dt.date.today())
             min_mem = st.slider("板块最少成分股", 3, 20, 5)
             every = st.slider("每几个交易日选一次", 1, 10, 3)
@@ -1444,11 +1500,22 @@ def main():
             basic = fetch_stock_basic(pro, lim)
             st.write("市值预筛…")
             codes = prescreen_by_mv(pro, lim, list(uni["ts_code"]), s_str, e_str, 50, 1000)
-            st.write(f"下载 {len(codes)} 只…")
+            # 自动挑更省调用的下载方式：
+            #   按股票取 = 2 × 股票数（固定）；按交易日取 = 2 × 交易日数
+            ndays = int(np.busday_count(start, end) * 0.97)
+            by_date = ndays < len(codes)
+            st.write(f"下载 {len(codes)} 只（约 {ndays} 个交易日）…")
+            st.write(f"   用**{'按交易日' if by_date else '按股票'}**取："
+                     f"约 {2*ndays if by_date else 2*len(codes)} 次调用"
+                     f"（另一种要 {2*len(codes) if by_date else 2*ndays} 次）")
             bar = st.progress(0.0); t0 = time.time()
-            px = download_all(token, codes, s_str, e_str, lim, True, workers,
-                              lambda a, b, c: bar.progress(a / b,
-                                  text=f"{a}/{b}　{(time.time()-t0)/60:.1f} 分"))
+            if by_date:
+                px = download_by_date(pro, lim, codes, s_str, e_str,
+                                      lambda p, s: bar.progress(p, text=s))
+            else:
+                px = download_all(token, codes, s_str, e_str, lim, True, workers,
+                                  lambda a, b, c: bar.progress(a / b,
+                                      text=f"{a}/{b}　{(time.time()-t0)/60:.1f} 分"))
             if not px:
                 st.error("没下到数据。"); st.stop()
             panel = build_panel(px); px.clear(); del px; gc.collect()
@@ -1858,6 +1925,15 @@ def main():
         if sr2 not in STOCK_RULES:
             sr2 = STOCK_RULES[0]
         d = panel["cal"][-1]
+        _today = pd.Timestamp(dt.date.today())
+        if d >= _today:
+            st.error(f"**数据末尾是今天（{d:%Y-%m-%d}），盘中可能是不完整的当日数据。** "
+                     "回测口径是「收盘后选出、次日开盘买入」，"
+                     "用盘中数据选出的名单和回测不是一回事。建议收盘后再跑。")
+        else:
+            st.success(f"**选股依据：{d:%Y-%m-%d} 收盘数据**"
+                       f"（今天是 {_today:%Y-%m-%d}）。"
+                       "按回测口径，这份名单应在**下一个交易日开盘**买入。")
         f = SF[sig2].loc[d].dropna().sort_values(ascending=False)
         st.subheader(f"{d:%Y-%m-%d}　板块排名")
         st.dataframe(pd.DataFrame({"板块": f.index, "信号值": f.values,
@@ -1889,7 +1965,8 @@ def main():
             st.dataframe(out, use_container_width=True, hide_index=True)
             st.download_button("下载 CSV", out.to_csv(index=False).encode("utf-8-sig"),
                                f"picks_{d:%Y%m%d}.csv", "text/csv")
-            st.info(f"**执行规则**：次日开盘买入，**持有 {hold} 个交易日后开盘卖出**。"
+            st.info(f"**执行规则**：{d:%Y-%m-%d} 之后的下一个交易日开盘买入，"
+                    f"**持有 {hold} 个交易日后开盘卖出**。"
                     "不设止盈止损——回测就是这个口径。"
                     "「日线K」仅供参考，实测按它过滤只会让结果变差。")
 
