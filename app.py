@@ -381,11 +381,11 @@ def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
                          for c in codes], index=codes, dtype=np.float32)
     limit_up_open = (raw_open >= pre_close.mul(1.0 + lim_pct, axis=1) - 0.004) & tradable
     limit_dn_open = (raw_open <= pre_close.mul(1.0 - lim_pct, axis=1) + 0.004) & tradable
-    del raw_open, pre_close, idxed      # 之后再也用不到，立刻释放
+    del pre_close, idxed                # 之后再也用不到，立刻释放
     gc.collect()
 
     return dict(cal=cal, codes=codes,
-                raw_close=raw_close, amount=amount, circ_mv=circ_mv,
+                raw_close=raw_close, raw_open=raw_open, amount=amount, circ_mv=circ_mv,
                 adj_close=adj_close, adj_open=adj_open,
                 adj_high=adj_high, adj_low=adj_low, tradable=tradable,
                 limit_up_open=limit_up_open, limit_dn_open=limit_dn_open)
@@ -894,22 +894,29 @@ def sector_layer_test(fac: pd.DataFrame, IDX: pd.DataFrame, horizons=(3, 5, 8, 1
 
 
 # ---------------- 买入位置过滤（日线 SKDJ K 值）----------------
-def daily_k(panel: dict, n: int = 9, m: int = 3) -> pd.DataFrame:
-    """日线 SKDJ 的 K 值。买入当天就已知，不含未来数据。"""
+def daily_kd(panel: dict, n: int = 9, m: int = 3):
+    """日线 SKDJ 的 K 和 D。买入当天就已知，不含未来数据。"""
     A, H, L = panel["adj_close"], panel["adj_high"], panel["adj_low"]
     lo, hi = L.rolling(n).min(), H.rolling(n).max()
     rng = (hi - lo).where((hi - lo) > 1e-9)
     ema = lambda d, p: d.ewm(span=p, adjust=False, min_periods=p).mean()
     rsv = ema((A - lo) / rng * 100.0, m)
-    return ema(rsv, m).astype(np.float32)
+    k = ema(rsv, m)
+    d = k.rolling(m).mean()
+    return k.astype(np.float32), d.astype(np.float32)
+
+
+def daily_k(panel: dict, n: int = 9, m: int = 3) -> pd.DataFrame:
+    return daily_kd(panel, n, m)[0]
 
 
 K_FILTER_NAMES = ["K0_不过滤", "K1_只买K<75", "K2_只买K<60",
                   "K3_只买K<75且近5日未到过75", "K4_只买K<75且K在上升",
-                  "K5_只买K>75(反向对照)"]
+                  "K5_只买K>75(反向对照)",
+                  "K6_排除高位死叉后1-5天", "K7_只买高位死叉后1-5天(反向对照)"]
 
 
-def build_k_masks(kdf: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+def build_k_masks(kdf: pd.DataFrame, dkf: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
     """
     买入位置的候选条件，全部只用当日及之前的数据。
 
@@ -920,7 +927,16 @@ def build_k_masks(kdf: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     k = kdf
     was_high = (k >= 75).rolling(5).max().fillna(0).astype(bool)
     rising = k > k.shift(1)
-    return {"K0_不过滤": None,
+    # 高位死叉：K 从 75 上方下穿 D。这是"高位转弱"，
+    # 和单纯"K 在高位"是两回事 —— 后者是强势股的常态。
+    if dkf is not None:
+        dead_hi = (k < dkf) & (k.shift(1) >= dkf.shift(1)) & (k.shift(1) >= 75)
+        recent_dead = dead_hi.rolling(5).max().fillna(0).astype(bool)
+    else:
+        recent_dead = pd.DataFrame(False, index=k.index, columns=k.columns)
+    return {"K6_排除高位死叉后1-5天": ~recent_dead,
+            "K7_只买高位死叉后1-5天(反向对照)": recent_dead,
+            "K0_不过滤": None,
             "K1_只买K<75": k < 75,
             "K2_只买K<60": k < 60,
             "K3_只买K<75且近5日未到过75": (k < 75) & (~was_high),
@@ -1119,6 +1135,7 @@ def track_fixed(picks: pd.DataFrame, panel: dict, hold_days: int = 8,
     cal = panel["adj_close"].index
     ci = {c: j for j, c in enumerate(panel["codes"])}
     AO = panel["adj_open"].to_numpy(dtype=np.float32)
+    RO = panel["raw_open"].to_numpy(dtype=np.float32)      # 真实开盘价，仅用于显示
     TRD = panel["tradable"].to_numpy(dtype=bool)
     LU = panel["limit_up_open"].to_numpy(dtype=bool)
     LD = panel["limit_dn_open"].to_numpy(dtype=bool)
@@ -1141,9 +1158,15 @@ def track_fixed(picks: pd.DataFrame, panel: dict, hold_days: int = 8,
             continue
         entry = float(AO[b, j]) * (1 + cin)
         exit_ = float(AO[e, j]) * (1 - cout)
+        # 上面两个是**复权价**（起点归一化为1.0），用来算收益才正确——
+        # 它把分红送股都还原了。但它不是你在交易软件上看到的价格，
+        # 所以额外给出当日真实开盘价，方便你逐笔核对。
         out.append({"date": p["date"], "code": p["code"], "板块": p.get("板块", "-"),
-                    "买入日": cal[b], "卖出日": cal[e], "买入价": entry, "卖出价": exit_,
-                    "收益率": exit_ / entry - 1.0, "持有交易日": e - b})
+                    "买入日": cal[b], "卖出日": cal[e],
+                    "买入价(实际)": round(float(RO[b, j]), 2) if np.isfinite(RO[b, j]) else np.nan,
+                    "卖出价(实际)": round(float(RO[e, j]), 2) if np.isfinite(RO[e, j]) else np.nan,
+                    "收益率": exit_ / entry - 1.0, "持有交易日": e - b,
+                    "买入价(复权)": round(entry, 4), "卖出价(复权)": round(exit_, 4)})
     return pd.DataFrame(out)
 
 
@@ -1389,9 +1412,9 @@ def main():
     with st.sidebar:
         token = st.text_input("Tushare Token", type="password",
                               value=os.environ.get("TUSHARE_TOKEN", ""))
-        top_sec = st.slider("选几个板块", 1, 5, 2)
+        top_sec = st.slider("选几个板块", 1, 5, 3)
         top_n = st.slider("总共选几只", 1, 5, 3)
-        hold = st.slider("持有交易日", 3, 20, 8)
+        hold = st.slider("持有交易日", 3, 30, 20)
         with st.expander("其他设置"):
             start = st.date_input("数据起始", dt.date(2018, 1, 1))
             end = st.date_input("数据结束", dt.date.today())
@@ -1481,13 +1504,15 @@ def main():
     SF2 = ss["sf2"]
     if ss.get("kmask_key") != dkey:
         with st.spinner("计算日线 SKDJ…"):
-            _kdf = daily_k(panel)
+            _kdf, _ddf = daily_kd(panel)
             ss["kdf"] = _kdf
-            ss["kmasks"] = build_k_masks(_kdf)
+            ss["kmasks"] = build_k_masks(_kdf, _ddf)
             ss["kmask_key"] = dkey
             gc.collect()
     KDF, KM = ss["kdf"], ss["kmasks"]
-    DEF_SIG = "【合成】动量族平均" if "【合成】动量族平均" in SF2 else list(SF2)[0]
+    # 默认用板块20日动量：滚动前推六年里五年都选中它，不是我挑的。
+    DEF_SIG = ("板块20日动量" if "板块20日动量" in SF2
+               else ("【合成】动量族平均" if "【合成】动量族平均" in SF2 else list(SF2)[0]))
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
 
@@ -1588,7 +1613,7 @@ def main():
                            index=list(SF2).index(DEF_SIG))
         if sig not in SF2:          # 兜底：控件异常时不让整页崩掉
             sig = DEF_SIG
-        use_reg = c1.checkbox("开启熊市开关（已证伪，默认关闭）", False)
+        use_reg = False   # 熊市开关已证伪（加权 −0.57%/笔，2022年把 −2.54% 变成 −10.65%），已移除
         st.warning(
             "**「★行业中性动量」是本轮新增的重点。** 三轮对照实验里，"
             "「只和同板块的股票比强弱」这一层每次都稳定为正"
@@ -1627,7 +1652,7 @@ def main():
                 ("★行业中性动量（零参数）",
                  lambda: industry_neutral_pick(panel, elig, sectors, dates, top_n)),
             ]
-            reg = pool_regime(panel, elig, 200) if use_reg else None
+            reg = None
             rows, keep, raw = [], {}, {}
             for i, (lab, fn) in enumerate(plans):
                 pk = fn()
@@ -1880,7 +1905,17 @@ def main():
 
                 st.divider()
                 d = st.selectbox("看哪个方案的成交明细", list(keep))
-                st.dataframe(keep[d].tail(300), use_container_width=True, height=300)
+                _td = keep[d].copy()
+                _order = [c for c in ["date", "code", "板块", "买入日", "卖出日",
+                                      "买入价(实际)", "卖出价(实际)", "收益率",
+                                      "持有交易日", "买入K", "买入价(复权)", "卖出价(复权)"]
+                          if c in _td.columns]
+                st.dataframe(_td[_order].tail(300), use_container_width=True, height=300)
+                st.caption("**买入价(实际)/卖出价(实际)** 是当日真实开盘价，可以直接和"
+                           "交易软件核对。**买入价(复权)** 是起点归一化为 1.0 的前复权序列——"
+                           "收益率必须用它算才正确（它把分红送股还原了），"
+                           "但它不是你在盘面上看到的价格。之前明细里只显示了后者，"
+                           "所以看起来像 1.9499 这种奇怪数字。")
                 if st.button("生成导出包"):
                     tb = {"01_对照结果": df, "02_成交明细": pd.concat(
                         [v.assign(方案=k) for k, v in keep.items()], ignore_index=True),
