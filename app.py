@@ -1073,7 +1073,8 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                       top_sec: int = 2, top_n: int = 3,
                       stock_rule: str = "S1_板块内最强",
                       sec_rule: str = "最强", cooldown: int = 5,
-                      seed: int = 20260910, kdf: pd.DataFrame = None) -> pd.DataFrame:
+                      seed: int = 20260910, kdf: pd.DataFrame = None,
+                      per_sec_cap: int = 0) -> pd.DataFrame:
     """
     两层选股：先按 sec_fac 选出 top_sec 个板块，再在板块内按 stock_rule 选股。
     sec_rule="随机" 时板块层用随机选择 —— 这是判断"板块层有没有加分"的对照组。
@@ -1114,11 +1115,18 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
             for c in order:
                 cand.append((s, c, float(v[c])))
         taken = 0
+        used: Dict[str, int] = {}
         for s, c, sc in cand:
             if taken >= top_n:
                 break
             if c in last and i - last[c] < cooldown:
                 continue
+            # 候选是按板块顺序排的（最强板块的股票全部在前），
+            # 不设上限时前 top_n 名往往全部来自最强板块。
+            # per_sec_cap>0 则强制分散。默认 0 = 不限，保持与已验证口径一致。
+            if per_sec_cap > 0 and used.get(s, 0) >= per_sec_cap:
+                continue
+            used[s] = used.get(s, 0) + 1
             rows.append({"date": d, "code": c, "板块": s, "rank": taken + 1,
                          "score": sc, "买入K": (float(kdf.loc[d, c])
                                                 if kdf is not None and c in kdf.columns
@@ -1458,6 +1466,10 @@ def main():
         top_sec = st.slider("选几个板块", 1, 5, 3)
         top_n = st.slider("每次选几只", 1, 5, 3)
         hold = st.slider("持有交易日", 3, 30, 20)
+        cap = st.slider("每个板块最多取几只（0=不限）", 0, 5, 0,
+                        help="0 是已验证过的口径：候选按板块顺序取，"
+                             "常常三只全来自最强板块。设为 1 则强制每个板块只取一只。"
+                             "改了这个，前面所有回测结论都要重跑。")
         with st.expander("其他设置"):
             start = st.date_input("数据起始", dt.date(2018, 1, 1))
             st.caption("**只用第④页选股的话，2025-01-01 起就够**（约410个交易日），"
@@ -1627,6 +1639,13 @@ def main():
                            f"{sum(len(v) for v in sectors.values())} 只股票纳入。"
                            "此前实测降噪比 0.60（波动降到个股的六成）。")
 
+        _nd = len(panel["cal"])
+        if _nd < 900:
+            st.error(f"**当前只有 {_nd} 个交易日（约 {_nd/244:.1f} 年），这一页的结果不可信。** "
+                     "分层检验的 t 值随样本量开平方缩水：8年约420个观测，"
+                     f"1.7年只有约{int(_nd/5)}个，t 会缩到 {np.sqrt(_nd/5/420):.2f} 倍。"
+                     "**信号之间的名次在这种样本下基本是噪音，不要据此换默认信号。** "
+                     "要比较信号，把数据起始改回 2018-01-01。")
         if st.button("跑全部板块信号", type="primary"):
             bar = st.progress(0.0); out = {}
             for i, nm in enumerate(SF):
@@ -1652,6 +1671,12 @@ def main():
                                           "末期t(朴素)": "{:.2f}"})
                          .background_gradient(subset=["Q4−Q1"], cmap="RdYlGn"),
                          use_container_width=True)
+            st.warning("**这一页测的是「板块指数会不会涨」，不是「按它选股能赚多少」。** "
+                       "8年数据上：这一页 60日动量最好（t 2.19）> 20日动量（t 1.89）；"
+                       "但实际回测里 20日动量 +1.56% > 60日动量 +1.00%，"
+                       "滚动前推六年里五年也选中 20日动量。\n\n"
+                       "**板块指数涨得准，不等于按它选出的股票赚得多。** "
+                       "换默认信号只应依据滚动前推，不要依据这一页。")
             st.info("**看重叠修正后的 t，不看朴素 t**（15日前瞻每几天采样一次，样本重叠）。"
                     "**真正的证据是一致性**：动量类信号如果单调性全部同号，"
                     "而「创20日新高」呈现相反的单调性——这种内部一致的结构"
@@ -1683,10 +1708,12 @@ def main():
             plans = [
                 ("两层：最强板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
-                                           top_sec, top_n, srule, "最强", kdf=KDF)),
+                                           top_sec, top_n, srule, "最强", kdf=KDF,
+                                           per_sec_cap=cap)),
                 ("对照A：随机板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
-                                           top_sec, top_n, srule, "随机", kdf=KDF)),
+                                           top_sec, top_n, srule, "随机", kdf=KDF,
+                                           per_sec_cap=cap)),
                 ("对照B：不分板块，全池 " + srule,
                  lambda: flat_stock_pick(panel, elig, dates, top_n, srule)),
                 ("对照C：全池随机",
@@ -1952,7 +1979,7 @@ def main():
                                                 for s in f.index]}).head(10),
                      use_container_width=True, hide_index=True)
         pk = sector_then_stock(panel, elig, sectors, SF[sig2], [d],
-                               top_sec, top_n, sr2, "最强", kdf=KDF)
+                               top_sec, top_n, sr2, "最强", kdf=KDF, per_sec_cap=cap)
         if len(pk) < top_n:
             info = [f"{s3}: {int(elig.loc[d, sectors[s3]].sum())} 只合格"
                     for s3 in list(f.index[:top_sec])]
@@ -1973,6 +2000,15 @@ def main():
                 "20日涨幅": f"{r['score']:.1%}",
                 "日线K": round(float(r["买入K"]), 1) if pd.notna(r.get("买入K")) else None
             } for _, r in pk.iterrows()])
+            vc = out["板块"].value_counts()
+            if len(vc) == 1 and len(out) > 1:
+                st.warning(f"**{len(out)} 只全部来自「{vc.index[0]}」。** "
+                           "候选按板块顺序取：最强板块的股票排在最前，"
+                           "不够才轮到次强板块。回测里有 5 日冷却期会自然分散，"
+                           "单看某一天没有冷却历史，就集中在最强板块。\n\n"
+                           "**这是已验证口径的正常表现，但意味着没有分散。** "
+                           "想强制分散，把侧边栏「每个板块最多取几只」设为 1——"
+                           "**但那是没验证过的新口径，改了要重跑第②页的对照和滚动前推。**")
             st.dataframe(out, use_container_width=True, hide_index=True)
             st.download_button("下载 CSV", out.to_csv(index=False).encode("utf-8-sig"),
                                f"picks_{d:%Y%m%d}.csv", "text/csv")
