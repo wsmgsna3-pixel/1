@@ -1340,7 +1340,7 @@ MOM_FAMILY = ["板块5日动量", "板块10日动量", "板块20日动量",
 def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
                  SF: Dict[str, pd.DataFrame], dates: List[pd.Timestamp],
                  signals: List[str] = None, top_secs=(2, 3), top_ns=(3,),
-                 holds=(15, 20), start_year: int = 2021,
+                 holds=(15, 20), start_year: int = 2021, per_sec_cap: int = 0,
                  comm: float = 0.0003, stamp: float = 0.0005,
                  slip: float = 0.001, progress=None) -> tuple:
     """
@@ -1357,7 +1357,8 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
     # 每个配置的全期成交只算一次，之后按年份切片即可
     allt: Dict[tuple, pd.DataFrame] = {}
     for i, (sg, ts, tn, hd) in enumerate(cfgs):
-        pk = sector_then_stock(panel, elig, sectors, SF[sg], dates, ts, tn, "S1_板块内最强", "最强")
+        pk = sector_then_stock(panel, elig, sectors, SF[sg], dates, ts, tn,
+                               "S1_板块内最强", "最强", per_sec_cap=per_sec_cap)
         tr = track_fixed(pk, panel, hd, comm=comm, stamp=stamp, slip=slip) if len(pk) else pd.DataFrame()
         if len(tr):
             tr = tr.dropna(subset=["收益率"]).copy()
@@ -1385,7 +1386,9 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
         cur = allt[bcfg][allt[bcfg]["年"] == y]
         if not len(cur):
             continue
-        picked.append({"年": y, "选中配置": f"{bcfg[0]}|{bcfg[1]}板块|{bcfg[2]}只|{bcfg[3]}日",
+        _cap = f"|每板块≤{per_sec_cap}" if per_sec_cap > 0 else "|板块不限"
+        picked.append({"年": y,
+                       "选中配置": f"{bcfg[0]}|{bcfg[1]}板块|{bcfg[2]}只|{bcfg[3]}日{_cap}",
                        "历史t": best, "当年笔数": len(cur),
                        "当年平均收益": cur["收益率"].mean(),
                        "当年胜率": (cur["收益率"] > 0).mean()})
@@ -1792,6 +1795,11 @@ def main():
 
             st.divider()
             st.markdown("### 滚动前推（搜索过参数后唯一算数的检验）")
+            st.caption(f"当前侧边栏设置：每次选 **{top_n}** 只，"
+                       f"每个板块最多 **{cap if cap else '不限'}** 只。"
+                       "滚动前推会在「2或3个板块 × 15或20日持有」里逐年搜索，"
+                       "**但板块上限不参与搜索**——它按你侧边栏的设置固定。"
+                       "所以换上限重跑，可以直接和上次比。")
             st.error("**每年年初只用截至上一年底的数据挑配置，再用它跑这一年。** "
                      "全样本上挑一个最优配置再看它的「样本外」，等于用样本外做了选择，"
                      "那个数字不算数。")
@@ -1800,7 +1808,7 @@ def main():
                 picked, wf = walk_forward(
                     panel, elig, sectors, SF, dates,
                     top_secs=(2, 3), top_ns=(top_n,), holds=(15, 20),
-                    start_year=2021,
+                    start_year=2021, per_sec_cap=cap,
                     progress=lambda p, n2: bar3.progress(p, text=n2), **kw)
                 ss["wf"] = (picked, wf); bar3.empty(); gc.collect()
             if ss.get("wf"):
