@@ -763,6 +763,86 @@ def empty_week_stats(score: pd.DataFrame, elig: pd.DataFrame,
     return df.groupby(df.index.year)["不足"].sum()
 
 
+def extend_panel(pro, lim: Limiter, panel: dict, end_str: str,
+                 progress=None) -> tuple:
+    """
+    增量更新：只补最近缺的那几个交易日，不重下全历史。
+
+    关键在于换了取数方式：按**交易日**取全市场（pro.daily(trade_date=...)），
+    一天一次调用；而全量下载是按**股票**取（每只 2 次调用，1400 只就是 2800 次）。
+    补 3 天只要 6 次调用，几秒钟完成。
+    """
+    cal = panel["cal"]
+    last = cal[-1]
+    tc = api_call(pro.trade_cal, lim, exchange="SSE",
+                  start_date=(last + pd.Timedelta(days=1)).strftime("%Y%m%d"),
+                  end_date=end_str, is_open="1")
+    if tc is None or not len(tc):
+        return panel, 0
+    days = sorted(str(x) for x in tc["cal_date"])
+    if not days:
+        return panel, 0
+
+    codes = panel["codes"]
+    cs = set(codes)
+    need = ["open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
+    acc = {k: {} for k in need + ["circ_mv"]}
+    got = []
+    for i, d in enumerate(days):
+        dd = api_call(pro.daily, lim, trade_date=d)
+        if dd is None or not len(dd):
+            continue
+        dd = dd[dd["ts_code"].isin(cs)].set_index("ts_code")
+        db = api_call(pro.daily_basic, lim, trade_date=d, fields="ts_code,circ_mv")
+        dt_ = pd.Timestamp(d)
+        for k in need:
+            acc[k][dt_] = dd[k].reindex(codes).astype(np.float32) if k in dd.columns else np.nan
+        acc["circ_mv"][dt_] = (db.set_index("ts_code")["circ_mv"].reindex(codes).astype(np.float32)
+                               if db is not None and len(db) else np.nan)
+        got.append(dt_)
+        if progress:
+            progress((i + 1) / len(days), f"补 {d}")
+    if not got:
+        return panel, 0
+
+    new = {k: pd.DataFrame(v).T.reindex(index=got, columns=codes) for k, v in acc.items()}
+    raw_close = pd.concat([panel["raw_close"], new["close"]])
+    raw_open = pd.concat([panel["raw_open"], new["open"]])
+    amount = pd.concat([panel["amount"], new["amount"]])
+    circ_mv = pd.concat([panel["circ_mv"], new["circ_mv"]])
+    pre_new = new["pre_close"]
+    pct_new = new["pct_chg"]
+
+    # 复权价按链式续接：新一天 = 上一天 × (1 + 当日涨跌幅)
+    adj_prev = panel["adj_close"]
+    step = (1.0 + pct_new.fillna(0.0).astype(np.float64) / 100.0).cumprod()
+    adj_new = step.mul(adj_prev.iloc[-1], axis=1)
+    tradable_new = new["close"].notna()
+    adj_new = adj_new.where(tradable_new).ffill()
+    adj_close = pd.concat([adj_prev, adj_new])
+
+    ratio = adj_close.shift(1).loc[got] / pre_new.where(pre_new > 0)
+    adj_open = pd.concat([panel["adj_open"], (new["open"] * ratio).astype(np.float32)])
+    adj_high = pd.concat([panel["adj_high"], (new["high"] * ratio).astype(np.float32)])
+    adj_low = pd.concat([panel["adj_low"], (new["low"] * ratio).astype(np.float32)])
+    tradable = pd.concat([panel["tradable"], tradable_new])
+
+    lim_pct = pd.Series([0.20 if (c.startswith("30") or c.startswith("688")) else 0.10
+                         for c in codes], index=codes, dtype=np.float32)
+    lu = pd.concat([panel["limit_up_open"],
+                    ((new["open"] >= pre_new.mul(1.0 + lim_pct, axis=1) - 0.004)
+                     & tradable_new)])
+    ld = pd.concat([panel["limit_dn_open"],
+                    ((new["open"] <= pre_new.mul(1.0 - lim_pct, axis=1) + 0.004)
+                     & tradable_new)])
+    out = dict(cal=raw_close.index, codes=codes,
+               raw_close=raw_close, raw_open=raw_open, amount=amount, circ_mv=circ_mv,
+               adj_close=adj_close, adj_open=adj_open, adj_high=adj_high,
+               adj_low=adj_low, tradable=tradable,
+               limit_up_open=lu, limit_dn_open=ld)
+    return out, len(got)
+
+
 # ======================================================================
 # 板块层 —— 把选股单位从个股换成行业，目的是降噪
 # ======================================================================
@@ -1323,7 +1403,11 @@ def main():
             comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
             slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
             workers = st.slider("下载并发", 1, 8, 4)
-        run = st.button("下载数据", type="primary", use_container_width=True)
+        run = st.button("下载数据（首次/换股票池）", use_container_width=True)
+        upd = st.button("增量更新到最新", type="primary", use_container_width=True,
+                        disabled=ss.get("panel") is None,
+                        help="只补最近缺的几个交易日，按交易日取全市场，"
+                             "几秒钟完成；不用重下 1400 只。")
         if ss.get("panel") is not None:
             _p = ss["panel"]
             st.success(f"{len(_p['codes'])} 只 × {len(_p['cal'])} 日")
@@ -1371,8 +1455,38 @@ def main():
             ss["panel"], ss["basic"], ss["uni"] = panel, basic, uni
             stt.update(label=f"完成，{(time.time()-t0)/60:.1f} 分钟", state="complete")
 
+    # ---------------- 增量更新 ----------------
+    if upd and ss.get("panel") is not None:
+        if not token:
+            st.error("请先填 Tushare Token")
+        else:
+            try:
+                import tushare as ts
+                ts.set_token(token); pro2 = ts.pro_api(token)
+                lim2 = Limiter(400)
+                bar = st.progress(0.0)
+                newp, nd = extend_panel(pro2, lim2, ss["panel"],
+                                        dt.date.today().strftime("%Y%m%d"),
+                                        progress=lambda p, s: bar.progress(p, text=s))
+                bar.empty()
+                if nd:
+                    ss["panel"] = newp
+                    for kk in ("sec", "elig", "elig_key", "kdf", "ddf",
+                               "res", "wf", "nz", "sigres", "ksplit", "kbk"):
+                        ss.pop(kk, None)
+                    gc.collect()
+                    st.success(f"已补 {nd} 个交易日，现在数据截至 "
+                               f"{newp['cal'][-1]:%Y-%m-%d}。")
+                else:
+                    st.info("已经是最新，没有需要补的交易日。")
+            except ImportError:
+                st.error("未安装 tushare")
+            except Exception as e:
+                st.error(f"增量更新失败：{e}。可以改用「下载数据」全量重下。")
+
     if ss.get("panel") is None:
-        st.info("左侧填 Token 后点「下载数据」。首次 5-15 分钟，之后走本地缓存。"); st.stop()
+        st.info("左侧填 Token 后点「下载数据」。首次 5-15 分钟，之后走本地缓存。\n\n"
+                "**日常使用**：点「增量更新到最新」（几秒钟），然后直接看第④页今日候选。"); st.stop()
 
     panel, basic, uni = ss["panel"], ss["basic"], ss["uni"]
     dkey = f"{len(panel['codes'])}|{panel['cal'][-1]:%Y%m%d}|{min_mem}"
@@ -1735,6 +1849,8 @@ def main():
 
     # ---------------- ④ 今日候选 ----------------
     with t4:
+        st.success("**日常只需要这一页。** 左侧点「增量更新到最新」（几秒），"
+                   "然后看下面的名单。前三页都是一次性验证，平时不用点。")
         sig2 = st.selectbox("板块信号", list(SF), key="s2", index=list(SF).index(DEF_SIG))
         if sig2 not in SF:
             sig2 = DEF_SIG
