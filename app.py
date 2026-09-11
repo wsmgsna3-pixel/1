@@ -1015,6 +1015,40 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
     return pd.DataFrame(rows)
 
 
+def split_by_mask(picks: pd.DataFrame, tr: pd.DataFrame, mask: pd.DataFrame,
+                   lab_yes: str = "是", lab_no: str = "否") -> pd.DataFrame:
+    """
+    把**同一批**成交按某个条件劈成两半，不做替补。
+
+    这才是干净的对比：K6/K7 那种带替补的跑法，两边都掺进了顶上来的
+    第4、5名，替补的代价和条件本身的效果混在一起，分不开。
+    直接划分同一批交易就没有这个问题。
+    """
+    if not len(tr) or mask is None:
+        return pd.DataFrame()
+    d = tr.dropna(subset=["收益率"]).copy()
+    flag = []
+    for _, r in d.iterrows():
+        try:
+            flag.append(bool(mask.loc[r["date"], r["code"]]))
+        except Exception:
+            flag.append(np.nan)
+    d["组"] = [lab_yes if f is True else (lab_no if f is False else None) for f in flag]
+    d = d.dropna(subset=["组"])
+    if len(d) < 100:
+        return pd.DataFrame()
+    out = []
+    for g, sub in d.groupby("组"):
+        day = sub.groupby("date")["收益率"].mean().sort_index()
+        se = day.std(ddof=1) / np.sqrt(len(day)) if len(day) > 3 else np.nan
+        out.append({"组": g, "笔数": len(sub), "占比": len(sub) / len(d),
+                    "平均收益": sub["收益率"].mean(),
+                    "中位收益": sub["收益率"].median(),
+                    "胜率": float((sub["收益率"] > 0).mean()),
+                    "聚类t": float(day.mean() / se) if se and se > 1e-12 else np.nan})
+    return pd.DataFrame(out).set_index("组")
+
+
 def k_bucket_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame) -> pd.DataFrame:
     """按买入当天的日线 K 值分档，看后续收益。直接检验「K>75 买入是否更差」。"""
     if not len(tr) or "买入K" not in picks.columns:
@@ -1736,6 +1770,9 @@ def main():
                     bar4.empty()
                     ss["kres"] = (pd.DataFrame(rows4).set_index("买入位置"),
                                   k_bucket_diagnosis(base_pk, base_tr))
+                    _dead = KM.get("K7_只买高位死叉后1-5天(反向对照)")
+                    ss["ksplit"] = split_by_mask(base_pk, base_tr, _dead,
+                                                 "死叉后1-5天", "其他")
                 if ss.get("kres"):
                     kdf_res, kbk = ss["kres"]
                     st.dataframe(kdf_res.style.format(
@@ -1756,6 +1793,30 @@ def main():
                                 "板块内动量最强 = 涨得最多 = K 高，"
                                 "所以这个选股规则**结构性地在超买区买入**。"
                                 "如果 K>75 确实是负收益区，这个过滤的影响会很大。")
+                    if ss.get("ksplit") is not None and len(ss["ksplit"]):
+                        st.markdown("**干净对比：把不过滤的那批交易直接劈成两半**")
+                        st.caption("不做替补，同一批交易按「买入日是否在高位死叉后1-5天」划分。"
+                                   "K6/K7 那种跑法两边都掺了顶上来的第4、5名，"
+                                   "替补的代价和条件本身的效果分不开。")
+                        st.dataframe(ss["ksplit"].style.format(
+                            {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}",
+                             "中位收益": "{:+.2%}", "胜率": "{:.1%}", "聚类t": "{:.2f}"})
+                            .background_gradient(subset=["中位收益"], cmap="RdYlGn"),
+                            use_container_width=True)
+                        try:
+                            sp_ = ss["ksplit"]
+                            y_, n_ = sp_.loc["死叉后1-5天"], sp_.loc["其他"]
+                            st.info(
+                                f"**死叉后买入 vs 其他**：中位 {y_['中位收益']:+.2%} vs "
+                                f"{n_['中位收益']:+.2%}，胜率 {y_['胜率']:.1%} vs {n_['胜率']:.1%}，"
+                                f"平均 {y_['平均收益']:+.2%} vs {n_['平均收益']:+.2%}。\n\n"
+                                "**如果中位和胜率明显更差、但平均差不多**，说明死叉后那批是"
+                                "「多数小亏、少数暴涨」——右尾扛着均值。\n\n"
+                                "**这对你尤其重要**：你只拿 1-3 只，抓到右尾的概率很低，"
+                                "实际体验更接近中位数。均值高但中位差的那批，"
+                                "对大资金分散持有有意义，对你没有。")
+                        except Exception:
+                            pass
                     try:
                         b0 = kdf_res.loc["K0_不过滤", "平均收益"]
                         b1 = kdf_res.loc["K1_只买K<75", "平均收益"]
