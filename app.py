@@ -1376,10 +1376,7 @@ def main():
 
     panel, basic, uni = ss["panel"], ss["basic"], ss["uni"]
     dkey = f"{len(panel['codes'])}|{panel['cal'][-1]:%Y%m%d}|{min_mem}"
-    st.caption(f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**　·　"
-               f"{len(panel['codes'])} 只 × {len(panel['cal'])} 个交易日　·　"
-               f"{len(sectors) if ss.get('sec') else '?'} 个板块"
-               if ss.get("sec") else f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**")
+
 
     # 合格池、板块、信号、日线KD —— 全部按数据版本缓存。
     # 不缓存的话每次交互都要重算 1400×2100 的全量矩阵，反复分配大数组
@@ -1405,6 +1402,9 @@ def main():
     KDF, DDF = ss["kdf"], ss["ddf"]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
+    st.caption(f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**　·　"
+               f"{len(panel['codes'])} 只 × {len(panel['cal'])} 个交易日　·　"
+               f"{len(sectors)} 个板块")
     DEF_SIG = "板块20日动量" if "板块20日动量" in SF else list(SF)[0]
 
     t1, t2, t3, t4 = st.tabs(["① 板块信号", "② 主回测", "③ 位置诊断", "④ 今日候选"])
