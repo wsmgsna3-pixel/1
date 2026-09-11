@@ -1795,11 +1795,12 @@ def main():
 
             st.divider()
             st.markdown("### 滚动前推（搜索过参数后唯一算数的检验）")
-            st.caption(f"当前侧边栏设置：每次选 **{top_n}** 只，"
-                       f"每个板块最多 **{cap if cap else '不限'}** 只。"
-                       "滚动前推会在「2或3个板块 × 15或20日持有」里逐年搜索，"
-                       "**但板块上限不参与搜索**——它按你侧边栏的设置固定。"
-                       "所以换上限重跑，可以直接和上次比。")
+            st.caption(
+                f"**滚动前推自己搜索**：板块数(2或3) × 持有期(15或20日) × 全部 {len(SF)} 个板块信号。\n\n"
+                f"**按你侧边栏固定**：每次选 **{top_n}** 只 · 每板块最多 "
+                f"**{cap if cap else '不限'}** 只 · 每 **{every}** 日选一次 · 成本设置。\n\n"
+                "所以改「选几个板块」和「持有交易日」对这里没影响（它自己会搜）；"
+                "改「每次选几只」「每板块最多几只」「每几日选一次」会改变结果。")
             st.error("**每年年初只用截至上一年底的数据挑配置，再用它跑这一年。** "
                      "全样本上挑一个最优配置再看它的「样本外」，等于用样本外做了选择，"
                      "那个数字不算数。")
@@ -1831,8 +1832,17 @@ def main():
                          "当年平均收益": "{:+.2%}", "当年胜率": "{:.1%}"})
                         .background_gradient(subset=["当年平均收益"], cmap="RdYlGn"),
                         use_container_width=True)
-                    st.caption("**看「选中配置」列是否年年相同。** 稳定=真信号，"
-                               "年年换=当年的运气。")
+                    nuniq = picked["选中配置"].nunique()
+                    top1 = picked["选中配置"].value_counts()
+                    if nuniq <= max(2, len(picked) // 3):
+                        st.success(f"**配置稳定**：{len(picked)} 年里只用了 {nuniq} 种，"
+                                   f"最常选中「{top1.index[0]}」{int(top1.iloc[0])} 次。"
+                                   "这很难从噪音里得到——我验证时，纯噪音数据上配置年年换，"
+                                   "植入真规律时六年只选中同一个。")
+                    else:
+                        st.error(f"**配置不稳定**：{len(picked)} 年里换了 {nuniq} 种。"
+                                 "每年的「最优」都不一样，说明所谓最优只是当年的运气，"
+                                 "当年你没有依据挑中它。**这比平均收益低更值得警惕。**")
                     yv = wf.groupby(pd.to_datetime(wf["date"]).dt.year)["收益率"].mean()
                     top2 = yv.nlargest(2).index
                     rest = wf[~pd.to_datetime(wf["date"]).dt.year.isin(top2)]
