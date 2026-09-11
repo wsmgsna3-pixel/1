@@ -834,13 +834,12 @@ def sector_factors(R: pd.DataFrame, IDX: pd.DataFrame,
     out["板块风险调整动量"] = (IDX / IDX.shift(20) - 1.0) / vol.where(vol > 1e-9)
     # 注：曾有"板块相对强度"= 20日动量减截面均值，那是单调变换，
     # 截面排序与20日动量完全相同，等于同一个信号数了两遍，已删除。
-    hh = IDX.rolling(60).max()
-    out["板块距60日高点"] = IDX / hh - 1.0
+    # 保留"创20日新高"：它单调性 −0.91、方向与动量相反，是有信息的反向对照。
+    # 已移除「板块距60日高点」(单调性0.54,t−0.05) 和
+    #        「板块成交额占比变化」(单调性−0.09,Q4−Q1 +0.02%) —— 两个都≈0。
     out["板块创20日新高"] = (IDX >= IDX.rolling(20).max()).astype(float)
     a5, a60 = amt_sec.rolling(5).mean(), amt_sec.rolling(60).mean()
     out["板块量能扩张"] = a5 / a60.where(a60 > 1e-9)
-    share = amt_sec.div(amt_sec.sum(axis=1), axis=0)
-    out["板块成交额占比变化"] = share - share.rolling(20).mean()
     return out
 
 
@@ -910,41 +909,19 @@ def daily_k(panel: dict, n: int = 9, m: int = 3) -> pd.DataFrame:
     return daily_kd(panel, n, m)[0]
 
 
-K_FILTER_NAMES = ["K0_不过滤", "K1_只买K<75", "K2_只买K<60",
-                  "K3_只买K<75且近5日未到过75", "K4_只买K<75且K在上升",
-                  "K5_只买K>75(反向对照)",
-                  "K6_排除高位死叉后1-5天", "K7_只买高位死叉后1-5天(反向对照)"]
+# 曾有 K1-K7 八个"带替补的买入位置过滤"，全部已移除：
+#   八个条件里不过滤最好(+2.34%)，两个相反方向的过滤都变差 0.6-0.7%；
+#   干净划分证明其中 87% 的表观效果来自"替补挖得太深"，不是条件本身。
+# 教训：任何"要不要加条件"的问题，都用 split_by_mask 做干净划分，
+#       不要跑带替补的过滤版——那个对比是被污染的。
 
 
-def build_k_masks(kdf: pd.DataFrame, dkf: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
-    """
-    买入位置的候选条件，全部只用当日及之前的数据。
-
-    K3 针对"从75上方跌下来才3-4天"那种速跌形态：K 现在虽然只有60多，
-    但刚从超买区掉下来，是下跌途中而不是低位启动。
-    K5 是反向对照——如果 K>75 真的差，只买 K>75 应该明显更差。
-    """
-    k = kdf
-    was_high = (k >= 75).rolling(5).max().fillna(0).astype(bool)
-    rising = k > k.shift(1)
-    # 高位死叉：K 从 75 上方下穿 D。这是"高位转弱"，
-    # 和单纯"K 在高位"是两回事 —— 后者是强势股的常态。
-    if dkf is not None:
-        dead_hi = (k < dkf) & (k.shift(1) >= dkf.shift(1)) & (k.shift(1) >= 75)
-        recent_dead = dead_hi.rolling(5).max().fillna(0).astype(bool)
-    else:
-        recent_dead = pd.DataFrame(False, index=k.index, columns=k.columns)
-    return {"K6_排除高位死叉后1-5天": ~recent_dead,
-            "K7_只买高位死叉后1-5天(反向对照)": recent_dead,
-            "K0_不过滤": None,
-            "K1_只买K<75": k < 75,
-            "K2_只买K<60": k < 60,
-            "K3_只买K<75且近5日未到过75": (k < 75) & (~was_high),
-            "K4_只买K<75且K在上升": (k < 75) & rising,
-            "K5_只买K>75(反向对照)": k >= 75}
+def high_dead_cross_mask(kdf: pd.DataFrame, dkf: pd.DataFrame, win: int = 5):
+    """K 从 75 上方下穿 D 之后 win 天内 —— 供干净划分用，不做过滤。"""
+    dead = (kdf < dkf) & (kdf.shift(1) >= dkf.shift(1)) & (kdf.shift(1) >= 75)
+    return dead.rolling(win).max().fillna(0).astype(bool)
 
 
-# ---------------- 板块 → 个股 两层选股 ----------------
 STOCK_RULES = ["S1_板块内最强", "S2_板块内最弱(回调)", "S3_板块内随机"]
 
 
@@ -953,8 +930,7 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                       top_sec: int = 2, top_n: int = 3,
                       stock_rule: str = "S1_板块内最强",
                       sec_rule: str = "最强", cooldown: int = 5,
-                      seed: int = 20260910, kdf: pd.DataFrame = None,
-                      k_mask: pd.DataFrame = None) -> pd.DataFrame:
+                      seed: int = 20260910, kdf: pd.DataFrame = None) -> pd.DataFrame:
     """
     两层选股：先按 sec_fac 选出 top_sec 个板块，再在板块内按 stock_rule 选股。
     sec_rule="随机" 时板块层用随机选择 —— 这是判断"板块层有没有加分"的对照组。
@@ -967,9 +943,6 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
     last: Dict[str, int] = {}
     rows = []
     secnames = list(sectors)
-    # 买入位置过滤：不合格的直接跳过，由下一名顺位替补，
-    # 所以每次仍然选满 top_n 只 —— 这和之前那些"剔除但不补位"的
-    # 过滤器有本质区别，不会让候选数腰斩、空窗爆掉。
     for d in dates:
         i = pos.get(d)
         if i is None or d not in sec_fac.index:
@@ -1003,9 +976,6 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                 break
             if c in last and i - last[c] < cooldown:
                 continue
-            if k_mask is not None:
-                if c not in k_mask.columns or not bool(k_mask.loc[d, c]):
-                    continue
             rows.append({"date": d, "code": c, "板块": s, "rank": taken + 1,
                          "score": sc, "买入K": (float(kdf.loc[d, c])
                                                 if kdf is not None and c in kdf.columns
@@ -1102,61 +1072,6 @@ def flat_stock_pick(panel: dict, elig: pd.DataFrame, dates: List[pd.Timestamp],
                 continue
             rows.append({"date": d, "code": c, "板块": "-", "rank": taken + 1,
                          "score": float(v[c])})
-            last[c] = i
-            taken += 1
-    return pd.DataFrame(rows)
-
-
-def industry_neutral_pick(panel: dict, elig: pd.DataFrame,
-                          sectors: Dict[str, List[str]], dates: List[pd.Timestamp],
-                          top_n: int = 3, win: int = 20, cooldown: int = 5) -> pd.DataFrame:
-    """
-    行业中性动量：每只股票只和**同板块**的股票比动量，取组内百分位，
-    再按这个百分位在全池排序取前 top_n。
-
-    为什么单独做一个：三轮对照实验里，「行业内相对强弱」这一层在每一轮都
-    稳定为正（+0.66% / +0.95% / +0.84%），而「选强势板块」那一层的贡献
-    在 +0.14%~+0.78% 之间大幅波动、依赖选哪个板块信号。
-    这个方案把不稳的那一层去掉，**没有任何信号可挑，零自由度**。
-    """
-    A = panel["adj_close"]
-    m = A / A.shift(win) - 1.0
-    code2sec = {c: s for s, cs in sectors.items() for c in cs}
-    cols = [c for c in A.columns if c in code2sec]
-    secs = pd.Series([code2sec[c] for c in cols], index=cols)
-    pct = pd.DataFrame(np.nan, index=A.index, columns=cols)
-    for s, g in secs.groupby(secs):
-        cs = list(g.index)
-        sub = m[cs].where(elig[cs])
-        n = sub.notna().sum(axis=1)
-        pct.loc[:, cs] = sub.rank(axis=1, pct=True).where(n >= 3)
-    # 每个板块的第一名百分位都是 1.0，十几只并列，必须打破平局。
-    # ⚠ 上一版我用「全池动量百分位」来破，等于在这些组内第一里挑绝对动量
-    # 最高的——而绝对动量正是已知的负收益端（全池最强 −0.16%）。
-    # 结果整个方案被拉回坑里（实测 +0.25%，介于 −0.16% 和 +0.84% 之间）。
-    # 平局必须用**中性**方式打破：确定性随机数，不引入任何方向性因子。
-    rs = np.random.default_rng(20260910)
-    tie = pd.DataFrame(rs.random((len(A.index), len(cols))),
-                       index=A.index, columns=cols)
-    pct = pct + tie * 1e-3
-
-    cal = list(A.index)
-    pos = {d: i for i, d in enumerate(cal)}
-    last: Dict[str, int] = {}
-    rows = []
-    for d in dates:
-        i = pos.get(d)
-        if i is None:
-            continue
-        v = pct.loc[d].dropna().sort_values(ascending=False)
-        taken = 0
-        for c in v.index:
-            if taken >= top_n:
-                break
-            if c in last and i - last[c] < cooldown:
-                continue
-            rows.append({"date": d, "code": c, "板块": code2sec.get(c, "-"),
-                         "rank": taken + 1, "score": float(v[c])})
             last[c] = i
             taken += 1
     return pd.DataFrame(rows)
@@ -1266,56 +1181,6 @@ def concentration_check(tr: pd.DataFrame, ks=(1, 3, 5, 10, 20)) -> pd.DataFrame:
 # ---------------- 避免挑选：合成信号 + 熊市开关 ----------------
 MOM_FAMILY = ["板块5日动量", "板块10日动量", "板块20日动量",
               "板块60日动量", "板块风险调整动量"]
-
-
-def composite_sector_signal(SF: Dict[str, pd.DataFrame],
-                            names: List[str] = None) -> pd.DataFrame:
-    """
-    动量族信号的截面百分位平均。
-
-    为什么要合成：9 个信号里挑通过的那个，等于用同一份数据挑了一次参数，
-    样本外拿不到那部分。四个动量信号实测全部同向（净贡献 +0.35%~+0.78%），
-    说明它们说的是同一件事，取平均既避开挑选，又比任何单个更稳。
-    """
-    use = [n for n in (names or MOM_FAMILY) if n in SF]
-    if not use:
-        return pd.DataFrame()
-    tot = None
-    for n in use:
-        r = SF[n].rank(axis=1, pct=True)
-        tot = r if tot is None else tot.add(r, fill_value=0.0)
-    return tot / len(use)
-
-
-def pool_regime(panel: dict, elig: pd.DataFrame, ma: int = 200) -> pd.Series:
-    """
-    大盘状态：合格池等权指数是否在 ma 日均线上方。
-    不预测，只跟随。2018 和 2022 贡献了几乎全部大亏，而那两年正是
-    池子自身的熊市 —— 掐掉它们比继续优化选股规则价值更大。
-    """
-    r = panel["adj_close"].pct_change().where(elig.shift(1).fillna(False)).mean(axis=1)
-    idx = (1.0 + r.fillna(0.0)).cumprod()
-    return (idx > idx.rolling(ma).mean()).fillna(False)
-
-
-def apply_regime(picks: pd.DataFrame, regime: pd.Series) -> pd.DataFrame:
-    """只保留大盘在均线上方那些天的候选。"""
-    if not len(picks):
-        return picks
-    ok = picks["date"].map(lambda d: bool(regime.get(d, False)))
-    return picks[ok].reset_index(drop=True)
-
-
-def regime_compare(tr_all: pd.DataFrame, tr_on: pd.DataFrame) -> pd.DataFrame:
-    """开关前后的逐年对比。"""
-    def yr(t, lab):
-        d = t.dropna(subset=["收益率"])
-        g = d.groupby(pd.to_datetime(d["date"]).dt.year)["收益率"]
-        return pd.DataFrame({f"{lab}_笔数": g.size(), f"{lab}_平均收益": g.mean()})
-    a, b = yr(tr_all, "不用开关"), yr(tr_on, "用开关")
-    out = a.join(b, how="outer")
-    out["差异"] = out["用开关_平均收益"] - out["不用开关_平均收益"]
-    return out
 
 
 # ======================================================================
@@ -1441,13 +1306,14 @@ def main():
     ss = st.session_state
     ss.setdefault("panel", None)
     st.title("板块轮动选股")
-    st.caption("先选最强板块，再从板块内选股。目的是降噪 —— 板块指数波动只有个股的一半。")
+    st.caption("先选最强板块，再从板块内选动量最高的股票。"
+               "科技/军工/新能源/机器人　·　流通市值 50-1000 亿　·　股价 10 元以上")
 
     with st.sidebar:
         token = st.text_input("Tushare Token", type="password",
                               value=os.environ.get("TUSHARE_TOKEN", ""))
         top_sec = st.slider("选几个板块", 1, 5, 3)
-        top_n = st.slider("总共选几只", 1, 5, 3)
+        top_n = st.slider("每次选几只", 1, 5, 3)
         hold = st.slider("持有交易日", 3, 30, 20)
         with st.expander("其他设置"):
             start = st.date_input("数据起始", dt.date(2018, 1, 1))
@@ -1461,6 +1327,7 @@ def main():
         if ss.get("panel") is not None:
             st.success(f"{len(ss['panel']['codes'])} 只 × {len(ss['panel']['cal'])} 日")
 
+    # ---------------- 下载 ----------------
     if run:
         if not token:
             st.error("请先填 Tushare Token"); st.stop()
@@ -1470,7 +1337,11 @@ def main():
             st.error("未安装 tushare：pip install tushare"); st.stop()
         ts.set_token(token); pro = ts.pro_api(token)
         lim = Limiter(400); API_ERRORS.clear()
-        for kk in ("panel", "sec", "res"):
+        for kk in list(ss.keys()):
+            if kk != "panel" or True:
+                pass
+        for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
+                   "elig", "elig_key", "kmask_key", "sec_mm"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -1482,8 +1353,7 @@ def main():
             n2 = uni["l2_name"].notna().sum() if "l2_name" in uni.columns else 0
             st.write(f"   {len(uni)} 只，其中 {n2} 只带二级行业")
             if n2 < len(uni) * 0.5:
-                st.warning("多数股票没取到二级行业。板块层需要它——"
-                           "可能是 Tushare 积分不足以调用 index_member_all。")
+                st.warning("多数股票没取到二级行业，板块层做不了——可能是积分不足。")
             st.write("取股票基础信息…")
             basic = fetch_stock_basic(pro, lim)
             st.write("市值预筛…")
@@ -1500,209 +1370,144 @@ def main():
             stt.update(label=f"完成，{(time.time()-t0)/60:.1f} 分钟", state="complete")
 
     if ss.get("panel") is None:
-        st.info("左侧填 Token 后点「下载数据」。首次 5-15 分钟，之后走缓存。"); st.stop()
+        st.info("左侧填 Token 后点「下载数据」。首次 5-15 分钟，之后走本地缓存。"); st.stop()
 
     panel, basic, uni = ss["panel"], ss["basic"], ss["uni"]
-    # 合格性矩阵每次交互都重算一遍全量 1400×2100 的布尔运算，
-    # 反复分配大数组会把云端内存顶爆 → 进程被杀 → 页面闪回初始状态。
-    # 这就是你遇到的"点一下就要重新下载"的原因。
-    dkey = ss.get("data_key") or f"{len(panel['codes'])}|{panel['cal'][-1]:%Y%m%d}"
-    ss["data_key"] = dkey
+    dkey = f"{len(panel['codes'])}|{panel['cal'][-1]:%Y%m%d}|{min_mem}"
+
+    # 合格池、板块、信号、日线KD —— 全部按数据版本缓存。
+    # 不缓存的话每次交互都要重算 1400×2100 的全量矩阵，反复分配大数组
+    # 会把云端内存顶爆、进程被杀、页面闪回初始状态。
     if ss.get("elig_key") != dkey:
-        with st.spinner("构建合格池…"):
+        with st.spinner("构建合格池与板块…"):
             ss["elig"] = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
-            ss["elig_key"] = dkey
-            gc.collect()
-    elig = ss["elig"]
-    if ss.get("sec") is None or ss.get("sec_mm") != min_mem:
-        with st.spinner("构建板块指数…"):
-            sectors = build_sector_map(uni, panel, elig, min_mem)
+            sectors = build_sector_map(uni, panel, ss["elig"], min_mem)
             if not sectors:
                 st.error("没能建立板块映射——二级行业数据缺失。"); st.stop()
-            R, IDX, cnt = build_sector_index(panel, elig, sectors)
-            amt = pd.DataFrame({s: panel["amount"][c].where(elig[c]).sum(axis=1)
+            R, IDX, cnt = build_sector_index(panel, ss["elig"], sectors)
+            amt = pd.DataFrame({s: panel["amount"][c].where(ss["elig"][c]).sum(axis=1)
                                 for s, c in sectors.items()})
+            kdf, ddf = daily_kd(panel)
             ss["sec"] = (sectors, R, IDX, cnt, sector_factors(R, IDX, amt))
-            ss["sec_mm"] = min_mem
-    sectors, R, IDX, cnt, SF = ss["sec"]
-    # 合成信号在这里统一构建：回测页和今日候选页必须用同一份，
-    # 否则会出现"回测用合成信号、实盘用单个信号"这种致命不一致。
-    if ss.get("sf2_key") != dkey:
-        _s2 = dict(SF)
-        _cp = composite_sector_signal(SF)
-        if len(_cp):
-            _s2["【合成】动量族平均"] = _cp
-        ss["sf2"] = _s2
-        ss["sf2_key"] = dkey
-        gc.collect()
-    SF2 = ss["sf2"]
-    if ss.get("kmask_key") != dkey:
-        with st.spinner("计算日线 SKDJ…"):
-            _kdf, _ddf = daily_kd(panel)
-            ss["kdf"] = _kdf
-            ss["kmasks"] = build_k_masks(_kdf, _ddf)
-            ss["kmask_key"] = dkey
+            ss["kdf"], ss["ddf"] = kdf, ddf
+            ss["elig_key"] = dkey
+            ss.pop("nz", None); ss.pop("sigres", None)
+            ss.pop("res", None); ss.pop("wf", None)
             gc.collect()
-    KDF, KM = ss["kdf"], ss["kmasks"]
-    # 默认用板块20日动量：滚动前推六年里五年都选中它，不是我挑的。
-    DEF_SIG = ("板块20日动量" if "板块20日动量" in SF2
-               else ("【合成】动量族平均" if "【合成】动量族平均" in SF2 else list(SF2)[0]))
+    elig = ss["elig"]
+    sectors, R, IDX, cnt, SF = ss["sec"]
+    KDF, DDF = ss["kdf"], ss["ddf"]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
+    DEF_SIG = "板块20日动量" if "板块20日动量" in SF else list(SF)[0]
 
-    t0_, t1_, t2_, t3_ = st.tabs(["① 降噪检验", "② 板块信号", "③ 板块层加分吗", "④ 今日候选"])
+    t1, t2, t3, t4 = st.tabs(["① 板块信号", "② 主回测", "③ 位置诊断", "④ 今日候选"])
 
-    # ---------- ① 降噪 ----------
-    with t0_:
-        st.markdown("### 地基：板块指数的波动比个股小多少")
-        st.markdown("如果降噪不明显，整个思路不成立，后面三页不用看。"
-                    "我在模拟数据上实测：20只等权时波动降到个股的 **52%**，"
-                    "信噪比提升约 **1.94 倍**。")
-        if st.button("运行降噪检验（只需跑一次）"):
-            with st.spinner("计算中…"):
-                ss["nz"] = sector_noise_check(panel, elig, sectors)
-        if ss.get("nz") is None:
-            st.info("这页只需在换数据后跑一次。点上面的按钮。")
-            st.stop()
-        nz = ss["nz"]
-        st.dataframe(nz.style.format({"平均成分股数": "{:.0f}", "个股平均波动": "{:.1%}",
-                                      "板块指数波动": "{:.1%}", "降噪比": "{:.2f}"})
-                     .background_gradient(subset=["降噪比"], cmap="RdYlGn_r"),
-                     use_container_width=True, height=420)
-        rr = float(nz["降噪比"].mean())
-        st.metric("平均降噪比", f"{rr:.2f}", f"信噪比提升 {1/rr:.2f} 倍")
-        if rr > 0.85:
-            st.error("降噪不明显。说明这些板块内的股票走势差异太大，"
-                     "等权指数没能滤掉个股噪音——板块思路在这个池子里不成立。")
-        else:
-            st.success(f"板块指数波动是个股的 {rr:.0%}，"
-                       f"同样的信号强度下信噪比提升 {1/rr:.2f} 倍。地基成立。")
-        st.caption(f"共 {len(sectors)} 个板块，"
-                   f"{sum(len(v) for v in sectors.values())} 只股票纳入。")
-
-    # ---------- ② 板块信号 ----------
-    with t1_:
+    # ---------------- ① 板块信号 ----------------
+    with t1:
         st.markdown("### 板块层面的信号有没有预测力")
-        st.markdown("**这一步不涉及选股**，只问：按信号把板块分组，未来几天板块指数"
-                    "的表现有没有单调差别。分不出来的话，选板块就没有依据。")
+        st.caption("**换新数据后跑一次就够，平时不用动。** 按信号把板块分四组，"
+                   "看未来 3/5/8/15 天板块指数的表现——不涉及选股。")
+        with st.expander("地基：板块指数比个股降噪多少（也是一次性的）"):
+            if st.button("运行降噪检验"):
+                with st.spinner("计算中…"):
+                    ss["nz"] = sector_noise_check(panel, elig, sectors)
+            if ss.get("nz") is not None:
+                nz = ss["nz"]
+                rr = float(nz["降噪比"].mean())
+                st.metric("平均降噪比", f"{rr:.2f}", f"信噪比提升 {1/rr:.2f} 倍")
+                st.dataframe(nz.style.format({"平均成分股数": "{:.0f}",
+                                              "个股平均波动": "{:.1%}",
+                                              "板块指数波动": "{:.1%}",
+                                              "降噪比": "{:.2f}"}),
+                             use_container_width=True, height=320)
+                (st.success if rr <= 0.85 else st.error)(
+                    f"板块指数波动是个股的 {rr:.0%}。" +
+                    ("地基成立。" if rr <= 0.85 else "降噪不明显，板块思路不成立。"))
+            else:
+                st.caption(f"共 {len(sectors)} 个板块，"
+                           f"{sum(len(v) for v in sectors.values())} 只股票纳入。"
+                           "此前实测降噪比 0.60（波动降到个股的六成）。")
+
         if st.button("跑全部板块信号", type="primary"):
             bar = st.progress(0.0); out = {}
-            names = list(SF)
-            for i, nm in enumerate(names):
+            for i, nm in enumerate(SF):
                 t = sector_layer_test(SF[nm], IDX, horizons=(3, 5, 8, 15))
                 if len(t):
                     out[nm] = t
-                bar.progress((i + 1) / len(names), text=nm)
+                bar.progress((i + 1) / len(SF), text=nm)
             ss["sigres"] = out; bar.empty()
         if ss.get("sigres"):
             out = ss["sigres"]
-            summ = []
-            for nm, t in out.items():
-                v = t["15日超额"].to_numpy()
-                summ.append({"板块信号": nm, "Q4−Q1": v[-1] - v[0],
-                             "单调性": float(np.corrcoef(np.arange(len(v)), v)[0, 1]),
-                             "Q4超额": v[-1], "Q1超额": v[0],
-                             "末期t(重叠修正)": t["末期t(重叠修正)"].iloc[-1],
-                             "末期t(朴素)": t["末期t(朴素)"].iloc[-1]})
-            sm = pd.DataFrame(summ).set_index("板块信号").sort_values(
-                "Q4−Q1", key=abs, ascending=False)
+            sm = pd.DataFrame([{
+                "板块信号": nm,
+                "Q4−Q1": t["15日超额"].iloc[-1] - t["15日超额"].iloc[0],
+                "单调性": float(np.corrcoef(np.arange(len(t)),
+                                          t["15日超额"].to_numpy())[0, 1]),
+                "Q4超额": t["15日超额"].iloc[-1],
+                "末期t(重叠修正)": t["末期t(重叠修正)"].iloc[-1],
+                "末期t(朴素)": t["末期t(朴素)"].iloc[-1]} for nm, t in out.items()
+            ]).set_index("板块信号").sort_values("Q4−Q1", key=abs, ascending=False)
             st.dataframe(sm.style.format({"Q4−Q1": "{:+.2%}", "单调性": "{:+.2f}",
-                                          "Q4超额": "{:+.2%}", "Q1超额": "{:+.2%}",
+                                          "Q4超额": "{:+.2%}",
                                           "末期t(重叠修正)": "{:.2f}",
                                           "末期t(朴素)": "{:.2f}"})
                          .background_gradient(subset=["Q4−Q1"], cmap="RdYlGn"),
                          use_container_width=True)
-            ok = sm[(sm["Q4−Q1"].abs() > 0.01) & (sm["单调性"].abs() > 0.8)
-                    & (sm["末期t(重叠修正)"].abs() > 2)]
-            if len(ok):
-                st.success(f"**{ok.index[0]}** 有明显单调关系："
-                           f"Q4−Q1 = {ok['Q4−Q1'].iloc[0]:+.2%}，"
-                           f"单调性 {ok['单调性'].iloc[0]:+.2f}。可以用它选板块。")
-            else:
-                st.error("**没有板块信号呈现明显单调关系。** 也就是说这个池子里"
-                         "板块之间的强弱不具备延续性，选板块没有依据。\\n\\n"
-                         "我在植入板块轮动的模拟数据上验证过这个检验器——"
-                         "那时 Q4−Q1 = +5.30%、t = 15.73。所以不是检验器不灵。")
+            st.info("**看重叠修正后的 t，不看朴素 t**（15日前瞻每几天采样一次，样本重叠）。"
+                    "**真正的证据是一致性**：动量类信号如果单调性全部同号，"
+                    "而「创20日新高」呈现相反的单调性——这种内部一致的结构"
+                    "很难从噪音里产生，比某一个格子的高 t 值可信。")
             pick = st.selectbox("看哪个信号的分组明细", list(out))
             st.dataframe(out[pick].style.format(
                 {**{f"{h}日超额": "{:+.2%}" for h in (3, 5, 8, 15)},
-                 **{f"{h}日胜率": "{:.1%}" for h in (3, 5, 8, 15)}, "末期t": "{:.2f}"}),
+                 **{f"{h}日胜率": "{:.1%}" for h in (3, 5, 8, 15)},
+                 "末期t(重叠修正)": "{:.2f}", "末期t(朴素)": "{:.2f}"}),
                 use_container_width=True)
-            st.warning("**看「末期t(重叠修正)」，不要看朴素 t。** 15日前瞻收益每 "
-                       f"{every} 天采样一次，相邻样本重叠，朴素标准误会把 t 放大约 "
-                       "√(重叠倍数)。这一处我最初漏做了修正，其他检验都做了。")
-            st.info("**真正的证据是一致性，不是单个 t 值。** 如果动量类的几个信号"
-                    "单调性全部同号、Q4−Q1 全部同向，而且「创新高」这类反向信号"
-                    "呈现相反的单调性——这种内部一致的结构很难从噪音里产生，"
-                    "比某一个格子的高 t 值可信得多。")
-            st.caption("判定：|Q4−Q1| > 1个百分点 且 |单调性| > 0.8 且 |重叠修正t| > 2。")
 
-    # ---------- ③ 板块层加分吗 ----------
-    with t2_:
-        st.markdown("### 板块层到底加不加分")
-        st.markdown("**核心对照**：同样的选股规则，一次用「最强板块」筛，一次用「随机板块」筛。"
-                    "两者之差就是板块层的净贡献。再加一个「不分板块直接全池选」做参照。")
+    # ---------------- ② 主回测 ----------------
+    with t2:
         c0, c1 = st.columns(2)
-        sig = c0.selectbox("用哪个板块信号", list(SF2),
-                           index=list(SF2).index(DEF_SIG))
-        if sig not in SF2:          # 兜底：控件异常时不让整页崩掉
+        sig = c0.selectbox("板块信号", list(SF), index=list(SF).index(DEF_SIG))
+        if sig not in SF:
             sig = DEF_SIG
-        use_reg = False   # 熊市开关已证伪（加权 −0.57%/笔，2022年把 −2.54% 变成 −10.65%），已移除
-        st.warning(
-            "**「★行业中性动量」是本轮新增的重点。** 三轮对照实验里，"
-            "「只和同板块的股票比强弱」这一层每次都稳定为正"
-            "（+0.66% / +0.95% / +0.84%），而「选强势板块」那一层"
-            "在 +0.14%~+0.78% 之间大幅波动、依赖你挑哪个板块信号。\n\n"
-            "这个方案把不稳的那一层去掉了：每只股票只和同板块的比动量，"
-            "取组内百分位再全池排序。**没有信号可挑，零自由度，也就没有挑选偏差。**")
-        st.info("**关于合成信号：我说错了。** 实测它比单用 60日动量更差"
-                "（板块层净贡献 +0.14% vs +0.35%，样本外 +0.60% vs +1.25%）。"
-                "把最强的信号和几个弱的平均是稀释不是分散——"
-                "和个股层面犯的是同一个错。\n\n"
-                "**熊市开关也已证伪**：加权净效果 −0.57%/笔，2022 年把 −2.54% "
-                "变成 −10.65%（熊市反弹反复触发，专挑假突破入场）。默认已关闭。")
-        srule = st.selectbox("板块内怎么选股", STOCK_RULES)
+        srule = c1.selectbox("板块内怎么选股", STOCK_RULES)
         if srule not in STOCK_RULES:
             srule = STOCK_RULES[0]
-        kf = st.selectbox("买入位置过滤（日线SKDJ）", K_FILTER_NAMES)
-        if kf not in K_FILTER_NAMES:
-            kf = K_FILTER_NAMES[0]
-        st.caption("不合格的候选**由下一名顺位替补**，每次仍选满设定只数——"
-                   "这和之前那些「剔除但不补位」的过滤器不同，不会让交易数腰斩。")
-        if st.button("运行对照实验", type="primary"):
+        st.caption(f"默认「{DEF_SIG}」不是我挑的——滚动前推六年里五年都选中它。"
+                   "**不要再逐个试信号挑最好的**，那会让后面所有检验失效。")
+        st.markdown("四个方案同时跑：两层 / 随机板块 / 不分板块 / 全池随机。"
+                    "**两层减随机板块 = 板块层的净贡献**，这个对照能干净分离"
+                    "「选板块」和「板块内选股」两层的功劳。")
+
+        if st.button("运行对照实验", type="primary", use_container_width=True):
             bar = st.progress(0.0)
             plans = [
                 ("两层：最强板块 + " + srule,
-                 lambda: sector_then_stock(panel, elig, sectors, SF2[sig], dates,
-                                           top_sec, top_n, srule, "最强",
-                                           kdf=KDF, k_mask=KM.get(kf))),
+                 lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
+                                           top_sec, top_n, srule, "最强", kdf=KDF)),
                 ("对照A：随机板块 + " + srule,
-                 lambda: sector_then_stock(panel, elig, sectors, SF2[sig], dates,
-                                           top_sec, top_n, srule, "随机")),
+                 lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
+                                           top_sec, top_n, srule, "随机", kdf=KDF)),
                 ("对照B：不分板块，全池 " + srule,
                  lambda: flat_stock_pick(panel, elig, dates, top_n, srule)),
                 ("对照C：全池随机",
                  lambda: flat_stock_pick(panel, elig, dates, top_n, "S3_板块内随机")),
-                ("★行业中性动量（零参数）",
-                 lambda: industry_neutral_pick(panel, elig, sectors, dates, top_n)),
             ]
-            reg = None
-            rows, keep, raw = [], {}, {}
+            rows, keep, pks = [], {}, {}
             for i, (lab, fn) in enumerate(plans):
                 pk = fn()
-                if reg is not None and len(pk):
-                    raw[lab] = track_fixed(pk, panel, hold, **kw)
-                    pk = apply_regime(pk, reg)
                 tr = track_fixed(pk, panel, hold, **kw) if len(pk) else pd.DataFrame()
                 s_ = _st(tr)
                 bar.progress((i + 1) / len(plans), text=lab)
                 if s_:
-                    rows.append({"方案": lab, **s_})
-                    keep[lab] = tr
-            ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, sig, srule, raw)
-            bar.empty()
+                    rows.append({"方案": lab, **s_}); keep[lab] = tr; pks[lab] = pk
+            ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, pks, sig, srule)
+            ss.pop("wf", None); ss.pop("ksplit", None)
+            bar.empty(); gc.collect()
+
         if ss.get("res"):
-            df, keep, sig_, sr_, raw_ = ss["res"]
+            df, keep, pks, sig_, sr_ = ss["res"]
             st.dataframe(df.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
                                           "中位收益": "{:+.2%}", "胜率": "{:.1%}",
                                           "聚类t": "{:.2f}"})
@@ -1710,337 +1515,233 @@ def main():
                                               vmin=-3, vmax=3),
                          use_container_width=True)
             try:
-                two = df.iloc[0]; ra = df.iloc[1]; fb = df.iloc[2]
-                gain = two["平均收益"] - ra["平均收益"]
-                st.metric("板块层的净贡献（两层 − 随机板块）", f"{gain:+.3%} / 笔",
+                two, ra, fb = df.iloc[0], df.iloc[1], df.iloc[2]
+                st.metric("板块层净贡献（两层 − 随机板块）",
+                          f"{two['平均收益']-ra['平均收益']:+.3%} / 笔",
                           f"两层 vs 全池直选 {two['平均收益']-fb['平均收益']:+.3%}")
-                need = (comm * 2 + 0.0005 + slip * 2)
-                st.caption(f"参考：单次往返成本 {need:.2%}。持有 {hold} 日 → "
-                           f"一年换手 {244/hold:.0f} 次 → 年成本 {need*244/hold:.1%}。"
-                           f"**每笔平均收益要超过 0 才有意义，超过 {need:.2%} 才算真有边际。**")
-                if gain > 0.004 and two["聚类t"] >= 2:
-                    st.success("板块层确实加分，且两层方案显著。可以往下做。")
-                elif abs(gain) <= 0.004:
-                    st.error("**板块层没有净贡献。** 最强板块和随机板块的结果差不多，"
-                             "说明「哪个板块强」这件事没有延续性。\\n\\n"
-                             "我在植入板块轮动的模拟数据上验证过：那时净贡献 +1.99%/笔，"
-                             "无轮动时 −0.03%。所以这个对照实验是灵敏的。")
-                else:
-                    st.warning("板块层有一些贡献，但两层方案本身未达显著。")
+                rt = (comm * 2 + 0.0005 + slip * 2)
+                st.caption(f"单次往返成本 {rt:.2%}；持有 {hold} 日 → 年换手 "
+                           f"{244/hold:.0f} 次 → 年成本 {rt*244/hold:.1%}。"
+                           f"**每笔平均收益要超过 {rt:.2%} 才算真有边际。**")
             except Exception:
                 pass
-            if keep:
-                if raw_:
-                    st.divider()
-                    st.markdown("### 熊市开关的效果")
-                    st.caption("2018 和 2022 贡献了几乎全部大亏，而那两年正是池子自身的熊市。"
-                               "开关不预测，只是跟随：等权指数在 200 日线下方时不出手。")
-                    k0 = list(keep)[0]
-                    if k0 in raw_:
-                        rc = regime_compare(raw_[k0], keep[k0])
-                        st.dataframe(rc.style.format(
-                            {"不用开关_笔数": "{:.0f}", "用开关_笔数": "{:.0f}",
-                             "不用开关_平均收益": "{:+.2%}", "用开关_平均收益": "{:+.2%}",
-                             "差异": "{:+.2%}"}, na_rep="—")
-                            .background_gradient(subset=["差异"], cmap="RdYlGn"),
-                            use_container_width=True)
-                        kept = len(keep[k0]) / max(1, len(raw_[k0]))
-                        st.caption(f"开关保留了 {kept:.0%} 的交易机会。"
-                                   "看「差异」列在 2018/2022 是不是明显为正——"
-                                   "如果是，说明开关掐对了地方；"
-                                   "如果在牛市年份也大幅为正，那是过度拟合的信号。")
-                st.divider()
-                st.markdown("### 买入位置对比（日线SKDJ K值）")
-                st.caption("同一套选股规则，只改「买入时 K 在什么位置」这一个变量。"
-                           "不合格的由下一名替补，所以交易数基本不变——是干净的单变量对比。")
-                if st.button("跑全部买入位置条件"):
-                    bar4 = st.progress(0.0); rows4 = []
-                    base_pk = None
-                    for i4, nm4 in enumerate(K_FILTER_NAMES):
-                        pk4 = sector_then_stock(panel, elig, sectors, SF2[sig], dates,
-                                                top_sec, top_n, srule, "最强",
-                                                kdf=KDF, k_mask=KM.get(nm4))
-                        tr4 = track_fixed(pk4, panel, hold, **kw) if len(pk4) else pd.DataFrame()
-                        s4 = _st(tr4)
-                        if nm4 == "K0_不过滤":
-                            base_pk, base_tr = pk4, tr4
-                        if s4:
-                            rows4.append({"买入位置": nm4, **s4})
-                        bar4.progress((i4 + 1) / len(K_FILTER_NAMES), text=nm4)
-                    bar4.empty()
-                    ss["kres"] = (pd.DataFrame(rows4).set_index("买入位置"),
-                                  k_bucket_diagnosis(base_pk, base_tr))
-                    _dead = KM.get("K7_只买高位死叉后1-5天(反向对照)")
-                    ss["ksplit"] = split_by_mask(base_pk, base_tr, _dead,
-                                                 "死叉后1-5天", "其他")
-                if ss.get("kres"):
-                    kdf_res, kbk = ss["kres"]
-                    st.dataframe(kdf_res.style.format(
-                        {"笔数": "{:.0f}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
-                         "胜率": "{:.1%}", "聚类t": "{:.2f}"})
-                        .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
-                        use_container_width=True)
-                    if len(kbk):
-                        st.markdown("**不过滤时，买入当天的 K 值分布**")
-                        st.dataframe(kbk.style.format(
-                            {"笔数": "{:.0f}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
-                             "胜率": "{:.1%}", "占比": "{:.1%}"})
-                            .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
-                            use_container_width=True)
-                        hi_share = kbk.loc[[x for x in kbk.index if x in ("75-85", ">85")],
-                                           "占比"].sum() if len(kbk) else 0
-                        st.info(f"**买入时 K>75 的占 {hi_share:.0%}。** "
-                                "板块内动量最强 = 涨得最多 = K 高，"
-                                "所以这个选股规则**结构性地在超买区买入**。"
-                                "如果 K>75 确实是负收益区，这个过滤的影响会很大。")
-                    if ss.get("ksplit") is not None and len(ss["ksplit"]):
-                        st.markdown("**干净对比：把不过滤的那批交易直接劈成两半**")
-                        st.caption("不做替补，同一批交易按「买入日是否在高位死叉后1-5天」划分。"
-                                   "K6/K7 那种跑法两边都掺了顶上来的第4、5名，"
-                                   "替补的代价和条件本身的效果分不开。")
-                        st.dataframe(ss["ksplit"].style.format(
-                            {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}",
-                             "中位收益": "{:+.2%}", "胜率": "{:.1%}", "聚类t": "{:.2f}"})
-                            .background_gradient(subset=["中位收益"], cmap="RdYlGn"),
-                            use_container_width=True)
-                        try:
-                            sp_ = ss["ksplit"]
-                            y_, n_ = sp_.loc["死叉后1-5天"], sp_.loc["其他"]
-                            st.info(
-                                f"**死叉后买入 vs 其他**：中位 {y_['中位收益']:+.2%} vs "
-                                f"{n_['中位收益']:+.2%}，胜率 {y_['胜率']:.1%} vs {n_['胜率']:.1%}，"
-                                f"平均 {y_['平均收益']:+.2%} vs {n_['平均收益']:+.2%}。\n\n"
-                                "**如果中位和胜率明显更差、但平均差不多**，说明死叉后那批是"
-                                "「多数小亏、少数暴涨」——右尾扛着均值。\n\n"
-                                "**这对你尤其重要**：你只拿 1-3 只，抓到右尾的概率很低，"
-                                "实际体验更接近中位数。均值高但中位差的那批，"
-                                "对大资金分散持有有意义，对你没有。")
-                        except Exception:
-                            pass
-                    try:
-                        b0 = kdf_res.loc["K0_不过滤", "平均收益"]
-                        b1 = kdf_res.loc["K1_只买K<75", "平均收益"]
-                        b5 = kdf_res.loc["K5_只买K>75(反向对照)", "平均收益"]
-                        st.metric("K<75 相对不过滤", f"{b1-b0:+.3%} / 笔")
-                        if b1 > b0 and b5 < b0:
-                            st.success("**方向一致**：只买 K<75 更好，只买 K>75 更差。"
-                                       "反向对照给出相反结果，这比单看一个数字可信得多。")
-                        elif b1 > b0:
-                            st.warning("K<75 更好，但反向对照没给出相反结果——证据只算一半。")
-                        else:
-                            st.error("过滤没有改善。你在 12 笔上看到的现象，"
-                                     "在全池 8 年数据上不成立。")
-                    except Exception:
-                        pass
 
-                st.divider()
-                st.markdown("### ⑤ 滚动前推检验（搜索过参数后，唯一还算数的检验）")
-                st.error("**如果你试过多个配置再挑最好的，上面的「样本外」已经不算数了。** "
-                         "因为你在挑选时看过它。滚动前推模拟「你当年真的会怎么做」："
-                         "每年年初只用截至上一年底的数据挑配置，再用它跑这一年，"
-                         "第二年重新挑。这才是真正没被污染的样本外。")
-                if st.button("运行滚动前推", type="primary"):
-                    bar3 = st.progress(0.0)
-                    picked, wf = walk_forward(
-                        panel, elig, sectors, SF2, dates,
-                        signals=[s for s in SF2 if not s.startswith("【合成】")],
-                        top_secs=(2, 3), top_ns=(top_n,), holds=(15, 20),
-                        start_year=2021,
-                        progress=lambda p, n2: bar3.progress(p, text=n2), **kw)
-                    ss["wf"] = (picked, wf); bar3.empty()
-                if ss.get("wf"):
-                    picked, wf = ss["wf"]
-                    if not len(wf):
-                        st.warning("样本不足。")
-                    else:
-                        s5 = wf_summary(wf, hold_days=hold, step_days=every)
-                        m5 = st.columns(4)
-                        m5[0].metric("滚动前推 平均收益", f"{s5['平均收益']:+.2%}")
-                        m5[1].metric("胜率", f"{s5['胜率']:.1%}")
-                        m5[2].metric("t(按年，最严格)", f"{s5['t(按年)']:.2f}",
-                                     f"逐年为正 {s5['逐年为正']}/{s5['年数']}")
-                        m5[3].metric("笔数", f"{s5['笔数']}")
-                        st.caption(
-                            f"另两个口径供对照：按日朴素 t={s5['t(按日,朴素)']:.2f}，"
-                            f"按日重叠修正 t={s5['t(按日,重叠修正)']:.2f}。"
-                            "**该看的是「按年」**——滚动前推每年重新挑一次配置，"
-                            "年与年之间才是真正独立的观测；按日算会把同一年内高度重叠的"
-                            "持仓当成几百个独立样本，严重高估。")
-                        st.dataframe(picked.style.format(
-                            {"历史t": "{:.2f}", "当年笔数": "{:.0f}",
-                             "当年平均收益": "{:+.2%}", "当年胜率": "{:.1%}"})
-                            .background_gradient(subset=["当年平均收益"], cmap="RdYlGn"),
-                            use_container_width=True)
-                        npos = int((picked["当年平均收益"] > 0).sum())
-                        st.caption(f"每年选中的配置见「选中配置」列。逐年为正 {npos}/{len(picked)}。"
-                                   "**注意每年选中的配置是否稳定**——如果年年都换，"
-                                   "说明所谓最优只是当年的运气。")
-                        # 额外看：剔除表现最好的两年后还剩多少
-                        yv = wf.groupby(pd.to_datetime(wf["date"]).dt.year)["收益率"]
-                        ym, yn = yv.mean(), yv.size()
-                        top2 = ym.nlargest(2).index
-                        rest = wf[~pd.to_datetime(wf["date"]).dt.year.isin(top2)]
-                        if len(rest):
-                            st.warning(
-                                f"**剔除最好的两年（{list(top2)}）后，其余年份平均 "
-                                f"{rest['收益率'].mean():+.3%}/笔。** 如果这个数接近零，"
-                                "说明整体成绩靠少数年份撑着——那几年的行情你无法预定。")
-                        if s5["t(按年)"] >= 2 and s5["平均收益"] > 0:
-                            st.success("**滚动前推也站得住。** 这是搜索过参数之后"
-                                       "唯一还算数的证据，含金量比前面任何数字都高。")
-                        else:
-                            yv2 = wf.groupby(pd.to_datetime(wf["date"]).dt.year)["收益率"].mean()
-                            need = int(np.ceil((2 * yv2.std(ddof=1) / yv2.mean()) ** 2)) \
-                                if yv2.mean() > 0 else 0
-                            if s5["平均收益"] > 0 and s5["逐年为正"] >= s5["年数"] * 0.6:
-                                st.warning(
-                                    f"**滚动前推为正但样本不足**（{s5['平均收益']:+.2%}，"
-                                    f"逐年为正 {s5['逐年为正']}/{s5['年数']}，按年 "
-                                    f"t={s5['t(按年)']:.2f}）。\n\n"
-                                    "**这不等于过拟合。** 过拟合的标志是样本内好、样本外垮；"
-                                    "而这里的样本外是正的，配置也稳定。真正的问题是"
-                                    f"年度样本太少——以这个边际大小和年间波动，"
-                                    f"大约需要 **{need} 年** 才能达到 t=2，我们只有 "
-                                    f"{s5['年数']} 年。\n\n"
-                                    "**结论是「证据不足」，不是「已被证伪」。** "
-                                    "唯一能改变它的是新数据：往后每周记录名单，"
-                                    "攒够年份再看。手上这几年已经被反复用过了。")
-                            else:
-                                st.error(f"**滚动前推没站住**（{s5['平均收益']:+.2%}，"
-                                         f"按年 t={s5['t(按年)']:.2f}，逐年为正 "
-                                         f"{s5['逐年为正']}/{s5['年数']}）。"
-                                         "当年你没有能力挑中事后看最好的那个配置。")
-
-                st.divider()
-                st.markdown("### 三项必做诊断")
-                st.caption("前面几轮就是这三项戳破的幻觉：平均收益漂亮，"
-                           "但利润 94% 来自 513 笔里的 5 笔、或者只靠一年撑着、"
-                           "或者样本内好样本外垮。")
-                dsel = st.selectbox("诊断哪个方案", list(keep), key="diag_sel")
-                trd = keep[dsel]
-                c1, c2 = st.columns(2)
-                sp = split_check(trd)
-                c1.markdown("**样本内 / 样本外**（2023-01-01 分界）")
-                if len(sp):
-                    c1.dataframe(sp.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
-                                                  "中位收益": "{:+.2%}", "胜率": "{:.1%}",
-                                                  "聚类t": "{:.2f}"}),
-                                 use_container_width=True)
-                pc = concentration_check(trd)
-                c2.markdown("**利润集中度**")
-                if len(pc):
-                    c2.dataframe(pc.style.format({"占总利润": "{:.1%}",
-                                                  "剔除后单笔均值": "{:+.3%}",
-                                                  "剩余比例": "{:.0%}"}),
-                                 use_container_width=True)
-                    c2.caption(f"全部 {pc.attrs['总笔数']} 笔，原始均值 "
-                               f"{pc.attrs['原均值']:+.2%}")
-                yy = yearly_check(trd)
+            st.divider()
+            st.markdown("### 三项诊断")
+            st.caption("前面几轮就是这三项戳破的幻觉：平均收益漂亮，但利润 94% 来自 "
+                       "513 笔里的 5 笔、或者只靠一年撑着。"
+                       "**注意：如果你试过多个配置再挑最好的，这里的「样本外」已经不算数**"
+                       "——往下看滚动前推。")
+            dsel = st.selectbox("诊断哪个方案", list(keep))
+            trd = keep[dsel]
+            cA, cB = st.columns(2)
+            sp = split_check(trd)
+            cA.markdown("**样本内 / 样本外**（2023-01-01 分界）")
+            if len(sp):
+                cA.dataframe(sp.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
+                                              "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                                              "聚类t": "{:.2f}"}),
+                             use_container_width=True)
+            pc = concentration_check(trd)
+            cB.markdown("**利润集中度**")
+            if len(pc):
+                cB.dataframe(pc.style.format({"占总利润": "{:.1%}",
+                                              "剔除后单笔均值": "{:+.3%}",
+                                              "剩余比例": "{:.0%}"}),
+                             use_container_width=True)
+            yy = yearly_check(trd)
+            if len(yy):
                 st.markdown("**逐年**")
-                if len(yy):
-                    st.dataframe(yy.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
-                                                  "中位收益": "{:+.2%}", "胜率": "{:.1%}",
-                                                  "聚类t": "{:.2f}"})
-                                 .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
-                                 use_container_width=True)
-                    npos = int((yy["平均收益"] > 0).sum())
-                    msgs = []
-                    if len(sp) == 2:
-                        o = sp.loc["样本外"]
-                        msgs.append(("样本外 " + ("站得住" if o["平均收益"] > 0 and o["聚类t"] >= 1.5
-                                                 else "没站住")
-                                     + f"（{o['平均收益']:+.2%}，t={o['聚类t']:.2f}）",
-                                     o["平均收益"] > 0 and o["聚类t"] >= 1.5))
-                    if len(pc) and 5 in pc.index:
-                        keep5 = pc.loc[5, "剩余比例"]
-                        msgs.append((f"剔除最赚的5笔后仍保留 {keep5:.0%} 的均值",
-                                     keep5 > 0.5))
-                    msgs.append((f"逐年为正 {npos}/{len(yy)}", npos >= len(yy) * 0.7))
-                    for txt, good in msgs:
-                        (st.success if good else st.error)(("✅ " if good else "❌ ") + txt)
-                    if all(g for _, g in msgs):
-                        st.success("**三项全过。** 这是整个项目里第一次。"
-                                   "可以考虑小仓位实盘验证了。")
-                    else:
-                        st.warning("有诊断未通过。未通过的那几项正是最容易骗人的地方。")
+                st.dataframe(yy.style.format({"笔数": "{:.0f}", "平均收益": "{:+.2%}",
+                                              "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                                              "聚类t": "{:.2f}"})
+                             .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
+                             use_container_width=True)
+                st.write(f"逐年为正 **{int((yy['平均收益']>0).sum())}/{len(yy)}**")
 
-                st.divider()
-                d = st.selectbox("看哪个方案的成交明细", list(keep))
-                _td = keep[d].copy()
-                _order = [c for c in ["date", "code", "板块", "买入日", "卖出日",
-                                      "买入价(实际)", "卖出价(实际)", "收益率",
-                                      "持有交易日", "买入K", "买入价(复权)", "卖出价(复权)"]
-                          if c in _td.columns]
-                st.dataframe(_td[_order].tail(300), use_container_width=True, height=300)
-                st.caption("**买入价(实际)/卖出价(实际)** 是当日真实开盘价，可以直接和"
-                           "交易软件核对。**买入价(复权)** 是起点归一化为 1.0 的前复权序列——"
-                           "收益率必须用它算才正确（它把分红送股还原了），"
-                           "但它不是你在盘面上看到的价格。之前明细里只显示了后者，"
-                           "所以看起来像 1.9499 这种奇怪数字。")
-                if st.button("生成导出包"):
-                    tb = {"01_对照结果": df, "02_成交明细": pd.concat(
-                        [v.assign(方案=k) for k, v in keep.items()], ignore_index=True),
-                        "00_参数": pd.DataFrame([{
-                            "板块信号": sig_, "选股规则": sr_, "选几个板块": top_sec,
-                            "选几只": top_n, "持有交易日": hold,
-                            "板块数": len(sectors),
-                            "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}]
-                        ).T.rename(columns={0: "值"})}
-                    if ss.get("sigres"):
-                        tb["03_板块信号分层"] = pd.concat(
-                            [t.assign(信号=k) for k, t in ss["sigres"].items()])
-                    tb["04_降噪检验"] = sector_noise_check(panel, elig, sectors)
+            st.divider()
+            st.markdown("### 滚动前推（搜索过参数后唯一算数的检验）")
+            st.error("**每年年初只用截至上一年底的数据挑配置，再用它跑这一年。** "
+                     "全样本上挑一个最优配置再看它的「样本外」，等于用样本外做了选择，"
+                     "那个数字不算数。")
+            if st.button("运行滚动前推", type="primary"):
+                bar3 = st.progress(0.0)
+                picked, wf = walk_forward(
+                    panel, elig, sectors, SF, dates,
+                    top_secs=(2, 3), top_ns=(top_n,), holds=(15, 20),
+                    start_year=2021,
+                    progress=lambda p, n2: bar3.progress(p, text=n2), **kw)
+                ss["wf"] = (picked, wf); bar3.empty(); gc.collect()
+            if ss.get("wf"):
+                picked, wf = ss["wf"]
+                if not len(wf):
+                    st.warning("样本不足。")
+                else:
+                    s5 = wf_summary(wf, hold_days=hold, step_days=every)
+                    m5 = st.columns(4)
+                    m5[0].metric("平均收益", f"{s5['平均收益']:+.2%}")
+                    m5[1].metric("胜率", f"{s5['胜率']:.1%}")
+                    m5[2].metric("t(按年，最严格)", f"{s5['t(按年)']:.2f}",
+                                 f"逐年为正 {s5['逐年为正']}/{s5['年数']}")
+                    m5[3].metric("笔数", f"{s5['笔数']}")
+                    st.caption(f"对照：按日朴素 t={s5['t(按日,朴素)']:.2f}，"
+                               f"按日重叠修正 t={s5['t(按日,重叠修正)']:.2f}。"
+                               "**该看按年**——每年重新挑一次配置，年与年之间才真正独立。")
+                    st.dataframe(picked.style.format(
+                        {"历史t": "{:.2f}", "当年笔数": "{:.0f}",
+                         "当年平均收益": "{:+.2%}", "当年胜率": "{:.1%}"})
+                        .background_gradient(subset=["当年平均收益"], cmap="RdYlGn"),
+                        use_container_width=True)
+                    st.caption("**看「选中配置」列是否年年相同。** 稳定=真信号，"
+                               "年年换=当年的运气。")
+                    yv = wf.groupby(pd.to_datetime(wf["date"]).dt.year)["收益率"].mean()
+                    top2 = yv.nlargest(2).index
+                    rest = wf[~pd.to_datetime(wf["date"]).dt.year.isin(top2)]
+                    if len(rest):
+                        st.warning(f"剔除最好的两年（{list(top2)}）后，其余年份平均 "
+                                   f"{rest['收益率'].mean():+.3%}/笔。")
+                    if s5["t(按年)"] >= 2 and s5["平均收益"] > 0:
+                        st.success("**滚动前推也站得住。** 这是搜索过参数之后唯一算数的证据。")
+                    elif s5["平均收益"] > 0 and s5["逐年为正"] >= s5["年数"] * 0.6:
+                        need = int(np.ceil((2 * yv.std(ddof=1) / yv.mean()) ** 2)) \
+                            if yv.mean() > 0 else 0
+                        st.warning(
+                            f"**为正但样本不足**（{s5['平均收益']:+.2%}，按年 "
+                            f"t={s5['t(按年)']:.2f}）。**这不等于过拟合**——"
+                            "过拟合是样本内好、样本外垮，而这里样本外为正、配置也稳定。"
+                            f"问题是年度样本太少：以这个边际和年间波动，约需 **{need} 年** "
+                            f"才能到 t=2，现在只有 {s5['年数']} 年。\n\n"
+                            "**结论是「证据不足」，不是「已被证伪」。** "
+                            "唯一能改变它的是新数据——往后每周记录名单，攒够年份再看。")
+                    else:
+                        st.error(f"**滚动前推没站住**（{s5['平均收益']:+.2%}，按年 "
+                                 f"t={s5['t(按年)']:.2f}）。当年你没有能力挑中"
+                                 "事后看最好的那个配置。")
+
+            st.divider()
+            d = st.selectbox("看哪个方案的成交明细", list(keep))
+            _td = keep[d].copy()
+            _order = [c for c in ["date", "code", "板块", "买入日", "卖出日",
+                                  "买入价(实际)", "卖出价(实际)", "收益率",
+                                  "持有交易日", "买入K", "买入价(复权)", "卖出价(复权)"]
+                      if c in _td.columns]
+            st.dataframe(_td[_order].tail(300), use_container_width=True, height=300)
+            st.caption("**买入价(实际)** 是当日真实开盘价，可直接与交易软件核对。"
+                       "**买入价(复权)** 是起点归一化为 1.0 的前复权序列——"
+                       "收益率必须用它算才正确（还原了分红送股），但它不是盘面价格。")
+            if st.button("生成导出包"):
+                with st.spinner("打包中…"):
+                    tb = {"01_对照结果": df,
+                          "02_成交明细": pd.concat([v.assign(方案=k)
+                                                 for k, v in keep.items()],
+                                                ignore_index=True),
+                          "00_参数": pd.DataFrame([{
+                              "板块信号": sig_, "选股规则": sr_, "选几个板块": top_sec,
+                              "每次选几只": top_n, "持有交易日": hold,
+                              "每几日选一次": every, "板块数": len(sectors),
+                              "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}]
+                          ).T.rename(columns={0: "值"})}
                     for k2, v2 in keep.items():
                         tag = k2.split("：")[0]
                         for nm2, fn2 in (("样本内外", split_check), ("逐年", yearly_check),
                                          ("集中度", concentration_check)):
                             r2 = fn2(v2)
                             if len(r2):
-                                tb[f"05_{nm2}_{tag}"] = r2
+                                tb[f"03_{nm2}_{tag}"] = r2
+                    if ss.get("sigres"):
+                        tb["04_板块信号分层"] = pd.concat(
+                            [t.assign(信号=k) for k, t in ss["sigres"].items()])
+                    if ss.get("wf"):
+                        tb["05_滚动前推_逐年"] = ss["wf"][0]
+                    if ss.get("ksplit") is not None and len(ss["ksplit"]):
+                        tb["06_位置诊断_干净划分"] = ss["ksplit"]
+                    if ss.get("kbk") is not None and len(ss["kbk"]):
+                        tb["07_位置诊断_K分档"] = ss["kbk"]
+                    if ss.get("nz") is not None:
+                        tb["08_降噪检验"] = ss["nz"]
                     ss["zipb"] = export_all(tb)
                     ss["zipn"] = f"sector_{dt.datetime.now():%Y%m%d_%H%M}.zip"
-                if ss.get("zipb"):
-                    st.download_button(f"下载 {ss['zipn']}", ss["zipb"], ss["zipn"],
-                                       "application/zip", type="primary",
-                                       use_container_width=True)
+                    gc.collect()
+            if ss.get("zipb"):
+                st.download_button(f"下载 {ss['zipn']}（{len(ss['zipb'])/1024:.0f} KB）",
+                                   ss["zipb"], ss["zipn"], "application/zip",
+                                   type="primary", use_container_width=True)
 
-    # ---------- ④ 今日候选 ----------
-    with t3_:
-        sig2 = st.selectbox("板块信号", list(SF2), key="s2",
-                            index=list(SF2).index(DEF_SIG))
-        if sig2 not in SF2:
+    # ---------------- ③ 位置诊断 ----------------
+    with t3:
+        st.markdown("### 想加任何买入条件，先在这里验")
+        st.error("**不要用「带替补的过滤」去验证条件。** 实测：8 个买入位置过滤里"
+                 "不过滤最好（+2.34%），两个相反方向的过滤都变差 0.6-0.7%；"
+                 "而干净划分显示 **87% 的表观效果来自「替补往排名深处挖」**，"
+                 "不是条件本身。排名是有信息的——第1名比第4、5名值钱。")
+        st.markdown("**正确做法**：把同一批成交按条件劈成两半，不做替补。"
+                    "两组笔数加起来等于总数，就没有污染。")
+        if not ss.get("res"):
+            st.info("先到「② 主回测」跑一次对照实验。")
+        else:
+            df, keep, pks, sig_, sr_ = ss["res"]
+            base = list(keep)[0]
+            pk0, tr0 = pks[base], keep[base]
+            cond = st.selectbox("按什么条件划分",
+                                ["买入日在高位死叉后1-5天", "买入时 K≥75", "买入时 K≥60"])
+            if st.button("运行干净划分", type="primary"):
+                with st.spinner("计算中…"):
+                    if cond == "买入日在高位死叉后1-5天":
+                        mk = high_dead_cross_mask(KDF, DDF, 5); ly, ln = "死叉后1-5天", "其他"
+                    elif cond == "买入时 K≥75":
+                        mk = KDF >= 75; ly, ln = "K≥75", "K<75"
+                    else:
+                        mk = KDF >= 60; ly, ln = "K≥60", "K<60"
+                    ss["ksplit"] = split_by_mask(pk0, tr0, mk, ly, ln)
+                    ss["kbk"] = k_bucket_diagnosis(pk0, tr0)
+            if ss.get("ksplit") is not None and len(ss["ksplit"]):
+                st.dataframe(ss["ksplit"].style.format(
+                    {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}",
+                     "中位收益": "{:+.2%}", "胜率": "{:.1%}", "聚类t": "{:.2f}"})
+                    .background_gradient(subset=["中位收益"], cmap="RdYlGn"),
+                    use_container_width=True)
+                n_all = len(tr0.dropna(subset=["收益率"]))
+                st.caption(f"两组笔数合计 {int(ss['ksplit']['笔数'].sum())}，"
+                           f"总成交 {n_all} —— 相等说明是真划分，不是替补。")
+                st.info("**判读**：胜率差的标准误约 2-3 个百分点，"
+                        "差异小于这个量级就是噪音。\n\n"
+                        "**你只拿 1-3 只，抓到右尾的概率低，实际体验更接近中位数**——"
+                        "所以中位数和胜率对你比平均收益更有参考价值。")
+            if ss.get("kbk") is not None and len(ss["kbk"]):
+                st.markdown("**买入当天日线 SKDJ 的 K 值分档**")
+                st.dataframe(ss["kbk"].style.format(
+                    {"笔数": "{:.0f}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                     "胜率": "{:.1%}", "占比": "{:.1%}"})
+                    .background_gradient(subset=["平均收益"], cmap="RdYlGn"),
+                    use_container_width=True)
+                st.caption("此前实测：六档全部为正，K>75 那两档胜率最高。"
+                           "板块内最强 = 涨得最多 = K 高，**强势股待在高位是特征不是缺陷**。")
+
+    # ---------------- ④ 今日候选 ----------------
+    with t4:
+        sig2 = st.selectbox("板块信号", list(SF), key="s2", index=list(SF).index(DEF_SIG))
+        if sig2 not in SF:
             sig2 = DEF_SIG
         sr2 = st.selectbox("板块内选股", STOCK_RULES, key="r2")
         if sr2 not in STOCK_RULES:
             sr2 = STOCK_RULES[0]
         d = panel["cal"][-1]
-        f = SF2[sig2].loc[d].dropna().sort_values(ascending=False)
+        f = SF[sig2].loc[d].dropna().sort_values(ascending=False)
         st.subheader(f"{d:%Y-%m-%d}　板块排名")
         st.dataframe(pd.DataFrame({"板块": f.index, "信号值": f.values,
                                    "合格成分股": [int(elig.loc[d, sectors[s]].sum())
                                                 for s in f.index]}).head(10),
                      use_container_width=True, hide_index=True)
-        reg2 = pool_regime(panel, elig, 200)
-        on = bool(reg2.get(d, False))
-        if not on:
-            st.error("**熊市开关：关闭中。** 合格池等权指数在 200 日线下方，"
-                     "按回测口径今天不该出手。下面的候选仅供参考。")
-        else:
-            st.success("熊市开关：开启中（池子等权指数在 200 日线上方）。")
-        pk = sector_then_stock(panel, elig, sectors, SF2[sig2], [d], top_sec, top_n, sr2, "最强")
+        pk = sector_then_stock(panel, elig, sectors, SF[sig2], [d],
+                               top_sec, top_n, sr2, "最强", kdf=KDF)
         if len(pk) < top_n:
-            picked_secs = list(f.index[:top_sec])
-            info = []
-            for s3 in picked_secs:
-                cs = [c for c in sectors[s3] if elig.loc[d, c]]
-                info.append(f"{s3}: {len(cs)} 只合格")
-            st.warning(
-                f"**只选出 {len(pk)} 只，少于设定的 {top_n} 只。** 原因见下方各板块"
-                f"的合格股票数：{'；'.join(info)}。\n\n"
-                "候选是**按板块顺序**取的：先取最强板块里动量最高的，不够再取次强板块。"
-                "回测里因为有冷却期（同股 5 日内不重复），会自然分散到多个板块；"
-                "而单看某一天没有冷却历史，就会集中在最强板块。"
-                "如果最强板块当天合格股票不足，总数就会少于设定值。")
+            info = [f"{s3}: {int(elig.loc[d, sectors[s3]].sum())} 只合格"
+                    for s3 in list(f.index[:top_sec])]
+            st.warning(f"**只选出 {len(pk)} 只，少于设定的 {top_n} 只。** "
+                       f"各板块合格数：{'；'.join(info)}。\n\n"
+                       "候选按板块顺序取：先取最强板块里动量最高的，不够再取次强板块。"
+                       "回测里有冷却期（同股 5 日内不重复）会自然分散，"
+                       "单看某一天没有冷却历史，就会集中在最强板块。")
         if not len(pk):
             st.warning("今日无候选。")
         else:
@@ -2050,10 +1751,15 @@ def main():
                 "板块": r["板块"],
                 "收盘价": round(float(panel["raw_close"].loc[d, r["code"]]), 2),
                 "流通市值(亿)": round(float(panel["circ_mv"].loc[d, r["code"]]) / 1e4),
-                "20日涨幅": f"{r['score']:.1%}"} for _, r in pk.iterrows()])
+                "20日涨幅": f"{r['score']:.1%}",
+                "日线K": round(float(r["买入K"]), 1) if pd.notna(r.get("买入K")) else None
+            } for _, r in pk.iterrows()])
             st.dataframe(out, use_container_width=True, hide_index=True)
             st.download_button("下载 CSV", out.to_csv(index=False).encode("utf-8-sig"),
-                               f"sector_picks_{d:%Y%m%d}.csv", "text/csv")
+                               f"picks_{d:%Y%m%d}.csv", "text/csv")
+            st.info(f"**执行规则**：次日开盘买入，**持有 {hold} 个交易日后开盘卖出**。"
+                    "不设止盈止损——回测就是这个口径。"
+                    "「日线K」仅供参考，实测按它过滤只会让结果变差。")
 
     if API_ERRORS:
         with st.expander(f"接口异常 {len(API_ERRORS)} 条"):
