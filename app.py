@@ -456,6 +456,10 @@ def build_eligibility(panel: dict, basic: pd.DataFrame, uni: pd.DataFrame,
     amt = panel["amount"]         # 千元
 
     ok = panel["tradable"].copy()
+    # circ_mv 来自 daily_basic，它比 daily 发布得晚 —— 收盘后先有价、后有市值。
+    # 那一天市值全空会让所有股票市值筛选不通过，候选直接崩掉。
+    # 市值是慢变量，用前几天的完全够用；ffill 只取过去的值，不含未来信息。
+    cmv = cmv.where(panel["tradable"]).ffill(limit=5)
     ok &= cmv.notna() & (cmv >= mv_lo * 1e4) & (cmv <= mv_hi * 1e4)
     ok &= rc >= min_price
     ok &= amt.rolling(20).mean() >= min_amt_yi * 1e5
@@ -764,7 +768,7 @@ def empty_week_stats(score: pd.DataFrame, elig: pd.DataFrame,
 
 
 def extend_panel(pro, lim: Limiter, panel: dict, end_str: str,
-                 progress=None) -> tuple:
+                 refresh_days: int = 2, progress=None) -> tuple:
     """
     增量更新：只补最近缺的那几个交易日，不重下全历史。
 
@@ -772,8 +776,19 @@ def extend_panel(pro, lim: Limiter, panel: dict, end_str: str,
     一天一次调用；而全量下载是按**股票**取（每只 2 次调用，1400 只就是 2800 次）。
     补 3 天只要 6 次调用，几秒钟完成。
     """
+    # 同时**重取最后 refresh_days 天**，不只是补新日子。
+    # 原因：Tushare 的 daily 15-16点入库、daily_basic 15-17点，市值比价格晚。
+    # 收盘后不久下载的话，最后一天会有价无市值，而这个残缺会一直留在 panel 里 ——
+    # 只补新日子的话永远修不好它。
     cal = panel["cal"]
-    last = cal[-1]
+    k = min(max(int(refresh_days), 0), len(cal) - 1)
+    keep_to = len(cal) - 1 - k              # 保留到这一行（含）
+    last = cal[keep_to]
+    for _key in ("raw_close", "raw_open", "amount", "circ_mv", "adj_close",
+                 "adj_open", "adj_high", "adj_low", "tradable",
+                 "limit_up_open", "limit_dn_open"):
+        panel = dict(panel)
+        panel[_key] = panel[_key].iloc[:keep_to + 1]
     tc = api_call(pro.trade_cal, lim, exchange="SSE",
                   start_date=(last + pd.Timedelta(days=1)).strftime("%Y%m%d"),
                   end_date=end_str, is_open="1")
@@ -1474,22 +1489,23 @@ def main():
                              "常常三只全来自最强板块。设为 1 则强制每个板块只取一只。"
                              "改了这个，前面所有回测结论都要重跑。")
         with st.expander("其他设置"):
-            start = st.date_input("数据起始", dt.date(2018, 1, 1))
-            st.caption("**只用第④页选股的话，2025-01-01 起就够**（约410个交易日），"
-                       "下载调用数只有全量的 29%。\n\n"
-                       "但第②页的样本内外拆分需跨越 2023-01-01，"
-                       "滚动前推需要 2021 年起——**要重新做验证就得用 2018 年起**。")
+            start = st.date_input("数据起始（选「验证」模式时生效）", dt.date(2018, 1, 1))
             end = st.date_input("数据结束", dt.date.today())
             min_mem = st.slider("板块最少成分股", 3, 20, 5)
             every = st.slider("每几个交易日选一次", 1, 10, 3)
             comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
             slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
             workers = st.slider("下载并发", 1, 8, 4)
+        mode = st.radio("下载范围", ["日常（近2年，快）", "验证（2018起，慢）"],
+                        help="实测：起始日期从2018改到2026，第④页选出的股票**完全相同**——"
+                             "板块动量和个股动量都是比值，与起点无关。\n\n"
+                             "但第①②页需要长历史：样本内外拆分要跨2023，滚动前推要2021年起。"
+                             "验证已经做完了，日常用「近2年」即可。")
         run = st.button("下载数据（首次/换股票池）", use_container_width=True)
         upd = st.button("增量更新到最新", type="primary", use_container_width=True,
                         disabled=ss.get("panel") is None,
-                        help="只补最近缺的几个交易日，按交易日取全市场，"
-                             "几秒钟完成；不用重下 1400 只。")
+                        help="补最近缺的交易日，并**重取最后 2 天**（市值比价格晚发布，"
+                             "早下载的话最后一天会有价无市值）。按交易日取全市场，几秒完成。")
         if ss.get("panel") is not None:
             _p = ss["panel"]
             st.success(f"{len(_p['codes'])} 只 × {len(_p['cal'])} 日")
@@ -1512,6 +1528,8 @@ def main():
                    "elig", "elig_key", "kmask_key", "sec_mm"):
             ss.pop(kk, None)
         gc.collect()
+        if mode.startswith("日常"):
+            start = dt.date.today() - dt.timedelta(days=730)
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
         with st.status("下载中…", expanded=True) as stt:
             st.write("取申万行业成分股（含二级行业）…")
@@ -1560,16 +1578,23 @@ def main():
                 bar = st.progress(0.0)
                 newp, nd = extend_panel(pro2, lim2, ss["panel"],
                                         dt.date.today().strftime("%Y%m%d"),
+                                        refresh_days=2,
                                         progress=lambda p, s: bar.progress(p, text=s))
                 bar.empty()
                 if nd:
+                    _mv = float(newp["circ_mv"].iloc[-1].notna().mean())
                     ss["panel"] = newp
                     for kk in ("sec", "elig", "elig_key", "kdf", "ddf",
                                "res", "wf", "nz", "sigres", "ksplit", "kbk"):
                         ss.pop(kk, None)
                     gc.collect()
-                    st.success(f"已补 {nd} 个交易日，现在数据截至 "
-                               f"{newp['cal'][-1]:%Y-%m-%d}。")
+                    st.success(f"已更新 {nd} 个交易日（含重取最后 2 天），"
+                               f"现在数据截至 {newp['cal'][-1]:%Y-%m-%d}，"
+                               f"当日流通市值覆盖 {_mv:.0%}。")
+                    if _mv < 0.5:
+                        st.warning("市值覆盖仍然偏低。Tushare 的 daily_basic（市值）"
+                                   "15-17点入库，比 daily（价格）晚；周五负载高时可能更晚。"
+                                   "**稍后再点一次增量更新即可**——它会重取最后两天。")
                 else:
                     st.info("已经是最新，没有需要补的交易日。")
             except ImportError:
@@ -1578,8 +1603,23 @@ def main():
                 st.error(f"增量更新失败：{e}。可以改用「下载数据」全量重下。")
 
     if ss.get("panel") is None:
-        st.info("左侧填 Token 后点「下载数据」。首次 5-15 分钟，之后走本地缓存。\n\n"
-                "**日常使用**：点「增量更新到最新」（几秒钟），然后直接看第④页今日候选。"); st.stop()
+        st.info("左侧填 Token 后点「下载数据」。\n\n"
+                "**日常选股用「日常（近2年）」模式**——实测起始日期从 2018 改到 2026，"
+                "第④页选出的股票完全相同（动量都是比值，与起点无关），"
+                "但下载调用数只有 1/3，一两分钟就好。\n\n"
+                "**只有要重跑第①②页的验证时才用「验证（2018起）」**。")
+        with st.expander("为什么有时候一打开就要重新下载？"):
+            st.markdown(
+                "有两层缓存，都可能丢：\n\n"
+                "1. **内存里的 panel**：应用进程重启就没了。Streamlit Cloud 会在"
+                "长时间没人访问后休眠，再次打开就是新进程。\n"
+                "2. **磁盘上的分股缓存**：**每次你覆盖 app.py，云端都会重建容器，"
+                "这份缓存一起被清掉**——这大概是你遇到最多的情况。\n\n"
+                "我试过把整个数据打包供你下载/回传，但压缩后仍有 **87MB**"
+                "（价格是随机游走，压不动），不实用。\n\n"
+                "**实际的解法就是用「日常」模式**：近2年数据一两分钟下完，"
+                "选股结果和8年完全一致。代码稳定不再频繁改动之后，缓存也就能留住了。")
+        st.stop()
 
     panel, basic, uni = ss["panel"], ss["basic"], ss["uni"]
     dkey = f"{len(panel['codes'])}|{panel['cal'][-1]:%Y%m%d}|{min_mem}"
@@ -1982,13 +2022,25 @@ def main():
             sr2 = STOCK_RULES[0]
         d = panel["cal"][-1]
         _today = pd.Timestamp(dt.date.today())
-        if d >= _today:
-            st.error(f"**数据末尾是今天（{d:%Y-%m-%d}），盘中可能是不完整的当日数据。** "
-                     "回测口径是「收盘后选出、次日开盘买入」，"
-                     "用盘中数据选出的名单和回测不是一回事。建议收盘后再跑。")
+        # 判断依据是"数据全不全"，不是"是不是今天"——收盘后当天数据就是完整可用的。
+        _cov_px = float(panel["raw_close"].loc[d].notna().mean())
+        _cov_mv = float(panel["circ_mv"].loc[d].notna().mean())
+        _ref = float(panel["raw_close"].iloc[-6:-1].notna().mean().mean())
+        _nel = int(elig.loc[d].sum())
+        _nel_ref = float(elig.iloc[-6:-1].sum(axis=1).mean())
+        if _cov_px < _ref * 0.8:
+            st.error(f"**{d:%Y-%m-%d} 的收盘价只覆盖了 {_cov_px:.0%} 的股票**"
+                     f"（前几日平均 {_ref:.0%}）。数据不完整，盘中跑的话请收盘后再来。")
+        elif _cov_mv < 0.5:
+            st.warning(f"**{d:%Y-%m-%d} 的流通市值只覆盖 {_cov_mv:.0%}。** "
+                       "Tushare 的 daily_basic（市值）比 daily（价格）发布晚，"
+                       "已用前几日市值补齐（市值是慢变量，这样做不影响判断）。")
+        if _nel < _nel_ref * 0.5:
+            st.error(f"**今日合格股票只有 {_nel} 只，而前几日平均 {_nel_ref:.0f} 只。** "
+                     "名单可能不可靠，建议稍后重新增量更新再看。")
         else:
-            st.success(f"**选股依据：{d:%Y-%m-%d} 收盘数据**"
-                       f"（今天是 {_today:%Y-%m-%d}）。"
+            st.success(f"**选股依据：{d:%Y-%m-%d} 收盘数据**（今天是 {_today:%Y-%m-%d}），"
+                       f"合格股票 {_nel} 只。"
                        "按回测口径，这份名单应在**下一个交易日开盘**买入。")
         f = SF[sig2].loc[d].dropna().sort_values(ascending=False)
         st.subheader(f"{d:%Y-%m-%d}　板块排名")
