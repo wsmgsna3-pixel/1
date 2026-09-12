@@ -45,8 +45,8 @@ except Exception:  # 便于在无 streamlit 环境下单测纯计算函数
 # ----------------------------------------------------------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, ".cache_pool")
-PX_DIR = os.path.join(CACHE_DIR, "px")
-os.makedirs(PX_DIR, exist_ok=True)
+DAY_DIR = os.path.join(CACHE_DIR, "day")   # 唯一的缓存：每个交易日一个文件
+os.makedirs(DAY_DIR, exist_ok=True)
 
 # 申万2021 一级行业（整体纳入）
 SW_L1_ALL = ["电子", "计算机", "通信", "传媒", "国防军工", "电力设备", "机械设备",
@@ -210,97 +210,6 @@ def fetch_stock_basic(pro, lim: Limiter) -> pd.DataFrame:
     if not parts:
         return pd.DataFrame(columns=["ts_code", "name", "list_date", "delist_date"])
     return pd.concat(parts, ignore_index=True).drop_duplicates("ts_code")
-
-
-def _px_path(ts_code: str) -> str:
-    return os.path.join(PX_DIR, ts_code.replace(".", "_") + ".pkl")
-
-
-PX_COLS = ["trade_date", "open", "high", "low", "close", "pre_close", "pct_chg", "amount", "circ_mv"]
-
-
-def fetch_one_stock(pro_get: Callable, lim: Limiter, ts_code: str, start: str, end: str,
-                    use_cache: bool = True) -> Optional[pd.DataFrame]:
-    """
-    单只股票的日线 + 每日指标，落地磁盘缓存（每股一个文件，中途崩溃可续传）。
-    注意 Tushare 的 pre_close 已做除权处理，pct_chg 因此是正确的复权收益率，
-    所以不需要额外拉 adj_factor。high/low 本系统用不到，不下载也不保存。
-    """
-    path = _px_path(ts_code)
-    if use_cache and os.path.exists(path):
-        try:
-            with open(path, "rb") as f:
-                blob = pickle.load(f)
-            # 必须比对「请求区间」而不是「数据区间」：股票首个交易日几乎不会
-            # 正好等于请求起始日（节假日、上市较晚、已退市），拿数据区间去比会
-            # 导致永远未命中、每次全量重下。
-            if isinstance(blob, dict) and "df" in blob:
-                if (blob.get("start", "99999999") <= start
-                        and blob.get("end", "0") >= end):
-                    return blob["df"]
-        except Exception:
-            pass
-
-    pro = pro_get()
-    d = api_call(pro.daily, lim, ts_code=ts_code, start_date=start, end_date=end)
-    if d is None or len(d) == 0:
-        return None
-    b = api_call(pro.daily_basic, lim, ts_code=ts_code, start_date=start, end_date=end,
-                 fields="trade_date,circ_mv")
-    d = d[[c for c in PX_COLS if c in d.columns]].copy()
-    if b is not None and len(b):
-        d = d.merge(b[["trade_date", "circ_mv"]], on="trade_date", how="left")
-    else:
-        d["circ_mv"] = np.nan
-    d["trade_date"] = pd.to_datetime(d["trade_date"], format="%Y%m%d")
-    for c in d.columns:
-        if c != "trade_date":
-            d[c] = pd.to_numeric(d[c], errors="coerce").astype(np.float32)   # 内存减半
-    d = d.sort_values("trade_date").reset_index(drop=True)
-    try:
-        with open(path, "wb") as f:
-            pickle.dump({"start": start, "end": end, "df": d}, f, protocol=4)
-    except Exception:
-        pass
-    return d
-
-
-def download_all(token: str, codes: List[str], start: str, end: str, lim: Limiter,
-                 use_cache: bool, workers: int,
-                 progress_cb: Optional[Callable] = None) -> Dict[str, pd.DataFrame]:
-    """
-    多线程下载。瓶颈是单次请求的网络往返（约 0.5-1 秒），不是频次上限，
-    所以并发能把吞吐从「延迟受限」拉到「频次受限」，4 线程通常快 3-4 倍。
-    限流器全局共享，账号层面的频次不会被突破。
-    """
-    import tushare as ts
-
-    local = threading.local()
-
-    def pro_get():
-        if not hasattr(local, "pro"):
-            local.pro = ts.pro_api(token)     # 每线程一个客户端，不共享连接
-        return local.pro
-
-    out: Dict[str, pd.DataFrame] = {}
-    done = 0
-    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
-        futs = {ex.submit(fetch_one_stock, pro_get, lim, c, start, end, use_cache): c
-                for c in codes}
-        for fut in as_completed(futs):
-            c = futs[fut]
-            try:
-                d = fut.result()
-            except Exception as e:
-                d = None
-                with _ERR_LOCK:
-                    API_ERRORS.append(f"{c}: {e}")
-            if d is not None and len(d) > 30:
-                out[c] = d
-            done += 1
-            if progress_cb is not None and (done % 10 == 0 or done == len(codes)):
-                progress_cb(done, len(codes), len(out))   # 回调只在主线程消费
-    return out
 
 
 def prescreen_by_mv(pro, lim: Limiter, codes: List[str], start: str, end: str,
@@ -767,101 +676,45 @@ def empty_week_stats(score: pd.DataFrame, elig: pd.DataFrame,
     return df.groupby(df.index.year)["不足"].sum()
 
 
-def extend_panel(pro, lim: Limiter, panel: dict, end_str: str,
-                 refresh_days: int = 2, progress=None) -> tuple:
+def _day_path(d: str) -> str:
+    return os.path.join(DAY_DIR, f"{d}.pkl")
+
+
+def fetch_one_day(pro, lim: Limiter, d: str):
     """
-    增量更新：只补最近缺的那几个交易日，不重下全历史。
+    取某个交易日的全市场行情+市值。返回 (daily, basic, 是否完整)。
 
-    关键在于换了取数方式：按**交易日**取全市场（pro.daily(trade_date=...)），
-    一天一次调用；而全量下载是按**股票**取（每只 2 次调用，1400 只就是 2800 次）。
-    补 3 天只要 6 次调用，几秒钟完成。
+    **只有数据齐全才写缓存。** Tushare 的 daily(价格) 15-16点入库、
+    daily_basic(市值) 15-17点，收盘后不久抓到的当天可能有价无市值。
+    不完整就不缓存，下次自然会重取 —— 这样不需要"重取最近N天"之类的特例。
     """
-    # 同时**重取最后 refresh_days 天**，不只是补新日子。
-    # 原因：Tushare 的 daily 15-16点入库、daily_basic 15-17点，市值比价格晚。
-    # 收盘后不久下载的话，最后一天会有价无市值，而这个残缺会一直留在 panel 里 ——
-    # 只补新日子的话永远修不好它。
-    cal = panel["cal"]
-    k = min(max(int(refresh_days), 0), len(cal) - 1)
-    keep_to = len(cal) - 1 - k              # 保留到这一行（含）
-    last = cal[keep_to]
-    for _key in ("raw_close", "raw_open", "amount", "circ_mv", "adj_close",
-                 "adj_open", "adj_high", "adj_low", "tradable",
-                 "limit_up_open", "limit_dn_open"):
-        panel = dict(panel)
-        panel[_key] = panel[_key].iloc[:keep_to + 1]
-    tc = api_call(pro.trade_cal, lim, exchange="SSE",
-                  start_date=(last + pd.Timedelta(days=1)).strftime("%Y%m%d"),
-                  end_date=end_str, is_open="1")
-    if tc is None or not len(tc):
-        return panel, 0
-    days = sorted(str(x) for x in tc["cal_date"])
-    if not days:
-        return panel, 0
-
-    codes = panel["codes"]
-    cs = set(codes)
-    need = ["open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
-    acc = {k: {} for k in need + ["circ_mv"]}
-    got = []
-    for i, d in enumerate(days):
-        dd = api_call(pro.daily, lim, trade_date=d)
-        if dd is None or not len(dd):
-            continue
-        dd = dd[dd["ts_code"].isin(cs)].set_index("ts_code")
-        db = api_call(pro.daily_basic, lim, trade_date=d, fields="ts_code,circ_mv")
-        dt_ = pd.Timestamp(d)
-        for k in need:
-            acc[k][dt_] = dd[k].reindex(codes).astype(np.float32) if k in dd.columns else np.nan
-        acc["circ_mv"][dt_] = (db.set_index("ts_code")["circ_mv"].reindex(codes).astype(np.float32)
-                               if db is not None and len(db) else np.nan)
-        got.append(dt_)
-        if progress:
-            progress((i + 1) / len(days), f"补 {d}")
-    if not got:
-        return panel, 0
-
-    new = {k: pd.DataFrame(v).T.reindex(index=got, columns=codes) for k, v in acc.items()}
-    if "close" not in new or new["close"].notna().sum().sum() == 0:
-        return panel, 0
-    raw_close = pd.concat([panel["raw_close"], new["close"]])
-    raw_open = pd.concat([panel["raw_open"], new["open"]])
-    amount = pd.concat([panel["amount"], new["amount"]])
-    circ_mv = pd.concat([panel["circ_mv"], new["circ_mv"]])
-    pre_new = new["pre_close"]
-    pct_new = new["pct_chg"]
-
-    # 复权价按链式续接：新一天 = 上一天 × (1 + 当日涨跌幅)
-    adj_prev = panel["adj_close"]
-    step = (1.0 + pct_new.fillna(0.0).astype(np.float64) / 100.0).cumprod()
-    adj_new = step.mul(adj_prev.iloc[-1], axis=1)
-    tradable_new = new["close"].notna()
-    adj_new = adj_new.where(tradable_new).ffill()
-    adj_close = pd.concat([adj_prev, adj_new])
-
-    ratio = adj_close.shift(1).loc[got] / pre_new.where(pre_new > 0)
-    adj_open = pd.concat([panel["adj_open"], (new["open"] * ratio).astype(np.float32)])
-    adj_high = pd.concat([panel["adj_high"], (new["high"] * ratio).astype(np.float32)])
-    adj_low = pd.concat([panel["adj_low"], (new["low"] * ratio).astype(np.float32)])
-    tradable = pd.concat([panel["tradable"], tradable_new])
-
-    lim_pct = pd.Series([0.20 if (c.startswith("30") or c.startswith("688")) else 0.10
-                         for c in codes], index=codes, dtype=np.float32)
-    lu = pd.concat([panel["limit_up_open"],
-                    ((new["open"] >= pre_new.mul(1.0 + lim_pct, axis=1) - 0.004)
-                     & tradable_new)])
-    ld = pd.concat([panel["limit_dn_open"],
-                    ((new["open"] <= pre_new.mul(1.0 - lim_pct, axis=1) + 0.004)
-                     & tradable_new)])
-    out = dict(cal=raw_close.index, codes=codes,
-               raw_close=raw_close, raw_open=raw_open, amount=amount, circ_mv=circ_mv,
-               adj_close=adj_close, adj_open=adj_open, adj_high=adj_high,
-               adj_low=adj_low, tradable=tradable,
-               limit_up_open=lu, limit_dn_open=ld)
-    return out, len(got)
+    if os.path.exists(_day_path(d)):
+        try:
+            with open(_day_path(d), "rb") as f:
+                blob = pickle.load(f)
+            if isinstance(blob, dict) and "daily" in blob:
+                return blob["daily"], blob.get("basic"), True
+        except Exception:
+            pass
+    dd = api_call(pro.daily, lim, trade_date=d)
+    if dd is None or not len(dd):
+        return None, None, False
+    db = api_call(pro.daily_basic, lim, trade_date=d, fields="ts_code,circ_mv")
+    # 完整 = 有价格，且市值覆盖了大部分有价格的股票
+    full = db is not None and len(db) >= len(dd) * 0.8
+    if full:
+        try:
+            os.makedirs(DAY_DIR, exist_ok=True)
+            with open(_day_path(d), "wb") as f:
+                pickle.dump({"daily": dd, "basic": db}, f, protocol=4)
+        except Exception as e:
+            if len(API_ERRORS) < 200:
+                API_ERRORS.append(f"缓存写入失败 {d}: {e}")
+    return dd, db, full
 
 
 def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
-                     progress=None) -> dict:
+                     progress=None, min_rows: int = 30) -> tuple:
     """
     按**交易日**取全市场，再筛出我们要的股票。
 
@@ -878,14 +731,24 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
     need = ["open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
     rows = {k: {} for k in need + ["circ_mv"]}
     ok = 0
+    hit, skipped = 0, []
     for i, d in enumerate(days):
-        dd = api_call(pro.daily, lim, trade_date=d)
+        cached = os.path.exists(_day_path(d))
+        dd, db, full = fetch_one_day(pro, lim, d)
+        if cached and dd is not None:
+            hit += 1
         if dd is None or not len(dd):
             if progress:
                 progress((i + 1) / len(days), f"{d} 无数据")
             continue
+        if not full:
+            # 数据没齐（通常是当天市值还没发布）——整天丢弃，不进 panel。
+            # 于是 panel 自然停在最后一个完整的交易日。
+            skipped.append(d)
+            if progress:
+                progress((i + 1) / len(days), f"{d} 数据未齐，跳过")
+            continue
         dd = dd[dd["ts_code"].isin(cs)].drop_duplicates("ts_code").set_index("ts_code")
-        db = api_call(pro.daily_basic, lim, trade_date=d, fields="ts_code,circ_mv")
         dt_ = pd.Timestamp(d)
         for k in need:
             if k in dd.columns:
@@ -895,9 +758,10 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
                                     .set_index("ts_code")["circ_mv"].astype(np.float32))
         ok += 1
         if progress and (i % 5 == 0 or i == len(days) - 1):
-            progress((i + 1) / len(days), f"{d}　{ok}/{len(days)}")
+            progress((i + 1) / len(days),
+                     f"{d}　{ok}/{len(days)}　缓存命中 {hit}")
     if not ok:
-        return {}
+        return {}, skipped
     # 转回"每只股票一张长表"，复用 build_panel，保证和按股票下载的口径完全一致
     wide = {k: pd.DataFrame(v).T.sort_index() for k, v in rows.items() if v}
     if "close" not in wide:
@@ -911,14 +775,74 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
         if "close" not in cols:
             continue
         df = pd.DataFrame(cols).dropna(subset=["close"])
-        if len(df) < 30:
+        if len(df) < min_rows:      # 增量更新只有几天，不能用这个门槛
             continue
         for k in need:                       # 补齐 build_panel 需要的列
             if k not in df.columns:
                 df[k] = np.nan
         df = df.reset_index().rename(columns={"index": "trade_date"})
         out[c] = df
-    return out
+    return out, skipped
+
+
+def update_panel(pro, lim: Limiter, panel: dict, end_str: str,
+                 progress=None) -> tuple:
+    """
+    增量更新：只取 panel 末尾之后、且数据已齐的交易日，接到后面。
+
+    和初次下载走同一条路（按交易日取、同一份缓存）。
+    因为不完整的日子根本不会进 panel，所以不需要"重取最近N天"——
+    数据没齐时 panel 就停在上一个完整交易日，齐了再点一次自然就补上。
+    """
+    last = panel["cal"][-1]
+    px, skipped = download_by_date(
+        pro, lim, panel["codes"],
+        (last + pd.Timedelta(days=1)).strftime("%Y%m%d"), end_str,
+        progress, min_rows=1)
+    if not px:
+        return panel, 0, skipped
+
+    cs = panel["codes"]
+    # 不用 build_panel 重新归一化，直接按"旧段末值 × 累计涨跌幅"续接，
+    # 这样接缝处天然连续，也不需要任何比例修正。
+    days_new = sorted({d for f in px.values() for d in f["trade_date"]})
+    idx = pd.DatetimeIndex(days_new)
+    def wide(col, dtype=np.float32):
+        m = pd.DataFrame(index=idx, columns=cs, dtype=dtype)
+        for c, f in px.items():
+            if c in m.columns and col in f.columns:
+                m.loc[f["trade_date"], c] = f[col].to_numpy()
+        return m
+    rc, ro = wide("close"), wide("open")
+    hi, lo = wide("high"), wide("low")
+    pre, pct = wide("pre_close"), wide("pct_chg")
+    amt, cmv = wide("amount"), wide("circ_mv")
+
+    tradable_new = rc.notna()
+    step = (1.0 + pct.astype(np.float64).fillna(0.0) / 100.0).cumprod()
+    adj_new = step.mul(panel["adj_close"].iloc[-1].reindex(cs), axis=1)
+    adj_new = adj_new.where(tradable_new).ffill()
+    ratio = pd.concat([panel["adj_close"].iloc[[-1]], adj_new]).shift(1).loc[idx] / \
+        pre.where(pre > 0)
+
+    out = {"codes": cs}
+    out["raw_close"] = pd.concat([panel["raw_close"], rc])
+    out["raw_open"] = pd.concat([panel["raw_open"], ro])
+    out["amount"] = pd.concat([panel["amount"], amt])
+    out["circ_mv"] = pd.concat([panel["circ_mv"], cmv])
+    out["adj_close"] = pd.concat([panel["adj_close"], adj_new])
+    out["adj_open"] = pd.concat([panel["adj_open"], (ro * ratio).astype(np.float32)])
+    out["adj_high"] = pd.concat([panel["adj_high"], (hi * ratio).astype(np.float32)])
+    out["adj_low"] = pd.concat([panel["adj_low"], (lo * ratio).astype(np.float32)])
+    out["tradable"] = pd.concat([panel["tradable"], tradable_new])
+    lim_pct = pd.Series([0.20 if (c.startswith("30") or c.startswith("688")) else 0.10
+                         for c in cs], index=cs, dtype=np.float32)
+    out["limit_up_open"] = pd.concat([panel["limit_up_open"],
+        (ro >= pre.mul(1.0 + lim_pct, axis=1) - 0.004) & tradable_new])
+    out["limit_dn_open"] = pd.concat([panel["limit_dn_open"],
+        (ro <= pre.mul(1.0 - lim_pct, axis=1) + 0.004) & tradable_new])
+    out["cal"] = out["raw_close"].index
+    return out, len(idx), skipped
 
 
 # ======================================================================
@@ -1537,7 +1461,6 @@ def main():
             every = st.slider("每几个交易日选一次", 1, 10, 3)
             comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
             slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
-            workers = st.slider("下载并发", 1, 8, 4)
         mode = st.radio("下载范围", ["日常（近2年，快）", "验证（2018起，慢）"],
                         help="实测：起始日期从2018改到2026，第④页选出的股票**完全相同**——"
                              "板块动量和个股动量都是比值，与起点无关。\n\n"
@@ -1546,8 +1469,8 @@ def main():
         run = st.button("下载数据（首次/换股票池）", use_container_width=True)
         upd = st.button("增量更新到最新", type="primary", use_container_width=True,
                         disabled=ss.get("panel") is None,
-                        help="补最近缺的交易日，并**重取最后 2 天**（市值比价格晚发布，"
-                             "早下载的话最后一天会有价无市值）。按交易日取全市场，几秒完成。")
+                        help="只取还没有的交易日，几秒完成。数据没齐的当天会自动跳过，"
+                             "齐了之后再点一次就补上。")
         if ss.get("panel") is not None:
             _p = ss["panel"]
             st.success(f"{len(_p['codes'])} 只 × {len(_p['cal'])} 日")
@@ -1590,18 +1513,26 @@ def main():
             #   按股票取 = 2 × 股票数（固定）；按交易日取 = 2 × 交易日数
             ndays = int(np.busday_count(start, end) * 0.97)
             by_date = ndays < len(codes)
+            # 缓存可写性自检：写不进去就会每次全量重下，必须提前告知
+            try:
+                os.makedirs(DAY_DIR, exist_ok=True)
+                _t = os.path.join(DAY_DIR, ".wtest")
+                with open(_t, "wb") as _f:
+                    _f.write(b"1")
+                os.remove(_t)
+                _cached = len([x for x in os.listdir(DAY_DIR) if x.endswith(".pkl")])
+                st.write(f"   磁盘缓存可用，已有 {_cached} 个交易日")
+            except Exception as _e:
+                st.warning(f"**磁盘缓存不可写（{_e}）**，每次都会全量重下。")
             st.write(f"下载 {len(codes)} 只（约 {ndays} 个交易日）…")
             st.write(f"   用**{'按交易日' if by_date else '按股票'}**取："
                      f"约 {2*ndays if by_date else 2*len(codes)} 次调用"
                      f"（另一种要 {2*len(codes) if by_date else 2*ndays} 次）")
             bar = st.progress(0.0); t0 = time.time()
-            if by_date:
-                px = download_by_date(pro, lim, codes, s_str, e_str,
-                                      lambda p, s: bar.progress(p, text=s))
-            else:
-                px = download_all(token, codes, s_str, e_str, lim, True, workers,
-                                  lambda a, b, c: bar.progress(a / b,
-                                      text=f"{a}/{b}　{(time.time()-t0)/60:.1f} 分"))
+            px, skipped = download_by_date(pro, lim, codes, s_str, e_str,
+                                           lambda p, s: bar.progress(p, text=s))
+            if skipped:
+                st.write(f"   跳过数据未齐的 {len(skipped)} 天：{'、'.join(skipped[-3:])}")
             if not px:
                 st.error("没下到数据。"); st.stop()
             panel = build_panel(px); px.clear(); del px; gc.collect()
@@ -1618,26 +1549,23 @@ def main():
                 ts.set_token(token); pro2 = ts.pro_api(token)
                 lim2 = Limiter(400)
                 bar = st.progress(0.0)
-                newp, nd = extend_panel(pro2, lim2, ss["panel"],
-                                        dt.date.today().strftime("%Y%m%d"),
-                                        refresh_days=2,
-                                        progress=lambda p, s: bar.progress(p, text=s))
+                newp, nd, skipped = update_panel(
+                    pro2, lim2, ss["panel"], dt.date.today().strftime("%Y%m%d"),
+                    progress=lambda p, s: bar.progress(p, text=s))
                 bar.empty()
                 if nd:
-                    _mv = float(newp["circ_mv"].iloc[-1].notna().mean())
                     ss["panel"] = newp
                     for kk in ("sec", "elig", "elig_key", "kdf", "ddf",
                                "res", "wf", "nz", "sigres", "ksplit", "kbk"):
                         ss.pop(kk, None)
                     gc.collect()
-                    st.success(f"已更新 {nd} 个交易日（含重取最后 2 天），"
-                               f"现在数据截至 {newp['cal'][-1]:%Y-%m-%d}，"
-                               f"当日流通市值覆盖 {_mv:.0%}。")
-                    if _mv < 0.5:
-                        st.warning("市值覆盖仍然偏低。Tushare 的 daily_basic（市值）"
-                                   "15-17点入库，比 daily（价格）晚；周五负载高时可能更晚。"
-                                   "**稍后再点一次增量更新即可**——它会重取最后两天。")
-                else:
+                    st.success(f"已补 {nd} 个交易日，数据截至 "
+                               f"{newp['cal'][-1]:%Y-%m-%d}。")
+                if skipped:
+                    st.warning(f"**{'、'.join(skipped)} 的数据还没齐**（通常是流通市值"
+                               "尚未发布，Tushare 的市值比价格晚 1-2 小时），已跳过。"
+                               "数据齐了之后再点一次「增量更新」就会补上。")
+                elif not nd:
                     st.info("已经是最新，没有需要补的交易日。")
             except ImportError:
                 st.error("未安装 tushare")
@@ -2081,13 +2009,11 @@ def main():
         _ref = float(panel["raw_close"].iloc[-6:-1].notna().mean().mean())
         _nel = int(elig.loc[d].sum())
         _nel_ref = float(elig.iloc[-6:-1].sum(axis=1).mean())
-        if _cov_px < _ref * 0.8:
-            st.error(f"**{d:%Y-%m-%d} 的收盘价只覆盖了 {_cov_px:.0%} 的股票**"
-                     f"（前几日平均 {_ref:.0%}）。数据不完整，盘中跑的话请收盘后再来。")
-        elif _cov_mv < 0.5:
-            st.warning(f"**{d:%Y-%m-%d} 的流通市值只覆盖 {_cov_mv:.0%}。** "
-                       "Tushare 的 daily_basic（市值）比 daily（价格）发布晚，"
-                       "已用前几日市值补齐（市值是慢变量，这样做不影响判断）。")
+        _lag = int(np.busday_count(d.date(), _today.date()))
+        if _lag >= 1:
+            st.info(f"**选股依据：{d:%Y-%m-%d} 收盘数据**（今天是 {_today:%Y-%m-%d}）。"
+                    + ("　今天的数据还没齐（通常是市值未发布），"
+                       "点左侧「增量更新」可以试着补上。" if _lag == 1 else ""))
         if _nel < _nel_ref * 0.5:
             st.error(f"**今日合格股票只有 {_nel} 只，而前几日平均 {_nel_ref:.0f} 只。** "
                      "名单可能不可靠，建议稍后重新增量更新再看。")
