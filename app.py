@@ -1132,10 +1132,16 @@ def split_by_mask(picks: pd.DataFrame, tr: pd.DataFrame, mask: pd.DataFrame,
     for g, sub in d.groupby("组"):
         day = sub.groupby("date")["收益率"].mean().sort_index()
         se = day.std(ddof=1) / np.sqrt(len(day)) if len(day) > 3 else np.nan
+        v = sub["收益率"]
         out.append({"组": g, "笔数": len(sub), "占比": len(sub) / len(d),
-                    "平均收益": sub["收益率"].mean(),
-                    "中位收益": sub["收益率"].median(),
-                    "胜率": float((sub["收益率"] > 0).mean()),
+                    "平均收益": v.mean(), "中位收益": v.median(),
+                    "胜率": float((v > 0).mean()),
+                    # 左尾：问的不是"平均差多少"，而是"会不会大亏"。
+                    # 这是两个不同的统计量，均值相近时左尾仍可能差很多。
+                    "亏10%以上": float((v <= -0.10).mean()),
+                    "亏20%以上": float((v <= -0.20).mean()),
+                    "最差5%分位": float(v.quantile(0.05)),
+                    "亏损笔均亏": float(v[v < 0].mean()) if (v < 0).any() else np.nan,
                     "聚类t": float(day.mean() / se) if se and se > 1e-12 else np.nan})
     return pd.DataFrame(out).set_index("组")
 
@@ -1924,11 +1930,25 @@ def main():
                         ss["ksplit"] = split_by_mask(pk0, tr0, mk, ly, ln)
                         ss["kbk"] = k_bucket_diagnosis(pk0, tr0)
             if ss.get("ksplit") is not None and len(ss["ksplit"]):
-                st.dataframe(ss["ksplit"].style.format(
-                    {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}",
-                     "中位收益": "{:+.2%}", "胜率": "{:.1%}", "聚类t": "{:.2f}"})
+                _f = {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}",
+                      "中位收益": "{:+.2%}", "胜率": "{:.1%}", "聚类t": "{:.2f}",
+                      "亏10%以上": "{:.1%}", "亏20%以上": "{:.1%}",
+                      "最差5%分位": "{:+.1%}", "亏损笔均亏": "{:+.2%}"}
+                _sp = ss["ksplit"]
+                st.dataframe(_sp.style.format({k: v for k, v in _f.items()
+                                               if k in _sp.columns})
                     .background_gradient(subset=["中位收益"], cmap="RdYlGn"),
                     use_container_width=True)
+                if "亏10%以上" in _sp.columns and len(_sp) == 2:
+                    a, b = _sp.iloc[0], _sp.iloc[1]
+                    n1, n2 = a["笔数"], b["笔数"]
+                    p = (a["亏10%以上"] * n1 + b["亏10%以上"] * n2) / (n1 + n2)
+                    se_ = (p * (1 - p) * (1 / n1 + 1 / n2)) ** 0.5
+                    d_ = a["亏10%以上"] - b["亏10%以上"]
+                    st.info(f"**「亏10%以上」的比例差 {d_:+.1%}，标准误 {se_:.1%}"
+                            f"（{abs(d_)/se_ if se_ > 0 else 0:.1f} 个标准误）。**\n\n"
+                            "小于 2 个标准误就是噪音。**均值相近但左尾差很多**才说明"
+                            "这个条件能避开大亏——那是和平均收益不同的另一件事。")
                 n_all = len(tr0.dropna(subset=["收益率"]))
                 st.caption(f"各组笔数合计 {int(ss['ksplit']['笔数'].sum())}，"
                            f"总成交 {n_all} —— 相等说明是真划分，不是替补。")
