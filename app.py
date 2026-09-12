@@ -52,6 +52,7 @@ except Exception:
 
 CACHE_DIR = os.path.join(APP_DIR, ".cache_pool")
 PX_DIR = os.path.join(CACHE_DIR, "px")     # 唯一的缓存：每只股票一个文件
+CACHE_TTL_HOURS = 24                       # 缓存 24 小时后自动失效，重新下载
 os.makedirs(PX_DIR, exist_ok=True)
 
 # 申万2021 一级行业（整体纳入）
@@ -278,6 +279,10 @@ def fetch_one_stock(pro_get: Callable, lim: Limiter, ts_code: str, start: str, e
     path = _px_path(ts_code)
     if use_cache and os.path.exists(path):
         try:
+            # 超过 CACHE_TTL_HOURS 小时的缓存视为过期。行情每天都会新增，
+            # 隔夜的缓存即使覆盖了请求区间，也缺最近的交易日。
+            if time.time() - os.path.getmtime(path) > CACHE_TTL_HOURS * 3600:
+                raise TimeoutError("cache expired")
             with open(path, "rb") as f:
                 blob = pickle.load(f)
             # 必须比对「请求区间」而不是「数据区间」：股票首个交易日几乎不会
@@ -814,11 +819,15 @@ def day_cache_info() -> tuple:
 # ======================================================================
 # 板块层 —— 把选股单位从个股换成行业，目的是降噪
 # ======================================================================
-def build_sector_map(uni: pd.DataFrame, panel: dict, elig: pd.DataFrame,
-                     min_members: int = 5) -> Dict[str, List[str]]:
+def build_sector_map(uni: pd.DataFrame, panel: dict) -> Dict[str, List[str]]:
     """
-    code → 申万二级行业。成分股不足 min_members 的板块并入"其他"，
-    因为几只股票的等权指数降不了多少噪音，还会制造伪板块。
+    code → 申万二级行业。**不做任何筛选**。
+
+    旧版本按"全期平均合格数 ≥ 5"决定一个行业算不算板块，那有两个毛病：
+      1. 前视偏差 —— 回测 2019 年时，板块名单是用截至 2026 年的数据定的；
+         一个 2024 年才活跃起来的板块，在 2019 年的回测里就已经存在。
+      2. 窗口依赖 —— 换个数据起始日期，板块名单就变，同一天能选出不同的股票。
+    现在改成逐日判定（见 build_sector_index 的 avail），两个毛病同时消失。
     """
     if "l2_name" not in uni.columns:
         return {}
@@ -827,45 +836,51 @@ def build_sector_map(uni: pd.DataFrame, panel: dict, elig: pd.DataFrame,
     grp: Dict[str, List[str]] = {}
     for sec, g in m.groupby("l2_name"):
         codes = [c for c in g["ts_code"] if c in panel["codes"]]
-        # 用历史平均合格数判断板块够不够大
-        if len(codes) and float(elig[codes].sum(axis=1).mean()) >= min_members:
+        if codes:
             grp[str(sec)] = codes
     return grp
 
 
 def build_sector_index(panel: dict, elig: pd.DataFrame,
-                       sectors: Dict[str, List[str]]) -> tuple:
+                       sectors: Dict[str, List[str]],
+                       min_members: int = 5) -> tuple:
     """
-    每个板块的等权指数（只用当期合格成分股，无幸存者偏差）。
-    返回 (板块日收益表, 板块指数, 每日成分股数)。
+    每个板块的等权指数，外加**逐日的可用性**。
+    返回 (板块日收益表, 板块指数, 每日成分股数, 每日是否可用)。
+
+    可用 = 当天该板块的合格成分股 ≥ min_members。只用当天的信息，
+    所以不含前视；也因此换数据窗口不会改变任何一天的判定。
+    指数本身用 ≥3 只就算（够画出走势），但不足 min_members 的日子不可选。
     """
     ret = panel["adj_close"].pct_change()
-    rows, cnts = {}, {}
+    rows, cnts, avs = {}, {}, {}
     for sec, codes in sectors.items():
         m = elig[codes]
-        r = ret[codes].where(m)
         n = m.sum(axis=1)
-        rows[sec] = r.mean(axis=1).where(n >= 3)
+        rows[sec] = ret[codes].where(m).mean(axis=1).where(n >= 3)
         cnts[sec] = n
+        avs[sec] = (n >= min_members)
     R = pd.DataFrame(rows)
     IDX = (1.0 + R.fillna(0.0)).cumprod().where(R.notna()).ffill()
-    return R, IDX, pd.DataFrame(cnts)
+    return R, IDX, pd.DataFrame(cnts), pd.DataFrame(avs)
 
 
 def sector_noise_check(panel: dict, elig: pd.DataFrame,
-                       sectors: Dict[str, List[str]]) -> pd.DataFrame:
+                       sectors: Dict[str, List[str]],
+                       min_members: int = 5) -> pd.DataFrame:
     """
     最关键的前置检验：板块指数的波动到底比个股小多少？
     如果降噪幅度不明显，"换单位"这个思路就不成立，后面不用做了。
     """
     ret = panel["adj_close"].pct_change()
-    R, _, cnt = build_sector_index(panel, elig, sectors)
+    R, _, cnt, av = build_sector_index(panel, elig, sectors, min_members)
     rows = []
     for sec, codes in sectors.items():
         m = elig[codes]
         iv = ret[codes].where(m).std().mean() * np.sqrt(252)     # 成分股平均年化波动
         sv = R[sec].std() * np.sqrt(252)                          # 板块指数年化波动
         rows.append({"板块": sec, "平均成分股数": float(m.sum(axis=1).mean()),
+                     "可用天数占比": float(av[sec].mean()),
                      "个股平均波动": float(iv), "板块指数波动": float(sv),
                      "降噪比": float(sv / iv) if iv > 0 else np.nan})
     d = pd.DataFrame(rows).set_index("板块").sort_values("平均成分股数", ascending=False)
@@ -873,8 +888,12 @@ def sector_noise_check(panel: dict, elig: pd.DataFrame,
 
 
 def sector_factors(R: pd.DataFrame, IDX: pd.DataFrame,
-                   amt_sec: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """板块层面的候选信号。全部只用过去数据。"""
+                   amt_sec: pd.DataFrame,
+                   avail: pd.DataFrame = None) -> Dict[str, pd.DataFrame]:
+    """
+    板块层面的候选信号。全部只用过去数据。
+    avail 给出后，不可用的日子会被置空 —— 那天这个板块就不会被选中。
+    """
     out = {}
     for w in (5, 10, 20, 60):
         out[f"板块{w}日动量"] = IDX / IDX.shift(w) - 1.0
@@ -888,6 +907,9 @@ def sector_factors(R: pd.DataFrame, IDX: pd.DataFrame,
     out["板块创20日新高"] = (IDX >= IDX.rolling(20).max()).astype(float)
     a5, a60 = amt_sec.rolling(5).mean(), amt_sec.rolling(60).mean()
     out["板块量能扩张"] = a5 / a60.where(a60 > 1e-9)
+    if avail is not None:
+        av = avail.reindex(index=IDX.index, columns=IDX.columns).fillna(False)
+        out = {k: v.where(av) for k, v in out.items()}
     return out
 
 
@@ -979,7 +1001,7 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                       stock_rule: str = "S1_板块内最强",
                       sec_rule: str = "最强", cooldown: int = 5,
                       seed: int = 20260910, kdf: pd.DataFrame = None,
-                      per_sec_cap: int = 0) -> pd.DataFrame:
+                      per_sec_cap: int = 0, min_members: int = 5) -> pd.DataFrame:
     """
     两层选股：先按 sec_fac 选出 top_sec 个板块，再在板块内按 stock_rule 选股。
     sec_rule="随机" 时板块层用随机选择 —— 这是判断"板块层有没有加分"的对照组。
@@ -1006,7 +1028,8 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
         cand = []
         for s in picks_sec:
             codes = [c for c in sectors[s] if elig.loc[d, c]]
-            if not codes:
+            # 当天合格成分股不足的板块不可选（信号那边已置空，这里再挡一道）
+            if len(codes) < min_members:
                 continue
             v = m20.loc[d, codes].dropna()
             if not len(v):
@@ -1288,6 +1311,7 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
                  SF: Dict[str, pd.DataFrame], dates: List[pd.Timestamp],
                  signals: List[str] = None, top_secs=(2, 3), top_ns=(3,),
                  holds=(15, 20), start_year: int = 2021, per_sec_cap: int = 0,
+                 min_members: int = 5,
                  comm: float = 0.0003, stamp: float = 0.0005,
                  slip: float = 0.001, progress=None) -> tuple:
     """
@@ -1305,7 +1329,8 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
     allt: Dict[tuple, pd.DataFrame] = {}
     for i, (sg, ts, tn, hd) in enumerate(cfgs):
         pk = sector_then_stock(panel, elig, sectors, SF[sg], dates, ts, tn,
-                               "S1_板块内最强", "最强", per_sec_cap=per_sec_cap)
+                               "S1_板块内最强", "最强", per_sec_cap=per_sec_cap,
+                               min_members=min_members)
         tr = track_fixed(pk, panel, hd, comm=comm, stamp=stamp, slip=slip) if len(pk) else pd.DataFrame()
         if len(tr):
             tr = tr.dropna(subset=["收益率"]).copy()
@@ -1435,7 +1460,8 @@ def main():
         run = st.button("下载数据", type="primary", use_container_width=True)
         _cn, _cmb, _c0, _c1 = day_cache_info()
         if _cn:
-            st.caption(f"行情缓存 {_cn} 只股票 · {_cmb:.0f}MB")
+            st.caption(f"行情缓存 {_cn} 只股票 · {_cmb:.0f}MB · "
+                       f"{CACHE_TTL_HOURS} 小时后自动失效")
         else:
             st.caption("行情缓存为空")
         if st.button("清除缓存并重新下载", use_container_width=True):
@@ -1535,21 +1561,22 @@ def main():
     if ss.get("elig_key") != dkey:
         with st.spinner("构建合格池与板块…"):
             ss["elig"] = build_eligibility(panel, basic, uni, 50, 1000, 10.0, 2.0, 365)
-            sectors = build_sector_map(uni, panel, ss["elig"], min_mem)
+            sectors = build_sector_map(uni, panel)
             if not sectors:
                 st.error("没能建立板块映射——二级行业数据缺失。"); st.stop()
-            R, IDX, cnt = build_sector_index(panel, ss["elig"], sectors)
+            R, IDX, cnt, AV = build_sector_index(panel, ss["elig"], sectors, min_mem)
             amt = pd.DataFrame({s: panel["amount"][c].where(ss["elig"][c]).sum(axis=1)
                                 for s, c in sectors.items()})
             kdf, ddf = daily_kd(panel)
-            ss["sec"] = (sectors, R, IDX, cnt, sector_factors(R, IDX, amt))
+            ss["sec"] = (sectors, R, IDX, cnt,
+                         sector_factors(R, IDX, amt, AV), AV)
             ss["kdf"], ss["ddf"] = kdf, ddf
             ss["elig_key"] = dkey
             ss.pop("nz", None); ss.pop("sigres", None)
             ss.pop("res", None); ss.pop("wf", None)
             gc.collect()
     elig = ss["elig"]
-    sectors, R, IDX, cnt, SF = ss["sec"]
+    sectors, R, IDX, cnt, SF, AV = ss["sec"]
     KDF, DDF = ss["kdf"], ss["ddf"]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
@@ -1568,7 +1595,7 @@ def main():
         with st.expander("地基：板块指数比个股降噪多少（也是一次性的）"):
             if st.button("运行降噪检验"):
                 with st.spinner("计算中…"):
-                    ss["nz"] = sector_noise_check(panel, elig, sectors)
+                    ss["nz"] = sector_noise_check(panel, elig, sectors, min_mem)
             if ss.get("nz") is not None:
                 nz = ss["nz"]
                 rr = float(nz["降噪比"].mean())
@@ -1656,11 +1683,11 @@ def main():
                 ("两层：最强板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
                                            top_sec, top_n, srule, "最强", kdf=KDF,
-                                           per_sec_cap=cap)),
+                                           per_sec_cap=cap, min_members=min_mem)),
                 ("对照A：随机板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
                                            top_sec, top_n, srule, "随机", kdf=KDF,
-                                           per_sec_cap=cap)),
+                                           per_sec_cap=cap, min_members=min_mem)),
                 ("对照B：不分板块，全池 " + srule,
                  lambda: flat_stock_pick(panel, elig, dates, top_n, srule)),
                 ("对照C：全池随机",
@@ -1753,7 +1780,7 @@ def main():
                 picked, wf = walk_forward(
                     panel, elig, sectors, SF, dates,
                     top_secs=(2, 3), top_ns=(top_n,), holds=(15, 20),
-                    start_year=2021, per_sec_cap=cap,
+                    start_year=2021, per_sec_cap=cap, min_members=min_mem,
                     progress=lambda p, n2: bar3.progress(p, text=n2), **kw)
                 ss["wf"] = (picked, wf); bar3.empty(); gc.collect()
             if ss.get("wf"):
@@ -1962,7 +1989,8 @@ def main():
                                                 for s in f.index]}).head(10),
                      use_container_width=True, hide_index=True)
         pk = sector_then_stock(panel, elig, sectors, SF[sig2], [d],
-                               top_sec, top_n, sr2, "最强", kdf=KDF, per_sec_cap=cap)
+                               top_sec, top_n, sr2, "最强", kdf=KDF, per_sec_cap=cap,
+                               min_members=min_mem)
         if len(pk) < top_n:
             info = [f"{s3}: {int(elig.loc[d, sectors[s3]].sum())} 只合格"
                     for s3 in list(f.index[:top_sec])]
