@@ -750,6 +750,7 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
     lock = threading.Lock()
 
     def one(d):
+        """只取数、只写 results —— 绝不碰界面。"""
         nonlocal hit
         cached = os.path.exists(_day_path(d))
         p = (ts_mod.pro_api(token) if (token and ts_mod is not None) else pro)
@@ -758,14 +759,18 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
             results[d] = r
             if cached and r[0] is not None:
                 hit += 1
-            done[0] += 1
-            if progress and (done[0] % 5 == 0 or done[0] == len(days)):
-                progress(done[0] / len(days),
-                         f"{done[0]}/{len(days)}　缓存命中 {hit}")
+        return d
 
-    todo = [d for d in days]
+    # progress 回调会写 Streamlit 界面，而 Streamlit 的 UI 调用只能在主线程
+    # （工作线程里调会抛 NoSessionContext）。所以进度只在主线程汇报。
+    todo = list(days)
     with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        list(ex.map(one, todo))
+        futs = [ex.submit(one, d) for d in todo]
+        for i, f in enumerate(cf.as_completed(futs)):
+            f.result()                      # 让工作线程的异常浮出来
+            if progress and (i % 5 == 0 or i == len(todo) - 1):
+                progress((i + 1) / len(todo),
+                         f"{i + 1}/{len(todo)}　缓存命中 {hit}")
 
     for i, d in enumerate(days):
         dd, db, full = results.get(d, (None, None, False))
