@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import gc
 import time
+import concurrent.futures as cf
 import pickle
 import threading
 import datetime as dt
@@ -44,6 +45,11 @@ except Exception:  # 便于在无 streamlit 环境下单测纯计算函数
 # 常量配置
 # ----------------------------------------------------------------------
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    import tushare as ts_mod
+except Exception:
+    ts_mod = None
+
 CACHE_DIR = os.path.join(APP_DIR, ".cache_pool")
 DAY_DIR = os.path.join(CACHE_DIR, "day")   # 唯一的缓存：每个交易日一个文件
 os.makedirs(DAY_DIR, exist_ok=True)
@@ -705,8 +711,12 @@ def fetch_one_day(pro, lim: Limiter, d: str):
     if full:
         try:
             os.makedirs(DAY_DIR, exist_ok=True)
-            with open(_day_path(d), "wb") as f:
+            # 先写临时文件再改名：并发下两个线程同时写同一天时，
+            # 不会产生半截的坏文件（改名在同一文件系统上是原子的）。
+            tmp = _day_path(d) + f".tmp{os.getpid()}_{threading.get_ident()}"
+            with open(tmp, "wb") as f:
                 pickle.dump({"daily": dd, "basic": db}, f, protocol=4)
+            os.replace(tmp, _day_path(d))
         except Exception as e:
             if len(API_ERRORS) < 200:
                 API_ERRORS.append(f"缓存写入失败 {d}: {e}")
@@ -714,7 +724,8 @@ def fetch_one_day(pro, lim: Limiter, d: str):
 
 
 def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
-                     progress=None, min_rows: int = 30) -> tuple:
+                     progress=None, min_rows: int = 30, workers: int = 6,
+                     token: str = None) -> tuple:
     """
     按**交易日**取全市场，再筛出我们要的股票。
 
@@ -731,22 +742,39 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
     need = ["open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
     rows = {k: {} for k in need + ["circ_mv"]}
     ok = 0
-    hit, skipped = 0, []
-    for i, d in enumerate(days):
+    # 并发取数。瓶颈不是频次限制（daily 每分钟可 500 次），而是每次调用
+    # 0.3-1 秒的网络往返 —— 串行跑 1000 次就是八分钟。多线程共享同一个
+    # Limiter，所以总频次仍然受控。
+    hit, skipped, done = 0, [], [0]
+    results: Dict[str, tuple] = {}
+    lock = threading.Lock()
+
+    def one(d):
+        nonlocal hit
         cached = os.path.exists(_day_path(d))
-        dd, db, full = fetch_one_day(pro, lim, d)
-        if cached and dd is not None:
-            hit += 1
+        p = (ts_mod.pro_api(token) if (token and ts_mod is not None) else pro)
+        r = fetch_one_day(p, lim, d)
+        with lock:
+            results[d] = r
+            if cached and r[0] is not None:
+                hit += 1
+            done[0] += 1
+            if progress and (done[0] % 5 == 0 or done[0] == len(days)):
+                progress(done[0] / len(days),
+                         f"{done[0]}/{len(days)}　缓存命中 {hit}")
+
+    todo = [d for d in days]
+    with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        list(ex.map(one, todo))
+
+    for i, d in enumerate(days):
+        dd, db, full = results.get(d, (None, None, False))
         if dd is None or not len(dd):
-            if progress:
-                progress((i + 1) / len(days), f"{d} 无数据")
             continue
         if not full:
             # 数据没齐（通常是当天市值还没发布）——整天丢弃，不进 panel。
             # 于是 panel 自然停在最后一个完整的交易日。
             skipped.append(d)
-            if progress:
-                progress((i + 1) / len(days), f"{d} 数据未齐，跳过")
             continue
         dd = dd[dd["ts_code"].isin(cs)].drop_duplicates("ts_code").set_index("ts_code")
         dt_ = pd.Timestamp(d)
@@ -786,7 +814,7 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
 
 
 def update_panel(pro, lim: Limiter, panel: dict, end_str: str,
-                 progress=None) -> tuple:
+                 progress=None, workers: int = 6, token: str = None) -> tuple:
     """
     增量更新：只取 panel 末尾之后、且数据已齐的交易日，接到后面。
 
@@ -798,7 +826,7 @@ def update_panel(pro, lim: Limiter, panel: dict, end_str: str,
     px, skipped = download_by_date(
         pro, lim, panel["codes"],
         (last + pd.Timedelta(days=1)).strftime("%Y%m%d"), end_str,
-        progress, min_rows=1)
+        progress, min_rows=1, workers=workers, token=token)
     if not px:
         return panel, 0, skipped
 
@@ -843,6 +871,35 @@ def update_panel(pro, lim: Limiter, panel: dict, end_str: str,
         (ro <= pre.mul(1.0 - lim_pct, axis=1) + 0.004) & tradable_new])
     out["cal"] = out["raw_close"].index
     return out, len(idx), skipped
+
+
+def clear_day_cache() -> int:
+    """清空行情缓存，返回删除的文件数。"""
+    n = 0
+    try:
+        for f in os.listdir(DAY_DIR):
+            if f.endswith(".pkl"):
+                try:
+                    os.remove(os.path.join(DAY_DIR, f))
+                    n += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return n
+
+
+def day_cache_info() -> tuple:
+    """返回 (缓存天数, 占用MB, 最早日期, 最晚日期)。"""
+    try:
+        fs = [f for f in os.listdir(DAY_DIR) if f.endswith(".pkl")]
+    except Exception:
+        return 0, 0.0, None, None
+    if not fs:
+        return 0, 0.0, None, None
+    mb = sum(os.path.getsize(os.path.join(DAY_DIR, f)) for f in fs) / 1e6
+    ds = sorted(f[:-4] for f in fs)
+    return len(fs), mb, ds[0], ds[-1]
 
 
 # ======================================================================
@@ -1461,6 +1518,11 @@ def main():
             every = st.slider("每几个交易日选一次", 1, 10, 3)
             comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
             slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
+            workers = st.slider("并发线程", 1, 12, 6,
+                                help="官方文档：daily 每分钟可调 500 次，5000积分频次更高。"
+                                     "瓶颈其实是每次调用的网络往返，多线程能跑满频次。")
+            rate = st.slider("每分钟调用上限", 100, 800, 450, 50,
+                             help="留在官方 500 次/分以下。若出现频繁报错就调低。")
         mode = st.radio("下载范围", ["日常（近2年，快）", "验证（2018起，慢）"],
                         help="实测：起始日期从2018改到2026，第④页选出的股票**完全相同**——"
                              "板块动量和个股动量都是比值，与起点无关。\n\n"
@@ -1471,6 +1533,18 @@ def main():
                         disabled=ss.get("panel") is None,
                         help="只取还没有的交易日，几秒完成。数据没齐的当天会自动跳过，"
                              "齐了之后再点一次就补上。")
+        _cn, _cmb, _c0, _c1 = day_cache_info()
+        if _cn:
+            st.caption(f"行情缓存 {_cn} 个交易日 · {_cmb:.0f}MB · {_c0}~{_c1}")
+        else:
+            st.caption("行情缓存为空")
+        if st.button("清除缓存并重新下载", use_container_width=True):
+            n = clear_day_cache()
+            for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
+                       "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf"):
+                ss.pop(kk, None)
+            gc.collect()
+            st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
         if ss.get("panel") is not None:
             _p = ss["panel"]
             st.success(f"{len(_p['codes'])} 只 × {len(_p['cal'])} 日")
@@ -1485,7 +1559,7 @@ def main():
         except ImportError:
             st.error("未安装 tushare：pip install tushare"); st.stop()
         ts.set_token(token); pro = ts.pro_api(token)
-        lim = Limiter(400); API_ERRORS.clear()
+        lim = Limiter(rate); API_ERRORS.clear()
         for kk in list(ss.keys()):
             if kk != "panel" or True:
                 pass
@@ -1530,7 +1604,8 @@ def main():
                      f"（另一种要 {2*len(codes) if by_date else 2*ndays} 次）")
             bar = st.progress(0.0); t0 = time.time()
             px, skipped = download_by_date(pro, lim, codes, s_str, e_str,
-                                           lambda p, s: bar.progress(p, text=s))
+                                           lambda p, s: bar.progress(p, text=s),
+                                           workers=workers, token=token)
             if skipped:
                 st.write(f"   跳过数据未齐的 {len(skipped)} 天：{'、'.join(skipped[-3:])}")
             if not px:
@@ -1547,11 +1622,12 @@ def main():
             try:
                 import tushare as ts
                 ts.set_token(token); pro2 = ts.pro_api(token)
-                lim2 = Limiter(400)
+                lim2 = Limiter(rate)
                 bar = st.progress(0.0)
                 newp, nd, skipped = update_panel(
                     pro2, lim2, ss["panel"], dt.date.today().strftime("%Y%m%d"),
-                    progress=lambda p, s: bar.progress(p, text=s))
+                    progress=lambda p, s: bar.progress(p, text=s),
+                    workers=workers, token=token)
                 bar.empty()
                 if nd:
                     ss["panel"] = newp
