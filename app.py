@@ -128,6 +128,16 @@ _ERR_LOCK = threading.Lock()
 API_ERRORS: List[str] = []
 
 
+def _safe_progress(cb, *a):
+    """进度回调只是给人看的，任何异常都不该让下载失败。"""
+    if cb is None:
+        return
+    try:
+        cb(*a)
+    except Exception:
+        pass
+
+
 def api_call(fn, lim: Limiter, retries: int = 3, **kwargs):
     """带限流与重试的 Tushare 调用。失败返回 None。可在工作线程中安全调用。"""
     last = None
@@ -736,7 +746,7 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
     tc = api_call(pro.trade_cal, lim, exchange="SSE", start_date=start,
                   end_date=end, is_open="1")
     if tc is None or not len(tc):
-        return {}
+        return {}, []
     days = sorted(str(x) for x in tc["cal_date"])
     cs = set(codes)
     need = ["open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
@@ -768,9 +778,9 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
         futs = [ex.submit(one, d) for d in todo]
         for i, f in enumerate(cf.as_completed(futs)):
             f.result()                      # 让工作线程的异常浮出来
-            if progress and (i % 5 == 0 or i == len(todo) - 1):
-                progress((i + 1) / len(todo),
-                         f"{i + 1}/{len(todo)}　缓存命中 {hit}")
+            if i % 5 == 0 or i == len(todo) - 1:
+                _safe_progress(progress, (i + 1) / len(todo),
+                               f"{i + 1}/{len(todo)}　缓存命中 {hit}")
 
     for i, d in enumerate(days):
         dd, db, full = results.get(d, (None, None, False))
@@ -791,14 +801,14 @@ def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
                                     .set_index("ts_code")["circ_mv"].astype(np.float32))
         ok += 1
         if progress and (i % 5 == 0 or i == len(days) - 1):
-            progress((i + 1) / len(days),
+            _safe_progress(progress, (i + 1) / len(days),
                      f"{d}　{ok}/{len(days)}　缓存命中 {hit}")
     if not ok:
         return {}, skipped
     # 转回"每只股票一张长表"，复用 build_panel，保证和按股票下载的口径完全一致
     wide = {k: pd.DataFrame(v).T.sort_index() for k, v in rows.items() if v}
     if "close" not in wide:
-        return {}
+        return {}, skipped
     # 只保留在 daily 里真正出现过的股票。daily_basic 会返回当天全市场
     # （含无成交的），daily 不会 —— 直接取并集会混进没有 close 列的股票。
     have = sorted(wide["close"].columns)
