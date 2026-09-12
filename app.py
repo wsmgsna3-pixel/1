@@ -51,8 +51,8 @@ except Exception:
     ts_mod = None
 
 CACHE_DIR = os.path.join(APP_DIR, ".cache_pool")
-DAY_DIR = os.path.join(CACHE_DIR, "day")   # 唯一的缓存：每个交易日一个文件
-os.makedirs(DAY_DIR, exist_ok=True)
+PX_DIR = os.path.join(CACHE_DIR, "px")     # 唯一的缓存：每只股票一个文件
+os.makedirs(PX_DIR, exist_ok=True)
 
 # 申万2021 一级行业（整体纳入）
 SW_L1_ALL = ["电子", "计算机", "通信", "传媒", "国防军工", "电力设备", "机械设备",
@@ -259,6 +259,97 @@ def prescreen_by_mv(pro, lim: Limiter, codes: List[str], start: str, end: str,
         return codes
     kept = [c for c in codes if c in ever]
     return kept if len(kept) >= 50 else codes
+
+
+def _px_path(ts_code: str) -> str:
+    return os.path.join(PX_DIR, ts_code.replace(".", "_") + ".pkl")
+
+
+PX_COLS = ["trade_date", "open", "high", "low", "close", "pre_close", "pct_chg", "amount", "circ_mv"]
+
+
+def fetch_one_stock(pro_get: Callable, lim: Limiter, ts_code: str, start: str, end: str,
+                    use_cache: bool = True) -> Optional[pd.DataFrame]:
+    """
+    单只股票的日线 + 每日指标，落地磁盘缓存（每股一个文件，中途崩溃可续传）。
+    注意 Tushare 的 pre_close 已做除权处理，pct_chg 因此是正确的复权收益率，
+    所以不需要额外拉 adj_factor。high/low 本系统用不到，不下载也不保存。
+    """
+    path = _px_path(ts_code)
+    if use_cache and os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                blob = pickle.load(f)
+            # 必须比对「请求区间」而不是「数据区间」：股票首个交易日几乎不会
+            # 正好等于请求起始日（节假日、上市较晚、已退市），拿数据区间去比会
+            # 导致永远未命中、每次全量重下。
+            if isinstance(blob, dict) and "df" in blob:
+                if (blob.get("start", "99999999") <= start
+                        and blob.get("end", "0") >= end):
+                    return blob["df"]
+        except Exception:
+            pass
+
+    pro = pro_get()
+    d = api_call(pro.daily, lim, ts_code=ts_code, start_date=start, end_date=end)
+    if d is None or len(d) == 0:
+        return None
+    b = api_call(pro.daily_basic, lim, ts_code=ts_code, start_date=start, end_date=end,
+                 fields="trade_date,circ_mv")
+    d = d[[c for c in PX_COLS if c in d.columns]].copy()
+    if b is not None and len(b):
+        d = d.merge(b[["trade_date", "circ_mv"]], on="trade_date", how="left")
+    else:
+        d["circ_mv"] = np.nan
+    d["trade_date"] = pd.to_datetime(d["trade_date"], format="%Y%m%d")
+    for c in d.columns:
+        if c != "trade_date":
+            d[c] = pd.to_numeric(d[c], errors="coerce").astype(np.float32)   # 内存减半
+    d = d.sort_values("trade_date").reset_index(drop=True)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump({"start": start, "end": end, "df": d}, f, protocol=4)
+    except Exception:
+        pass
+    return d
+
+
+def download_all(token: str, codes: List[str], start: str, end: str, lim: Limiter,
+                 use_cache: bool, workers: int,
+                 progress_cb: Optional[Callable] = None) -> Dict[str, pd.DataFrame]:
+    """
+    多线程下载。瓶颈是单次请求的网络往返（约 0.5-1 秒），不是频次上限，
+    所以并发能把吞吐从「延迟受限」拉到「频次受限」，4 线程通常快 3-4 倍。
+    限流器全局共享，账号层面的频次不会被突破。
+    """
+    import tushare as ts
+
+    local = threading.local()
+
+    def pro_get():
+        if not hasattr(local, "pro"):
+            local.pro = ts.pro_api(token)     # 每线程一个客户端，不共享连接
+        return local.pro
+
+    out: Dict[str, pd.DataFrame] = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+        futs = {ex.submit(fetch_one_stock, pro_get, lim, c, start, end, use_cache): c
+                for c in codes}
+        for fut in as_completed(futs):
+            c = futs[fut]
+            try:
+                d = fut.result()
+            except Exception as e:
+                d = None
+                with _ERR_LOCK:
+                    API_ERRORS.append(f"{c}: {e}")
+            if d is not None and len(d) > 30:
+                out[c] = d
+            done += 1
+            if progress_cb is not None and (done % 10 == 0 or done == len(codes)):
+                progress_cb(done, len(codes), len(out))   # 回调只在主线程消费
+    return out
 
 
 def build_panel(px: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -692,210 +783,14 @@ def empty_week_stats(score: pd.DataFrame, elig: pd.DataFrame,
     return df.groupby(df.index.year)["不足"].sum()
 
 
-def _day_path(d: str) -> str:
-    return os.path.join(DAY_DIR, f"{d}.pkl")
-
-
-def fetch_one_day(pro, lim: Limiter, d: str):
-    """
-    取某个交易日的全市场行情+市值。返回 (daily, basic, 是否完整)。
-
-    **只有数据齐全才写缓存。** Tushare 的 daily(价格) 15-16点入库、
-    daily_basic(市值) 15-17点，收盘后不久抓到的当天可能有价无市值。
-    不完整就不缓存，下次自然会重取 —— 这样不需要"重取最近N天"之类的特例。
-    """
-    if os.path.exists(_day_path(d)):
-        try:
-            with open(_day_path(d), "rb") as f:
-                blob = pickle.load(f)
-            if isinstance(blob, dict) and "daily" in blob:
-                return blob["daily"], blob.get("basic"), True
-        except Exception:
-            pass
-    dd = api_call(pro.daily, lim, trade_date=d)
-    if dd is None or not len(dd):
-        return None, None, False
-    db = api_call(pro.daily_basic, lim, trade_date=d, fields="ts_code,circ_mv")
-    # 完整 = 有价格，且市值覆盖了大部分有价格的股票
-    full = db is not None and len(db) >= len(dd) * 0.8
-    if full:
-        try:
-            os.makedirs(DAY_DIR, exist_ok=True)
-            # 先写临时文件再改名：并发下两个线程同时写同一天时，
-            # 不会产生半截的坏文件（改名在同一文件系统上是原子的）。
-            tmp = _day_path(d) + f".tmp{os.getpid()}_{threading.get_ident()}"
-            with open(tmp, "wb") as f:
-                pickle.dump({"daily": dd, "basic": db}, f, protocol=4)
-            os.replace(tmp, _day_path(d))
-        except Exception as e:
-            if len(API_ERRORS) < 200:
-                API_ERRORS.append(f"缓存写入失败 {d}: {e}")
-    return dd, db, full
-
-
-def download_by_date(pro, lim: Limiter, codes: List[str], start: str, end: str,
-                     progress=None, min_rows: int = 30, workers: int = 6,
-                     token: str = None) -> tuple:
-    """
-    按**交易日**取全市场，再筛出我们要的股票。
-
-    按股票取是每只 2 次调用、固定 2800 次，和时间跨度无关；
-    按交易日取是每天 2 次，跨度越短越划算。
-    交叉点在「天数 = 股票数」，约 5.7 年——短于此都该走这条路。
-    """
-    tc = api_call(pro.trade_cal, lim, exchange="SSE", start_date=start,
-                  end_date=end, is_open="1")
-    if tc is None or not len(tc):
-        return {}, []
-    days = sorted(str(x) for x in tc["cal_date"])
-    cs = set(codes)
-    need = ["open", "high", "low", "close", "pre_close", "pct_chg", "amount"]
-    rows = {k: {} for k in need + ["circ_mv"]}
-    ok = 0
-    # 并发取数。瓶颈不是频次限制（daily 每分钟可 500 次），而是每次调用
-    # 0.3-1 秒的网络往返 —— 串行跑 1000 次就是八分钟。多线程共享同一个
-    # Limiter，所以总频次仍然受控。
-    hit, skipped, done = 0, [], [0]
-    results: Dict[str, tuple] = {}
-    lock = threading.Lock()
-
-    def one(d):
-        """只取数、只写 results —— 绝不碰界面。"""
-        nonlocal hit
-        cached = os.path.exists(_day_path(d))
-        p = (ts_mod.pro_api(token) if (token and ts_mod is not None) else pro)
-        r = fetch_one_day(p, lim, d)
-        with lock:
-            results[d] = r
-            if cached and r[0] is not None:
-                hit += 1
-        return d
-
-    # progress 回调会写 Streamlit 界面，而 Streamlit 的 UI 调用只能在主线程
-    # （工作线程里调会抛 NoSessionContext）。所以进度只在主线程汇报。
-    todo = list(days)
-    with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futs = [ex.submit(one, d) for d in todo]
-        for i, f in enumerate(cf.as_completed(futs)):
-            f.result()                      # 让工作线程的异常浮出来
-            if i % 5 == 0 or i == len(todo) - 1:
-                _safe_progress(progress, (i + 1) / len(todo),
-                               f"{i + 1}/{len(todo)}　缓存命中 {hit}")
-
-    for i, d in enumerate(days):
-        dd, db, full = results.get(d, (None, None, False))
-        if dd is None or not len(dd):
-            continue
-        if not full:
-            # 数据没齐（通常是当天市值还没发布）——整天丢弃，不进 panel。
-            # 于是 panel 自然停在最后一个完整的交易日。
-            skipped.append(d)
-            continue
-        dd = dd[dd["ts_code"].isin(cs)].drop_duplicates("ts_code").set_index("ts_code")
-        dt_ = pd.Timestamp(d)
-        for k in need:
-            if k in dd.columns:
-                rows[k][dt_] = dd[k].astype(np.float32)
-        if db is not None and len(db):
-            rows["circ_mv"][dt_] = (db.drop_duplicates("ts_code")
-                                    .set_index("ts_code")["circ_mv"].astype(np.float32))
-        ok += 1
-        if progress and (i % 5 == 0 or i == len(days) - 1):
-            _safe_progress(progress, (i + 1) / len(days),
-                     f"{d}　{ok}/{len(days)}　缓存命中 {hit}")
-    if not ok:
-        return {}, skipped
-    # 转回"每只股票一张长表"，复用 build_panel，保证和按股票下载的口径完全一致
-    wide = {k: pd.DataFrame(v).T.sort_index() for k, v in rows.items() if v}
-    if "close" not in wide:
-        return {}, skipped
-    # 只保留在 daily 里真正出现过的股票。daily_basic 会返回当天全市场
-    # （含无成交的），daily 不会 —— 直接取并集会混进没有 close 列的股票。
-    have = sorted(wide["close"].columns)
-    out = {}
-    for c in have:
-        cols = {k: w[c] for k, w in wide.items() if c in w.columns}
-        if "close" not in cols:
-            continue
-        df = pd.DataFrame(cols).dropna(subset=["close"])
-        if len(df) < min_rows:      # 增量更新只有几天，不能用这个门槛
-            continue
-        for k in need:                       # 补齐 build_panel 需要的列
-            if k not in df.columns:
-                df[k] = np.nan
-        df = df.reset_index().rename(columns={"index": "trade_date"})
-        out[c] = df
-    return out, skipped
-
-
-def update_panel(pro, lim: Limiter, panel: dict, end_str: str,
-                 progress=None, workers: int = 6, token: str = None) -> tuple:
-    """
-    增量更新：只取 panel 末尾之后、且数据已齐的交易日，接到后面。
-
-    和初次下载走同一条路（按交易日取、同一份缓存）。
-    因为不完整的日子根本不会进 panel，所以不需要"重取最近N天"——
-    数据没齐时 panel 就停在上一个完整交易日，齐了再点一次自然就补上。
-    """
-    last = panel["cal"][-1]
-    px, skipped = download_by_date(
-        pro, lim, panel["codes"],
-        (last + pd.Timedelta(days=1)).strftime("%Y%m%d"), end_str,
-        progress, min_rows=1, workers=workers, token=token)
-    if not px:
-        return panel, 0, skipped
-
-    cs = panel["codes"]
-    # 不用 build_panel 重新归一化，直接按"旧段末值 × 累计涨跌幅"续接，
-    # 这样接缝处天然连续，也不需要任何比例修正。
-    days_new = sorted({d for f in px.values() for d in f["trade_date"]})
-    idx = pd.DatetimeIndex(days_new)
-    def wide(col, dtype=np.float32):
-        m = pd.DataFrame(index=idx, columns=cs, dtype=dtype)
-        for c, f in px.items():
-            if c in m.columns and col in f.columns:
-                m.loc[f["trade_date"], c] = f[col].to_numpy()
-        return m
-    rc, ro = wide("close"), wide("open")
-    hi, lo = wide("high"), wide("low")
-    pre, pct = wide("pre_close"), wide("pct_chg")
-    amt, cmv = wide("amount"), wide("circ_mv")
-
-    tradable_new = rc.notna()
-    step = (1.0 + pct.astype(np.float64).fillna(0.0) / 100.0).cumprod()
-    adj_new = step.mul(panel["adj_close"].iloc[-1].reindex(cs), axis=1)
-    adj_new = adj_new.where(tradable_new).ffill()
-    ratio = pd.concat([panel["adj_close"].iloc[[-1]], adj_new]).shift(1).loc[idx] / \
-        pre.where(pre > 0)
-
-    out = {"codes": cs}
-    out["raw_close"] = pd.concat([panel["raw_close"], rc])
-    out["raw_open"] = pd.concat([panel["raw_open"], ro])
-    out["amount"] = pd.concat([panel["amount"], amt])
-    out["circ_mv"] = pd.concat([panel["circ_mv"], cmv])
-    out["adj_close"] = pd.concat([panel["adj_close"], adj_new])
-    out["adj_open"] = pd.concat([panel["adj_open"], (ro * ratio).astype(np.float32)])
-    out["adj_high"] = pd.concat([panel["adj_high"], (hi * ratio).astype(np.float32)])
-    out["adj_low"] = pd.concat([panel["adj_low"], (lo * ratio).astype(np.float32)])
-    out["tradable"] = pd.concat([panel["tradable"], tradable_new])
-    lim_pct = pd.Series([0.20 if (c.startswith("30") or c.startswith("688")) else 0.10
-                         for c in cs], index=cs, dtype=np.float32)
-    out["limit_up_open"] = pd.concat([panel["limit_up_open"],
-        (ro >= pre.mul(1.0 + lim_pct, axis=1) - 0.004) & tradable_new])
-    out["limit_dn_open"] = pd.concat([panel["limit_dn_open"],
-        (ro <= pre.mul(1.0 - lim_pct, axis=1) + 0.004) & tradable_new])
-    out["cal"] = out["raw_close"].index
-    return out, len(idx), skipped
-
-
 def clear_day_cache() -> int:
     """清空行情缓存，返回删除的文件数。"""
     n = 0
     try:
-        for f in os.listdir(DAY_DIR):
+        for f in os.listdir(PX_DIR):
             if f.endswith(".pkl"):
                 try:
-                    os.remove(os.path.join(DAY_DIR, f))
+                    os.remove(os.path.join(PX_DIR, f))
                     n += 1
                 except Exception:
                     pass
@@ -907,14 +802,13 @@ def clear_day_cache() -> int:
 def day_cache_info() -> tuple:
     """返回 (缓存天数, 占用MB, 最早日期, 最晚日期)。"""
     try:
-        fs = [f for f in os.listdir(DAY_DIR) if f.endswith(".pkl")]
+        fs = [f for f in os.listdir(PX_DIR) if f.endswith(".pkl")]
     except Exception:
         return 0, 0.0, None, None
     if not fs:
         return 0, 0.0, None, None
-    mb = sum(os.path.getsize(os.path.join(DAY_DIR, f)) for f in fs) / 1e6
-    ds = sorted(f[:-4] for f in fs)
-    return len(fs), mb, ds[0], ds[-1]
+    mb = sum(os.path.getsize(os.path.join(PX_DIR, f)) for f in fs) / 1e6
+    return len(fs), mb, None, None
 
 
 # ======================================================================
@@ -1533,24 +1427,15 @@ def main():
             every = st.slider("每几个交易日选一次", 1, 10, 3)
             comm = st.number_input("佣金(单边,万分之)", 0.0, 10.0, 3.0, 0.1) / 1e4
             slip = st.number_input("滑点(单边,%)", 0.0, 0.5, 0.10, 0.01) / 100.0
-            workers = st.slider("并发线程", 1, 12, 6,
-                                help="官方文档：daily 每分钟可调 500 次，5000积分频次更高。"
-                                     "瓶颈其实是每次调用的网络往返，多线程能跑满频次。")
+            workers = st.slider("下载并发", 1, 8, 4,
+                                help="按股票下载，每只 2 次调用。"
+                                     "官方 daily 每分钟 500 次，4 线程足够跑满。")
             rate = st.slider("每分钟调用上限", 100, 800, 450, 50,
-                             help="留在官方 500 次/分以下。若出现频繁报错就调低。")
-        mode = st.radio("下载范围", ["日常（近2年，快）", "验证（2018起，慢）"],
-                        help="实测：起始日期从2018改到2026，第④页选出的股票**完全相同**——"
-                             "板块动量和个股动量都是比值，与起点无关。\n\n"
-                             "但第①②页需要长历史：样本内外拆分要跨2023，滚动前推要2021年起。"
-                             "验证已经做完了，日常用「近2年」即可。")
-        run = st.button("下载数据（首次/换股票池）", use_container_width=True)
-        upd = st.button("增量更新到最新", type="primary", use_container_width=True,
-                        disabled=ss.get("panel") is None,
-                        help="只取还没有的交易日，几秒完成。数据没齐的当天会自动跳过，"
-                             "齐了之后再点一次就补上。")
+                             help="留在官方 500 次/分以下。频繁报错就调低。")
+        run = st.button("下载数据", type="primary", use_container_width=True)
         _cn, _cmb, _c0, _c1 = day_cache_info()
         if _cn:
-            st.caption(f"行情缓存 {_cn} 个交易日 · {_cmb:.0f}MB · {_c0}~{_c1}")
+            st.caption(f"行情缓存 {_cn} 只股票 · {_cmb:.0f}MB")
         else:
             st.caption("行情缓存为空")
         if st.button("清除缓存并重新下载", use_container_width=True):
@@ -1582,8 +1467,6 @@ def main():
                    "elig", "elig_key", "kmask_key", "sec_mm"):
             ss.pop(kk, None)
         gc.collect()
-        if mode.startswith("日常"):
-            start = dt.date.today() - dt.timedelta(days=730)
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
         with st.status("下载中…", expanded=True) as stt:
             st.write("取申万行业成分股（含二级行业）…")
@@ -1618,57 +1501,17 @@ def main():
                      f"约 {2*ndays if by_date else 2*len(codes)} 次调用"
                      f"（另一种要 {2*len(codes) if by_date else 2*ndays} 次）")
             bar = st.progress(0.0); t0 = time.time()
-            px, skipped = download_by_date(pro, lim, codes, s_str, e_str,
-                                           lambda p, s: bar.progress(p, text=s),
-                                           workers=workers, token=token)
-            if skipped:
-                st.write(f"   跳过数据未齐的 {len(skipped)} 天：{'、'.join(skipped[-3:])}")
+            px = download_all(token, codes, s_str, e_str, lim, True, workers,
+                              lambda a, b, c: bar.progress(a / b,
+                                  text=f"{a}/{b}　{(time.time()-t0)/60:.1f} 分"))
             if not px:
                 st.error("没下到数据。"); st.stop()
             panel = build_panel(px); px.clear(); del px; gc.collect()
             ss["panel"], ss["basic"], ss["uni"] = panel, basic, uni
             stt.update(label=f"完成，{(time.time()-t0)/60:.1f} 分钟", state="complete")
 
-    # ---------------- 增量更新 ----------------
-    if upd and ss.get("panel") is not None:
-        if not token:
-            st.error("请先填 Tushare Token")
-        else:
-            try:
-                import tushare as ts
-                ts.set_token(token); pro2 = ts.pro_api(token)
-                lim2 = Limiter(rate)
-                bar = st.progress(0.0)
-                newp, nd, skipped = update_panel(
-                    pro2, lim2, ss["panel"], dt.date.today().strftime("%Y%m%d"),
-                    progress=lambda p, s: bar.progress(p, text=s),
-                    workers=workers, token=token)
-                bar.empty()
-                if nd:
-                    ss["panel"] = newp
-                    for kk in ("sec", "elig", "elig_key", "kdf", "ddf",
-                               "res", "wf", "nz", "sigres", "ksplit", "kbk"):
-                        ss.pop(kk, None)
-                    gc.collect()
-                    st.success(f"已补 {nd} 个交易日，数据截至 "
-                               f"{newp['cal'][-1]:%Y-%m-%d}。")
-                if skipped:
-                    st.warning(f"**{'、'.join(skipped)} 的数据还没齐**（通常是流通市值"
-                               "尚未发布，Tushare 的市值比价格晚 1-2 小时），已跳过。"
-                               "数据齐了之后再点一次「增量更新」就会补上。")
-                elif not nd:
-                    st.info("已经是最新，没有需要补的交易日。")
-            except ImportError:
-                st.error("未安装 tushare")
-            except Exception as e:
-                st.error(f"增量更新失败：{e}。可以改用「下载数据」全量重下。")
-
     if ss.get("panel") is None:
-        st.info("左侧填 Token 后点「下载数据」。\n\n"
-                "**日常选股用「日常（近2年）」模式**——实测起始日期从 2018 改到 2026，"
-                "第④页选出的股票完全相同（动量都是比值，与起点无关），"
-                "但下载调用数只有 1/3，一两分钟就好。\n\n"
-                "**只有要重跑第①②页的验证时才用「验证（2018起）」**。")
+        st.info("左侧填 Token 后点「下载数据」。首次约 10-20 分钟，之后走本地缓存。")
         with st.expander("为什么有时候一打开就要重新下载？"):
             st.markdown(
                 "有两层缓存，都可能丢：\n\n"
