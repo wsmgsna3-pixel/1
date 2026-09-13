@@ -1921,12 +1921,16 @@ def main():
                         ss["ksplit"] = run_age_diagnosis(pk0, tr0, SF[sig_],
                                                          panel["cal"])
                         ss["kbk"] = None
-                    elif cond == "买入日在高位死叉后1-5天":
-                        mk = high_dead_cross_mask(KDF, DDF, 5); ly, ln = "死叉后1-5天", "其他"
-                    elif cond == "买入时 K≥75":
-                        mk = KDF >= 75; ly, ln = "K≥75", "K<75"
                     else:
-                        mk = KDF >= 60; ly, ln = "K≥60", "K<60"
+                        if cond == "买入日在高位死叉后1-5天":
+                            mk = high_dead_cross_mask(KDF, DDF, 5)
+                            ly, ln = "死叉后1-5天", "其他"
+                        elif cond == "买入时 K≥75":
+                            mk = KDF >= 75
+                            ly, ln = "K≥75", "K<75"
+                        else:
+                            mk = KDF >= 60
+                            ly, ln = "K≥60", "K<60"
                         ss["ksplit"] = split_by_mask(pk0, tr0, mk, ly, ln)
                         ss["kbk"] = k_bucket_diagnosis(pk0, tr0)
             if ss.get("ksplit") is not None and len(ss["ksplit"]):
