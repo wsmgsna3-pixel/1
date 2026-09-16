@@ -21,6 +21,11 @@
 
 本版改动
 --------
+- 第③页新增「板块结构」三个干净划分：买入时板块合格成分股数、板块内60日上涨比例、
+  合格数与60日前相比的变化。按同期超额（扣掉同一天全池随机收益）和逐年一致性判断。
+
+上一版改动
+----------
 - 侧边栏默认值改为滚动前推六年选中的配置：3个板块、每次3只、每板块最多2只、
   持有20日、每1日选一次、冷却2日，持有到期不止损。
 - 删除已验证无效的内容：跳过日线K（带补位）、止损/利润保护出场规则及其对比页。
@@ -1175,6 +1180,123 @@ def in_sector_rank_test(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List
     return {"summary": summ, "pair": pair, "yearly": yearly}
 
 
+STRUCT_SPLITS = {
+    "成分股数": ("买入时板块合格成分股数", ["5-7只", "8-15只", "16只以上"]),
+    "上涨比例": ("买入时板块内60日上涨的比例", ["低于50%", "50-80%", "80%以上"]),
+    "合格数变化": ("合格成分股数与60个交易日前相比", ["减少(>10%)", "基本持平(±10%)", "增加(>10%)"]),
+}
+
+
+def sector_structure(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
+                     cnt: pd.DataFrame, tr: pd.DataFrame, pool_tr: pd.DataFrame = None,
+                     hold: int = 20, step_days: int = 1) -> dict:
+    """
+    板块结构的三个干净划分 —— 同一批成交，只按买入当天所在板块的状态分组，不做替补。
+
+      成分股数   ：当天板块合格成分股几只。检验「小板块指数被一两只票拉高、排名靠噪音」。
+      上涨比例   ：当天合格成分股里，60日涨幅为正的占几成。检验「集群效应」——
+                   多数股票一起涨，比一两只票拉起指数更可靠。
+      合格数变化 ：当天合格数比60个交易日前多了还是少了。检验「资金涌入、越来越多股票
+                   达标」是否在60日动量之外还有信息。
+
+    全部只用买入决策当天收盘及以前的数据。
+    「同期超额」= 收益率 − 同一天全池随机买入的平均收益，扣掉大盘在那段时间的涨跌，
+    否则某一组只是恰好集中在牛市年份也会显得更好。
+    """
+    if tr is None or not len(tr) or "板块" not in tr.columns:
+        return {}
+    A = panel["adj_close"]
+    r60 = A / A.shift(60) - 1.0
+    br = {}
+    for sec, codes in sectors.items():
+        e = elig[codes]
+        n = e.sum(axis=1)
+        up = ((r60[codes] > 0) & e).sum(axis=1)
+        br[sec] = up / n.where(n > 0)
+    BR = pd.DataFrame(br)
+    CNT = cnt.reindex(index=A.index)
+    C60 = CNT.shift(60)
+    CH = (CNT - C60) / C60.where(C60 > 0)
+    CH = CH.mask((C60 == 0) & (CNT > 0), np.inf)
+    del r60
+
+    d = tr.dropna(subset=["收益率"]).copy()
+    d["date"] = pd.to_datetime(d["date"])
+
+    def look(M):
+        out = []
+        for dt_, sec in zip(d["date"], d["板块"]):
+            try:
+                out.append(float(M.at[dt_, sec]))
+            except Exception:
+                out.append(np.nan)
+        return np.array(out, dtype=float)
+
+    n_ = look(CNT)
+    b_ = look(BR)
+    c_ = look(CH)
+    d["成分股数"] = np.select([n_ <= 7, n_ <= 15, n_ > 15], STRUCT_SPLITS["成分股数"][1], default=None)
+    d["上涨比例"] = np.select([b_ < 0.5, b_ < 0.8, b_ >= 0.8], STRUCT_SPLITS["上涨比例"][1], default=None)
+    d["合格数变化"] = np.select([c_ < -0.1, c_ <= 0.1, c_ > 0.1], STRUCT_SPLITS["合格数变化"][1], default=None)
+    d.loc[~np.isfinite(n_), "成分股数"] = None
+    d.loc[~np.isfinite(b_), "上涨比例"] = None
+    d.loc[np.isnan(c_), "合格数变化"] = None
+    d["_买入时合格数"] = n_
+    d["_上涨比例值"] = b_
+
+    has_pool = pool_tr is not None and len(pool_tr)
+    if has_pool:
+        pm = pool_tr.dropna(subset=["收益率"]).assign(date=lambda x: pd.to_datetime(x["date"]))
+        pm = pm.groupby("date")["收益率"].mean()
+        d["同期超额"] = d["收益率"] - d["date"].map(pm)
+    d["年"] = d["date"].dt.year
+    lag = max(1, int(np.ceil(hold / max(step_days, 1))))
+    val = "同期超额" if has_pool else "收益率"
+
+    res = {}
+    for key, (title, order) in STRUCT_SPLITS.items():
+        sub_all = d.dropna(subset=[key])
+        if len(sub_all) < 100:
+            continue
+        rows = []
+        for g in order:
+            sub = sub_all[sub_all[key] == g]
+            if not len(sub):
+                continue
+            day = sub.groupby("date")[val].mean().dropna().sort_index()
+            yr = sub.groupby("年")[val].mean()
+            r = {"分组": g, "笔数": len(sub), "占比": len(sub) / len(sub_all),
+                 "平均收益": sub["收益率"].mean(), "中位收益": sub["收益率"].median(),
+                 "胜率": float((sub["收益率"] > 0).mean()),
+                 "资金年化(近似)": cap_annual(sub)}
+            if has_pool:
+                r["同期超额"] = sub["同期超额"].mean()
+            r[f"t(重叠修正,{val})"] = newey_west_t(day, lag)
+            r["覆盖年数"] = len(yr)
+            r["超额为正年数" if has_pool else "为正年数"] = f"{int((yr > 0).sum())}/{len(yr)}"
+            rows.append(r)
+        summ = pd.DataFrame(rows).set_index("分组")
+        yearly = sub_all.pivot_table(index="年", columns=key, values=val, aggfunc="mean")
+        yearly = yearly[[c for c in order if c in yearly.columns]]
+        cnt_y = sub_all.pivot_table(index="年", columns=key, values=val, aggfunc="size")
+        cnt_y = cnt_y.reindex(columns=yearly.columns)
+        # 两头对比：同一年里两组都至少有 20 笔，才算一次有效的比较
+        lo, hi = order[0], order[-1]
+        verdict = ""
+        if lo in yearly.columns and hi in yearly.columns:
+            ok = (cnt_y[lo] >= 20) & (cnt_y[hi] >= 20)
+            diff = (yearly[hi] - yearly[lo])[ok].dropna()
+            if len(diff):
+                verdict = (f"「{hi}」减「{lo}」：{len(diff)} 个两组都有足够笔数的年份里，"
+                           f"{int((diff > 0).sum())} 年为正，平均差 {diff.mean():+.2%}。")
+        res[key] = {"title": title, "summary": summ, "yearly": yearly,
+                    "yearly_n": cnt_y, "verdict": verdict, "val": val}
+    dist = pd.DataFrame({"买入时合格数": d["_买入时合格数"], "上涨比例": d["_上涨比例值"]}).describe(
+        percentiles=[.1, .25, .5, .75, .9]).T
+    res["_dist"] = dist
+    return res
+
+
 def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
                       cal) -> pd.DataFrame:
     """
@@ -1613,7 +1735,7 @@ def main():
             n = clear_day_cache()
             for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
                        "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf",
-                       "rankres", "live", "live_key"):
+                       "rankres", "live", "live_key", "struct"):
                 ss.pop(kk, None)
             gc.collect()
             st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
@@ -1636,7 +1758,7 @@ def main():
             if kk != "panel" or True:
                 pass
         for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
-                   "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key"):
+                   "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key", "struct"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -1852,7 +1974,7 @@ def main():
             ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, pks, sig, srule)
             ss["res_lab"] = (f"{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜持有{hold}日｜"
                              f"每{every}日选｜冷却{cool}日")
-            ss.pop("wf", None); ss.pop("ksplit", None)
+            ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("struct", None)
             bar.empty(); gc.collect()
 
         if ss.get("res"):
@@ -2046,6 +2168,13 @@ def main():
                         tb["07_位置诊断_K分档"] = ss["kbk"]
                     if ss.get("nz") is not None:
                         tb["08_降噪检验"] = ss["nz"]
+                    if ss.get("struct"):
+                        _num = {"成分股数": "12", "上涨比例": "13", "合格数变化": "14"}
+                        for _k3, _v3 in ss["struct"].items():
+                            if _k3.startswith("_"):
+                                continue
+                            tb[f"{_num.get(_k3, '15')}_板块结构_{_k3}_汇总"] = _v3["summary"]
+                            tb[f"{_num.get(_k3, '15')}_板块结构_{_k3}_逐年"] = _v3["yearly"]
                     if ss.get("rankres"):
                         _rr = ss["rankres"]
                         for _k2, _nm2 in (("summary", "09_排名分档_汇总"),
@@ -2123,6 +2252,71 @@ def main():
                              .background_gradient(cmap="RdYlGn", axis=None),
                              use_container_width=True)
             st.caption("你只拿 1-3 只，抓到右尾的概率低，**中位收益和胜率比平均收益更贴近真实体验**。")
+        st.divider()
+
+        st.markdown("### 板块结构：成分股数量 · 板块内上涨比例 · 合格数变化")
+        st.caption("用第②页最近一次对照实验「两层」方案的**同一批成交**，按买入当天所在板块的状态分组，"
+                   "不做替补。三个划分一次跑完。")
+        if not ss.get("res"):
+            st.info("先到「② 主回测」跑一次对照实验。")
+        else:
+            if st.button("运行板块结构划分", type="primary"):
+                _df3, _keep3, _pks3, _, _ = ss["res"]
+                _base3 = list(_keep3)[0]
+                _pool3 = next((v for k, v in _keep3.items() if str(k).startswith("对照C")), None)
+                with st.spinner("计算每个板块每天的合格数和上涨比例…"):
+                    ss["struct"] = sector_structure(panel, elig, sectors, cnt, _keep3[_base3],
+                                                    _pool3, hold=hold, step_days=every)
+                    ss["struct_lab"] = ss.get("res_lab", "")
+                    gc.collect()
+            _sr = ss.get("struct")
+            if _sr is not None and not _sr:
+                st.warning("样本不足，没有结果。")
+            elif _sr:
+                st.caption(f"口径：{ss.get('struct_lab', '')}")
+                st.info("**怎么读**：主要看「同期超额」——每笔收益减去同一天全池随机买入的平均收益，"
+                        "扣掉了大盘那段时间的涨跌。一个划分要算有用，需要同时满足："
+                        "① 各组「同期超额」有明显、按顺序的差别（例如 16只以上 > 8-15只 > 5-7只）；"
+                        "② 差别在多数年份成立（看每个划分下面那句两头对比）；"
+                        "③ t(重叠修正) 的绝对值接近或超过 2。**只满足①不算数**——每天买3只、拿20天，"
+                        "相邻成交高度重叠，几个百分点的差别很容易是噪音。")
+                _expl = {
+                    "成分股数": "检验「小板块指数被一两只票拉高、排名靠噪音」。如果 5-7只 明显最差，"
+                               "可以考虑提高「板块最少成分股」（要重跑滚动前推）。",
+                    "上涨比例": "检验「集群效应」：板块里多数股票一起涨，是否比少数几只拉起指数更可靠。"
+                               "如果 80%以上 明显最好、低于50% 明显最差，集群效应成立。",
+                    "合格数变化": "检验「资金涌入、越来越多股票达标」在60日动量之外有没有额外信息。"
+                                "如果各组差不多，说明它和动量说的是同一件事。",
+                }
+                _fmt = {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                        "胜率": "{:.1%}", "资金年化(近似)": "{:+.1%}", "同期超额": "{:+.2%}",
+                        "覆盖年数": "{:.0f}"}
+                for _k3 in ("成分股数", "上涨比例", "合格数变化"):
+                    if _k3 not in _sr:
+                        continue
+                    _v3 = _sr[_k3]
+                    st.markdown(f"**{_v3['title']}**")
+                    _sm = _v3["summary"]
+                    _tcol = [c for c in _sm.columns if c.startswith("t(")]
+                    st.dataframe(_sm.style.format({**_fmt, **{c: "{:.2f}" for c in _tcol}})
+                                 .background_gradient(subset=["同期超额"] if "同期超额" in _sm.columns
+                                                      else ["平均收益"], cmap="RdYlGn"),
+                                 use_container_width=True)
+                    if _v3["verdict"]:
+                        st.caption(_v3["verdict"] + "　" + _expl[_k3])
+                    else:
+                        st.caption(_expl[_k3])
+                    with st.expander(f"逐年{_v3['val']}（{_k3}）"):
+                        st.dataframe(_v3["yearly"].style.format("{:+.2%}")
+                                     .background_gradient(cmap="RdYlGn", axis=None),
+                                     use_container_width=True)
+                        st.dataframe(_v3["yearly_n"].fillna(0).astype(int), use_container_width=True)
+                        st.caption("下表是每年各组的笔数。笔数少于 20 的格子基本是噪音。")
+                if "_dist" in _sr:
+                    with st.expander("买入时合格数、上涨比例的分布"):
+                        st.dataframe(_sr["_dist"].style.format("{:.2f}"), use_container_width=True)
+                st.warning("**只看这里不改规则。** 就算某个划分看起来有效，也是在全样本上看出来的。"
+                           "要用它，得先定成明确的规则（比如「板块最少成分股改成8」），再跑第②页对照和滚动前推。")
         st.divider()
 
         st.markdown("### 想加任何买入条件，先在这里验")
