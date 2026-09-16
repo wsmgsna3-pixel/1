@@ -21,22 +21,18 @@
 
 本版改动
 --------
-- 新增出场规则：止损8%/10%、涨过10%回吐一半、涨过20%回落到+10% 及组合。
-  侧边栏选定后，第②页对照、滚动前推、今日候选都按它执行；第②页「出场规则对比」
-  用同一批票换卖法比较，并拆解止损错杀、利润保护留住了多少。
-- 新增「资金年化(近似)」= 总收益 ÷ 总持有交易日 × 244。每笔平均收益不能乘笔数。
-- 新增「跳过日线K低于」（带补位，不会出现没有股票）；第③页「K阈值敏感性」
-  同配置比较 不跳过/30/40/50；第②页设了它会自动加「对照D：同配置不跳过K」。
+- 侧边栏默认值改为滚动前推六年选中的配置：3个板块、每次3只、每板块最多2只、
+  持有20日、每1日选一次、冷却2日，持有到期不止损。
+- 删除已验证无效的内容：跳过日线K（带补位）、止损/利润保护出场规则及其对比页。
+- 保留「资金年化(近似)」：每笔平均收益不能乘笔数。
 
-上一版改动
+更早的改动
 ----------
 - 「今日候选」按回测完全相同的日程（同起点、每 N 日一次、同样冷却）重放到最新一天，
-  名单 = 回测在这一天会选的票。旧版只算当天、没有冷却历史，所以天天同一份名单。
-- 侧边栏新增「冷却交易日」：轮换就靠它。1 日选一次 + 冷却 2 日 = 每天换名单。
-- 第③页新增「板块内排名分档」：第1-2/3-4/5-6/7-10名同日同板块配对比较。
-- 修复：第③页「高位死叉后1-5天」「K≥75」两个划分之前没有真正计算。
-- 修复：下载时引用了未定义的缓存目录，导致每次误报"缓存不可写"。
-- 默认板块信号改为「板块60日动量」（最近一次滚动前推六年都选中它）。
+  名单 = 回测在这一天会选的票。
+- 侧边栏「冷却交易日」：轮换就靠它。
+- 第③页「板块内排名分档」：第1-2/3-4/5-6/7-10名同日同板块配对比较。
+- 修复：第③页「高位死叉后1-5天」「K≥75」两个划分之前没有真正计算；下载时误报缓存不可写。
 =========================================================================
 """
 from __future__ import annotations
@@ -1020,8 +1016,7 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                       stock_rule: str = "S1_板块内最强",
                       sec_rule: str = "最强", cooldown: int = 5,
                       seed: int = 20260910, kdf: pd.DataFrame = None,
-                      per_sec_cap: int = 0, min_members: int = 5,
-                      k_skip: float = 0.0) -> pd.DataFrame:
+                      per_sec_cap: int = 0, min_members: int = 5) -> pd.DataFrame:
     """
     两层选股：先按 sec_fac 选出 top_sec 个板块，再在板块内按 stock_rule 选股。
     sec_rule="随机" 时板块层用随机选择 —— 这是判断"板块层有没有加分"的对照组。
@@ -1030,10 +1025,6 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
     名额顺延给板块内下一名。例：每 3 日选一次 + 冷却 5 日 → 板块和排名不变时，
     名单在「第1-2名」和「第3-4名」之间交替；每 1 日选一次 + 冷却 2 日 → 每天交替。
     冷却 ≤ 选股间隔时冷却不起作用，连续选股日名单会一模一样。
-
-    k_skip>0：日线 K 低于它的股票先跳过，名额顺延给后面的名次；
-    如果前几个板块的剩余股票全部跳过后仍凑不满，再把跳过的按原顺序补回来，
-    所以入选只数永远不会比不过滤时少——不会出现"今天没有股票"。
     """
     A = panel["adj_close"]
     m20 = (A / A.shift(20) - 1.0)
@@ -1076,40 +1067,19 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
         taken = 0
         used: Dict[str, int] = {}
         krow = kdf.loc[d] if (kdf is not None and d in kdf.index) else None
-        skipped = []
-
-        def _k(c):
-            if krow is None or c not in krow.index:
-                return np.nan
-            return float(krow[c])
-
         for s, c, sc, rk in cand:
             if taken >= top_n:
                 break
             if c in last and i - last[c] < cooldown:
                 continue
-            # 候选是按板块顺序排的（最强板块的股票全部在前），
-            # 不设上限时前 top_n 名往往全部来自最强板块。
-            # per_sec_cap>0 则强制分散。默认 0 = 不限，保持与已验证口径一致。
-            if per_sec_cap > 0 and used.get(s, 0) >= per_sec_cap:
-                continue
-            kv = _k(c)
-            if k_skip > 0 and np.isfinite(kv) and kv < k_skip:
-                skipped.append((s, c, sc, rk, kv))
-                continue
-            used[s] = used.get(s, 0) + 1
-            rows.append({"date": d, "code": c, "板块": s, "rank": taken + 1,
-                         "板块内名次": rk, "score": sc, "买入K": kv, "K低补位": False})
-            last[c] = i
-            taken += 1
-        for s, c, sc, rk, kv in skipped:              # 凑不满才补回来
-            if taken >= top_n:
-                break
+            # 候选是按板块顺序排的（最强板块的股票全部在前）。
+            # per_sec_cap>0 则每个板块最多取这么多只，剩下的名额轮到下一个板块。
             if per_sec_cap > 0 and used.get(s, 0) >= per_sec_cap:
                 continue
             used[s] = used.get(s, 0) + 1
+            kv = float(krow[c]) if (krow is not None and c in krow.index) else np.nan
             rows.append({"date": d, "code": c, "板块": s, "rank": taken + 1,
-                         "板块内名次": rk, "score": sc, "买入K": kv, "K低补位": True})
+                         "板块内名次": rk, "score": sc, "买入K": kv})
             last[c] = i
             taken += 1
     return pd.DataFrame(rows)
@@ -1203,50 +1173,6 @@ def in_sector_rank_test(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List
     yearly = tr.pivot_table(index="年", columns="档", values="收益率", aggfunc="mean")
     yearly = yearly[[c for c in order if c in yearly.columns]]
     return {"summary": summ, "pair": pair, "yearly": yearly}
-
-
-def k_skip_sensitivity(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
-                       sec_fac: pd.DataFrame, dates: List[pd.Timestamp], kdf: pd.DataFrame,
-                       top_sec: int, top_n: int, cooldown: int, per_sec_cap: int,
-                       min_members: int, hold: int, exit_rule: str,
-                       thresholds=(0, 30, 40, 50), cut: str = "2023-01-01",
-                       **kw) -> tuple:
-    """
-    同一配置，只改「跳过 K 低于多少」（带补位）。
-    40 是看了 K 分档之后才想到的数，本身带着挑选。如果 30/40/50 一路平滑地好于 0，
-    说明是真现象；如果只有 40 突出、旁边的 30 和 50 都不行，那多半是恰好切在了噪音上。
-    """
-    c = pd.Timestamp(cut)
-    rule = EXIT_RULES.get(exit_rule, {})
-    trs, rows = {}, []
-    for th in thresholds:
-        pk = sector_then_stock(panel, elig, sectors, sec_fac, dates, top_sec, top_n,
-                               "S1_板块内最强", "最强", cooldown=cooldown, kdf=kdf,
-                               per_sec_cap=per_sec_cap, min_members=min_members,
-                               k_skip=float(th))
-        if not len(pk):
-            continue
-        t = track_exit(pk, panel, hold, rule, **kw).dropna(subset=["收益率"])
-        if not len(t):
-            continue
-        t = t.merge(pk[["date", "code", "K低补位"]], on=["date", "code"], how="left")
-        t["年"] = pd.to_datetime(t["date"]).dt.year
-        trs[th] = t
-    if 0 not in trs:
-        return pd.DataFrame(), pd.DataFrame()
-    yrs = {th: pd.Series({y: cap_annual(g) for y, g in t.groupby("年")}) for th, t in trs.items()}
-    for th, t in trs.items():
-        dy = (yrs[th] - yrs[0].reindex(yrs[th].index)).dropna()
-        rows.append({"跳过K低于": "不跳过" if th == 0 else f"{th}",
-                     "笔数": len(t), "资金年化(近似)": cap_annual(t),
-                     "样本内年化": cap_annual(t[t["date"] < c]),
-                     "样本外年化": cap_annual(t[t["date"] >= c]),
-                     "逐年胜过不跳过": "-" if th == 0 else f"{int((dy > 0).sum())}/{len(dy)}",
-                     "平均收益": t["收益率"].mean(), "中位收益": t["收益率"].median(),
-                     "胜率": float((t["收益率"] > 0).mean()),
-                     "补位占比": float(t["K低补位"].fillna(False).astype(bool).mean())})
-    yearly = pd.DataFrame({("不跳过" if th == 0 else f"跳过K<{th}"): v for th, v in yrs.items()})
-    return pd.DataFrame(rows).set_index("跳过K低于"), yearly
 
 
 def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
@@ -1425,182 +1351,16 @@ def track_fixed(picks: pd.DataFrame, panel: dict, hold_days: int = 8,
     return pd.DataFrame(out)
 
 
-# ---------------- 出场规则（止损 / 利润保护）----------------
-# 固定的一小组规则，不做参数搜索——规则越多，挑出"最好的"越可能是运气。
-#   sl   : 从买入价下跌这么多就卖
-#   prot : ("half", x)      —— 最高涨幅到过 x 之后，涨幅回吐一半就卖
-#          ("floor", x, y)  —— 最高涨幅到过 x 之后，回落到 +y 就卖
-EXIT_BASE = "持有到期（基准）"
-EXIT_RULES = {
-    EXIT_BASE: {},
-    "止损8%": {"sl": 0.08},
-    "止损10%": {"sl": 0.10},
-    "止损8% + 涨过10%回吐一半": {"sl": 0.08, "prot": ("half", 0.10)},
-    "止损8% + 涨过20%回落到+10%": {"sl": 0.08, "prot": ("floor", 0.20, 0.10)},
-    "止损10% + 涨过10%回吐一半": {"sl": 0.10, "prot": ("half", 0.10)},
-    "止损10% + 涨过20%回落到+10%": {"sl": 0.10, "prot": ("floor", 0.20, 0.10)},
-    "不止损，只保护利润：涨过10%回吐一半": {"prot": ("half", 0.10)},
-}
-
-
-def track_exit(picks: pd.DataFrame, panel: dict, hold_days: int = 20,
-               rule: dict = None, comm: float = 0.0003, stamp: float = 0.0005,
-               slip: float = 0.001) -> pd.DataFrame:
-    """
-    带止损 / 利润保护的成交。持有交易日 = 最长持有，没触发就到期开盘卖。
-
-    成交口径（全部偏保守）：
-      - 次日开盘买，买入当天不能卖（T+1）。
-      - 某天开盘就低于卖出线 → 按开盘价卖（跳空低开，吃到滑点）；
-        盘中最低价碰到卖出线 → 按卖出线价格卖。
-      - 开盘即跌停 → 当天卖不掉，顺延到下一天。停牌同样顺延。
-      - 当天的卖出线只用**截至前一天**的最高价算。当天冲高再回落，
-        当天不会按新高去保护利润——日线看不出盘中先高还是先低，按不利的算。
-      - 只统计「到期日在数据范围内」的交易，和持有到期同一批。否则最近
-        几周里提前止损的交易会被计入、还没触发的被丢掉，最后一年会偏差。
-    """
-    rule = rule or {}
-    sl, prot = rule.get("sl"), rule.get("prot")
-    if not sl and not prot:
-        tr = track_fixed(picks, panel, hold_days, comm=comm, stamp=stamp, slip=slip)
-        if len(tr):
-            tr["出场原因"] = "到期"
-        return tr
-    cal = panel["adj_close"].index
-    n_cal = len(cal)
-    ci = {c: j for j, c in enumerate(panel["codes"])}
-    AO = panel["adj_open"].to_numpy(dtype=np.float64)
-    AH = panel["adj_high"].to_numpy(dtype=np.float64)
-    AL = panel["adj_low"].to_numpy(dtype=np.float64)
-    RO = panel["raw_open"].to_numpy(dtype=np.float64)
-    TRD = panel["tradable"].to_numpy(dtype=bool)
-    LU = panel["limit_up_open"].to_numpy(dtype=bool)
-    LD = panel["limit_dn_open"].to_numpy(dtype=bool)
-    pos = {d: i for i, d in enumerate(cal)}
-    cin, cout = comm + slip, comm + stamp + slip
-    out = []
-    for p in picks[["date", "code"] + (["板块"] if "板块" in picks.columns else [])].itertuples(index=False):
-        d0, code = p[0], p[1]
-        sec = p[2] if len(p) > 2 else "-"
-        i0 = pos.get(d0); j = ci.get(code)
-        if i0 is None or j is None:
-            continue
-        b = i0 + 1
-        if b >= n_cal or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
-            continue
-        e_sched = b + hold_days
-        if e_sched >= n_cal:
-            continue
-        p0 = AO[b, j]
-        H, L, O = AH[b:e_sched, j], AL[b:e_sched, j], AO[b:e_sched, j]
-        T, D = TRD[b:e_sched, j], LD[b:e_sched, j]
-        Hn = np.where(T & np.isfinite(H), H, -np.inf)
-        peak = np.maximum.accumulate(Hn)
-        peak_prev = np.maximum(np.concatenate(([-np.inf], peak[:-1])), p0)
-        g = peak_prev / p0 - 1.0
-        sl_lvl = np.full(len(H), p0 * (1.0 - sl)) if sl else np.full(len(H), -np.inf)
-        if prot:
-            if prot[0] == "half":
-                pr_lvl = np.where(g >= prot[1], p0 * (1.0 + g / 2.0), -np.inf)
-            else:
-                pr_lvl = np.where(g >= prot[1], p0 * (1.0 + prot[2]), -np.inf)
-        else:
-            pr_lvl = np.full(len(H), -np.inf)
-        lvl = np.maximum(sl_lvl, pr_lvl)
-        ok = T & ~D & np.isfinite(O) & np.isfinite(L)
-        ok[0] = False                                   # T+1
-        hit_o = ok & (O <= lvl)
-        hit = hit_o | (ok & (L <= lvl))
-        if hit.any():
-            k = int(np.argmax(hit))
-            e = b + k
-            px = O[k] if hit_o[k] else lvl[k]
-            reason = "利润保护" if pr_lvl[k] > -np.inf and pr_lvl[k] >= sl_lvl[k] else "止损"
-        else:
-            e = e_sched
-            while e < n_cal and (not TRD[e, j] or LD[e, j] or not np.isfinite(AO[e, j])):
-                e += 1
-                if e - b > hold_days + 5:
-                    break
-            if e >= n_cal or not np.isfinite(AO[e, j]):
-                continue
-            px = AO[e, j]
-            reason = "到期"
-        hi_seg = AH[b:e + 1, j]
-        hi_seg = hi_seg[np.isfinite(hi_seg)]
-        entry = p0 * (1 + cin)
-        exit_ = px * (1 - cout)
-        r_ratio = RO[e, j] / AO[e, j] if np.isfinite(RO[e, j]) and AO[e, j] > 0 else np.nan
-        out.append({"date": d0, "code": code, "板块": sec,
-                    "买入日": cal[b], "卖出日": cal[e],
-                    "买入价(实际)": round(float(RO[b, j]), 2) if np.isfinite(RO[b, j]) else np.nan,
-                    "卖出价(实际)": round(float(px * r_ratio), 2) if np.isfinite(r_ratio) else np.nan,
-                    "收益率": exit_ / entry - 1.0, "持有交易日": e - b,
-                    "出场原因": reason,
-                    "期间最高涨幅": float(hi_seg.max() / p0 - 1.0) if len(hi_seg) else np.nan,
-                    "买入价(复权)": round(entry, 4), "卖出价(复权)": round(exit_, 4)})
-    return pd.DataFrame(out)
-
-
 def cap_annual(tr: pd.DataFrame) -> float:
     """
     按资金占用天数折算的年化（单利）：总收益 ÷ 总持有交易日 × 244。
     假设资金一直满仓轮动——卖出后第二天就买入新名单。
-    持有期不同的规则只能用它比，不能直接比每笔平均收益：
-    止损让资金提前释放，同样的钱一年能多转几轮。
+    每笔平均收益不能乘以笔数：每天买几只、每只拿20天，同时在手里的有几十只。
     """
     if tr is None or not len(tr) or "持有交易日" not in tr.columns:
         return np.nan
     hd = tr["持有交易日"].clip(lower=1).sum()
     return float(tr["收益率"].sum() / hd * 244) if hd > 0 else np.nan
-
-
-def exit_compare(picks: pd.DataFrame, panel: dict, hold: int, cut: str = "2023-01-01",
-                 **kw) -> dict:
-    """同一批票，只换出场规则。不重新选股，所以差别只来自卖法。"""
-    trs = {}
-    for nm, rule in EXIT_RULES.items():
-        t = track_exit(picks, panel, hold, rule, **kw)
-        if len(t):
-            t = t.dropna(subset=["收益率"]).copy()
-            t["年"] = pd.to_datetime(t["date"]).dt.year
-            trs[nm] = t
-    if EXIT_BASE not in trs:
-        return {}
-    base = trs[EXIT_BASE]
-    base_y = pd.Series({y: cap_annual(g) for y, g in base.groupby("年")})
-    bret = base.set_index(["date", "code"])["收益率"]
-    c = pd.Timestamp(cut)
-    rows, yrows, why = [], {}, []
-    for nm, t in trs.items():
-        yy = pd.Series({y: cap_annual(g) for y, g in t.groupby("年")})
-        yrows[nm] = yy
-        cmp_ = (yy - base_y.reindex(yy.index)).dropna()
-        ins, outs = t[t["date"] < c], t[t["date"] >= c]
-        rows.append({"出场规则": nm, "笔数": len(t),
-                     "资金年化(近似)": cap_annual(t),
-                     "样本内年化": cap_annual(ins), "样本外年化": cap_annual(outs),
-                     "逐年胜过基准": "-" if nm == EXIT_BASE else f"{int((cmp_ > 0).sum())}/{len(cmp_)}",
-                     "平均收益": t["收益率"].mean(), "中位收益": t["收益率"].median(),
-                     "胜率": float((t["收益率"] > 0).mean()),
-                     "平均持有日": t["持有交易日"].mean(),
-                     "最差10%分位": t["收益率"].quantile(0.10)})
-        if nm == EXIT_BASE:
-            continue
-        tt = t.set_index(["date", "code"])
-        for rsn in ("止损", "利润保护", "到期"):
-            sub = tt[tt["出场原因"] == rsn]
-            if not len(sub):
-                continue
-            hold_ret = bret.reindex(sub.index).dropna()
-            why.append({"出场规则": nm, "出场原因": rsn, "笔数": len(sub),
-                        "占比": len(sub) / len(tt),
-                        "按规则卖出的收益": sub["收益率"].mean(),
-                        "同一批票拿到期的收益": hold_ret.mean() if len(hold_ret) else np.nan,
-                        "拿到期会转为盈利的比例": float((hold_ret > 0).mean()) if len(hold_ret) else np.nan})
-    return {"summary": pd.DataFrame(rows).set_index("出场规则"),
-            "yearly": pd.DataFrame(yrows),
-            "why": pd.DataFrame(why).set_index(["出场规则", "出场原因"]) if why else pd.DataFrame()}
 
 
 # ---------------- 三项必做诊断 ----------------
@@ -1675,7 +1435,6 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
                  signals: List[str] = None, top_secs=(2, 3), top_ns=(3,),
                  holds=(15, 20), start_year: int = 2021, per_sec_cap: int = 0,
                  min_members: int = 5, cooldown: int = 5,
-                 kdf: pd.DataFrame = None, k_skip: float = 0.0, exit_rule: str = EXIT_BASE,
                  comm: float = 0.0003, stamp: float = 0.0005,
                  slip: float = 0.001, progress=None) -> tuple:
     """
@@ -1693,11 +1452,9 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
     allt: Dict[tuple, pd.DataFrame] = {}
     for i, (sg, ts, tn, hd) in enumerate(cfgs):
         pk = sector_then_stock(panel, elig, sectors, SF[sg], dates, ts, tn,
-                               "S1_板块内最强", "最强", cooldown=cooldown, kdf=kdf,
-                               per_sec_cap=per_sec_cap, min_members=min_members,
-                               k_skip=k_skip)
-        tr = (track_exit(pk, panel, hd, EXIT_RULES.get(exit_rule, {}), comm=comm,
-                         stamp=stamp, slip=slip) if len(pk) else pd.DataFrame())
+                               "S1_板块内最强", "最强", cooldown=cooldown,
+                               per_sec_cap=per_sec_cap, min_members=min_members)
+        tr = track_fixed(pk, panel, hd, comm=comm, stamp=stamp, slip=slip) if len(pk) else pd.DataFrame()
         if len(tr):
             tr = tr.dropna(subset=["收益率"]).copy()
             tr["年"] = pd.to_datetime(tr["date"]).dt.year
@@ -1725,8 +1482,7 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
         if not len(cur):
             continue
         _cap = ((f"|每板块≤{per_sec_cap}" if per_sec_cap > 0 else "|板块不限")
-                + f"|冷却{cooldown}日" + (f"|跳过K<{k_skip:g}" if k_skip > 0 else "")
-                + ("" if exit_rule == EXIT_BASE else f"|{exit_rule}"))
+                + f"|冷却{cooldown}日")
         picked.append({"年": y,
                        "选中配置": f"{bcfg[0]}|{bcfg[1]}板块|{bcfg[2]}只|{bcfg[3]}日{_cap}",
                        "历史t": best, "当年笔数": len(cur),
@@ -1810,19 +1566,22 @@ def main():
     with st.sidebar:
         token = st.text_input("Tushare Token", type="password",
                               value=os.environ.get("TUSHARE_TOKEN", ""))
-        top_sec = st.slider("选几个板块", 1, 5, 3)
+        st.caption("默认值 = 滚动前推六年选中的配置：板块60日动量 · 3个板块 · 每次3只 · "
+                   "每板块最多2只 · 持有20日 · 每1日选一次 · 冷却2日 · 持有到期不止损。")
+        top_sec = st.slider("选几个板块", 1, 5, 3,
+                            help="每次3只、每板块最多2只时，名额是「第1板块2只 + 第2板块1只」，"
+                                 "第3个板块只在前两个凑不满时才用到，所以设2或3选出的票几乎相同。")
         top_n = st.slider("每次选几只", 1, 5, 3)
-        hold = st.slider("持有交易日（设了出场规则时 = 最长持有）", 3, 60, 20)
-        cap = st.slider("每个板块最多取几只（0=不限）", 0, 5, 0,
-                        help="0 是已验证过的口径：候选按板块顺序取，"
-                             "常常三只全来自最强板块。设为 1 则强制每个板块只取一只。"
-                             "改了这个，前面所有回测结论都要重跑。")
+        hold = st.slider("持有交易日", 3, 30, 20, help="持有到期、次日开盘买、到期日开盘卖，不设止盈止损。")
+        cap = st.slider("每个板块最多取几只（0=不限）", 0, 5, 2,
+                        help="候选按板块顺序取。设为 2：最强板块最多取2只，剩下的名额给下一个板块。"
+                             "改了这个，前面的回测结论都要重跑。")
         st.markdown("**名单轮换**")
-        every = st.slider("每几个交易日选一次", 1, 10, 3,
-                          help="回测和「今日候选」用同一个日程。设成 1 = 每天都是选股日。")
-        cool = st.slider("同一只股票冷却几个交易日", 1, 20, 5,
-                         help="入选后这么多个交易日内不再入选，名额顺延给板块内下一名——"
-                              "这就是轮换。默认 3 日选一次 + 冷却 5 日是已验证口径。")
+        every = st.slider("每几个交易日选一次", 1, 10, 1,
+                          help="回测和「今日候选」用同一个日程。1 = 每天都是选股日。")
+        cool = st.slider("同一只股票冷却几个交易日", 1, 20, 2,
+                         help="入选后这么多个交易日内不再入选，名额顺延给板块内下一名——这就是轮换。"
+                              "1 日选一次 + 冷却 2 日 = 名单隔日交替。")
         if cool <= every:
             st.caption(f"⚠️ 冷却 {cool} ≤ 选股间隔 {every}，**冷却不起作用**："
                        "板块和排名不变时，连续选股日名单一模一样。")
@@ -1831,17 +1590,7 @@ def main():
             st.caption(f"同一只股票每 **{_k}** 个选股日最多入选一次。"
                        + ("板块和排名不变时，名单在「前几名」和「后几名」之间**交替**。"
                           if _k == 2 else
-                          f"板块和排名不变时，名单要轮 {_k} 组才回到第1名，挖得较深。")
-                       + ("　**每天换名单 = 1 日选一次 + 冷却 2 日。**" if every != 1 or cool != 2 else ""))
-        st.markdown("**买卖规则**")
-        exit_rule = st.selectbox("出场规则", list(EXIT_RULES), index=0,
-                                 help="基准是持有到期、不止损。改了这个，第②页对照、"
-                                      "滚动前推、今日候选的执行规则都跟着变。"
-                                      "先在第②页「出场规则对比」看同一批票换卖法的差别。")
-        k_skip = st.slider("跳过日线K低于（0=不跳过）", 0, 60, 0, 5,
-                           help="K 低于这个数的股票先跳过，名额顺延给板块内后面的名次；"
-                                "实在凑不满再补回来，所以不会出现今天没有股票。"
-                                "先在第③页「K阈值敏感性」确认 30/40/50 都一致再用。")
+                          f"板块和排名不变时，名单要轮 {_k} 组才回到第1名，挖得较深。"))
         with st.expander("其他设置"):
             start = st.date_input("数据起始（选「验证」模式时生效）", dt.date(2018, 1, 1))
             end = st.date_input("数据结束", dt.date.today())
@@ -1864,7 +1613,7 @@ def main():
             n = clear_day_cache()
             for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
                        "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf",
-                       "rankres", "live", "live_key", "exitcmp", "ksens"):
+                       "rankres", "live", "live_key"):
                 ss.pop(kk, None)
             gc.collect()
             st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
@@ -1887,8 +1636,7 @@ def main():
             if kk != "panel" or True:
                 pass
         for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
-                   "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key",
-                   "exitcmp", "ksens"):
+                   "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -2074,50 +1822,37 @@ def main():
                    "**不要再逐个试信号挑最好的**，那会让后面所有检验失效。")
         st.markdown("四个方案同时跑：两层 / 随机板块 / 不分板块 / 全池随机。"
                     "**两层减随机板块 = 板块层的净贡献**，这个对照能干净分离"
-                    "「选板块」和「板块内选股」两层的功劳。"
-                    + ("设了「跳过K」时多跑一个**对照D：同配置不跳过K**，两者之差就是K过滤的净贡献。"
-                       if k_skip > 0 else ""))
-        st.caption(f"当前出场规则：**{exit_rule}**　·　"
-                   f"{'跳过日线K<' + str(k_skip) + '（带补位）' if k_skip > 0 else '不跳过K'}")
+                    "「选板块」和「板块内选股」两层的功劳。")
 
         if st.button("运行对照实验", type="primary", use_container_width=True):
             bar = st.progress(0.0)
             plans = [
-                ("两层：最强板块 + " + srule + (f"（跳过K<{k_skip}）" if k_skip > 0 else ""),
+                ("两层：最强板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
                                            top_sec, top_n, srule, "最强", cooldown=cool,
-                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem,
-                                           k_skip=k_skip)),
+                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem)),
                 ("对照A：随机板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
                                            top_sec, top_n, srule, "随机", cooldown=cool,
-                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem,
-                                           k_skip=k_skip)),
+                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem)),
                 ("对照B：不分板块，全池 " + srule,
                  lambda: flat_stock_pick(panel, elig, dates, top_n, srule, cooldown=cool)),
                 ("对照C：全池随机",
                  lambda: flat_stock_pick(panel, elig, dates, top_n, "S3_板块内随机",
                                          cooldown=cool)),
             ]
-            if k_skip > 0:
-                plans.append(("对照D：同配置不跳过K",
-                              lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
-                                                        top_sec, top_n, srule, "最强",
-                                                        cooldown=cool, kdf=KDF,
-                                                        per_sec_cap=cap,
-                                                        min_members=min_mem)))
             rows, keep, pks = [], {}, {}
-            _rule = EXIT_RULES.get(exit_rule, {})
             for i, (lab, fn) in enumerate(plans):
                 pk = fn()
-                tr = track_exit(pk, panel, hold, _rule, **kw) if len(pk) else pd.DataFrame()
+                tr = track_fixed(pk, panel, hold, **kw) if len(pk) else pd.DataFrame()
                 s_ = _st(tr)
                 bar.progress((i + 1) / len(plans), text=lab)
                 if s_:
                     rows.append({"方案": lab, **s_}); keep[lab] = tr; pks[lab] = pk
             ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, pks, sig, srule)
-            ss["res_lab"] = f"{exit_rule}｜{'跳过K<' + str(k_skip) if k_skip > 0 else '不跳过K'}"
-            ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("exitcmp", None)
+            ss["res_lab"] = (f"{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜持有{hold}日｜"
+                             f"每{every}日选｜冷却{cool}日")
+            ss.pop("wf", None); ss.pop("ksplit", None)
             bar.empty(); gc.collect()
 
         if ss.get("res"):
@@ -2138,58 +1873,12 @@ def main():
                 st.metric("板块层净贡献（两层 − 随机板块）",
                           f"{two['平均收益']-ra['平均收益']:+.3%} / 笔",
                           f"资金年化差 {two['资金年化(近似)']-ra['资金年化(近似)']:+.1%}")
-                if k_skip > 0 and any(str(x).startswith("对照D") for x in df.index):
-                    dd_ = df.loc[[x for x in df.index if str(x).startswith("对照D")][0]]
-                    st.metric(f"K过滤净贡献（跳过K<{k_skip} − 不跳过）",
-                              f"{two['资金年化(近似)']-dd_['资金年化(近似)']:+.1%} 资金年化",
-                              f"每笔 {two['平均收益']-dd_['平均收益']:+.3%}")
                 rt = (comm * 2 + 0.0005 + slip * 2)
                 st.caption(f"单次往返成本 {rt:.2%}；持有 {hold} 日 → 年换手 "
                            f"{244/hold:.0f} 次 → 年成本 {rt*244/hold:.1%}。"
                            f"**每笔平均收益要超过 {rt:.2%} 才算真有边际。**")
             except Exception:
                 pass
-
-            st.divider()
-            st.markdown("### 出场规则对比（同一批票，只换卖法）")
-            st.caption(f"用上表第一行「{list(keep)[0]}」选出的**同一批票**，分别按 {len(EXIT_RULES)} 种规则卖。"
-                       f"没触发就持有到第 {hold} 个交易日开盘卖。选股完全不变，差别只来自卖法。")
-            if st.button("运行出场规则对比", type="primary"):
-                with st.spinner("逐笔模拟止损和利润保护…"):
-                    ss["exitcmp"] = exit_compare(pks[list(keep)[0]], panel, hold, **kw)
-                    gc.collect()
-            _ec = ss.get("exitcmp")
-            if _ec:
-                st.dataframe(_ec["summary"].style.format(
-                    {"笔数": "{:.0f}", "资金年化(近似)": "{:+.1%}", "样本内年化": "{:+.1%}",
-                     "样本外年化": "{:+.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
-                     "胜率": "{:.1%}", "平均持有日": "{:.1f}", "最差10%分位": "{:+.1%}"})
-                    .background_gradient(subset=["资金年化(近似)"], cmap="RdYlGn"),
-                    use_container_width=True)
-                st.info("**先看「资金年化」，不要看每笔平均收益。** 止损让资金提前释放，"
-                        "同样的钱一年能多转几轮，每笔平均收益低一点也可能年化更高。\n\n"
-                        "**再看一致性**：「样本内年化」「样本外年化」两列是否都好于基准，"
-                        "「逐年胜过基准」是否多数年份成立。只在全样本好、两段里有一段不行的，不要选。\n\n"
-                        f"这里有 {len(EXIT_RULES) - 1} 种规则和基准比，**纯靠运气也会有一两种看起来更好**。"
-                        "差距小于几个百分点的年化，当作没差别。")
-                if len(_ec["why"]):
-                    st.markdown("**卖出原因拆解——对应你说的几种情况**")
-                    st.dataframe(_ec["why"].style.format(
-                        {"笔数": "{:.0f}", "占比": "{:.1%}", "按规则卖出的收益": "{:+.2%}",
-                         "同一批票拿到期的收益": "{:+.2%}", "拿到期会转为盈利的比例": "{:.1%}"}),
-                        use_container_width=True, height=420)
-                    st.caption("**止损那几行**：「拿到期会转为盈利的比例」就是「买入后先跌再涨」被止损"
-                               "错杀的比例；「同一批票拿到期的收益」比「按规则卖出的收益」高多少，就是止损的代价。\n\n"
-                               "**利润保护那几行**：「按规则卖出的收益」高于「拿到期的收益」，"
-                               "说明保护利润真的留住了钱（「涨了又跌回去」的情况）；反过来就是卖早了，"
-                               "错过了后面的继续上涨。")
-                if len(_ec["yearly"]):
-                    st.markdown("**逐年资金年化**")
-                    st.dataframe(_ec["yearly"].T.style.format("{:+.1%}")
-                                 .background_gradient(cmap="RdYlGn", axis=None),
-                                 use_container_width=True)
-                st.caption("选定一种后，在侧边栏「出场规则」里设成它，再跑一次滚动前推——"
-                           "滚动前推会用这个卖法重新挑配置、按年检验。")
 
             st.divider()
             st.markdown("### 三项诊断")
@@ -2236,8 +1925,7 @@ def main():
                 f"**滚动前推自己搜索**：板块数(2或3) × 持有期(15或20日) × 全部 {len(SF)} 个板块信号。\n\n"
                 f"**按你侧边栏固定**：每次选 **{top_n}** 只 · 每板块最多 "
                 f"**{cap if cap else '不限'}** 只 · 每 **{every}** 日选一次 · "
-                f"冷却 **{cool}** 日 · 出场「**{exit_rule}**」 · "
-                f"{'跳过K<**' + str(k_skip) + '**' if k_skip > 0 else '不跳过K'} · 成本设置。\n\n"
+                f"冷却 **{cool}** 日 · 持有到期不止损 · 成本设置。\n\n"
                 "所以改「选几个板块」和「持有交易日」对这里没影响（它自己会搜）；"
                 "改「每次选几只」「每板块最多几只」「每几日选一次」「冷却」会改变结果。")
             st.error("**每年年初只用截至上一年底的数据挑配置，再用它跑这一年。** "
@@ -2249,7 +1937,6 @@ def main():
                     panel, elig, sectors, SF, dates,
                     top_secs=(2, 3), top_ns=(top_n,), holds=(15, 20),
                     start_year=2021, per_sec_cap=cap, min_members=min_mem, cooldown=cool,
-                    kdf=KDF, k_skip=k_skip, exit_rule=exit_rule,
                     progress=lambda p, n2: bar3.progress(p, text=n2), **kw)
                 ss["wf"] = (picked, wf); bar3.empty(); gc.collect()
             if ss.get("wf"):
@@ -2317,7 +2004,7 @@ def main():
             _td = keep[d].copy()
             _order = [c for c in ["date", "code", "板块", "买入日", "卖出日",
                                   "买入价(实际)", "卖出价(实际)", "收益率",
-                                  "持有交易日", "出场原因", "期间最高涨幅", "买入K",
+                                  "持有交易日", "买入K",
                                   "买入价(复权)", "卖出价(复权)"]
                       if c in _td.columns]
             if "卖出日" in _td.columns and len(_td):
@@ -2338,7 +2025,6 @@ def main():
                               "板块信号": sig_, "选股规则": sr_, "选几个板块": top_sec,
                               "每次选几只": top_n, "持有交易日": hold,
                               "每几日选一次": every, "冷却交易日": cool,
-                              "出场规则": exit_rule, "跳过K低于": k_skip,
                               "每板块最多几只": cap, "板块数": len(sectors),
                               "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}]
                           ).T.rename(columns={0: "值"})}
@@ -2360,14 +2046,6 @@ def main():
                         tb["07_位置诊断_K分档"] = ss["kbk"]
                     if ss.get("nz") is not None:
                         tb["08_降噪检验"] = ss["nz"]
-                    if ss.get("exitcmp"):
-                        tb["12_出场规则对比"] = ss["exitcmp"]["summary"]
-                        if len(ss["exitcmp"]["why"]):
-                            tb["13_出场原因拆解"] = ss["exitcmp"]["why"]
-                        tb["14_出场规则逐年年化"] = ss["exitcmp"]["yearly"].T
-                    if ss.get("ksens") is not None and len(ss["ksens"][0]):
-                        tb["15_K阈值敏感性"] = ss["ksens"][0]
-                        tb["16_K阈值逐年年化"] = ss["ksens"][1]
                     if ss.get("rankres"):
                         _rr = ss["rankres"]
                         for _k2, _nm2 in (("summary", "09_排名分档_汇总"),
@@ -2447,47 +2125,10 @@ def main():
             st.caption("你只拿 1-3 只，抓到右尾的概率低，**中位收益和胜率比平均收益更贴近真实体验**。")
         st.divider()
 
-        st.markdown("### K阈值敏感性：跳过日线K低的票（带补位）")
-        st.caption(f"同一配置（侧边栏的板块数、只数、冷却、每板块上限、出场规则「{exit_rule}」），"
-                   "只改「跳过K低于多少」，分别跑 不跳过 / 30 / 40 / 50。跳过的名额顺延给板块内后面的名次，"
-                   "凑不满再补回来。**排名分档已经显示前10名看不出差别，所以补位不会被「往深处挖」拖累。**")
-        sig4 = st.selectbox("板块信号", list(SF), key="s4", index=list(SF).index(DEF_SIG))
-        if sig4 not in SF:
-            sig4 = DEF_SIG
-        if st.button("运行K阈值敏感性", type="primary"):
-            with st.spinner("四组阈值各跑一遍…"):
-                ss["ksens"] = k_skip_sensitivity(
-                    panel, elig, sectors, SF[sig4], dates, KDF, top_sec, top_n, cool, cap,
-                    min_mem, hold, exit_rule, **kw)
-                ss["ksens_lab"] = (f"{sig4}｜{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜"
-                                   f"每{every}日｜冷却{cool}｜{exit_rule}")
-                gc.collect()
-        _ks = ss.get("ksens")
-        if _ks is not None and len(_ks[0]):
-            st.caption(f"参数：{ss.get('ksens_lab', '')}")
-            st.dataframe(_ks[0].style.format(
-                {"笔数": "{:.0f}", "资金年化(近似)": "{:+.1%}", "样本内年化": "{:+.1%}",
-                 "样本外年化": "{:+.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
-                 "胜率": "{:.1%}", "补位占比": "{:.1%}"})
-                .background_gradient(subset=["资金年化(近似)"], cmap="RdYlGn"),
-                use_container_width=True)
-            st.dataframe(_ks[1].style.format("{:+.1%}")
-                         .background_gradient(cmap="RdYlGn", axis=None),
-                         use_container_width=True)
-            st.info("**怎么判断能不能用**：40 是看了K分档之后才想到的数，本身带着挑选。"
-                    "要同时满足三条才可信——① 30、40、50 **都**好于不跳过，而且大致平滑，不是只有 40 突出；"
-                    "② 样本内、样本外两段都好于不跳过；③「逐年胜过不跳过」多数年份成立。\n\n"
-                    "满足后在侧边栏把「跳过日线K低于」设成 40，再跑一次第②页对照（会自动加对照D）和滚动前推。"
-                    "「补位占比」是凑不满、只好把K低的票补回来的比例，太高说明整个板块都在跌。")
-        elif _ks is not None:
-            st.warning("样本不足，没有结果。")
-        st.divider()
-
         st.markdown("### 想加任何买入条件，先在这里验")
-        st.warning("**旧结论与新结论**：早期实验里带替补的过滤变差，当时判断是"
-                   "「替补往排名深处挖」造成的。后来的板块内排名分档显示前10名看不出差别，"
-                   "所以补位本身不再是主要污染源。但仍然要**和同配置不过滤直接比**"
-                   "（上面的K阈值敏感性、第②页对照D），不能只看划分结果就决定。")
+        st.warning("**已验证过、不用再试的**：跳过日线K<30/40/50（带补位）三个阈值都不稳定，"
+                   "2023年后全部不如不跳过；高位死叉后1-5天买入反而更好；"
+                   "止损8%/10%与持有到期复利结果几乎相同；各种利润保护（涨后回吐卖出）都明显变差。")
         st.markdown("**正确做法**：把同一批成交按条件劈成两半，不做替补。"
                     "两组笔数加起来等于总数，就没有污染。")
         if not ss.get("res"):
@@ -2498,11 +2139,7 @@ def main():
             pk0, tr0 = pks[base], keep[base]
             cond = st.selectbox("按什么条件划分",
                                 ["板块已霸榜几天（执行时机）",
-                                 "买入日在高位死叉后1-5天", "买入时 K≥75", "买入时 K≥60",
-                                 "买入时 K<40"])
-            if k_skip > 0 and "K" in cond:
-                st.warning(f"侧边栏设了「跳过K<{k_skip}」，第②页第一行的票已经过滤过，"
-                           "按K划分会失真。要看K划分，先把它设回 0、重跑第②页对照。")
+                                 "买入日在高位死叉后1-5天", "买入时 K≥75", "买入时 K≥60"])
             if st.button("运行干净划分", type="primary"):
                 with st.spinner("计算中…"):
                     if cond.startswith("板块已霸榜"):
@@ -2513,8 +2150,6 @@ def main():
                         mk = high_dead_cross_mask(KDF, DDF, 5); ly, ln = "死叉后1-5天", "其他"
                     elif cond == "买入时 K≥75":
                         mk = KDF >= 75; ly, ln = "K≥75", "K<75"
-                    elif cond == "买入时 K<40":
-                        mk = KDF < 40; ly, ln = "K<40", "K≥40"
                     else:
                         mk = KDF >= 60; ly, ln = "K≥60", "K<60"
                     # 旧版这两行缩进在 else 里面，「高位死叉」「K≥75」两个选项
@@ -2596,13 +2231,13 @@ def main():
         # （同一个起点、每 every 日一次、同样的冷却）从头推到今天，名单 = 回测在这一天会选的票。
         if not dates:
             st.warning("数据太短，没有选股日。"); st.stop()
-        lkey = (dkey, sig2, sr2, top_sec, top_n, cap, every, cool, k_skip)
+        lkey = (dkey, sig2, sr2, top_sec, top_n, cap, every, cool)
         if ss.get("live_key") != lkey:
             with st.spinner("按回测日程重放选股（含冷却轮换）…"):
                 ss["live"] = sector_then_stock(panel, elig, sectors, SF[sig2], dates,
                                                top_sec, top_n, sr2, "最强", cooldown=cool,
                                                kdf=KDF, per_sec_cap=cap,
-                                               min_members=min_mem, k_skip=k_skip)
+                                               min_members=min_mem)
                 ss["live_key"] = lkey
         pk_all = ss["live"]
         ld = dates[-1]
@@ -2628,56 +2263,33 @@ def main():
                        "前几个板块的剩余股票可能不够填满名额。")
         nm = basic.set_index("ts_code")["name"].to_dict()
 
-        def _kd(c):
-            k = KDF.loc[d, c] if c in KDF.columns else np.nan
-            dd_ = DDF.loc[d, c] if c in DDF.columns else np.nan
-            if not (pd.notna(k) and pd.notna(dd_)):
-                return None, None, ""
-            return round(float(k), 1), round(float(dd_), 1), ("K>D 上行" if k > dd_ else "K<D 下行")
-
         if not len(pk):
             st.warning("今日无候选。")
         else:
             rows_ = []
             for _, r in pk.iterrows():
-                c = r["code"]; k_, d_, dir_ = _kd(c)
+                c = r["code"]
                 rc = panel["raw_close"].loc[d, c]
                 mv = panel["circ_mv"].loc[:d, c].dropna()
+                kk = KDF.loc[d, c] if c in KDF.columns else np.nan
                 rows_.append({
                     "序": int(r["rank"]), "代码": c, "名称": nm.get(c, ""), "板块": r["板块"],
                     "板块内名次": int(r["板块内名次"]) if pd.notna(r.get("板块内名次")) else None,
                     "20日涨幅(选股日)": f"{r['score']:.1%}",
                     f"收盘价({d:%m-%d})": round(float(rc), 2) if pd.notna(rc) else None,
                     "流通市值(亿)": round(float(mv.iloc[-1]) / 1e4) if len(mv) else None,
-                    "日线K": k_, "日线D": d_, "日线方向": dir_,
-                    "K低补位": "是" if bool(r.get("K低补位", False)) else ""})
+                    "日线K": round(float(kk), 1) if pd.notna(kk) else None})
             out = pd.DataFrame(rows_)
             st.subheader(f"{ld:%Y-%m-%d}　候选名单")
             st.dataframe(out, use_container_width=True, hide_index=True)
             st.download_button("下载 CSV", out.to_csv(index=False).encode("utf-8-sig"),
                                f"picks_{ld:%Y%m%d}.csv", "text/csv")
-            _r = EXIT_RULES.get(exit_rule, {})
-            _parts = []
-            if _r.get("sl"):
-                _parts.append(f"跌到 **买入价×{1 - _r['sl']:.2f}** 就卖")
-            if _r.get("prot"):
-                _pp = _r["prot"]
-                if _pp[0] == "half":
-                    _parts.append(f"最高价到过 **买入价×{1 + _pp[1]:.2f}** 之后，涨幅回吐一半就卖"
-                                  "（例：最高涨过 +16%，回到 +8% 卖）")
-                else:
-                    _parts.append(f"最高价到过 **买入价×{1 + _pp[1]:.2f}** 之后，"
-                                  f"回落到 **买入价×{1 + _pp[2]:.2f}** 就卖")
-            _exit_txt = ("；".join(_parts) + f"；都没触发，第 {hold} 个交易日开盘卖。"
-                         "卖出线按**前一天为止**的最高价算，买入当天不卖（T+1）。"
-                         if _parts else f"**持有 {hold} 个交易日后开盘卖出**，不设止盈止损。")
-            st.info(f"**执行规则（回测口径：{exit_rule}）**：{ld:%Y-%m-%d} 之后的下一个交易日开盘买入；"
-                    f"{_exit_txt}\n\n"
-                    + (f"跳过日线K<{k_skip}的票，名额顺延；「K低补位」=是 表示实在凑不满才补回来的。\n\n"
-                       if k_skip > 0 else "") +
+            st.info(f"**执行规则（回测口径）**：{ld:%Y-%m-%d} 之后的下一个交易日开盘买入，"
+                    f"**持有 {hold} 个交易日后开盘卖出**，不设止盈止损。\n\n"
                     "「板块内名次」是该股在本板块里按20日涨幅的名次；名次靠后说明前面的票在冷却中，"
-                    "名额顺延到了它。「日线K/D/方向」是最新收盘的状态，**仅供参考**——"
-                    "要不要据此不买，先到第③页用「高位死叉后1-5天」做干净划分验证。")
+                    "名额顺延到了它（实测板块内前10名收益看不出差别）。\n\n"
+                    "「日线K」仅供参考：实测跳过K低的票、避开高位死叉的票，都不能提高收益。"
+                    "**看到日线在跌就不买，等于偏离回测口径。**")
 
         # 最近几个选股日的名单 —— 用来确认轮换确实在发生
         if len(pk_all):
