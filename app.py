@@ -21,18 +21,22 @@
 
 本版改动
 --------
+- 第③页新增「绝对动量 · 热点过气」：① 按买入时板块60日动量正负、20日动量排名做干净划分；
+  ② 把「只买60日动量>0的板块」「只买20日动量前8的板块」写成规则与基准对比，
+  按全部资金算年化（空仓记 0），并统计每年空仓周数。
+- sector_then_stock 新增可选 sec_ok（板块许可），默认不启用，选股结果不变。
+
+上一版改动
+----------
 - 第③页新增「板块结构」三个干净划分：买入时板块合格成分股数、板块内60日上涨比例、
   合格数与60日前相比的变化。按同期超额（扣掉同一天全池随机收益）和逐年一致性判断。
 
-上一版改动
+更早的改动
 ----------
 - 侧边栏默认值改为滚动前推六年选中的配置：3个板块、每次3只、每板块最多2只、
   持有20日、每1日选一次、冷却2日，持有到期不止损。
 - 删除已验证无效的内容：跳过日线K（带补位）、止损/利润保护出场规则及其对比页。
 - 保留「资金年化(近似)」：每笔平均收益不能乘笔数。
-
-更早的改动
-----------
 - 「今日候选」按回测完全相同的日程（同起点、每 N 日一次、同样冷却）重放到最新一天，
   名单 = 回测在这一天会选的票。
 - 侧边栏「冷却交易日」：轮换就靠它。
@@ -1021,7 +1025,8 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                       stock_rule: str = "S1_板块内最强",
                       sec_rule: str = "最强", cooldown: int = 5,
                       seed: int = 20260910, kdf: pd.DataFrame = None,
-                      per_sec_cap: int = 0, min_members: int = 5) -> pd.DataFrame:
+                      per_sec_cap: int = 0, min_members: int = 5,
+                      sec_ok: pd.DataFrame = None) -> pd.DataFrame:
     """
     两层选股：先按 sec_fac 选出 top_sec 个板块，再在板块内按 stock_rule 选股。
     sec_rule="随机" 时板块层用随机选择 —— 这是判断"板块层有没有加分"的对照组。
@@ -1030,6 +1035,10 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
     名额顺延给板块内下一名。例：每 3 日选一次 + 冷却 5 日 → 板块和排名不变时，
     名单在「第1-2名」和「第3-4名」之间交替；每 1 日选一次 + 冷却 2 日 → 每天交替。
     冷却 ≤ 选股间隔时冷却不起作用，连续选股日名单会一模一样。
+
+    sec_ok（可选，日期×板块 的 True/False）：只从当天为 True 的板块里选。
+    符合条件的板块不足时就少选，全部不符合就当天不选——不会拿不符合的板块凑数。
+    默认 None = 不限制，与已验证口径完全一致。
     """
     A = panel["adj_close"]
     m20 = (A / A.shift(20) - 1.0)
@@ -1046,6 +1055,13 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
         f = sec_fac.loc[d].dropna()
         if len(f) < top_sec + 1:
             continue
+        if sec_ok is not None:
+            if d not in sec_ok.index:
+                continue
+            _okr = sec_ok.loc[d].reindex(f.index).fillna(False).astype(bool)
+            f = f[_okr.to_numpy()]
+            if not len(f):
+                continue
         if sec_rule == "随机":
             picks_sec = list(rng.choice(f.index, min(top_sec, len(f)), replace=False))
         else:
@@ -1295,6 +1311,197 @@ def sector_structure(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[st
         percentiles=[.1, .25, .5, .75, .9]).T
     res["_dist"] = dist
     return res
+
+
+def _bucket_report(d: pd.DataFrame, key: str, title: str, order: List[str], val: str,
+                   lag: int, hi: List[str], lo: List[str]) -> dict:
+    """同一批成交按 key 分组的汇总 + 逐年 + 「hi 组 − lo 组」逐年对比。"""
+    sub_all = d.dropna(subset=[key])
+    if len(sub_all) < 100:
+        return {}
+    has_pool = "同期超额" in d.columns
+    rows = []
+    for g in order:
+        sub = sub_all[sub_all[key] == g]
+        if not len(sub):
+            continue
+        day = sub.groupby("date")[val].mean().dropna().sort_index()
+        yr = sub.groupby("年")[val].mean()
+        r = {"分组": g, "笔数": len(sub), "占比": len(sub) / len(sub_all),
+             "平均收益": sub["收益率"].mean(), "中位收益": sub["收益率"].median(),
+             "胜率": float((sub["收益率"] > 0).mean()), "资金年化(近似)": cap_annual(sub)}
+        if has_pool:
+            r["同期超额"] = sub["同期超额"].mean()
+        r[f"t(重叠修正,{val})"] = newey_west_t(day, lag)
+        r["覆盖年数"] = len(yr)
+        r["超额为正年数" if has_pool else "为正年数"] = f"{int((yr > 0).sum())}/{len(yr)}"
+        rows.append(r)
+    summ = pd.DataFrame(rows).set_index("分组")
+    yearly = sub_all.pivot_table(index="年", columns=key, values=val, aggfunc="mean")
+    yearly = yearly[[c for c in order if c in yearly.columns]]
+    cnt_y = sub_all.pivot_table(index="年", columns=key, values=val, aggfunc="size")
+    cnt_y = cnt_y.reindex(columns=yearly.columns)
+    # 合并后的两边：同一年两边都至少 20 笔才算一次比较；另给「两边之差」的重叠修正 t
+    verdict = ""
+    H, L = sub_all[sub_all[key].isin(hi)], sub_all[sub_all[key].isin(lo)]
+    if len(H) >= 30 and len(L) >= 30:
+        hy, ly_ = H.groupby("年")[val].agg(["mean", "size"]), L.groupby("年")[val].agg(["mean", "size"])
+        j = hy.join(ly_, lsuffix="_h", rsuffix="_l", how="inner")
+        j = j[(j["size_h"] >= 20) & (j["size_l"] >= 20)]
+        diff = (j["mean_h"] - j["mean_l"])
+        hd = H.groupby("date")[val].mean()
+        ld = L.groupby("date")[val].mean()
+        dd = (hd - ld).dropna().sort_index()          # 两边在同一天都有成交的日子
+        t_d = newey_west_t(dd, lag) if len(dd) >= 30 else np.nan
+        hn, ln_ = "、".join(hi), "、".join(lo)
+        verdict = (f"「{hn}」减「{ln_}」：平均 {H[val].mean() - L[val].mean():+.2%}；"
+                   + (f"{len(diff)} 个两边都有足够笔数的年份里 {int((diff > 0).sum())} 年为正；"
+                      if len(diff) else "")
+                   + (f"同一天两边都有成交的 {len(dd)} 天，差值 t={t_d:.2f}。"
+                      if pd.notna(t_d) else "同一天两边都有成交的日子太少，无法算差值 t。"))
+    return {"title": title, "summary": summ, "yearly": yearly, "yearly_n": cnt_y,
+            "verdict": verdict, "val": val}
+
+
+def sector_state_splits(SF: Dict[str, pd.DataFrame], tr: pd.DataFrame,
+                        pool_tr: pd.DataFrame = None, hold: int = 20,
+                        step_days: int = 1) -> dict:
+    """
+    两个干净划分（同一批成交、不做替补），都只用买入决策当天收盘及以前的数据：
+
+      绝对动量：买入当天所在板块的60日动量是正还是负。
+                检验「整个股票池都在跌时，选出的'跌得最少'的板块」是否更差。
+      热点过气：买入当天所在板块的20日动量在全部板块里排第几。
+                检验「60日动量还靠前、但20日已经掉到后面」的板块是否更差。
+    """
+    if tr is None or not len(tr) or "板块" not in tr.columns:
+        return {}
+    M60 = SF.get("板块60日动量")
+    M20 = SF.get("板块20日动量")
+    if M60 is None or M20 is None:
+        return {}
+    R20 = M20.rank(axis=1, ascending=False, method="min")
+    d = tr.dropna(subset=["收益率"]).copy()
+    d["date"] = pd.to_datetime(d["date"])
+
+    def look(M):
+        out = []
+        for dt_, sec in zip(d["date"], d["板块"]):
+            try:
+                out.append(float(M.at[dt_, sec]))
+            except Exception:
+                out.append(np.nan)
+        return np.array(out, dtype=float)
+
+    v60, r20 = look(M60), look(R20)
+    ab = ["低于-10%", "-10%~0", "0~+10%", "高于+10%"]
+    d["绝对动量"] = np.select([v60 < -0.10, v60 <= 0, v60 <= 0.10, v60 > 0.10], ab, default=None)
+    d.loc[~np.isfinite(v60), "绝对动量"] = None
+    rb = ["20日排名前3", "20日排名4-8", "20日排名9名以后"]
+    d["热点过气"] = np.select([r20 <= 3, r20 <= 8, r20 > 8], rb, default=None)
+    d.loc[~np.isfinite(r20), "热点过气"] = None
+
+    has_pool = pool_tr is not None and len(pool_tr)
+    if has_pool:
+        pm = pool_tr.dropna(subset=["收益率"]).assign(date=lambda x: pd.to_datetime(x["date"]))
+        d["同期超额"] = d["收益率"] - d["date"].map(pm.groupby("date")["收益率"].mean())
+    d["年"] = d["date"].dt.year
+    lag = max(1, int(np.ceil(hold / max(step_days, 1))))
+    val = "同期超额" if has_pool else "收益率"
+    res = {}
+    r1 = _bucket_report(d, "绝对动量", "买入时所在板块的60日动量", ab, val, lag,
+                        hi=ab[2:], lo=ab[:2])
+    if r1:
+        res["绝对动量"] = r1
+    r2 = _bucket_report(d, "热点过气", "买入时所在板块的20日动量排名（全部板块中）", rb, val, lag,
+                        hi=rb[:2], lo=rb[2:])
+    if r2:
+        res["热点过气"] = r2
+    return res
+
+
+def sector_rule_test(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
+                     SF: Dict[str, pd.DataFrame], sig: str, dates: List[pd.Timestamp],
+                     top_sec: int, top_n: int, cooldown: int, per_sec_cap: int,
+                     min_members: int, hold: int, kdf: pd.DataFrame = None,
+                     cut: str = "2023-01-01", **kw) -> dict:
+    """
+    把两个想法写成规则，和基准用同一配置对比：
+      绝对动量  ：只从60日动量 > 0 的板块里选；不够就少买，一个都没有就空仓。
+      热点未过气：只从20日动量排在全部板块前8名的板块里选（永远有候选）。
+    阈值 0 和 前8 是事先定的，没有在数据上挑。
+
+    年化有两种算法：
+      按全部资金：空着的仓位收益记 0，分母用基准的总持有天数 —— 这是你账户真实会看到的；
+      按实际持仓：只算买了的那些钱 —— 只说明「买的票好不好」。
+    空仓少买时这两个会差很多，要看前者。
+    """
+    M60, M20 = SF["板块60日动量"], SF["板块20日动量"]
+    R20 = M20.rank(axis=1, ascending=False, method="min")
+    rules = {"基准（不限制）": None,
+             "绝对动量：只买60日动量>0的板块": (M60 > 0),
+             "热点未过气：只买20日动量前8的板块": (R20 <= 8)}
+    c = pd.Timestamp(cut)
+    trs, pks = {}, {}
+    for nm, ok in rules.items():
+        pk = sector_then_stock(panel, elig, sectors, SF[sig], dates, top_sec, top_n,
+                               "S1_板块内最强", "最强", cooldown=cooldown, kdf=kdf,
+                               per_sec_cap=per_sec_cap, min_members=min_members, sec_ok=ok)
+        pks[nm] = pk
+        t = track_fixed(pk, panel, hold, **kw) if len(pk) else pd.DataFrame()
+        if len(t):
+            t = t.dropna(subset=["收益率"]).copy()
+            t["年"] = pd.to_datetime(t["date"]).dt.year
+        trs[nm] = t
+    base_nm = list(rules)[0]
+    base = trs[base_nm]
+    if not len(base):
+        return {}
+    bdays_y = base.groupby("年")["持有交易日"].sum()
+    bdays = float(base["持有交易日"].sum())
+    b_in = float(base.loc[pd.to_datetime(base["date"]) < c, "持有交易日"].sum())
+    b_out = bdays - b_in
+
+    def full_ann(t, denom):
+        if not denom or denom <= 0:
+            return np.nan
+        return float(t["收益率"].sum() / denom * 244) if len(t) else 0.0   # 空仓 = 收益 0
+
+    # 空仓周：某一周所有选股日都一只没选
+    grid = pd.DataFrame({"date": pd.to_datetime(pd.Index(dates))})
+    iso = grid["date"].dt.isocalendar()
+    grid["周"] = iso["year"].astype(str) + "-" + iso["week"].astype(str).str.zfill(2)
+    grid["年"] = grid["date"].dt.year
+    rows, yrows, erows = [], {}, {}
+    for nm, t in trs.items():
+        pk = pks[nm]
+        npk = pk.groupby("date").size() if len(pk) else pd.Series(dtype=float)
+        g = grid.copy()
+        g["只数"] = g["date"].map(npk).fillna(0)
+        wk = g.groupby(["年", "周"])["只数"].sum()
+        empty_w = (wk == 0).groupby(level=0).sum()
+        erows[nm] = empty_w
+        ty = pd.Series({y: full_ann(t[t["年"] == y] if len(t) else t, bdays_y[y])
+                        for y in bdays_y.index})
+        yrows[nm] = ty
+        cmp_ = (ty - yrows[base_nm].reindex(ty.index)).dropna() if nm != base_nm else pd.Series(dtype=float)
+        tin = t[pd.to_datetime(t["date"]) < c] if len(t) else t
+        tout = t[pd.to_datetime(t["date"]) >= c] if len(t) else t
+        rows.append({"规则": nm, "笔数": len(t), "相当于基准的仓位": len(t) / len(base),
+                     "年化(按全部资金)": full_ann(t, bdays),
+                     "样本内(按全部资金)": full_ann(tin, b_in),
+                     "样本外(按全部资金)": full_ann(tout, b_out),
+                     "逐年胜过基准": "-" if nm == base_nm else f"{int((cmp_ > 0).sum())}/{len(cmp_)}",
+                     "年化(按实际持仓)": cap_annual(t),
+                     "平均收益": t["收益率"].mean() if len(t) else np.nan,
+                     "中位收益": t["收益率"].median() if len(t) else np.nan,
+                     "胜率": float((t["收益率"] > 0).mean()) if len(t) else np.nan,
+                     "少于满额的选股日": float((g["只数"] < top_n).mean()),
+                     "每年空仓周(平均)": float(empty_w.mean()) if len(empty_w) else 0.0,
+                     "每年空仓周(最多)": int(empty_w.max()) if len(empty_w) else 0})
+    return {"summary": pd.DataFrame(rows).set_index("规则"),
+            "yearly": pd.DataFrame(yrows),
+            "empty": pd.DataFrame(erows).fillna(0).astype(int)}
 
 
 def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
@@ -1735,7 +1942,7 @@ def main():
             n = clear_day_cache()
             for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
                        "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf",
-                       "rankres", "live", "live_key", "struct"):
+                       "rankres", "live", "live_key", "struct", "hot", "hotrule"):
                 ss.pop(kk, None)
             gc.collect()
             st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
@@ -1758,7 +1965,8 @@ def main():
             if kk != "panel" or True:
                 pass
         for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
-                   "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key", "struct"):
+                   "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key", "struct",
+                   "hot", "hotrule"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -1975,6 +2183,7 @@ def main():
             ss["res_lab"] = (f"{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜持有{hold}日｜"
                              f"每{every}日选｜冷却{cool}日")
             ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("struct", None)
+            ss.pop("hot", None); ss.pop("hotrule", None)
             bar.empty(); gc.collect()
 
         if ss.get("res"):
@@ -2175,6 +2384,14 @@ def main():
                                 continue
                             tb[f"{_num.get(_k3, '15')}_板块结构_{_k3}_汇总"] = _v3["summary"]
                             tb[f"{_num.get(_k3, '15')}_板块结构_{_k3}_逐年"] = _v3["yearly"]
+                    if ss.get("hot"):
+                        for _k4, _v4 in ss["hot"].items():
+                            tb[f"15_{_k4}_划分汇总"] = _v4["summary"]
+                            tb[f"15_{_k4}_划分逐年"] = _v4["yearly"]
+                    if ss.get("hotrule"):
+                        tb["16_规则对比_汇总"] = ss["hotrule"]["summary"]
+                        tb["16_规则对比_逐年年化"] = ss["hotrule"]["yearly"]
+                        tb["16_规则对比_每年空仓周"] = ss["hotrule"]["empty"]
                     if ss.get("rankres"):
                         _rr = ss["rankres"]
                         for _k2, _nm2 in (("summary", "09_排名分档_汇总"),
@@ -2317,6 +2534,84 @@ def main():
                         st.dataframe(_sr["_dist"].style.format("{:.2f}"), use_container_width=True)
                 st.warning("**只看这里不改规则。** 就算某个划分看起来有效，也是在全样本上看出来的。"
                            "要用它，得先定成明确的规则（比如「板块最少成分股改成8」），再跑第②页对照和滚动前推。")
+        st.divider()
+
+        st.markdown("### 绝对动量 · 热点过气")
+        st.caption("两步一起跑：**① 干净划分**——第②页「两层」方案的同一批成交，按买入当天所在板块的"
+                   "60日动量正负、20日动量排名分组，不做替补；**② 规则对比**——把两个想法写成规则"
+                   "（只买60日动量>0的板块 / 只买20日动量前8的板块），和基准用同一配置各跑一遍，"
+                   "并统计每年空仓几周。阈值 0 和 前8 是事先定的。")
+        if not ss.get("res"):
+            st.info("先到「② 主回测」跑一次对照实验。")
+        else:
+            if st.button("运行绝对动量和热点过气检验", type="primary"):
+                _df5, _keep5, _pks5, _sig5, _ = ss["res"]
+                _base5 = list(_keep5)[0]
+                _pool5 = next((v for k, v in _keep5.items() if str(k).startswith("对照C")), None)
+                with st.spinner("① 划分同一批成交…"):
+                    ss["hot"] = sector_state_splits(SF, _keep5[_base5], _pool5,
+                                                    hold=hold, step_days=every)
+                with st.spinner("② 三条规则各跑一遍（约半分钟）…"):
+                    ss["hotrule"] = sector_rule_test(
+                        panel, elig, sectors, SF, _sig5, dates, top_sec, top_n, cool, cap,
+                        min_mem, hold, kdf=KDF, **kw)
+                ss["hot_lab"] = ss.get("res_lab", "")
+                gc.collect()
+            _h = ss.get("hot")
+            _hr = ss.get("hotrule")
+            if _h is not None or _hr is not None:
+                st.caption(f"口径：{ss.get('hot_lab', '')}")
+            _fmt5 = {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                     "胜率": "{:.1%}", "资金年化(近似)": "{:+.1%}", "同期超额": "{:+.2%}",
+                     "覆盖年数": "{:.0f}"}
+            _ex5 = {"绝对动量": "看「0~+10%、高于+10%」是否明显好于「低于-10%、-10%~0」。"
+                              "如果60日动量为负的板块明显更差，「只买正动量板块」才有意义。",
+                    "热点过气": "看「20日排名9名以后」是否明显差于前面两组。"
+                              "如果差不多，说明60日强、20日已转弱的板块并不比其他的差，热点转换不需要追。"}
+            if _h:
+                st.markdown("**① 干净划分**")
+                for _k5 in ("绝对动量", "热点过气"):
+                    if _k5 not in _h:
+                        continue
+                    _v5 = _h[_k5]
+                    st.markdown(f"*{_v5['title']}*")
+                    _sm5 = _v5["summary"]
+                    _tc5 = [c for c in _sm5.columns if c.startswith("t(")]
+                    st.dataframe(_sm5.style.format({**_fmt5, **{c: "{:.2f}" for c in _tc5}})
+                                 .background_gradient(subset=["同期超额"] if "同期超额" in _sm5.columns
+                                                      else ["平均收益"], cmap="RdYlGn"),
+                                 use_container_width=True)
+                    st.caption((_v5["verdict"] + "　" if _v5["verdict"] else "") + _ex5[_k5])
+                    with st.expander(f"逐年{_v5['val']}（{_k5}）"):
+                        st.dataframe(_v5["yearly"].style.format("{:+.2%}")
+                                     .background_gradient(cmap="RdYlGn", axis=None),
+                                     use_container_width=True)
+                        st.dataframe(_v5["yearly_n"].fillna(0).astype(int), use_container_width=True)
+                        st.caption("下表是每年各组笔数，少于 20 的格子基本是噪音。")
+            elif _h is not None:
+                st.warning("① 样本不足，没有结果。")
+            if _hr:
+                st.markdown("**② 规则对比（同一配置，只改允许选哪些板块）**")
+                st.dataframe(_hr["summary"].style.format(
+                    {"笔数": "{:.0f}", "相当于基准的仓位": "{:.0%}", "年化(按全部资金)": "{:+.1%}",
+                     "样本内(按全部资金)": "{:+.1%}", "样本外(按全部资金)": "{:+.1%}",
+                     "年化(按实际持仓)": "{:+.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                     "胜率": "{:.1%}", "少于满额的选股日": "{:.0%}",
+                     "每年空仓周(平均)": "{:.1f}", "每年空仓周(最多)": "{:.0f}"})
+                    .background_gradient(subset=["年化(按全部资金)"], cmap="RdYlGn"),
+                    use_container_width=True)
+                st.info("**看「年化(按全部资金)」**：空着的仓位收益记 0，这才是账户真实会看到的。"
+                        "「按实际持仓」只说明买到的票好不好——空仓越多，它越容易虚高。\n\n"
+                        "一条规则要算有用，需要：按全部资金的年化好于基准，**样本内、样本外两段都好于基准**，"
+                        "「逐年胜过基准」多数年份成立；绝对动量还要看「每年空仓周(最多)」是否在你能接受的范围内"
+                        "（你的要求是每年不超过 5 周）。")
+                with st.expander("逐年年化（按全部资金）和每年空仓周数"):
+                    st.dataframe(_hr["yearly"].T.style.format("{:+.1%}")
+                                 .background_gradient(cmap="RdYlGn", axis=None),
+                                 use_container_width=True)
+                    st.dataframe(_hr["empty"].T, use_container_width=True)
+            elif _hr is not None:
+                st.warning("② 没有结果。")
         st.divider()
 
         st.markdown("### 想加任何买入条件，先在这里验")
