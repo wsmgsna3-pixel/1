@@ -21,6 +21,10 @@
 
 本版改动
 --------
+- 修正持仓模拟：上一版从数据最早一段开始，那时名单经常为空，几份资金会在第一个
+  有票的日子同时买入，此后同进同出，「错开入场」失效，20个起点几乎是同一条路径。
+  现在从名单稳定有票的日子开始，并显示「同日入场占比」用来核对。
+
 - 侧边栏新增开关「跳过高出30日线30%以上的票（顺延补位）」，默认关闭；
   打开后第②页对照、滚动前推、今日候选都按它执行。
 - 第③页新增「按你的实际持仓模拟」：同时只持有N只（默认3只），卖一只买一只，
@@ -1779,7 +1783,7 @@ def stock_snapshot(mine: pd.DataFrame, panel: dict, BIAS: pd.DataFrame, KDF: pd.
 
 
 def holding_sim(pk: pd.DataFrame, panel: dict, dates: List[pd.Timestamp], n_hold: int = 3,
-                hold: int = 20, every: int = 1, **kw) -> dict:
+                hold: int = 20, every: int = 1, start_idx: int = 0, **kw) -> dict:
     """
     按「同时只持有 n_hold 只」模拟账户（贴近实盘）：
       资金分 n_hold 份，每份同一时间只拿 1 只股票，各份错开入场；
@@ -1787,6 +1791,11 @@ def holding_sim(pk: pd.DataFrame, panel: dict, dates: List[pd.Timestamp], n_hold
       名单为空或全都已持有，这一份就拿现金等下一天。
     不同的开始日期结果不同，全部算出来看中位和最差——只拿几只时，运气成分很大。
     另外统计「两只同时大亏」：持有期间有重叠的两笔交易，都亏损超过20%，算一次。
+
+    start_idx：从名单稳定有票的那天开始。数据最早一段可用板块太少、常常空名单，
+    如果从那里开始，几份资金会在第一个有票的日子同时买入，此后一直同进同出，
+    「错开入场」就失效了（上一版就是这个问题）。
+    「同日入场占比」用来检查这一点：接近 0 说明各份确实错开，接近 1 说明同进同出。
     """
     tr, _, _ = track_delayed(pk, panel, hold, None, 20, **kw)
     if not len(tr):
@@ -1797,11 +1806,11 @@ def holding_sim(pk: pd.DataFrame, panel: dict, dates: List[pd.Timestamp], n_hold
     by_day = {d: g.sort_values("rank") for d, g in tr.groupby("date")}
     Hg = max(1, int(np.ceil(hold / max(every, 1))))
     gap = max(1, Hg // n_hold)
-    yrs = max((grid[-1] - grid[0]).days / 365.25, 0.5)
-    paths, finals, dds, taken_all, pair_cnt, curve0 = [], [], [], [], [], None
+    yrs = max((grid[-1] - grid[min(start_idx, n - 1)]).days / 365.25, 0.5)
+    paths, finals, dds, taken_all, pair_cnt, curve0, syncs = [], [], [], [], [], None, []
     for s0 in range(Hg):
         val = np.full(n_hold, 1.0 / n_hold)
-        nxt = {j: s0 + j * gap for j in range(n_hold)}
+        nxt = {j: start_idx + s0 + j * gap for j in range(n_hold)}
         held, pending, eq, taken = {}, {}, [], []
         for i in range(n):
             for j, f in pending.pop(i, []):
@@ -1846,9 +1855,11 @@ def holding_sim(pk: pd.DataFrame, panel: dict, dates: List[pd.Timestamp], n_hold
                         cnt += 1
             T["起点"] = s0
             taken_all.append(T)
+            _c = T.groupby("date")["份"].transform("size")
+            syncs.append(float((_c >= 2).mean()))
         pair_cnt.append(cnt)
         if s0 == 0:
-            curve0 = pd.Series(ev, index=grid)
+            curve0 = pd.Series(ev, index=grid).iloc[start_idx:]
     f = np.array(finals)
     TT = pd.concat(taken_all, ignore_index=True) if taken_all else pd.DataFrame()
     return {"最终倍数(中位)": float(np.median(f)), "最终倍数(最差)": float(f.min()),
@@ -1861,6 +1872,7 @@ def holding_sim(pk: pd.DataFrame, panel: dict, dates: List[pd.Timestamp], n_hold
             "单笔胜率": float((TT["收益率"] > 0).mean()) if len(TT) else np.nan,
             "两只同时大亏次数(中位)": float(np.median(pair_cnt)),
             "两只同时大亏次数(最多)": int(max(pair_cnt)) if pair_cnt else 0,
+            "同日入场占比": float(np.mean(syncs)) if syncs else np.nan,
             "_curve": curve0}
 
 
@@ -1871,12 +1883,26 @@ def holding_compare(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str
                     **kw) -> dict:
     """同一配置两份名单：不跳过 / 跳过高出30日线30%以上（顺延补位），都按「同时只持有 n_hold 只」模拟。"""
     lists = {"不跳过": None, "跳过高出30日线30%以上（顺延补位）": (BIAS >= 0.30).fillna(False)}
+    pks = {nm: sector_then_stock(panel, elig, sectors, sec_fac, dates, top_sec, top_n,
+                                 "S1_板块内最强", "最强", cooldown=cooldown, kdf=kdf,
+                                 per_sec_cap=per_sec_cap, min_members=min_members, skip_mask=m)
+           for nm, m in lists.items()}
+    # 共同起点：此后连续 60 个选股日，两份名单每天都至少有 n_hold 只
+    ok = np.ones(len(dates), dtype=bool)
+    for pk in pks.values():
+        cnt_ = pk.groupby("date").size() if len(pk) else pd.Series(dtype=float)
+        ok &= (pd.Series(list(dates)).map(cnt_).fillna(0).to_numpy() >= n_hold)
+    win, start_idx = 60, 0
+    run = 0
+    for i in range(len(ok)):
+        run = run + 1 if ok[i] else 0
+        if run >= win:
+            start_idx = i - win + 1
+            break
     rows, curves = [], {}
     for nm, m in lists.items():
-        pk = sector_then_stock(panel, elig, sectors, sec_fac, dates, top_sec, top_n,
-                               "S1_板块内最强", "最强", cooldown=cooldown, kdf=kdf,
-                               per_sec_cap=per_sec_cap, min_members=min_members, skip_mask=m)
-        r = holding_sim(pk, panel, dates, n_hold, hold, every, **kw)
+        pk = pks[nm]
+        r = holding_sim(pk, panel, dates, n_hold, hold, every, start_idx=start_idx, **kw)
         if not r:
             continue
         c = r.pop("_curve")
@@ -1885,7 +1911,8 @@ def holding_compare(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str
             curves[nm] = c
     if not rows:
         return {}
-    return {"summary": pd.DataFrame(rows).set_index("名单"), "curves": pd.DataFrame(curves)}
+    return {"summary": pd.DataFrame(rows).set_index("名单"), "curves": pd.DataFrame(curves),
+            "start": pd.Timestamp(list(dates)[start_idx])}
 
 
 def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
@@ -2217,7 +2244,7 @@ def _st(tr: pd.DataFrame) -> dict:
             "聚类t(朴素)": day.mean() / se if se > 1e-12 else np.nan}
 
 
-APP_VERSION = "2026-09-25 · 持仓模拟版"
+APP_VERSION = "2026-09-25 · 持仓模拟修正版"
 
 
 def main():
@@ -2972,8 +2999,12 @@ def main():
                  "复利年化(中位)": "{:+.1%}", "最大回撤(中位)": "{:.0%}", "最大回撤(最差)": "{:.0%}",
                  "每条路径笔数": "{:.0f}", "单笔亏损超20%的比例": "{:.1%}",
                  "持有中浮亏超20%的比例": "{:.1%}", "单笔胜率": "{:.1%}",
-                 "两只同时大亏次数(中位)": "{:.0f}", "两只同时大亏次数(最多)": "{:.0f}"}),
+                 "两只同时大亏次数(中位)": "{:.0f}", "两只同时大亏次数(最多)": "{:.0f}",
+                 "同日入场占比": "{:.0%}"}),
                 use_container_width=True)
+            if "start" in _hs:
+                st.caption(f"模拟从 {_hs['start']:%Y-%m-%d} 开始（此后名单稳定有票）。"
+                           "「同日入场占比」接近 0 说明几份资金确实错开买入；接近 100% 说明同进同出，结果不可信。")
             _sm = _hs["summary"]
             try:
                 st.markdown(
