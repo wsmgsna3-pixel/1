@@ -21,6 +21,14 @@
 
 本版改动
 --------
+- 第②页新增「账户净值模拟（真实复利）」：分1份/4份/每天一份入场，给出复利倍数、
+  最大回撤（中位与最差起点）、回撤起止日期和逐年复利收益。
+- 第③页新增「日线SKDJ下跌趋势」检验：从75上方跌下来、死叉后一直没金叉、K和D都在75下方。
+  ① 干净划分；② 基准 / 剔除不补位（实盘做法）/ 剔除顺延补位 三种做法，按复利和回撤比较。
+- 第④页候选表和「候选股事后表现」加「日线SKDJ」一列，标出处在下跌趋势的票，用来核对定义。
+
+更早的改动
+----------
 - 第④页新增「候选股事后表现」：过去 N 个选股日的全部候选，按回测口径算收益
   （已满20日的与回测逐笔一致，未满的按最新收盘算浮动）；可粘贴自己的实盘记录，
   自动比较「你选中的」和「同一天没选中的」。
@@ -997,6 +1005,25 @@ def daily_k(panel: dict, n: int = 9, m: int = 3) -> pd.DataFrame:
     return daily_kd(panel, n, m)[0]
 
 
+def skdj_downtrend_mask(K: pd.DataFrame, D: pd.DataFrame, level: float = 75.0,
+                        look: int = 10) -> pd.DataFrame:
+    """
+    「日线 SKDJ 从 75 上方跌下来、一直在跌」的状态，逐日逐股 True/False，只用当天及以前的数据：
+      ① 当前处在死叉状态（K < D），而且这段死叉开始前的 look 个交易日内 K 曾经 ≥ level
+         （= 从高位跌下来的那次死叉）；
+      ② 死叉以来一直没有金叉（中间只要 K 重新上穿 D，这段就结束）；
+      ③ 当天 K 和 D 都已经跌到 level 以下。
+    刚死叉、K 还在 75 上方的头几天不算（那一段之前验证过，反而更好）。
+    """
+    below = (K < D)
+    below_prev = below.shift(1).fillna(False).astype(bool)
+    cross = below & ~below_prev                                   # 死叉那天
+    was_high = K.rolling(look, min_periods=1).max().shift(1) >= level
+    start_high = (cross & was_high).astype(float).where(cross)   # 只在死叉那天有值
+    state = start_high.ffill().where(below, 0.0).fillna(0.0) > 0.5
+    return state & (K < level) & (D < level)
+
+
 STOCK_RULES = ["S1_板块内最强", "S2_板块内最弱(回调)", "S3_板块内随机"]
 
 
@@ -1010,7 +1037,8 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
                       stock_rule: str = "S1_板块内最强",
                       sec_rule: str = "最强", cooldown: int = 5,
                       seed: int = 20260910, kdf: pd.DataFrame = None,
-                      per_sec_cap: int = 0, min_members: int = 5) -> pd.DataFrame:
+                      per_sec_cap: int = 0, min_members: int = 5,
+                      skip_mask: pd.DataFrame = None) -> pd.DataFrame:
     """
     两层选股：先按 sec_fac 选出 top_sec 个板块，再在板块内按 stock_rule 选股。
     sec_rule="随机" 时板块层用随机选择 —— 这是判断"板块层有没有加分"的对照组。
@@ -1019,6 +1047,9 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
     名额顺延给板块内下一名。例：每 3 日选一次 + 冷却 5 日 → 板块和排名不变时，
     名单在「第1-2名」和「第3-4名」之间交替；每 1 日选一次 + 冷却 2 日 → 每天交替。
     冷却 ≤ 选股间隔时冷却不起作用，连续选股日名单会一模一样。
+
+    skip_mask（可选）：当天为 True 的股票直接跳过，名额顺延给后面的名次；
+    跳过的票不补回来，前几个板块凑不满就少选。默认 None，结果与已验证口径完全一致。
     """
     A = panel["adj_close"]
     m20 = (A / A.shift(20) - 1.0)
@@ -1061,6 +1092,7 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
         taken = 0
         used: Dict[str, int] = {}
         krow = kdf.loc[d] if (kdf is not None and d in kdf.index) else None
+        srow = skip_mask.loc[d] if (skip_mask is not None and d in skip_mask.index) else None
         for s, c, sc, rk in cand:
             if taken >= top_n:
                 break
@@ -1069,6 +1101,8 @@ def sector_then_stock(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[s
             # 候选是按板块顺序排的（最强板块的股票全部在前）。
             # per_sec_cap>0 则每个板块最多取这么多只，剩下的名额轮到下一个板块。
             if per_sec_cap > 0 and used.get(s, 0) >= per_sec_cap:
+                continue
+            if srow is not None and c in srow.index and bool(srow[c]):
                 continue
             used[s] = used.get(s, 0) + 1
             kv = float(krow[c]) if (krow is not None and c in krow.index) else np.nan
@@ -1279,6 +1313,168 @@ def match_my_trades(hist: pd.DataFrame, mine: pd.DataFrame) -> pd.Series:
             hit = (c6 == m["代码6位"]) & (pd.to_datetime(hist["买入日"]) == m["日期"])
         flag |= hit
     return flag
+
+
+def account_sim(tr: pd.DataFrame, dates: List[pd.Timestamp], hold: int = 20,
+                every: int = 1, tranches=(1, 4, 0)) -> dict:
+    """
+    账户净值模拟（真实复利）：资金分成 k 份，每份隔 gap 个选股日入场，
+    买入当天名单（名单里有几只就平分几只），持有 hold 日后卖出，收回的钱立刻买当天的新名单。
+    k=0 表示「每个选股日都投一份」（≈ 回测里的满仓轮动）。
+    某天名单为空（例如被过滤掉），那一份就拿现金等到下一轮。
+    k 份不同的起始日会给出不同的结果，全部算出来看中位和最差——
+    这就是「什么时候开始」的运气成分。
+    """
+    if tr is None or not len(tr):
+        return {}
+    H = max(1, int(round(hold / max(every, 1))))
+    dts = list(dates)
+    basket = tr.dropna(subset=["收益率"]).groupby("date")["收益率"].mean()
+    r = pd.Series(dts, index=dts).map(basket).fillna(0.0).to_numpy()
+    n = len(r)
+    yrs = max((dts[-1] - dts[0]).days / 365.25, 0.5)
+    out, curve = [], None
+    for k in tranches:
+        kk = H if k == 0 else k
+        gap = max(1, H // kk)
+        finals, dds, paths = [], [], []
+        for s0 in range(gap):
+            vals = np.full(kk, 1.0 / kk)
+            eq_v = []
+            # 净值在每份到期卖出时结算；持仓中的浮亏不计入，真实回撤会更深一些
+            nxt = {s0 + j * gap: j for j in range(kk)}          # 入场日 -> 份号
+            pend = {}
+            for i in range(n):
+                if i in pend:                                   # 到期结算
+                    j, ri = pend.pop(i)
+                    vals[j] *= 1.0 + ri
+                    nxt[i] = j
+                if i in nxt:                                    # 入场
+                    j = nxt.pop(i)
+                    if i + H < n:
+                        pend[i + H] = (j, r[i])
+                eq_v.append(vals.sum())
+            ev = np.array(eq_v)
+            finals.append(ev[-1])
+            dds.append(float((ev / np.maximum.accumulate(ev) - 1.0).min()))
+            paths.append(ev)
+        f = np.array(finals)
+        lab = "每个选股日投一份（≈回测）" if k == 0 else f"分{kk}份，每{gap}个选股日投一份"
+        if kk == 1:
+            lab = f"一次全仓，每{H}个选股日换一次"
+        out.append({"入场方式": lab, "起始日数": len(f),
+                    "最终倍数(中位)": float(np.median(f)), "最终倍数(最差)": float(f.min()),
+                    "最终倍数(最好)": float(f.max()),
+                    "复利年化(中位)": float(np.median(f) ** (1 / yrs) - 1),
+                    "最大回撤(中位)": float(np.median(dds)), "最大回撤(最差)": float(min(dds))})
+        if k == 0:
+            curve = pd.Series(paths[0], index=pd.DatetimeIndex(dts))
+    res = {"summary": pd.DataFrame(out).set_index("入场方式")}
+    if curve is not None:
+        dd = curve / curve.cummax() - 1.0
+        tr_ = dd.idxmin(); pk = curve[:tr_].idxmax()
+        rec = curve[tr_:][curve[tr_:] >= curve[pk]]
+        res.update({"curve": curve, "dd": dd, "peak": pk, "trough": tr_,
+                    "recover": rec.index[0] if len(rec) else None,
+                    "yearly": curve.groupby(curve.index.year).last().pct_change()
+                    .fillna(curve.groupby(curve.index.year).last().iloc[0] - 1.0)})
+    return res
+
+
+def skdj_filter_test(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
+                     sec_fac: pd.DataFrame, dates: List[pd.Timestamp], mask: pd.DataFrame,
+                     base_pk: pd.DataFrame, base_tr: pd.DataFrame, pool_tr: pd.DataFrame,
+                     top_sec: int, top_n: int, cooldown: int, per_sec_cap: int,
+                     min_members: int, hold: int, every: int, kdf: pd.DataFrame = None,
+                     cut: str = "2023-01-01", **kw) -> dict:
+    """
+    SKDJ 下跌趋势过滤的检验：
+      ① 干净划分：同一批成交按「买入决策当天是否处在下跌趋势」分两组，不替补；
+      ② 三种做法对比，都按全部资金（空着的钱收益记 0）和真实复利的账户净值来比：
+         基准            —— 名单全买；
+         剔除，不补位    —— 名单不变，下跌趋势的票不买，钱空着（= 你实盘的做法）；
+         剔除，顺延补位  —— 下跌趋势的票跳过，名额给板块内后面的名次。
+    """
+    c = pd.Timestamp(cut)
+    lag = max(1, int(np.ceil(hold / max(every, 1))))
+
+    def flag(df):
+        out = []
+        for dt_, cc in zip(df["date"], df["code"]):
+            try:
+                out.append(bool(mask.at[dt_, cc]))
+            except Exception:
+                out.append(False)
+        return np.array(out, dtype=bool)
+
+    bt = base_tr.dropna(subset=["收益率"]).copy()
+    bt["下跌趋势"] = flag(bt)
+    if pool_tr is not None and len(pool_tr):
+        pm = pool_tr.dropna(subset=["收益率"]).groupby("date")["收益率"].mean()
+        bt["同期超额"] = bt["收益率"] - bt["date"].map(pm)
+    bt["年"] = pd.to_datetime(bt["date"]).dt.year
+    val = "同期超额" if "同期超额" in bt.columns else "收益率"
+    rows = []
+    for lab, sub in (("下跌趋势（你不会买的）", bt[bt["下跌趋势"]]), ("其他", bt[~bt["下跌趋势"]])):
+        if not len(sub):
+            continue
+        day = sub.groupby("date")[val].mean().dropna().sort_index()
+        yr = sub.groupby("年")[val].mean()
+        rows.append({"分组": lab, "笔数": len(sub), "占比": len(sub) / len(bt),
+                     "平均收益": sub["收益率"].mean(), "中位收益": sub["收益率"].median(),
+                     "胜率": float((sub["收益率"] > 0).mean()),
+                     "20日内最惨10%": sub["收益率"].quantile(0.10),
+                     val: sub[val].mean(), f"t(重叠修正,{val})": newey_west_t(day, lag),
+                     "为正年数": f"{int((yr > 0).sum())}/{len(yr)}"})
+    split = pd.DataFrame(rows).set_index("分组")
+    yearly_split = bt.pivot_table(index="年", columns="下跌趋势", values=val, aggfunc="mean")
+    yearly_split = yearly_split.rename(columns={True: "下跌趋势", False: "其他"})
+
+    # 三种做法
+    v_drop = bt[~bt["下跌趋势"]].drop(columns=["下跌趋势"])
+    pk_sub = sector_then_stock(panel, elig, sectors, sec_fac, dates, top_sec, top_n,
+                               "S1_板块内最强", "最强", cooldown=cooldown, kdf=kdf,
+                               per_sec_cap=per_sec_cap, min_members=min_members,
+                               skip_mask=mask)
+    v_sub = track_fixed(pk_sub, panel, hold, **kw).dropna(subset=["收益率"]) if len(pk_sub) else pd.DataFrame()
+    plans = {"基准：名单全买": bt, "剔除，不补位（你的实盘做法）": v_drop, "剔除，顺延补位": v_sub}
+    bdays = float(bt["持有交易日"].sum())
+    b_in = float(bt.loc[pd.to_datetime(bt["date"]) < c, "持有交易日"].sum())
+    b_y = bt.groupby("年")["持有交易日"].sum()
+
+    def fa(t, den):
+        if not den:
+            return np.nan
+        return float(t["收益率"].sum() / den * 244) if len(t) else 0.0
+
+    out, curves, yr_tab = [], {}, {}
+    for nm, t in plans.items():
+        if len(t):
+            t = t.copy(); t["年"] = pd.to_datetime(t["date"]).dt.year
+        ty = pd.Series({y: fa(t[t["年"] == y] if len(t) else t, b_y[y]) for y in b_y.index})
+        yr_tab[nm] = ty
+        sim = account_sim(t, dates, hold, every, tranches=(4, 0))
+        sm = sim.get("summary", pd.DataFrame())
+        d0 = sm.iloc[-1] if len(sm) else None
+        d4 = sm.iloc[0] if len(sm) else None
+        cmp_ = (ty - yr_tab[list(plans)[0]]).dropna() if nm != list(plans)[0] else pd.Series(dtype=float)
+        tin = t[pd.to_datetime(t["date"]) < c] if len(t) else t
+        out.append({"做法": nm, "笔数": len(t), "相当于基准的仓位": len(t) / len(bt),
+                    "单利年化(按全部资金)": fa(t, bdays),
+                    "样本内": fa(tin, b_in), "样本外": fa(t.drop(tin.index) if len(t) else t, bdays - b_in),
+                    "逐年胜过基准": "-" if nm == list(plans)[0] else f"{int((cmp_ > 0).sum())}/{len(cmp_)}",
+                    "中位收益": t["收益率"].median() if len(t) else np.nan,
+                    "胜率": float((t["收益率"] > 0).mean()) if len(t) else np.nan,
+                    "复利倍数(每天一份)": d0["最终倍数(中位)"] if d0 is not None else np.nan,
+                    "最大回撤(每天一份)": d0["最大回撤(中位)"] if d0 is not None else np.nan,
+                    "复利倍数(分4份,最差起点)": d4["最终倍数(最差)"] if d4 is not None else np.nan,
+                    "最大回撤(分4份,最差起点)": d4["最大回撤(最差)"] if d4 is not None else np.nan})
+        if "curve" in sim:
+            curves[nm] = sim["curve"]
+    return {"split": split, "yearly_split": yearly_split,
+            "plans": pd.DataFrame(out).set_index("做法"),
+            "yearly": pd.DataFrame(yr_tab), "curves": pd.DataFrame(curves),
+            "share": float(bt["下跌趋势"].mean())}
 
 
 def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
@@ -1667,7 +1863,7 @@ def main():
             n = clear_day_cache()
             for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
                        "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf",
-                       "rankres", "live", "live_key", "hist_key", "hist"):
+                       "rankres", "live", "live_key", "hist_key", "hist", "dtm", "dtm_key", "skdj"):
                 ss.pop(kk, None)
             gc.collect()
             st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
@@ -1691,7 +1887,7 @@ def main():
                 pass
         for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
                    "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key",
-                   "hist_key", "hist"):
+                   "hist_key", "hist", "dtm", "dtm_key", "skdj"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -1779,6 +1975,10 @@ def main():
     elig = ss["elig"]
     sectors, R, IDX, cnt, SF, AV = ss["sec"]
     KDF, DDF = ss["kdf"], ss["ddf"]
+    if ss.get("dtm_key") != dkey or ss.get("dtm") is None:
+        ss["dtm"] = skdj_downtrend_mask(KDF, DDF)
+        ss["dtm_key"] = dkey
+    DTM = ss["dtm"]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
     st.caption(f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**　·　"
@@ -1907,7 +2107,7 @@ def main():
             ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, pks, sig, srule)
             ss["res_lab"] = (f"{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜持有{hold}日｜"
                              f"每{every}日选｜冷却{cool}日")
-            ss.pop("wf", None); ss.pop("ksplit", None)
+            ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("skdj", None)
             bar.empty(); gc.collect()
 
         if ss.get("res"):
@@ -1934,6 +2134,31 @@ def main():
                            f"**每笔平均收益要超过 {rt:.2%} 才算真有边际。**")
             except Exception:
                 pass
+
+            st.divider()
+            st.markdown("### 账户净值模拟（真实复利）")
+            st.caption("上面的「资金年化」是单利，会高估。这里按实盘方式模拟：资金分成几份、分批入场，"
+                       f"每份买当天名单、持有 {hold} 日卖出后，收回的钱马上买当天新名单，一路复利。"
+                       "不同的开始日期会得到不同结果，都算出来给中位和最差。")
+            _acct = account_sim(keep[list(keep)[0]], dates, hold, every, tranches=(1, 4, 0))
+            if _acct:
+                st.dataframe(_acct["summary"].style.format(
+                    {"起始日数": "{:.0f}", "最终倍数(中位)": "×{:.2f}", "最终倍数(最差)": "×{:.2f}",
+                     "最终倍数(最好)": "×{:.2f}", "复利年化(中位)": "{:+.1%}",
+                     "最大回撤(中位)": "{:.0%}", "最大回撤(最差)": "{:.0%}"}),
+                    use_container_width=True)
+                if "curve" in _acct:
+                    st.line_chart(_acct["curve"].rename("账户净值（每个选股日投一份）"), height=220)
+                    _rc = _acct["recover"]
+                    st.caption(f"最大回撤 {_acct['dd'].min():.0%}：从 {_acct['peak']:%Y-%m-%d} 的高点，"
+                               f"跌到 {_acct['trough']:%Y-%m-%d} 的低点，"
+                               + (f"{_rc:%Y-%m-%d} 才回到原高点。" if _rc is not None else "至今没有回到原高点。")
+                               + "　逐年（复利）：" + "　".join(
+                                   f"{y} {v:+.0%}" for y, v in _acct["yearly"].items()))
+                st.info("**分批入场去掉的是「开始时点」的运气**（看「最差」两列），"
+                        "去不掉策略本身的回撤（看每天一份那一行）。"
+                        "**投入这个策略的钱，要按能承受「最大回撤(最差)」那一列来定。**"
+                        "净值按每份到期卖出时结算，持仓中的浮亏没算进去，真实回撤会更深一些。")
 
             st.divider()
             st.markdown("### 三项诊断")
@@ -2099,6 +2324,16 @@ def main():
                         tb["06_执行时机_龙头领跑天数"] = ss["ksplit"]
                     if ss.get("nz") is not None:
                         tb["08_降噪检验"] = ss["nz"]
+                    if ss.get("skdj"):
+                        tb["17_SKDJ下跌趋势_划分"] = ss["skdj"]["split"]
+                        tb["17_SKDJ下跌趋势_三种做法"] = ss["skdj"]["plans"]
+                        tb["17_SKDJ下跌趋势_逐年"] = ss["skdj"]["yearly"].T
+                    try:
+                        _ac = account_sim(keep[list(keep)[0]], dates, hold, every, tranches=(1, 4, 0))
+                        if _ac:
+                            tb["18_账户净值模拟"] = _ac["summary"]
+                    except Exception:
+                        pass
                     if ss.get("rankres"):
                         _rr = ss["rankres"]
                         for _k2, _nm2 in (("summary", "09_排名分档_汇总"),
@@ -2176,6 +2411,56 @@ def main():
                              .background_gradient(cmap="RdYlGn", axis=None),
                              use_container_width=True)
             st.caption("你只拿 1-3 只，抓到右尾的概率低，**中位收益和胜率比平均收益更贴近真实体验**。")
+        st.divider()
+
+        st.markdown("### 日线SKDJ下跌趋势：不买从75上方跌下来、一直在跌的票")
+        st.caption("定义（只用买入决策当天及以前的数据）：① 这段死叉开始前10个交易日内K曾经≥75，"
+                   "即从高位跌下来；② 死叉以来一直没有金叉；③ 当天K和D都已在75以下。"
+                   "刚死叉、K还在75上方的头几天**不算**。先到第④页「候选股事后表现」看「日线SKDJ」一列，"
+                   "确认标出来的票和你自己的判断一致，再看这里的结果。")
+        if not ss.get("res"):
+            st.info("先到「② 主回测」跑一次对照实验。")
+        else:
+            if st.button("运行SKDJ下跌趋势检验", type="primary"):
+                _df6, _keep6, _pks6, _sig6, _ = ss["res"]
+                _b6 = list(_keep6)[0]
+                _pool6 = next((v for k, v in _keep6.items() if str(k).startswith("对照C")), None)
+                with st.spinner("划分、三种做法各算一遍、模拟账户净值…"):
+                    ss["skdj"] = skdj_filter_test(
+                        panel, elig, sectors, SF[_sig6], dates, DTM, _pks6[_b6], _keep6[_b6], _pool6,
+                        top_sec, top_n, cool, cap, min_mem, hold, every, kdf=KDF, **kw)
+                    ss["skdj_lab"] = ss.get("res_lab", "")
+                    gc.collect()
+            _sk = ss.get("skdj")
+            if _sk:
+                st.caption(f"口径：{ss.get('skdj_lab', '')}　·　基准成交里处在下跌趋势的占 {_sk['share']:.0%}")
+                st.markdown("**① 干净划分：同一批成交，下跌趋势的票 vs 其他**")
+                _sp = _sk["split"]
+                st.dataframe(_sp.style.format(
+                    {"笔数": "{:.0f}", "占比": "{:.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                     "胜率": "{:.1%}", "20日内最惨10%": "{:+.1%}", "同期超额": "{:+.2%}", "收益率": "{:+.2%}",
+                     **{c: "{:.2f}" for c in _sp.columns if c.startswith("t(")}}),
+                    use_container_width=True)
+                with st.expander("逐年（同期超额）"):
+                    st.dataframe(_sk["yearly_split"].style.format("{:+.2%}")
+                                 .background_gradient(cmap="RdYlGn", axis=None), use_container_width=True)
+                st.markdown("**② 三种做法对比**")
+                st.dataframe(_sk["plans"].style.format(
+                    {"笔数": "{:.0f}", "相当于基准的仓位": "{:.0%}", "单利年化(按全部资金)": "{:+.1%}",
+                     "样本内": "{:+.1%}", "样本外": "{:+.1%}", "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                     "复利倍数(每天一份)": "×{:.2f}", "最大回撤(每天一份)": "{:.0%}",
+                     "复利倍数(分4份,最差起点)": "×{:.2f}", "最大回撤(分4份,最差起点)": "{:.0%}"}),
+                    use_container_width=True)
+                if len(_sk["curves"]):
+                    st.line_chart(_sk["curves"], height=240)
+                with st.expander("逐年单利年化（按全部资金）"):
+                    st.dataframe(_sk["yearly"].T.style.format("{:+.1%}")
+                                 .background_gradient(cmap="RdYlGn", axis=None), use_container_width=True)
+                st.info("**怎么判断**：你的实盘做法是「剔除，不补位」。它要算有用，需要"
+                        "① 复利倍数不低于基准、最大回撤明显更小（这是你最关心的）；"
+                        "② 样本内、样本外两段都不差于基准；③ 逐年多数年份胜过基准。\n\n"
+                        "**只看7月那几天不算数**：挑出最差的一段回头看，任何过滤都显得有用。"
+                        "要看它在全部8年里，是不是也在上涨行情中把后来大涨的票过滤掉了。")
         st.divider()
 
         st.markdown("### 执行时机：龙头板块已经领跑几天")
@@ -2301,13 +2586,15 @@ def main():
                 rc = panel["raw_close"].loc[d, c]
                 mv = panel["circ_mv"].loc[:d, c].dropna()
                 kk = KDF.loc[d, c] if c in KDF.columns else np.nan
+                _dt = bool(DTM.at[d, c]) if (c in DTM.columns and d in DTM.index) else False
                 rows_.append({
                     "序": int(r["rank"]), "代码": c, "名称": nm.get(c, ""), "板块": r["板块"],
                     "板块内名次": int(r["板块内名次"]) if pd.notna(r.get("板块内名次")) else None,
                     "20日涨幅(选股日)": f"{r['score']:.1%}",
                     f"收盘价({d:%m-%d})": round(float(rc), 2) if pd.notna(rc) else None,
                     "流通市值(亿)": round(float(mv.iloc[-1]) / 1e4) if len(mv) else None,
-                    "日线K": round(float(kk), 1) if pd.notna(kk) else None})
+                    "日线K": round(float(kk), 1) if pd.notna(kk) else None,
+                    "日线SKDJ": "下跌趋势" if _dt else ""})
             out = pd.DataFrame(rows_)
             st.subheader(f"{ld:%Y-%m-%d}　候选名单")
             st.dataframe(out, use_container_width=True, hide_index=True)
@@ -2355,6 +2642,8 @@ def main():
             st.info("还没有候选记录。")
         else:
             H["名称"] = H["code"].map(nm).fillna("")
+            H["日线SKDJ"] = ["下跌趋势" if (cc in DTM.columns and dd_ in DTM.index and bool(DTM.at[dd_, cc]))
+                           else "" for dd_, cc in zip(pd.to_datetime(H["选股日"]), H["code"])]
             my_txt = st.text_area(
                 "你实际买入的记录（每行一条：日期 代码。日期写选股日或买入日都可以）",
                 placeholder="2026-09-15 300413\n2026-09-17 603533",
@@ -2366,6 +2655,12 @@ def main():
                            "关掉网页后需要重新粘贴，建议把记录保存在手机备忘录里。")
             done = H[H["已满期"]]
             live_ = H[~H["已满期"] & H["收益率"].notna()]
+            if len(done) and (done["日线SKDJ"] == "下跌趋势").any():
+                _dn = done[done["日线SKDJ"] == "下跌趋势"]; _ot = done[done["日线SKDJ"] != "下跌趋势"]
+                st.caption(f"回看期内已满期的候选里，标为「下跌趋势」的 {len(_dn)} 只平均 {_dn['收益率'].mean():+.2%}"
+                           f"（胜率 {(_dn['收益率'] > 0).mean():.0%}），其他 {len(_ot)} 只平均 "
+                           f"{_ot['收益率'].mean():+.2%}（胜率 {(_ot['收益率'] > 0).mean():.0%}）。"
+                           "这只是最近几十天，结论要看第③页用8年数据跑的检验。")
             c1, c2, c3 = st.columns(3)
             if len(done):
                 c1.metric(f"已满{hold}日的候选", f"{len(done)} 只", f"平均 {done['收益率'].mean():+.2%}")
@@ -2419,8 +2714,8 @@ def main():
             show["选股日"] = pd.to_datetime(show["选股日"]).dt.strftime("%Y-%m-%d")
             show["买入日"] = pd.to_datetime(show["买入日"]).dt.strftime("%m-%d").fillna("")
             show["你买了"] = show["你买了"].map({True: "✓", False: ""})
-            show = show[["选股日", "序", "名称", "code", "板块", "板块内名次", "买入日", "买入价(实际)",
-                         "状态", "收益率", "期间最高", "期间最低", "你买了"]].rename(columns={"code": "代码"})
+            show = show[["选股日", "序", "名称", "code", "板块", "板块内名次", "日线SKDJ", "买入日",
+                         "买入价(实际)", "状态", "收益率", "期间最高", "期间最低", "你买了"]].rename(columns={"code": "代码"})
             st.dataframe(show.style.format({"收益率": "{:+.2%}", "期间最高": "{:+.1%}",
                                             "期间最低": "{:+.1%}", "买入价(实际)": "{:.2f}",
                                             "板块内名次": "{:.0f}"}, na_rep="")
