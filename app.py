@@ -21,6 +21,12 @@
 
 本版改动
 --------
+- 第③页新增「延迟入场」检验：同一份名单，比较次日直接买 / 等SKDJ上行(K>D且K上升)再买 /
+  等MACD柱连续2天回升再买（最多等20日）。除收益外，给出持有期内最大浮亏、
+  浮亏曾超20%的比例、账户复利与回撤。
+
+更早的改动
+----------
 - 第②页新增「账户净值模拟（真实复利）」：分1份/4份/每天一份入场，给出复利倍数、
   最大回撤（中位与最差起点）、回撤起止日期和逐年复利收益。
 - 第③页新增「日线SKDJ下跌趋势」检验：从75上方跌下来、死叉后一直没金叉、K和D都在75下方。
@@ -1477,6 +1483,150 @@ def skdj_filter_test(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[st
             "share": float(bt["下跌趋势"].mean())}
 
 
+def macd_hist(panel: dict) -> pd.DataFrame:
+    """日线 MACD(12,26,9) 柱子 = 2×(DIF−DEA)，与常见行情软件同口径（基于复权收盘价）。"""
+    A = panel["adj_close"]
+    ema = lambda x, p: x.ewm(span=p, adjust=False, min_periods=p).mean()
+    dif = ema(A, 12) - ema(A, 26)
+    return (2.0 * (dif - ema(dif, 9))).astype(np.float32)
+
+
+def track_delayed(picks: pd.DataFrame, panel: dict, hold: int = 20,
+                  trig: pd.DataFrame = None, max_wait: int = 20,
+                  comm: float = 0.0003, stamp: float = 0.0005,
+                  slip: float = 0.001) -> tuple:
+    """
+    延迟入场：股票上名单后，从选股日当天起等待触发条件（trig 为 True，用当天收盘数据判断），
+    触发后下一个交易日开盘买入，持有 hold 个交易日后开盘卖出；max_wait 个交易日内一直没触发就放弃。
+    trig=None 表示不等待（= 回测基准，结果与 track_fixed 逐笔一致）。
+    同一只股票多次上名单、等到的是同一个触发日时，只买一次。
+    另外记录持有期内的最大浮亏（期间最低）和最大浮盈（期间最高），用来衡量「拿着的过程」有多难受。
+    返回 (成交表, 上名单总数, 放弃数)。
+    """
+    cal = panel["adj_close"].index
+    n = len(cal)
+    ci = {c: j for j, c in enumerate(panel["codes"])}
+    pos = {d: i for i, d in enumerate(cal)}
+    AO = panel["adj_open"].to_numpy(dtype=np.float32)
+    AC = panel["adj_close"].to_numpy(dtype=np.float64)
+    AH = panel["adj_high"].to_numpy(dtype=np.float64)
+    AL = panel["adj_low"].to_numpy(dtype=np.float64)
+    RO = panel["raw_open"].to_numpy(dtype=np.float32)
+    TRD = panel["tradable"].to_numpy(dtype=bool)
+    LU = panel["limit_up_open"].to_numpy(dtype=bool)
+    LD = panel["limit_dn_open"].to_numpy(dtype=bool)
+    T = (trig.reindex(index=cal, columns=panel["codes"]).fillna(False).to_numpy(dtype=bool)
+         if trig is not None else None)
+    cin, cout = comm + slip, comm + stamp + slip
+    out, seen, total, gave_up = [], set(), 0, 0
+    cols = ["date", "code"] + (["板块"] if "板块" in picks.columns else [])
+    for p in picks[cols].itertuples(index=False):
+        d0, code = p[0], p[1]
+        sec = p[2] if len(p) > 2 else "-"
+        i0, j = pos.get(d0), ci.get(code)
+        if i0 is None or j is None:
+            continue
+        total += 1
+        if T is None:
+            t = i0
+        else:
+            t = None
+            for q in range(i0, min(i0 + max_wait, n - 2) + 1):
+                if T[q, j]:
+                    t = q
+                    break
+            if t is None:
+                if i0 + max_wait < n - 1:          # 等满了还没触发才算放弃；还在等的不算
+                    gave_up += 1
+                continue
+        if (code, t) in seen:
+            continue
+        seen.add((code, t))
+        b = t + 1
+        if b >= n or not TRD[b, j] or LU[b, j] or not np.isfinite(AO[b, j]):
+            continue
+        e = b + hold
+        while e < n and (not TRD[e, j] or LD[e, j] or not np.isfinite(AO[e, j])):
+            e += 1
+            if e - b > hold + 5:
+                break
+        if e >= n or not np.isfinite(AO[e, j]):
+            continue
+        p0 = float(AO[b, j])
+        lo, hi = AL[b:e, j], AH[b:e, j]
+        out.append({"date": cal[t], "选股日": d0, "code": code, "板块": sec,
+                    "买入日": cal[b], "卖出日": cal[e], "等待天数": t - i0,
+                    "买入价较选股日": p0 / AC[i0, j] - 1.0 if np.isfinite(AC[i0, j]) else np.nan,
+                    "买入价(实际)": round(float(RO[b, j]), 2) if np.isfinite(RO[b, j]) else np.nan,
+                    "收益率": float(AO[e, j]) * (1 - cout) / (p0 * (1 + cin)) - 1.0,
+                    "持有交易日": e - b,
+                    "期间最低": float(np.nanmin(lo) / p0 - 1.0) if np.isfinite(lo).any() else np.nan,
+                    "期间最高": float(np.nanmax(hi) / p0 - 1.0) if np.isfinite(hi).any() else np.nan})
+    return pd.DataFrame(out), total, gave_up
+
+
+ENTRY_RULES = {
+    "次日直接买（基准）": None,
+    "等SKDJ上行才买：K>D且K在上升（已经上行就次日买）": "skdj",
+    "等MACD柱连续2天回升才买（已经在回升就次日买）": "macd",
+}
+
+
+def entry_delay_test(pk: pd.DataFrame, panel: dict, dates: List[pd.Timestamp],
+                     KDF: pd.DataFrame, DDF: pd.DataFrame, MH: pd.DataFrame,
+                     hold: int = 20, every: int = 1, max_wait: int = 20,
+                     cut: str = "2023-01-01", **kw) -> dict:
+    """同一份名单，只改「什么时候买」，比较收益、持有过程中的浮亏和账户回撤。"""
+    trig = {"skdj": (KDF > DDF) & (KDF > KDF.shift(1)),
+            "macd": (MH > MH.shift(1)) & (MH.shift(1) > MH.shift(2))}
+    c = pd.Timestamp(cut)
+    res, curves, yrs = [], {}, {}
+    base_nm, base_days, b_in, b_y = None, None, None, None
+
+    def fa(t, den):
+        return float(t["收益率"].sum() / den * 244) if den else np.nan
+
+    for nm, key in ENTRY_RULES.items():
+        tr, total, gave = track_delayed(pk, panel, hold, trig.get(key) if key else None,
+                                        max_wait, **kw)
+        if not len(tr):
+            continue
+        tr["年"] = pd.to_datetime(tr["date"]).dt.year
+        if base_nm is None:
+            base_nm = nm
+            base_days = float(tr["持有交易日"].sum())
+            b_in = float(tr.loc[tr["date"] < c, "持有交易日"].sum())
+            b_y = tr.groupby("年")["持有交易日"].sum()
+        yy = pd.Series({y: fa(tr[tr["年"] == y], b_y[y]) for y in b_y.index})
+        yrs[nm] = yy
+        cmp_ = (yy - yrs[base_nm]).dropna() if nm != base_nm else pd.Series(dtype=float)
+        sim = account_sim(tr, dates, hold, every, tranches=(4, 0))
+        sm = sim.get("summary", pd.DataFrame())
+        d0 = sm.iloc[-1] if len(sm) else None
+        d4 = sm.iloc[0] if len(sm) else None
+        ins = tr[tr["date"] < c]
+        res.append({"入场方式": nm, "实际买入笔数": len(tr),
+                    "放弃比例": gave / total if total else np.nan,
+                    "平均等待天数": tr["等待天数"].mean(),
+                    "买入价较选股日(中位)": tr["买入价较选股日"].median(),
+                    "平均收益": tr["收益率"].mean(), "中位收益": tr["收益率"].median(),
+                    "胜率": float((tr["收益率"] > 0).mean()),
+                    "持有中最大浮亏(中位)": tr["期间最低"].median(),
+                    "浮亏曾超20%的比例": float((tr["期间最低"] <= -0.20).mean()),
+                    "单利年化(按全部资金)": fa(tr, base_days),
+                    "样本内": fa(ins, b_in), "样本外": fa(tr.drop(ins.index), base_days - b_in),
+                    "逐年胜过基准": "-" if nm == base_nm else f"{int((cmp_ > 0).sum())}/{len(cmp_)}",
+                    "复利倍数(每天一份)": d0["最终倍数(中位)"] if d0 is not None else np.nan,
+                    "最大回撤(每天一份)": d0["最大回撤(中位)"] if d0 is not None else np.nan,
+                    "最大回撤(分4份,最差起点)": d4["最大回撤(最差)"] if d4 is not None else np.nan})
+        if "curve" in sim:
+            curves[nm] = sim["curve"]
+    if not res:
+        return {}
+    return {"summary": pd.DataFrame(res).set_index("入场方式"),
+            "yearly": pd.DataFrame(yrs), "curves": pd.DataFrame(curves)}
+
+
 def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
                       cal) -> pd.DataFrame:
     """
@@ -1863,7 +2013,7 @@ def main():
             n = clear_day_cache()
             for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
                        "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf",
-                       "rankres", "live", "live_key", "hist_key", "hist", "dtm", "dtm_key", "skdj"):
+                       "rankres", "live", "live_key", "hist_key", "hist", "dtm", "dtm_key", "skdj", "mh", "mh_key", "delay"):
                 ss.pop(kk, None)
             gc.collect()
             st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
@@ -1887,7 +2037,7 @@ def main():
                 pass
         for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
                    "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key",
-                   "hist_key", "hist", "dtm", "dtm_key", "skdj"):
+                   "hist_key", "hist", "dtm", "dtm_key", "skdj", "mh", "mh_key", "delay"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -1979,6 +2129,10 @@ def main():
         ss["dtm"] = skdj_downtrend_mask(KDF, DDF)
         ss["dtm_key"] = dkey
     DTM = ss["dtm"]
+    if ss.get("mh_key") != dkey or ss.get("mh") is None:
+        ss["mh"] = macd_hist(panel)
+        ss["mh_key"] = dkey
+    MH = ss["mh"]
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
     st.caption(f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**　·　"
@@ -2107,7 +2261,7 @@ def main():
             ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, pks, sig, srule)
             ss["res_lab"] = (f"{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜持有{hold}日｜"
                              f"每{every}日选｜冷却{cool}日")
-            ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("skdj", None)
+            ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("skdj", None); ss.pop("delay", None)
             bar.empty(); gc.collect()
 
         if ss.get("res"):
@@ -2324,6 +2478,9 @@ def main():
                         tb["06_执行时机_龙头领跑天数"] = ss["ksplit"]
                     if ss.get("nz") is not None:
                         tb["08_降噪检验"] = ss["nz"]
+                    if ss.get("delay"):
+                        tb["19_延迟入场_对比"] = ss["delay"]["summary"]
+                        tb["19_延迟入场_逐年"] = ss["delay"]["yearly"].T
                     if ss.get("skdj"):
                         tb["17_SKDJ下跌趋势_划分"] = ss["skdj"]["split"]
                         tb["17_SKDJ下跌趋势_三种做法"] = ss["skdj"]["plans"]
@@ -2411,6 +2568,44 @@ def main():
                              .background_gradient(cmap="RdYlGn", axis=None),
                              use_container_width=True)
             st.caption("你只拿 1-3 只，抓到右尾的概率低，**中位收益和胜率比平均收益更贴近真实体验**。")
+        st.divider()
+
+        st.markdown("### 延迟入场：等日线转好再买")
+        st.caption("同一份名单，只改「什么时候买」：① 次日直接买（基准）；② 等日线SKDJ上行再买"
+                   "（K>D，而且K比前一天高——K还在75上方但已经拐头向下的，也要等），选股当天已经上行就照常次日买；③ 等MACD柱连续2天回升再买（绿柱缩短或红柱变长），"
+                   "已经在回升就照常次日买。触发后次日开盘买、持有到期；**最多等20个交易日，等不到就放弃**。"
+                   "同一只股票多次上名单、等到同一个触发日，只买一次。")
+        if not ss.get("res"):
+            st.info("先到「② 主回测」跑一次对照实验。")
+        else:
+            if st.button("运行延迟入场检验", type="primary"):
+                _df7, _keep7, _pks7, _, _ = ss["res"]
+                _b7 = list(_keep7)[0]
+                with st.spinner("三种买法各算一遍、模拟账户净值…"):
+                    ss["delay"] = entry_delay_test(_pks7[_b7], panel, dates, KDF, DDF, MH,
+                                                   hold=hold, every=every, max_wait=20, **kw)
+                    ss["delay_lab"] = ss.get("res_lab", "")
+                    gc.collect()
+            _dl = ss.get("delay")
+            if _dl:
+                st.caption(f"口径：{ss.get('delay_lab', '')}")
+                st.dataframe(_dl["summary"].style.format(
+                    {"实际买入笔数": "{:.0f}", "放弃比例": "{:.0%}", "平均等待天数": "{:.1f}",
+                     "买入价较选股日(中位)": "{:+.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
+                     "胜率": "{:.1%}", "持有中最大浮亏(中位)": "{:+.1%}", "浮亏曾超20%的比例": "{:.0%}",
+                     "单利年化(按全部资金)": "{:+.1%}", "样本内": "{:+.1%}", "样本外": "{:+.1%}",
+                     "复利倍数(每天一份)": "×{:.2f}", "最大回撤(每天一份)": "{:.0%}",
+                     "最大回撤(分4份,最差起点)": "{:.0%}"}),
+                    use_container_width=True)
+                if len(_dl["curves"]):
+                    st.line_chart(_dl["curves"], height=240)
+                with st.expander("逐年单利年化（按全部资金）"):
+                    st.dataframe(_dl["yearly"].T.style.format("{:+.1%}")
+                                 .background_gradient(cmap="RdYlGn", axis=None), use_container_width=True)
+                st.info("**这张表同时看收益和「拿着的过程」**：「持有中最大浮亏」「浮亏曾超20%的比例」"
+                        "是每笔交易在持有期间最深跌到过多少——这正是只看20日平均收益看不到的部分。\n\n"
+                        "延迟入场要算有用，需要：浮亏和账户回撤明显更小，同时复利倍数、样本内外、"
+                        "逐年都不明显差于基准。「买入价较选股日」为正，说明等待经常是在更高的价格买入。")
         st.divider()
 
         st.markdown("### 日线SKDJ下跌趋势：不买从75上方跌下来、一直在跌的票")
