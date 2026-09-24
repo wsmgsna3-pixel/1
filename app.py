@@ -21,6 +21,17 @@
 
 本版改动
 --------
+- 页面顶部和侧边栏显示程序版本，用来确认网页运行的是最新代码。
+- 「乖离规则检验」改为第③页的独立段落，不再需要先运行乖离划分。
+- 第④页候选表和「候选股事后表现」加「高出30日线」一列，30%以上标 ⚠️。
+
+更早的改动
+----------
+- 第③页乖离划分下新增「乖离规则检验」：跳过高出30日线30%以上的票，
+  比较基准 / 剔除不补位 / 顺延补位的复利倍数与账户回撤。
+
+更早的改动
+----------
 - 侧边栏默认改为每次5只、冷却5日。
 - 第③页新增「乖离」干净划分：按选中时股价高出30日线的幅度（10%以内/10%-30%/30%以上）
   分组，看收益、大亏比例和持有中浮亏；以及「逐只查看」：输入日期和代码，列出当天的
@@ -1399,9 +1410,10 @@ def skdj_filter_test(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[st
                      base_pk: pd.DataFrame, base_tr: pd.DataFrame, pool_tr: pd.DataFrame,
                      top_sec: int, top_n: int, cooldown: int, per_sec_cap: int,
                      min_members: int, hold: int, every: int, kdf: pd.DataFrame = None,
-                     cut: str = "2023-01-01", **kw) -> dict:
+                     cut: str = "2023-01-01", flag_label: str = "下跌趋势（你不会买的）",
+                     **kw) -> dict:
     """
-    SKDJ 下跌趋势过滤的检验：
+    买入过滤的通用检验（最早用于 SKDJ 下跌趋势，乖离规则也用它）：
       ① 干净划分：同一批成交按「买入决策当天是否处在下跌趋势」分两组，不替补；
       ② 三种做法对比，都按全部资金（空着的钱收益记 0）和真实复利的账户净值来比：
          基准            —— 名单全买；
@@ -1428,7 +1440,7 @@ def skdj_filter_test(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[st
     bt["年"] = pd.to_datetime(bt["date"]).dt.year
     val = "同期超额" if "同期超额" in bt.columns else "收益率"
     rows = []
-    for lab, sub in (("下跌趋势（你不会买的）", bt[bt["下跌趋势"]]), ("其他", bt[~bt["下跌趋势"]])):
+    for lab, sub in ((flag_label, bt[bt["下跌趋势"]]), ("其他", bt[~bt["下跌趋势"]])):
         if not len(sub):
             continue
         day = sub.groupby("date")[val].mean().dropna().sort_index()
@@ -2087,15 +2099,21 @@ def _st(tr: pd.DataFrame) -> dict:
             "聚类t(朴素)": day.mean() / se if se > 1e-12 else np.nan}
 
 
+APP_VERSION = "2026-09-25 · 乖离版"
+
+
 def main():
     st.set_page_config(page_title="板块轮动选股", layout="wide")
     ss = st.session_state
     ss.setdefault("panel", None)
     st.title("板块轮动选股")
+    st.caption(f"程序版本：**{APP_VERSION}**（如果这里显示的不是最新版本，说明网页还在运行旧代码，"
+               "需要在 GitHub 覆盖 app.py 后，于 Manage app 里 Reboot）")
     st.caption("先选最强板块，再从板块内选动量最高的股票。"
                "科技/军工/新能源/机器人　·　流通市值 50-1000 亿　·　股价 10 元以上")
 
     with st.sidebar:
+        st.caption(f"程序版本：{APP_VERSION}")
         token = st.text_input("Tushare Token", type="password",
                               value=os.environ.get("TUSHARE_TOKEN", ""))
         st.caption("默认值：板块60日动量 · 3个板块 · 每次5只 · 每板块最多2只 · 持有20日 · "
@@ -2147,7 +2165,7 @@ def main():
             for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
                        "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf",
                        "rankres", "live", "live_key", "hist_key", "hist", "dtm", "dtm_key", "skdj", "mh", "mh_key", "delay",
-                       "biasdf", "bias_key", "bias"):
+                       "biasdf", "bias_key", "bias", "biasrule"):
                 ss.pop(kk, None)
             gc.collect()
             st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
@@ -2172,7 +2190,7 @@ def main():
         for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
                    "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key",
                    "hist_key", "hist", "dtm", "dtm_key", "skdj", "mh", "mh_key", "delay",
-                       "biasdf", "bias_key", "bias"):
+                       "biasdf", "bias_key", "bias", "biasrule"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -2401,7 +2419,7 @@ def main():
             ss["res_lab"] = (f"{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜持有{hold}日｜"
                              f"每{every}日选｜冷却{cool}日")
             ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("skdj", None); ss.pop("delay", None)
-            ss.pop("bias", None)
+            ss.pop("bias", None); ss.pop("biasrule", None)
             bar.empty(); gc.collect()
 
         if ss.get("res"):
@@ -2622,6 +2640,9 @@ def main():
                         tb["20_乖离划分_汇总"] = ss["bias"]["summary"]
                         tb["20_乖离划分_逐年超额"] = ss["bias"]["yearly"]
                         tb["20_乖离划分_逐年大亏比例"] = ss["bias"]["big_y"]
+                    if ss.get("biasrule"):
+                        tb["21_乖离规则_三种做法"] = ss["biasrule"]["plans"]
+                        tb["21_乖离规则_逐年"] = ss["biasrule"]["yearly"].T
                     if ss.get("delay"):
                         tb["19_延迟入场_对比"] = ss["delay"]["summary"]
                         tb["19_延迟入场_逐年"] = ss["delay"]["yearly"].T
@@ -2757,6 +2778,42 @@ def main():
                         "如果这组大亏多、但大赚也多（平均收益不低），那它只是波动更大，"
                         "避开它会同时避开大亏和大赚。")
 
+        st.markdown("### 乖离规则检验：跳过高出30日线30%以上的票")
+        st.caption("不用先跑乖离划分，可以直接运行。把「高出30%以上不买」写成规则，与基准同一配置比较："
+                   "剔除后钱空着（不补位），或名额顺延给板块内后面的名次（顺延补位）。"
+                   "按全部资金、真实复利和账户回撤比较。")
+        if not ss.get("res"):
+            st.info("先到「② 主回测」跑一次对照实验。")
+        elif st.button("运行乖离规则检验", type="primary"):
+            _df9, _keep9, _pks9, _sig9, _ = ss["res"]
+            _b9 = list(_keep9)[0]
+            _pool9 = next((v for k, v in _keep9.items() if str(k).startswith("对照C")), None)
+            with st.spinner("三种做法各算一遍、模拟账户净值…"):
+                ss["biasrule"] = skdj_filter_test(
+                    panel, elig, sectors, SF[_sig9], dates, (BIAS >= 0.30).fillna(False),
+                    _pks9[_b9], _keep9[_b9], _pool9, top_sec, top_n, cool, cap, min_mem,
+                    hold, every, kdf=KDF, flag_label="高出30日线30%以上", **kw)
+                ss["biasrule_lab"] = ss.get("res_lab", "")
+                gc.collect()
+        _br = ss.get("biasrule")
+        if _br:
+            st.caption(f"口径：{ss.get('biasrule_lab', '')}")
+            st.markdown("**三种做法对比**")
+            st.dataframe(_br["plans"].style.format(
+                {"笔数": "{:.0f}", "相当于基准的仓位": "{:.0%}", "单利年化(按全部资金)": "{:+.1%}",
+                 "样本内": "{:+.1%}", "样本外": "{:+.1%}", "中位收益": "{:+.2%}", "胜率": "{:.1%}",
+                 "复利倍数(每天一份)": "×{:.2f}", "最大回撤(每天一份)": "{:.0%}",
+                 "复利倍数(分4份,最差起点)": "×{:.2f}", "最大回撤(分4份,最差起点)": "{:.0%}"}),
+                use_container_width=True)
+            st.caption("表格较宽，手机上请向左滑动查看后面的列。")
+            if len(_br["curves"]):
+                st.line_chart(_br["curves"], height=240)
+            with st.expander("逐年单利年化（按全部资金）"):
+                st.dataframe(_br["yearly"].T.style.format("{:+.1%}")
+                             .background_gradient(cmap="RdYlGn", axis=None), use_container_width=True)
+            st.info("**要算有用**：最大回撤（尤其「分4份,最差起点」）明显更小，同时复利倍数、"
+                    "样本内外、逐年都不明显差于基准。")
+        st.divider()
         st.markdown("**逐只查看**（每行：日期 代码；默认填的是你截图里的9只）")
         _snap_default = ("2026-07-03 688359\n2026-07-03 002643\n2026-07-03 300489\n"
                          "2026-07-07 301045\n2026-07-08 300671\n"
@@ -2796,6 +2853,7 @@ def main():
             _dl = ss.get("delay")
             if _dl:
                 st.caption(f"口径：{ss.get('delay_lab', '')}")
+                st.markdown("**汇总表**（较宽，手机上请向左滑动查看后面的列）")
                 st.dataframe(_dl["summary"].style.format(
                     {"实际买入笔数": "{:.0f}", "放弃比例": "{:.0%}", "平均等待天数": "{:.1f}",
                      "买入价较选股日(中位)": "{:+.1%}", "平均收益": "{:+.2%}", "中位收益": "{:+.2%}",
@@ -2996,7 +3054,9 @@ def main():
                     f"收盘价({d:%m-%d})": round(float(rc), 2) if pd.notna(rc) else None,
                     "流通市值(亿)": round(float(mv.iloc[-1]) / 1e4) if len(mv) else None,
                     "日线K": round(float(kk), 1) if pd.notna(kk) else None,
-                    "日线SKDJ": "下跌趋势" if _dt else ""})
+                    "日线SKDJ": "下跌趋势" if _dt else "",
+                    "高出30日线": (f"{float(BIAS.at[d, c]):+.0%}" + (" ⚠️" if float(BIAS.at[d, c]) >= 0.30 else ""))
+                    if (c in BIAS.columns and pd.notna(BIAS.at[d, c])) else ""})
             out = pd.DataFrame(rows_)
             st.subheader(f"{ld:%Y-%m-%d}　候选名单")
             st.dataframe(out, use_container_width=True, hide_index=True)
@@ -3006,6 +3066,8 @@ def main():
                     f"**持有 {hold} 个交易日后开盘卖出**，不设止盈止损。\n\n"
                     "「板块内名次」是该股在本板块里按20日涨幅的名次；名次靠后说明前面的票在冷却中，"
                     "名额顺延到了它（实测板块内前10名收益看不出差别）。\n\n"
+                    "「高出30日线」标 ⚠️ 的是高出30%以上：8年里这类票亏损超20%的概率约为其他票的三倍，"
+                    "但平均收益并不更低——要不要跳过，看第③页「乖离规则检验」。\n\n"
                     "「日线K」仅供参考：实测跳过K低的票、避开高位死叉的票，都不能提高收益。"
                     "**看到日线在跌就不买，等于偏离回测口径。**")
 
@@ -3044,6 +3106,8 @@ def main():
             st.info("还没有候选记录。")
         else:
             H["名称"] = H["code"].map(nm).fillna("")
+            H["乖离"] = [float(BIAS.at[dd_, cc]) if (cc in BIAS.columns and dd_ in BIAS.index) else np.nan
+                        for dd_, cc in zip(pd.to_datetime(H["选股日"]), H["code"])]
             H["日线SKDJ"] = ["下跌趋势" if (cc in DTM.columns and dd_ in DTM.index and bool(DTM.at[dd_, cc]))
                            else "" for dd_, cc in zip(pd.to_datetime(H["选股日"]), H["code"])]
             my_txt = st.text_area(
@@ -3057,6 +3121,12 @@ def main():
                            "关掉网页后需要重新粘贴，建议把记录保存在手机备忘录里。")
             done = H[H["已满期"]]
             live_ = H[~H["已满期"] & H["收益率"].notna()]
+            if len(done) and (done["乖离"] >= 0.30).any():
+                _hb = done[done["乖离"] >= 0.30]; _lb = done[~(done["乖离"] >= 0.30)]
+                st.caption(f"回看期内已满期的候选里，高出30日线30%以上的 {len(_hb)} 只：平均 {_hb['收益率'].mean():+.2%}，"
+                           f"亏损超20%的占 {(_hb['收益率'] <= -0.2).mean():.0%}；其他 {len(_lb)} 只：平均 "
+                           f"{_lb['收益率'].mean():+.2%}，亏损超20%的占 {(_lb['收益率'] <= -0.2).mean():.0%}。"
+                           "只是最近几十天，结论以第③页8年数据为准。")
             if len(done) and (done["日线SKDJ"] == "下跌趋势").any():
                 _dn = done[done["日线SKDJ"] == "下跌趋势"]; _ot = done[done["日线SKDJ"] != "下跌趋势"]
                 st.caption(f"回看期内已满期的候选里，标为「下跌趋势」的 {len(_dn)} 只平均 {_dn['收益率'].mean():+.2%}"
@@ -3116,7 +3186,9 @@ def main():
             show["选股日"] = pd.to_datetime(show["选股日"]).dt.strftime("%Y-%m-%d")
             show["买入日"] = pd.to_datetime(show["买入日"]).dt.strftime("%m-%d").fillna("")
             show["你买了"] = show["你买了"].map({True: "✓", False: ""})
-            show = show[["选股日", "序", "名称", "code", "板块", "板块内名次", "日线SKDJ", "买入日",
+            show["高出30日线"] = [(f"{v:+.0%}" + (" ⚠️" if v >= 0.30 else "")) if pd.notna(v) else ""
+                               for v in show["乖离"]]
+            show = show[["选股日", "序", "名称", "code", "板块", "板块内名次", "高出30日线", "日线SKDJ", "买入日",
                          "买入价(实际)", "状态", "收益率", "期间最高", "期间最低", "你买了"]].rename(columns={"code": "代码"})
             st.dataframe(show.style.format({"收益率": "{:+.2%}", "期间最高": "{:+.1%}",
                                             "期间最低": "{:+.1%}", "买入价(实际)": "{:.2f}",
