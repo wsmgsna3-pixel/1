@@ -21,6 +21,13 @@
 
 本版改动
 --------
+- 侧边栏新增开关「跳过高出30日线30%以上的票（顺延补位）」，默认关闭；
+  打开后第②页对照、滚动前推、今日候选都按它执行。
+- 第③页新增「按你的实际持仓模拟」：同时只持有N只（默认3只），卖一只买一只，
+  比较不跳过 / 跳过乖离30%以上两份名单的复利、回撤、单笔大亏比例和「两只同时大亏」次数。
+
+更早的改动
+----------
 - 页面顶部和侧边栏显示程序版本，用来确认网页运行的是最新代码。
 - 「乖离规则检验」改为第③页的独立段落，不再需要先运行乖离划分。
 - 第④页候选表和「候选股事后表现」加「高出30日线」一列，30%以上标 ⚠️。
@@ -1771,6 +1778,116 @@ def stock_snapshot(mine: pd.DataFrame, panel: dict, BIAS: pd.DataFrame, KDF: pd.
     return pd.DataFrame(rows)
 
 
+def holding_sim(pk: pd.DataFrame, panel: dict, dates: List[pd.Timestamp], n_hold: int = 3,
+                hold: int = 20, every: int = 1, **kw) -> dict:
+    """
+    按「同时只持有 n_hold 只」模拟账户（贴近实盘）：
+      资金分 n_hold 份，每份同一时间只拿 1 只股票，各份错开入场；
+      某一份卖出那天，用前一天收盘的名单，按序号买第一只「手里还没有」的票，持有到期；
+      名单为空或全都已持有，这一份就拿现金等下一天。
+    不同的开始日期结果不同，全部算出来看中位和最差——只拿几只时，运气成分很大。
+    另外统计「两只同时大亏」：持有期间有重叠的两笔交易，都亏损超过20%，算一次。
+    """
+    tr, _, _ = track_delayed(pk, panel, hold, None, 20, **kw)
+    if not len(tr):
+        return {}
+    tr = tr.merge(pk[["date", "code", "rank"]], on=["date", "code"], how="left")
+    grid = pd.DatetimeIndex(list(dates))
+    n = len(grid)
+    by_day = {d: g.sort_values("rank") for d, g in tr.groupby("date")}
+    Hg = max(1, int(np.ceil(hold / max(every, 1))))
+    gap = max(1, Hg // n_hold)
+    yrs = max((grid[-1] - grid[0]).days / 365.25, 0.5)
+    paths, finals, dds, taken_all, pair_cnt, curve0 = [], [], [], [], [], None
+    for s0 in range(Hg):
+        val = np.full(n_hold, 1.0 / n_hold)
+        nxt = {j: s0 + j * gap for j in range(n_hold)}
+        held, pending, eq, taken = {}, {}, [], []
+        for i in range(n):
+            for j, f in pending.pop(i, []):
+                val[j] *= f
+                held.pop(j, None)
+            for j in range(n_hold):
+                if nxt.get(j) != i:
+                    continue
+                cands = by_day.get(grid[i])
+                busy = {h for jj, h in held.items() if jj != j}
+                pick = None
+                if cands is not None:
+                    for r in cands.itertuples(index=False):
+                        if r.code not in busy:
+                            pick = r
+                            break
+                if pick is None:
+                    nxt[j] = i + 1
+                    continue
+                ex = int(grid.searchsorted(pd.Timestamp(pick.卖出日), side="left")) - 1
+                ex = max(ex, i + 1)
+                pending.setdefault(ex, []).append((j, 1.0 + float(pick.收益率)))
+                held[j] = pick.code
+                nxt[j] = ex
+                taken.append({"份": j, "date": grid[i], "code": pick.code, "买入日": pick.买入日,
+                              "卖出日": pick.卖出日, "收益率": float(pick.收益率),
+                              "期间最低": float(pick.期间最低) if pd.notna(pick.期间最低) else np.nan})
+            eq.append(val.sum())
+        ev = np.array(eq)
+        finals.append(ev[-1])
+        dds.append(float((ev / np.maximum.accumulate(ev) - 1.0).min()))
+        T = pd.DataFrame(taken)
+        # 两只同时大亏：不同份、持有期重叠、都亏超20%
+        cnt = 0
+        if len(T):
+            B = T[T["收益率"] <= -0.20].sort_values("买入日").reset_index(drop=True)
+            for a in range(len(B)):
+                for b in range(a + 1, len(B)):
+                    if B.at[b, "买入日"] >= B.at[a, "卖出日"]:
+                        break
+                    if B.at[a, "份"] != B.at[b, "份"]:
+                        cnt += 1
+            T["起点"] = s0
+            taken_all.append(T)
+        pair_cnt.append(cnt)
+        if s0 == 0:
+            curve0 = pd.Series(ev, index=grid)
+    f = np.array(finals)
+    TT = pd.concat(taken_all, ignore_index=True) if taken_all else pd.DataFrame()
+    return {"最终倍数(中位)": float(np.median(f)), "最终倍数(最差)": float(f.min()),
+            "最终倍数(最好)": float(f.max()),
+            "复利年化(中位)": float(np.median(f) ** (1 / yrs) - 1),
+            "最大回撤(中位)": float(np.median(dds)), "最大回撤(最差)": float(min(dds)),
+            "每条路径笔数": len(TT) / max(len(finals), 1),
+            "单笔亏损超20%的比例": float((TT["收益率"] <= -0.20).mean()) if len(TT) else np.nan,
+            "持有中浮亏超20%的比例": float((TT["期间最低"] <= -0.20).mean()) if len(TT) else np.nan,
+            "单笔胜率": float((TT["收益率"] > 0).mean()) if len(TT) else np.nan,
+            "两只同时大亏次数(中位)": float(np.median(pair_cnt)),
+            "两只同时大亏次数(最多)": int(max(pair_cnt)) if pair_cnt else 0,
+            "_curve": curve0}
+
+
+def holding_compare(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
+                    sec_fac: pd.DataFrame, dates: List[pd.Timestamp], BIAS: pd.DataFrame,
+                    top_sec: int, top_n: int, cooldown: int, per_sec_cap: int, min_members: int,
+                    n_hold: int = 3, hold: int = 20, every: int = 1, kdf: pd.DataFrame = None,
+                    **kw) -> dict:
+    """同一配置两份名单：不跳过 / 跳过高出30日线30%以上（顺延补位），都按「同时只持有 n_hold 只」模拟。"""
+    lists = {"不跳过": None, "跳过高出30日线30%以上（顺延补位）": (BIAS >= 0.30).fillna(False)}
+    rows, curves = [], {}
+    for nm, m in lists.items():
+        pk = sector_then_stock(panel, elig, sectors, sec_fac, dates, top_sec, top_n,
+                               "S1_板块内最强", "最强", cooldown=cooldown, kdf=kdf,
+                               per_sec_cap=per_sec_cap, min_members=min_members, skip_mask=m)
+        r = holding_sim(pk, panel, dates, n_hold, hold, every, **kw)
+        if not r:
+            continue
+        c = r.pop("_curve")
+        rows.append({"名单": nm, **r})
+        if c is not None:
+            curves[nm] = c
+    if not rows:
+        return {}
+    return {"summary": pd.DataFrame(rows).set_index("名单"), "curves": pd.DataFrame(curves)}
+
+
 def run_age_diagnosis(picks: pd.DataFrame, tr: pd.DataFrame, sec_fac: pd.DataFrame,
                       cal) -> pd.DataFrame:
     """
@@ -1980,7 +2097,7 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
                  holds=(15, 20), start_year: int = 2021, per_sec_cap: int = 0,
                  min_members: int = 5, cooldown: int = 5,
                  comm: float = 0.0003, stamp: float = 0.0005,
-                 slip: float = 0.001, progress=None) -> tuple:
+                 slip: float = 0.001, progress=None, skip_mask: pd.DataFrame = None) -> tuple:
     """
     模拟"你当年真的会怎么做"：
       每年年初，只用**截至上一年底**的数据，在全部配置里挑成绩最好的那个，
@@ -1997,7 +2114,8 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
     for i, (sg, ts, tn, hd) in enumerate(cfgs):
         pk = sector_then_stock(panel, elig, sectors, SF[sg], dates, ts, tn,
                                "S1_板块内最强", "最强", cooldown=cooldown,
-                               per_sec_cap=per_sec_cap, min_members=min_members)
+                               per_sec_cap=per_sec_cap, min_members=min_members,
+                               skip_mask=skip_mask)
         tr = track_fixed(pk, panel, hd, comm=comm, stamp=stamp, slip=slip) if len(pk) else pd.DataFrame()
         if len(tr):
             tr = tr.dropna(subset=["收益率"]).copy()
@@ -2026,7 +2144,7 @@ def walk_forward(panel: dict, elig: pd.DataFrame, sectors: Dict[str, List[str]],
         if not len(cur):
             continue
         _cap = ((f"|每板块≤{per_sec_cap}" if per_sec_cap > 0 else "|板块不限")
-                + f"|冷却{cooldown}日")
+                + f"|冷却{cooldown}日" + ("|跳过乖离≥30%" if skip_mask is not None else ""))
         picked.append({"年": y,
                        "选中配置": f"{bcfg[0]}|{bcfg[1]}板块|{bcfg[2]}只|{bcfg[3]}日{_cap}",
                        "历史t": best, "当年笔数": len(cur),
@@ -2099,7 +2217,7 @@ def _st(tr: pd.DataFrame) -> dict:
             "聚类t(朴素)": day.mean() / se if se > 1e-12 else np.nan}
 
 
-APP_VERSION = "2026-09-25 · 乖离版"
+APP_VERSION = "2026-09-25 · 持仓模拟版"
 
 
 def main():
@@ -2142,6 +2260,11 @@ def main():
                        + ("板块和排名不变时，名单在「前几名」和「后几名」之间**交替**。"
                           if _k == 2 else
                           f"板块和排名不变时，名单要轮 {_k} 组才回到第1名，挖得较深。"))
+        st.markdown("**买入过滤**")
+        skip_bias = st.checkbox("跳过高出30日线30%以上的票（顺延补位）", value=False,
+                                help="打开后，名单里股价高出30日均线30%以上的票直接跳过，名额顺延给板块内后面的名次。"
+                                     "8年里这类票单只亏损超20%的概率约20%，其他票约7%。"
+                                     "第②页对照、滚动前推、今日候选都按它执行。")
         with st.expander("其他设置"):
             start = st.date_input("数据起始（选「验证」模式时生效）", dt.date(2018, 1, 1))
             end = st.date_input("数据结束", dt.date.today())
@@ -2165,7 +2288,8 @@ def main():
             for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres",
                        "ksplit", "kbk", "elig", "elig_key", "kdf", "ddf",
                        "rankres", "live", "live_key", "hist_key", "hist", "dtm", "dtm_key", "skdj", "mh", "mh_key", "delay",
-                       "biasdf", "bias_key", "bias", "biasrule"):
+                       "biasdf", "bias_key", "bias", "biasrule",
+                       "holdsim"):
                 ss.pop(kk, None)
             gc.collect()
             st.success(f"已清除 {n} 个缓存文件，请点「下载数据」。")
@@ -2190,7 +2314,8 @@ def main():
         for kk in ("panel", "sec", "res", "nz", "sigres", "wf", "kres", "ksplit",
                    "elig", "elig_key", "kmask_key", "sec_mm", "rankres", "live", "live_key",
                    "hist_key", "hist", "dtm", "dtm_key", "skdj", "mh", "mh_key", "delay",
-                       "biasdf", "bias_key", "bias", "biasrule"):
+                       "biasdf", "bias_key", "bias", "biasrule",
+                       "holdsim"):
             ss.pop(kk, None)
         gc.collect()
         s_str, e_str = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
@@ -2290,6 +2415,7 @@ def main():
         ss["biasdf"] = ma30_bias(panel)
         ss["bias_key"] = dkey
     BIAS = ss["biasdf"]
+    SKIP = (BIAS >= 0.30).fillna(False) if skip_bias else None
     kw = dict(comm=comm, stamp=0.0005, slip=slip)
     dates = list(panel["cal"][130::every])
     st.caption(f"数据截至 **{panel['cal'][-1]:%Y-%m-%d}**　·　"
@@ -2396,11 +2522,13 @@ def main():
                 ("两层：最强板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
                                            top_sec, top_n, srule, "最强", cooldown=cool,
-                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem)),
+                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem,
+                                           skip_mask=SKIP)),
                 ("对照A：随机板块 + " + srule,
                  lambda: sector_then_stock(panel, elig, sectors, SF[sig], dates,
                                            top_sec, top_n, srule, "随机", cooldown=cool,
-                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem)),
+                                           kdf=KDF, per_sec_cap=cap, min_members=min_mem,
+                                           skip_mask=SKIP)),
                 ("对照B：不分板块，全池 " + srule,
                  lambda: flat_stock_pick(panel, elig, dates, top_n, srule, cooldown=cool)),
                 ("对照C：全池随机",
@@ -2417,7 +2545,7 @@ def main():
                     rows.append({"方案": lab, **s_}); keep[lab] = tr; pks[lab] = pk
             ss["res"] = (pd.DataFrame(rows).set_index("方案"), keep, pks, sig, srule)
             ss["res_lab"] = (f"{top_sec}板块｜{top_n}只｜每板块≤{cap or '不限'}｜持有{hold}日｜"
-                             f"每{every}日选｜冷却{cool}日")
+                             f"每{every}日选｜冷却{cool}日" + ("｜跳过乖离≥30%" if skip_bias else ""))
             ss.pop("wf", None); ss.pop("ksplit", None); ss.pop("skdj", None); ss.pop("delay", None)
             ss.pop("bias", None); ss.pop("biasrule", None)
             bar.empty(); gc.collect()
@@ -2529,6 +2657,7 @@ def main():
                     panel, elig, sectors, SF, dates,
                     top_secs=(2, 3), top_ns=(top_n,), holds=(15, 20),
                     start_year=2021, per_sec_cap=cap, min_members=min_mem, cooldown=cool,
+                    skip_mask=SKIP,
                     progress=lambda p, n2: bar3.progress(p, text=n2), **kw)
                 ss["wf"] = (picked, wf); bar3.empty(); gc.collect()
             if ss.get("wf"):
@@ -2617,6 +2746,7 @@ def main():
                               "板块信号": sig_, "选股规则": sr_, "选几个板块": top_sec,
                               "每次选几只": top_n, "持有交易日": hold,
                               "每几日选一次": every, "冷却交易日": cool,
+                              "跳过乖离≥30%": skip_bias,
                               "每板块最多几只": cap, "板块数": len(sectors),
                               "导出时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M")}]
                           ).T.rename(columns={0: "值"})}
@@ -2640,6 +2770,8 @@ def main():
                         tb["20_乖离划分_汇总"] = ss["bias"]["summary"]
                         tb["20_乖离划分_逐年超额"] = ss["bias"]["yearly"]
                         tb["20_乖离划分_逐年大亏比例"] = ss["bias"]["big_y"]
+                    if ss.get("holdsim"):
+                        tb["22_持仓模拟"] = ss["holdsim"]["summary"]
                     if ss.get("biasrule"):
                         tb["21_乖离规则_三种做法"] = ss["biasrule"]["plans"]
                         tb["21_乖离规则_逐年"] = ss["biasrule"]["yearly"].T
@@ -2782,6 +2914,9 @@ def main():
         st.caption("不用先跑乖离划分，可以直接运行。把「高出30%以上不买」写成规则，与基准同一配置比较："
                    "剔除后钱空着（不补位），或名额顺延给板块内后面的名次（顺延补位）。"
                    "按全部资金、真实复利和账户回撤比较。")
+        if skip_bias:
+            st.warning("侧边栏「跳过高出30日线30%以上」已打开，第②页的名单本身已经跳过这些票，"
+                       "这项检验会失去对照意义。请先关掉开关、重跑第②页对照实验，再运行这项检验。")
         if not ss.get("res"):
             st.info("先到「② 主回测」跑一次对照实验。")
         elif st.button("运行乖离规则检验", type="primary"):
@@ -2814,6 +2949,49 @@ def main():
             st.info("**要算有用**：最大回撤（尤其「分4份,最差起点」）明显更小，同时复利倍数、"
                     "样本内外、逐年都不明显差于基准。")
         st.divider()
+        st.markdown("### 按你的实际持仓模拟：同时只持有几只")
+        st.caption("资金分成几份，每份同一时间只拿1只：卖出那天按前一天的名单，买序号最靠前、手里还没有的那只，"
+                   "持有到期。比较「不跳过」和「跳过高出30日线30%以上（顺延补位）」两份名单。"
+                   "不同开始日期结果不同，全部算出来看中位和最差。与侧边栏开关无关，两种都会算。")
+        n_hold = st.slider("同时持有几只", 1, 5, 3, key="n_hold")
+        if st.button("运行持仓模拟", type="primary"):
+            _sig10 = ss["res"][3] if ss.get("res") else DEF_SIG
+            with st.spinner("两份名单各生成一遍，再按持仓方式模拟…"):
+                ss["holdsim"] = holding_compare(
+                    panel, elig, sectors, SF[_sig10], dates, BIAS, top_sec, top_n, cool, cap,
+                    min_mem, n_hold=n_hold, hold=hold, every=every, kdf=KDF, **kw)
+                ss["holdsim_lab"] = (f"{_sig10}｜{top_sec}板块｜名单{top_n}只｜每板块≤{cap or '不限'}｜"
+                                     f"冷却{cool}日｜持有{hold}日｜同时持有{n_hold}只")
+                gc.collect()
+        _hs = ss.get("holdsim")
+        if _hs:
+            st.caption(f"口径：{ss.get('holdsim_lab', '')}")
+            st.markdown("**对比表**（较宽，手机上请向左滑动）")
+            st.dataframe(_hs["summary"].style.format(
+                {"最终倍数(中位)": "×{:.2f}", "最终倍数(最差)": "×{:.2f}", "最终倍数(最好)": "×{:.2f}",
+                 "复利年化(中位)": "{:+.1%}", "最大回撤(中位)": "{:.0%}", "最大回撤(最差)": "{:.0%}",
+                 "每条路径笔数": "{:.0f}", "单笔亏损超20%的比例": "{:.1%}",
+                 "持有中浮亏超20%的比例": "{:.1%}", "单笔胜率": "{:.1%}",
+                 "两只同时大亏次数(中位)": "{:.0f}", "两只同时大亏次数(最多)": "{:.0f}"}),
+                use_container_width=True)
+            _sm = _hs["summary"]
+            try:
+                st.markdown(
+                    "- **最终倍数**：中位 " + "　对　".join(f"{k} ×{v:.2f}" for k, v in _sm["最终倍数(中位)"].items())
+                    + "\n- **最差起点的最终倍数**：" + "　对　".join(f"×{v:.2f}" for v in _sm["最终倍数(最差)"])
+                    + "\n- **最大回撤（最差起点）**：" + "　对　".join(f"{v:.0%}" for v in _sm["最大回撤(最差)"])
+                    + "\n- **单笔亏损超20%的比例**：" + "　对　".join(f"{v:.1%}" for v in _sm["单笔亏损超20%的比例"])
+                    + "\n- **8年里两只同时大亏的次数（中位）**：" + "　对　".join(f"{v:.0f} 次" for v in _sm["两只同时大亏次数(中位)"]))
+            except Exception:
+                pass
+            if len(_hs["curves"]):
+                st.line_chart(_hs["curves"], height=240)
+                st.caption("曲线是其中一个开始日期的净值（按每只卖出时结算）；表里是全部开始日期的中位和最差。")
+            st.info("**要算有用**：跳过之后「单笔亏损超20%的比例」「两只同时大亏次数」「最大回撤（最差）」明显更小，"
+                    "同时最终倍数（中位和最差）不明显更低。只拿几只时，各开始日期之间的差别会很大，"
+                    "看中位和最差两列，不要只看一条曲线。")
+        st.divider()
+
         st.markdown("**逐只查看**（每行：日期 代码；默认填的是你截图里的9只）")
         _snap_default = ("2026-07-03 688359\n2026-07-03 002643\n2026-07-03 300489\n"
                          "2026-07-07 301045\n2026-07-08 300671\n"
@@ -3005,13 +3183,13 @@ def main():
         # （同一个起点、每 every 日一次、同样的冷却）从头推到今天，名单 = 回测在这一天会选的票。
         if not dates:
             st.warning("数据太短，没有选股日。"); st.stop()
-        lkey = (dkey, sig2, sr2, top_sec, top_n, cap, every, cool)
+        lkey = (dkey, sig2, sr2, top_sec, top_n, cap, every, cool, skip_bias)
         if ss.get("live_key") != lkey:
             with st.spinner("按回测日程重放选股（含冷却轮换）…"):
                 ss["live"] = sector_then_stock(panel, elig, sectors, SF[sig2], dates,
                                                top_sec, top_n, sr2, "最强", cooldown=cool,
                                                kdf=KDF, per_sec_cap=cap,
-                                               min_members=min_mem)
+                                               min_members=min_mem, skip_mask=SKIP)
                 ss["live_key"] = lkey
         pk_all = ss["live"]
         ld = dates[-1]
@@ -3067,7 +3245,8 @@ def main():
                     "「板块内名次」是该股在本板块里按20日涨幅的名次；名次靠后说明前面的票在冷却中，"
                     "名额顺延到了它（实测板块内前10名收益看不出差别）。\n\n"
                     "「高出30日线」标 ⚠️ 的是高出30%以上：8年里这类票亏损超20%的概率约为其他票的三倍，"
-                    "但平均收益并不更低——要不要跳过，看第③页「乖离规则检验」。\n\n"
+                    "但平均收益并不更低——要不要跳过，看第③页「乖离规则检验」和「持仓模拟」。"
+                    + ("**侧边栏已打开跳过，名单里不会再出现这类票。**" if skip_bias else "") + "\n\n"
                     "「日线K」仅供参考：实测跳过K低的票、避开高位死叉的票，都不能提高收益。"
                     "**看到日线在跌就不买，等于偏离回测口径。**")
 
